@@ -202,6 +202,36 @@
 - `max_loss_pct = 1.5%`
 - `entry_confirm_pct = 1.0%`
 
+## 参数对照
+
+下面这些英文参数，后续在代码、配置和报表里尽量都保留，同时补上中文备注：
+
+- `mode`：交易模式，`short` 表示短线，`mid` 表示中线
+- `entry_price`：买入参考价
+- `stop_loss`：止损价
+- `take_profit`：止盈价
+- `risk_per_share`：每股风险，也就是买入价到止损价的差
+- `risk_reward`：盈亏比，通常写成 `R` 倍数
+- `position_pct`：建议仓位占比
+- `reason`：触发这条建议的原因说明
+- `confidence`：建议置信度，数值越高表示信号越稳定
+- `ma5`：5 日均线
+- `ma10`：10 日均线
+- `ma20`：20 日均线
+- `ma30`：30 日均线
+- `atr14`：14 日平均真实波幅，用来衡量波动
+- `support_level`：支撑位
+- `pressure_level`：压力位
+- `market_state`：市场状态
+- `trend_state`：趋势状态
+- `amount`：成交额
+- `pct_chg`：涨跌幅
+- `turnover`：换手率
+- `open`：开盘价
+- `high`：最高价
+- `low`：最低价
+- `prev_close`：昨收价
+
 ## 数据依赖
 
 第一版尽量只依赖：
@@ -285,4 +315,3 @@
 - 是否把仓位建议固定为百分比，还是同时输出股数
 - 是否优先服务短线，还是默认中线优先
 - 是否把这层逻辑接到企业微信通知里
-
