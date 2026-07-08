@@ -30,7 +30,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|readiness|ml-report|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|readiness|ml-report|backtest|test|show-env
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -54,9 +54,10 @@ show_menu() {
   9) 同步 JoinQuant 持仓
  10) 生成 readiness 报告
  11) 生成 ML 复盘报告
- 12) 查看当前配置
- 13) 运行测试
- 14) 首次安装/重写配置
+ 12) 运行本地信号回测
+ 13) 查看当前配置
+ 14) 运行测试
+ 15) 首次安装/重写配置
   h) 帮助
   q) 退出
 
@@ -111,9 +112,10 @@ menu_loop() {
       9) handle_command sync-joinquant ;;
       10) handle_command readiness ;;
       11) handle_command ml-report ;;
-      12) handle_command show-env ;;
-      13) handle_command test ;;
-      14) menu_install ;;
+      12) handle_command backtest ;;
+      13) handle_command show-env ;;
+      14) handle_command test ;;
+      15) menu_install ;;
       h|H) usage ;;
       q|Q|"") break ;;
       *) warn "未知选项：${choice}" ;;
@@ -179,6 +181,7 @@ env_value() {
 require_project_files() {
   for file in \
     a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
+    backtest_engine.py \
     joinquant_readiness_report.py ml_dataset.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
   done
@@ -476,6 +479,7 @@ Paper trading: $(env_value PAPER_TRADE_ENABLE 0), cash=$(env_value PAPER_TRADE_C
 JoinQuant: $(env_value JOINQUANT_ENABLE 0), dry_run=$(env_value JOINQUANT_DRY_RUN true)
 ML samples: $(env_value ML_SIGNAL_SAMPLE_FILE "${APP_DIR}/cache/ml/signal_samples.jsonl")
 ML report: $(env_value ML_REVIEW_REPORT_FILE "${APP_DIR}/output/ml_signal_review.md")
+Backtest report: ${APP_DIR}/output/backtest_report.md
 Holdings web port: $(env_value PORTFOLIO_WEB_PORT 8000)
 EOF
 }
@@ -519,6 +523,7 @@ handle_command() {
     sync-joinquant) run_foreground joinquant_sync.py ;;
     readiness) run_foreground joinquant_readiness_report.py ;;
     ml-report) run_foreground ml_dataset.py ;;
+    backtest) run_foreground backtest_engine.py ;;
     test) cd "${APP_DIR}"; "$(python_bin)" -m unittest discover -s tests -v ;;
     show-env) show_env_summary ;;
     help|-h|--help) usage ;;

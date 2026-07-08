@@ -182,7 +182,7 @@ cd /opt/stock-analysis
 bash run_ubuntu.sh
 ```
 
-常用菜单项包括查看状态、重启服务、查看日志、前台跑策略、同步 JoinQuant、生成 readiness、生成 ML 复盘和运行测试。
+常用菜单项包括查看状态、重启服务、查看日志、前台跑策略、同步 JoinQuant、生成 readiness、生成 ML 复盘、运行本地信号回测和运行测试。
 
 命令方式：
 ```bash
@@ -192,6 +192,7 @@ bash run_ubuntu.sh logs-strategy
 bash run_ubuntu.sh logs-web
 bash run_ubuntu.sh logs-joinquant
 bash run_ubuntu.sh show-env
+bash run_ubuntu.sh backtest
 bash run_ubuntu.sh test
 ```
 
@@ -204,6 +205,7 @@ bash run_ubuntu.sh run-joinquant-api
 bash run_ubuntu.sh sync-joinquant
 bash run_ubuntu.sh readiness
 bash run_ubuntu.sh ml-report
+bash run_ubuntu.sh backtest
 ```
 
 ## JoinQuant 平台配置
@@ -252,6 +254,15 @@ ML 样本日志：
 ```bash
 tail -n 5 cache/ml/signal_samples.jsonl
 ```
+
+本地信号回测：
+```bash
+bash run_ubuntu.sh backtest
+cat output/backtest_report.md
+head output/backtest_trades.csv
+```
+
+第一版回测默认读取 `cache/ml/signal_samples.jsonl`，如果没有该文件则读取 `cache/joinquant/signals.json`。它是信号级轻量回测：基于已生成的 JoinQuant/ML 信号模拟买卖、手续费、印花税、T+1、止盈止损和仓位限制，输出总收益、最大回撤、交易次数、胜率、未平仓数量和交易明细。完整历史重跑策略会在后续阶段补充。
 
 盘后信号追踪：
 ```bash
