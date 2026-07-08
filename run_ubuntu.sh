@@ -14,10 +14,12 @@ JQ_SYNC_SERVICE="stock-joinquant-sync.service"
 JQ_SYNC_TIMER="stock-joinquant-sync.timer"
 JQ_READINESS_SERVICE="stock-joinquant-readiness.service"
 JQ_READINESS_TIMER="stock-joinquant-readiness.timer"
+JQ_HEALTH_SERVICE="stock-joinquant-health.service"
+JQ_HEALTH_TIMER="stock-joinquant-health.timer"
 ML_REPORT_SERVICE="stock-ml-report.service"
 ML_REPORT_TIMER="stock-ml-report.timer"
 ALL_SERVICES=("${STRATEGY_SERVICE}" "${WEB_SERVICE}" "${JQ_SIGNAL_SERVICE}")
-ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}")
+ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}")
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -30,7 +32,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|readiness|ml-report|backtest|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|readiness|ml-report|backtest|test|show-env
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -52,12 +54,13 @@ show_menu() {
   7) 前台运行一次策略
   8) 前台启动 JoinQuant API
   9) 同步 JoinQuant 持仓
- 10) 生成 readiness 报告
- 11) 生成 ML 复盘报告
- 12) 运行本地信号回测
- 13) 查看当前配置
- 14) 运行测试
- 15) 首次安装/重写配置
+ 10) 生成 JoinQuant 健康检查
+ 11) 生成 readiness 报告
+ 12) 生成 ML 复盘报告
+ 13) 运行本地信号回测
+ 14) 查看当前配置
+ 15) 运行测试
+ 16) 首次安装/重写配置
   h) 帮助
   q) 退出
 
@@ -110,12 +113,13 @@ menu_loop() {
       7) handle_command run-strategy ;;
       8) handle_command run-joinquant-api ;;
       9) handle_command sync-joinquant ;;
-      10) handle_command readiness ;;
-      11) handle_command ml-report ;;
-      12) handle_command backtest ;;
-      13) handle_command show-env ;;
-      14) handle_command test ;;
-      15) menu_install ;;
+      10) handle_command health ;;
+      11) handle_command readiness ;;
+      12) handle_command ml-report ;;
+      13) handle_command backtest ;;
+      14) handle_command show-env ;;
+      15) handle_command test ;;
+      16) menu_install ;;
       h|H) usage ;;
       q|Q|"") break ;;
       *) warn "未知选项：${choice}" ;;
@@ -181,7 +185,7 @@ env_value() {
 require_project_files() {
   for file in \
     a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
-    backtest_engine.py \
+    joinquant_health.py backtest_engine.py \
     joinquant_readiness_report.py ml_dataset.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
   done
@@ -255,6 +259,9 @@ write_env_file() {
   set_env "JOINQUANT_MAX_POSITIONS" "5"
   set_env "JOINQUANT_MAX_TOTAL_POSITION_PCT" "80"
   set_env "JOINQUANT_REQUEST_TIMEOUT" "8"
+  set_env "JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN" "30"
+  set_env "JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN" "15"
+  set_env "JOINQUANT_HEALTH_FAILED_ORDER_LIMIT" "3"
   set_env "ML_SIGNAL_SAMPLE_FILE" "${APP_DIR}/cache/ml/signal_samples.jsonl"
   set_env "ML_REVIEW_REPORT_FILE" "${APP_DIR}/output/ml_signal_review.md"
   set_env "ENABLE_AI" "0"
@@ -358,6 +365,31 @@ Type=oneshot
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=-${ENV_FILE}
 ExecStart=${py} ${APP_DIR}/joinquant_readiness_report.py
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${JQ_HEALTH_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Build JoinQuant health report and alert
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${py} ${APP_DIR}/joinquant_health.py --notify
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${JQ_HEALTH_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Run JoinQuant health check every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=${JQ_HEALTH_SERVICE}
+
+[Install]
+WantedBy=timers.target
 EOF
 
   sudo tee "${SYSTEMD_DIR}/${JQ_READINESS_TIMER}" >/dev/null <<EOF
@@ -477,6 +509,7 @@ Webhook configured: $(if [[ -f "${ENV_FILE}" ]] && grep -Eq '^WECOM_WEBHOOK_URL=
 Scanner mode: $(env_value SCAN_MODE auto)
 Paper trading: $(env_value PAPER_TRADE_ENABLE 0), cash=$(env_value PAPER_TRADE_CASH 100000)
 JoinQuant: $(env_value JOINQUANT_ENABLE 0), dry_run=$(env_value JOINQUANT_DRY_RUN true)
+JoinQuant health: signal_max_age=$(env_value JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN 30)m, snapshot_max_age=$(env_value JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN 15)m
 ML samples: $(env_value ML_SIGNAL_SAMPLE_FILE "${APP_DIR}/cache/ml/signal_samples.jsonl")
 ML report: $(env_value ML_REVIEW_REPORT_FILE "${APP_DIR}/output/ml_signal_review.md")
 Backtest report: ${APP_DIR}/output/backtest_report.md
@@ -521,6 +554,7 @@ handle_command() {
     run-web) run_foreground holdings_web.py ;;
     run-joinquant-api) run_foreground joinquant_signal_server.py --host 0.0.0.0 --port "$(env_value JOINQUANT_SIGNAL_PORT 8010)" ;;
     sync-joinquant) run_foreground joinquant_sync.py ;;
+    health) run_foreground joinquant_health.py ;;
     readiness) run_foreground joinquant_readiness_report.py ;;
     ml-report) run_foreground ml_dataset.py ;;
     backtest) run_foreground backtest_engine.py ;;

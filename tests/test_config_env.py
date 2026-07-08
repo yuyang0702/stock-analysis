@@ -36,6 +36,9 @@ class ConfigEnvTest(unittest.TestCase):
             "JOINQUANT_DRY_RUN": "0",
             "JOINQUANT_MIN_SCORE": "81.5",
             "JOINQUANT_MAX_SIGNAL_AGE_MIN": "15",
+            "JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN": "25",
+            "JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN": "12",
+            "JOINQUANT_HEALTH_FAILED_ORDER_LIMIT": "2",
         }
         old_values = {key: os.environ.get(key) for key in updates}
         try:
@@ -70,6 +73,9 @@ class ConfigEnvTest(unittest.TestCase):
             self.assertFalse(reloaded.JOINQUANT_DRY_RUN_DEFAULT)
             self.assertEqual(reloaded.JOINQUANT_MIN_SCORE_DEFAULT, 81.5)
             self.assertEqual(reloaded.JOINQUANT_MAX_SIGNAL_AGE_MIN_DEFAULT, 15)
+            self.assertEqual(reloaded.JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN_DEFAULT, 25)
+            self.assertEqual(reloaded.JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN_DEFAULT, 12)
+            self.assertEqual(reloaded.JOINQUANT_HEALTH_FAILED_ORDER_LIMIT_DEFAULT, 2)
         finally:
             for key, value in old_values.items():
                 if value is None:

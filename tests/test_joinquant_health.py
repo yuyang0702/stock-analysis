@@ -1,0 +1,162 @@
+import json
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+
+import joinquant_health
+
+
+class JoinQuantHealthTest(unittest.TestCase):
+    def test_reports_ok_when_signal_and_snapshot_are_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account_snapshot.json"
+            history_file = base / "account_snapshot_history.jsonl"
+            report_file = base / "health.md"
+            now = datetime(2026, 7, 9, 10, 0, 0)
+            signal_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "generated_at": "2026-07-09 09:59:00",
+                        "signals": [{"id": "s1"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            snapshot = {
+                "schema_version": 1,
+                "generated_at": "2026-07-09 09:58:00",
+                "received_at": "2026-07-09 09:58:10",
+                "cash": 90000,
+                "total_value": 101000,
+                "positions": [{"code": "600000"}],
+                "orders": [{"status": "submitted"}],
+            }
+            snapshot_file.write_text(json.dumps(snapshot), encoding="utf-8")
+            history_file.write_text(json.dumps(snapshot, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                history_file,
+                report_file,
+                now=now,
+                signal_max_age_min=30,
+                snapshot_max_age_min=15,
+                failed_order_limit=1,
+            )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["snapshot_count_today"], 1)
+            self.assertEqual(result["position_count"], 1)
+            self.assertIn("JoinQuant 健康检查", report_file.read_text(encoding="utf-8"))
+
+    def test_reports_critical_when_snapshot_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account_snapshot.json"
+            report_file = base / "health.md"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "generated_at": "2026-07-09 09:59:00", "signals": []}),
+                encoding="utf-8",
+            )
+            snapshot_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "received_at": "2026-07-09 09:20:00",
+                        "positions": [],
+                        "orders": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                base / "missing_history.jsonl",
+                report_file,
+                now=datetime(2026, 7, 9, 10, 0, 0),
+                snapshot_max_age_min=15,
+            )
+
+            self.assertEqual(result["status"], "critical")
+            self.assertIn("snapshot_stale", result["issue_codes"])
+
+    def test_counts_failed_orders_from_today_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account_snapshot.json"
+            history_file = base / "account_snapshot_history.jsonl"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "generated_at": "2026-07-09 09:59:00", "signals": []}),
+                encoding="utf-8",
+            )
+            snapshot_file.write_text(
+                json.dumps({"schema_version": 1, "received_at": "2026-07-09 09:59:00", "positions": [], "orders": []}),
+                encoding="utf-8",
+            )
+            history_file.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "received_at": "2026-07-09 09:40:00",
+                                "orders": [{"status": "failed"}, {"status": "rejected"}],
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "received_at": "2026-07-08 14:40:00",
+                                "orders": [{"status": "failed"}],
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                history_file,
+                base / "health.md",
+                now=datetime(2026, 7, 9, 10, 0, 0),
+                failed_order_limit=1,
+            )
+
+            self.assertEqual(result["failed_orders_today"], 2)
+            self.assertIn("failed_orders_high", result["issue_codes"])
+
+    def test_alert_markdown_is_mobile_friendly(self) -> None:
+        md = joinquant_health.build_alert_markdown(
+            {
+                "status": "critical",
+                "generated_at": "2026-07-09 10:00:00",
+                "issue_codes": ["snapshot_stale"],
+                "issues": ["账户快照超时 40.0 分钟"],
+                "snapshot_age_min": 40.0,
+                "signal_age_min": 1.0,
+                "snapshot_count_today": 0,
+                "failed_orders_today": 0,
+                "position_count": 0,
+                "latest_total_value": 0,
+                "latest_cash": 0,
+            }
+        )
+
+        self.assertIn("【JoinQuant】健康异常", md)
+        self.assertIn("账户快照超时", md)
+        self.assertIn("快照年龄", md)
+
+
+if __name__ == "__main__":
+    unittest.main()

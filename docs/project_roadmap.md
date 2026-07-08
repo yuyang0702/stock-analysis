@@ -40,6 +40,7 @@ flowchart LR
 | JoinQuant 策略模板 | 已实现 | JoinQuant 平台运行 `joinquant_strategy.py`，默认使用模拟盘真实下单模式，不是 dry-run。 |
 | JoinQuant 执行回报 | 已实现 | 买入、卖出、跳过、失败等结果会通过回调进入服务器，并推送到微信。 |
 | JoinQuant 持仓同步 | 已实现 | 本地持仓展示读取 JoinQuant 回传结果，作为模拟盘主数据来源。 |
+| JoinQuant 健康检查与异常报警 | 已实现第一版 | `joinquant_health.py` 会检查信号文件、账户快照、今日快照次数和失败订单数，生成 `output/joinquant_health_YYYYMMDD.md`，并通过企业微信推送异常报警。 |
 | 节假日推送静默 | 已实现 | 非 A 股交易日默认不推普通扫描、买点提醒和 JoinQuant 空计划；可用 `NOTIFY_NON_TRADING_DAY=1` 临时打开联调。 |
 | 盘后信号追踪复盘 | 已实现 | 对已推送信号记录推送价、入场/止损/止盈、分数、题材和市场状态；盘后补充 D+N 快照、高低收、入场、止盈止损、最大浮盈、最大回撤和策略质量分组。 |
 | 本地信号级回测 | 已实现第一版 | `backtest_engine.py` 可读取 `cache/ml/signal_samples.jsonl` 或 `cache/joinquant/signals.json`，模拟信号买卖、手续费、印花税、T+1、止盈止损和仓位限制，输出 `output/backtest_report.md` 与 `output/backtest_trades.csv`。 |
@@ -59,8 +60,8 @@ flowchart LR
 | 4. 微信区分推送 | 已实现 | 当前主推 JoinQuant 模拟盘和执行回报；本地模拟盘标记只为废弃功能保留，默认不会推送。 |
 | 5. 手机微信展示优化 | 已实现 | 执行结果按短段落、状态、原因、数量、价格展示，适配手机阅读。 |
 | 6. 服务器完整部署 | 部分实现 | 一键脚本已完成；还需要实际服务器上配置公网 HTTPS、反向代理和定时器验证。 |
-| 7. 线上稳定性观察 | 待实现 | 连续观察交易日：拉信号、下单、失败原因、回调、同步是否稳定。 |
-| 8. 实盘前检查清单 | 部分实现 | 已有 readiness 报告雏形；后续需要加入更多线上健康检查。 |
+| 7. 线上稳定性观察 | 部分实现 | 已有健康检查定时器和异常报警；仍需连续交易日观察拉信号、下单、失败原因、回调、同步是否稳定。 |
+| 8. 实盘前检查清单 | 部分实现 | 已有 readiness 报告和健康检查报告；后续需要加入实盘级风控、交易适配层和审计清单。 |
 
 ## JoinQuant 可执行信号规则
 
@@ -185,8 +186,8 @@ JoinQuant 回传后补充以下标签：
 
 ## 后续优先级
 
-1. 在线服务器完整跑通 JoinQuant 模拟盘闭环：信号拉取、模拟下单、订单回报、微信通知、本地持仓同步。
-2. 观察 `cache/ml/signal_samples.jsonl` 和 `output/ml_signal_review.md` 是否每天稳定生成。
+1. 在线服务器完整跑通并连续观察 JoinQuant 模拟盘闭环：信号拉取、模拟下单、订单回报、微信通知、本地持仓同步和健康检查报警。
+2. 观察 `output/joinquant_health_YYYYMMDD.md`、`cache/ml/signal_samples.jsonl` 和 `output/ml_signal_review.md` 是否每天稳定生成。
 3. 观察 `output/backtest_report.md` 和 `output/backtest_trades.csv` 是否能稳定反映历史信号表现。
 4. 补齐多日收益标签：1 日、3 日、5 日、10 日收益，最大浮盈、最大浮亏、是否触发止损止盈。
 5. 按信号分数、市场状态、题材热度统计收益质量。

@@ -35,18 +35,30 @@
 
 目标：确认 JoinQuant 模拟盘链路能在真实交易日连续稳定运行。
 
-当前状态：通信链路已验证，服务器能收到 JoinQuant 的 `GET /joinquant/signals` 和 `POST /joinquant/account_snapshot`。
+当前状态：通信链路已验证，服务器能收到 JoinQuant 的 `GET /joinquant/signals` 和 `POST /joinquant/account_snapshot`。第一版健康检查已实现：`joinquant_health.py` 会生成 `output/joinquant_health_YYYYMMDD.md`，并在异常时通过企业微信报警。
 
 需要补充：
 
+已实现第一版：
+
 ```text
-1. 每日健康检查
-2. JoinQuant 拉信号失败报警
-3. 账户快照超过 N 分钟未更新报警
-4. 微信推送失败重试
-5. 每日收盘自动复盘
-6. 买入/卖出失败原因统计
-7. 订单回报和本地持仓一致性检查
+1. 每 5 分钟健康检查定时器
+2. 信号文件缺失/异常/超时检查
+3. 账户快照缺失/异常/超时检查
+4. 今日快照次数统计
+5. 今日失败/跳过订单统计
+6. 企业微信异常去重报警
+7. Markdown 健康检查报告
+```
+
+仍需补充：
+
+```text
+1. 微信推送失败重试
+2. 每日收盘稳定性日报
+3. 买入/卖出失败原因细分统计
+4. 订单回报和本地持仓一致性检查
+5. 连续交易日稳定性达标判定
 ```
 
 验收标准：
