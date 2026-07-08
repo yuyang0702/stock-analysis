@@ -134,6 +134,7 @@ stock-holdings-web.service
 stock-joinquant-signal.service
 stock-joinquant-sync.timer
 stock-joinquant-health.timer
+stock-notify-retry.timer
 stock-joinquant-readiness.timer
 stock-ml-report.timer
 ```
@@ -183,7 +184,7 @@ cd /opt/stock-analysis
 bash run_ubuntu.sh
 ```
 
-常用菜单项包括查看状态、重启服务、查看日志、前台跑策略、同步 JoinQuant、生成健康检查、生成 readiness、生成 ML 复盘、运行本地信号回测和运行测试。
+常用菜单项包括查看状态、重启服务、查看日志、前台跑策略、同步 JoinQuant、生成健康检查、重试失败微信推送、生成 readiness、生成 ML 复盘、运行本地信号回测和运行测试。
 
 命令方式：
 ```bash
@@ -194,6 +195,7 @@ bash run_ubuntu.sh logs-web
 bash run_ubuntu.sh logs-joinquant
 bash run_ubuntu.sh show-env
 bash run_ubuntu.sh health
+bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh backtest
 bash run_ubuntu.sh test
 ```
@@ -206,6 +208,7 @@ bash run_ubuntu.sh run-web
 bash run_ubuntu.sh run-joinquant-api
 bash run_ubuntu.sh sync-joinquant
 bash run_ubuntu.sh health
+bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh readiness
 bash run_ubuntu.sh ml-report
 bash run_ubuntu.sh backtest
@@ -255,7 +258,7 @@ bash run_ubuntu.sh health
 cat output/joinquant_health_$(date +%Y%m%d).md
 ```
 
-`stock-joinquant-health.timer` 会每 5 分钟运行一次。它会检查信号文件、账户快照、今日快照次数和失败订单数；发现信号/快照超时、文件异常或失败订单过多时，会通过企业微信发送去重后的异常报警。
+`stock-joinquant-health.timer` 会每 5 分钟运行一次。它会检查信号文件、账户快照、今日 API 拉取/回传次数、失败订单原因、持仓一致性和稳定性评分；发现信号/快照超时、文件异常、API 异常、持仓不一致或失败订单过多时，会通过企业微信发送去重后的异常报警。`stock-notify-retry.timer` 会每 5 分钟重试失败的企业微信推送。
 
 ML 基础复盘报告：
 ```bash

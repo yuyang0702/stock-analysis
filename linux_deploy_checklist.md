@@ -24,9 +24,12 @@ holdings_web.py
 joinquant_exporter.py
 joinquant_signal_server.py
 joinquant_sync.py
+joinquant_health.py
 joinquant_readiness_report.py
 joinquant_strategy.py
+notify_retry.py
 ml_dataset.py
+backtest_engine.py
 requirements.txt
 tests/
 ```
@@ -72,7 +75,15 @@ DRY_RUN = False
 
 ```bash
 bash run_ubuntu.sh test
+bash run_ubuntu.sh health
+bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh readiness
+```
+
+健康检查报告：
+
+```bash
+cat output/joinquant_health_$(date +%Y%m%d).md
 ```
 
 持仓网页：
