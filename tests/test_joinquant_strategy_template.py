@@ -25,6 +25,15 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
 
         self.assertIn('if event_count or getattr(g, "order_events", []):', text)
 
+    def test_template_posts_startup_self_test_without_orders(self) -> None:
+        text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
+
+        self.assertIn("STARTUP_SELF_TEST = True", text)
+        self.assertIn("startup_self_test(context)", text)
+        self.assertIn("def startup_self_test(context):", text)
+        self.assertIn("startup self test ok", text)
+        self.assertNotIn("execute_signals(context)\\n        post_account_snapshot(context)", text)
+
 
 if __name__ == "__main__":
     unittest.main()

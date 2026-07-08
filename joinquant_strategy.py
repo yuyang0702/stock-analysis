@@ -18,6 +18,7 @@ SIGNAL_URL = "http://SERVER_IP:8010/joinquant/signals"
 SNAPSHOT_URL = "http://SERVER_IP:8010/joinquant/account_snapshot"
 SYNC_TOKEN = ""
 DRY_RUN = False
+STARTUP_SELF_TEST = True
 MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_TOTAL_POSITION_PCT = 80.0
@@ -28,6 +29,8 @@ def initialize(context):
     g.executed_signal_ids = set()
     g.order_events = []
     run_daily(post_account_snapshot, time="15:05")
+    if STARTUP_SELF_TEST:
+        startup_self_test(context)
 
 
 def handle_data(context, data):
@@ -39,6 +42,12 @@ def fetch_and_execute(context):
     event_count = execute_signals(context)
     if event_count or getattr(g, "order_events", []):
         post_account_snapshot(context)
+
+
+def startup_self_test(context):
+    fetch_signals(context)
+    post_account_snapshot(context)
+    log.info("startup self test ok")
 
 
 def _url(base):
