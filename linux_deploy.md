@@ -265,6 +265,8 @@ ML 基础复盘报告：
 cat output/ml_signal_review.md
 ```
 
+当前 ML 只用于样本采集、基础复盘和信号级回测，不训练模型，也不会影响 JoinQuant 买入、卖出或仓位。
+
 ML 样本日志：
 ```bash
 tail -n 5 cache/ml/signal_samples.jsonl
