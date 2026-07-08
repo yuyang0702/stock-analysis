@@ -1,6 +1,6 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-07-07
+更新日期：2026-07-08
 
 本文档是当前项目规划的唯一主说明，合并已有能力、JoinQuant 接入方案、服务器部署流程，以及后续机器学习优化路线。其他早期设计文档只作为历史参考；如果口径冲突，以本文档为准。
 
@@ -103,6 +103,9 @@ flowchart LR
 - `joinquant_strategy.py` 复制到 JoinQuant 网站的策略编辑器中运行。
 - 服务器通过 `run_ubuntu.sh` 启动本地扫描、Web、JoinQuant 信号服务和定时任务。
 - 企业微信 webhook 和自定义 token 统一通过 `run_ubuntu.sh install --webhook ... --token ...` 写入服务器配置。
+- 代码统一托管在 GitHub：`https://github.com/yuyang0702/stock-analysis.git`。后续本地改完代码后先 `git add .`、`git commit`、`git push`；服务器进入 `/opt/stock-analysis` 后执行 `git pull origin main`，再用 `run_ubuntu.sh` 菜单重启服务。
+- 服务器目录固定为 `/opt/stock-analysis`；如果首次切换到 GitHub 版本，先把旧目录备份成 `stock-analysis.bak.YYYYMMDD-HHMMSS`，再 `git clone` 到新的 `stock-analysis` 目录。
+- `stock-analysis.env` 和 `cache/` 不上传 GitHub，分别保存服务器私有配置和运行数据；重新 clone 时需要从备份目录复制回来，日常 `git pull` 不会覆盖它们。
 - 本地模拟盘已废弃并默认关闭，避免和 JoinQuant 模拟盘产生双账户混淆。
 
 ## 机器学习优化方案

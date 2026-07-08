@@ -16,6 +16,79 @@ bash run_ubuntu.sh
 /opt/stock-analysis
 ```
 
+## GitHub 更新流程
+
+项目代码已经托管在：
+
+```text
+https://github.com/yuyang0702/stock-analysis.git
+```
+
+后续修改代码时，标准流程是：本地改代码并推送到 GitHub，服务器只用 `git pull` 增量更新，不再删除目录重新上传。
+
+### 本地修改后上传 GitHub
+
+在本地 Windows 项目目录执行：
+
+```bash
+git status
+git add .
+git commit -m "说明这次修改"
+git push
+```
+
+如果是 Codex 帮忙修改代码，Codex 会在本地完成检查、提交并推送到 GitHub。
+
+### 服务器更新到最新版
+
+服务器固定目录：
+
+```bash
+cd /opt/stock-analysis
+```
+
+更新代码并重启服务：
+
+```bash
+git pull origin main
+chmod +x run_ubuntu.sh
+bash run_ubuntu.sh
+```
+
+进入菜单后选择“重启服务”。如果只想用命令方式：
+
+```bash
+bash run_ubuntu.sh restart-all
+```
+
+### 首次从 GitHub 部署
+
+如果服务器上还没有 GitHub 版本，先备份旧目录，再 clone：
+
+```bash
+cd /opt
+mv stock-analysis stock-analysis.bak.$(date +%Y%m%d-%H%M%S)
+git clone --depth 1 https://github.com/yuyang0702/stock-analysis.git stock-analysis
+cd stock-analysis
+```
+
+再从备份目录复制服务器私有配置和运行缓存，例如备份目录是 `/opt/stock-analysis.bak.20260708-203220`：
+
+```bash
+cp /opt/stock-analysis.bak.20260708-203220/stock-analysis.env /opt/stock-analysis/ 2>/dev/null || true
+cp -r /opt/stock-analysis.bak.20260708-203220/cache /opt/stock-analysis/ 2>/dev/null || true
+```
+
+然后启动：
+
+```bash
+cd /opt/stock-analysis
+chmod +x run_ubuntu.sh
+bash run_ubuntu.sh
+```
+
+注意：`stock-analysis.env` 和 `cache/` 不上传 GitHub。前者保存企业微信 webhook、token、端口等私有配置；后者保存运行缓存、JoinQuant 同步状态、推送记录和复盘数据。日常 `git pull` 不会覆盖它们。
+
 ## 首次安装和启动
 
 ```bash
