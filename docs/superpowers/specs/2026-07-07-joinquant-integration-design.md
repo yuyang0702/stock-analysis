@@ -459,11 +459,13 @@ python joinquant_signal_server.py --host 0.0.0.0 --port 8010
 需要在 JoinQuant 策略脚本中配置：
 
 ```python
-SIGNAL_URL = "部署后的 HTTPS 信号接口地址/joinquant/signals"
-SNAPSHOT_URL = "部署后的 HTTPS 账户回写接口地址/joinquant/account_snapshot"
+SIGNAL_URL = "http://你的服务器IP:8010/joinquant/signals"
+SNAPSHOT_URL = "http://你的服务器IP:8010/joinquant/account_snapshot"
 SYNC_TOKEN = "从环境或策略参数读取"
 DRY_RUN = True
 ```
+
+如果服务器前面已经配置 Nginx、域名和 SSL 证书，再把 `http://服务器IP:8010` 换成 HTTPS 域名。直接访问内置 8010 服务时不要写 `https://`，否则 JoinQuant 会出现 `SSL: WRONG_VERSION_NUMBER`。
 
 如果暂时没有公网服务器，第一阶段可以手动把 `signals.json` 内容复制进 JoinQuant 脚本变量中验证执行逻辑。
 

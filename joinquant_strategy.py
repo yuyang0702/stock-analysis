@@ -3,6 +3,9 @@ Copy this file into JoinQuant as a strategy template.
 
 Set these values in the platform before running:
 SIGNAL_URL, SNAPSHOT_URL, SYNC_TOKEN, DRY_RUN.
+
+If you expose the built-in signal service directly on port 8010, use http://.
+Only use https:// after adding an HTTPS reverse proxy such as Nginx.
 """
 
 from datetime import datetime, timedelta
@@ -11,8 +14,8 @@ import urllib.parse
 import urllib.request
 
 
-SIGNAL_URL = "https://example.com/joinquant/signals"
-SNAPSHOT_URL = "https://example.com/joinquant/account_snapshot"
+SIGNAL_URL = "http://SERVER_IP:8010/joinquant/signals"
+SNAPSHOT_URL = "http://SERVER_IP:8010/joinquant/account_snapshot"
 SYNC_TOKEN = ""
 DRY_RUN = False
 MIN_SCORE = 75.0
