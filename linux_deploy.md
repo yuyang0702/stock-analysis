@@ -262,7 +262,9 @@ cat output/backtest_report.md
 head output/backtest_trades.csv
 ```
 
-第一版回测默认读取 `cache/ml/signal_samples.jsonl`，如果没有该文件则读取 `cache/joinquant/signals.json`。它是信号级轻量回测：基于已生成的 JoinQuant/ML 信号模拟买卖、手续费、印花税、T+1、止盈止损和仓位限制，输出总收益、最大回撤、交易次数、胜率、未平仓数量和交易明细。完整历史重跑策略会在后续阶段补充。
+第一版回测默认读取 `cache/ml/signal_samples.jsonl`，如果没有该文件则读取 `cache/joinquant/signals.json`。它是信号级轻量回测：基于已生成的 JoinQuant/ML 信号模拟买卖、手续费、印花税、T+1、止盈止损和仓位限制，输出总收益、最大回撤、交易次数、胜率、未平仓数量和交易明细。
+
+支持天数取决于输入文件里已经积累的信号天数：如果只有今天的 `signals.json`，就只能回测今天这一批；如果 `signal_samples.jsonl` 积累了 30/180 个交易日，就能覆盖对应区间。它目前不会自动下载历史行情，也不会按过去 6 个月逐日重跑全市场策略；完整历史回测会在后续阶段补充。
 
 盘后信号追踪：
 ```bash
