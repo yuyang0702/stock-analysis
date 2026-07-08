@@ -1,0 +1,195 @@
+# Linux 部署说明
+
+> 当前项目规划以 `docs/project_roadmap.md` 为准。本文只保留服务器执行步骤。
+
+项目上传到服务器后只用一个入口脚本：
+
+```bash
+bash run_ubuntu.sh
+```
+
+不带参数执行会进入交互菜单，适合日常使用；带参数执行仍然兼容原来的命令方式。
+
+建议目录：
+
+```bash
+/opt/stock-analysis
+```
+
+## 首次安装和启动
+
+```bash
+cd /opt/stock-analysis
+bash run_ubuntu.sh install \
+  --webhook '你的企业微信机器人URL' \
+  --token '你自己设置的长随机token'
+```
+
+可选参数：
+
+```bash
+bash run_ubuntu.sh install --cash 200000
+bash run_ubuntu.sh install --web-port 8080
+bash run_ubuntu.sh install --signal-port 8010
+bash run_ubuntu.sh install --skip-ocr
+bash run_ubuntu.sh install --skip-install
+bash run_ubuntu.sh install --no-start
+```
+
+`--webhook` 和 `--token` 会写入：
+
+```text
+/opt/stock-analysis/stock-analysis.env
+```
+
+对应字段：
+
+```bash
+WECOM_WEBHOOK_URL=你的企业微信机器人URL
+JOINQUANT_SYNC_TOKEN=你自己设置的长随机token
+NOTIFY_NON_TRADING_DAY=0
+A_SHARE_HOLIDAYS=
+```
+
+## 服务
+
+`install` 会注册并启动：
+
+```text
+stock-analysis.service
+stock-holdings-web.service
+stock-joinquant-signal.service
+stock-joinquant-sync.timer
+stock-joinquant-readiness.timer
+stock-ml-report.timer
+```
+
+默认安全模式：
+
+```bash
+JOINQUANT_ENABLE=1
+JOINQUANT_DRY_RUN=false
+PAPER_TRADE_ENABLE=0
+```
+
+`PAPER_TRADE_ENABLE=0` 表示本地模拟盘已废弃并默认停用；当前模拟交易主账户以 JoinQuant 模拟盘为准。
+
+## 微信推送与节假日
+
+默认推送规则：
+- 非 A 股交易日：不推普通扫描、买点提醒、JoinQuant 空计划，避免节假日刷屏。
+- 交易日盘前：可以推观察摘要，但不会导出 JoinQuant 买入计划。
+- 交易日盘中：允许买点提醒、JoinQuant 买入/卖出计划、执行回报。
+- 交易日午休：常驻模式默认跳过。
+- 交易日盘后：推盘后复盘和信号追踪复盘，不推买点下单计划。
+
+联调时如果想在周末或节假日仍然推送，把环境变量改成：
+
+```bash
+NOTIFY_NON_TRADING_DAY=1
+```
+
+法定节假日可手动配置，逗号分隔：
+
+```bash
+A_SHARE_HOLIDAYS=2026-10-01,2026-10-02,2026-10-05
+```
+
+修改后重启：
+
+```bash
+bash /opt/stock-analysis/run_ubuntu.sh restart-all
+```
+
+## 日常命令
+
+菜单方式：
+```bash
+cd /opt/stock-analysis
+bash run_ubuntu.sh
+```
+
+常用菜单项包括查看状态、重启服务、查看日志、前台跑策略、同步 JoinQuant、生成 readiness、生成 ML 复盘和运行测试。
+
+命令方式：
+```bash
+bash run_ubuntu.sh status-all
+bash run_ubuntu.sh restart-all
+bash run_ubuntu.sh logs-strategy
+bash run_ubuntu.sh logs-web
+bash run_ubuntu.sh logs-joinquant
+bash run_ubuntu.sh show-env
+bash run_ubuntu.sh test
+```
+
+前台调试：
+
+```bash
+bash run_ubuntu.sh run-strategy
+bash run_ubuntu.sh run-web
+bash run_ubuntu.sh run-joinquant-api
+bash run_ubuntu.sh sync-joinquant
+bash run_ubuntu.sh readiness
+bash run_ubuntu.sh ml-report
+```
+
+## JoinQuant 平台配置
+
+把 `joinquant_strategy.py` 复制到聚宽策略编辑器，然后填：
+
+```python
+SIGNAL_URL = "http://你的服务器IP:8010/joinquant/signals"
+SNAPSHOT_URL = "http://你的服务器IP:8010/joinquant/account_snapshot"
+SYNC_TOKEN = "你 install 时传入的 token"
+DRY_RUN = False
+```
+
+当前 `joinquant_strategy.py` 使用 `handle_data` 每根 bar 拉取并执行信号：服务器触发买入信号，JoinQuant 模拟盘就尝试买到目标仓位；服务器触发卖出信号，JoinQuant 模拟盘就尝试清仓卖出。执行后会立即回传快照，收盘后还会再回传一次账户状态。
+
+可执行信号规则：
+- 买入只在 A 股交易时间导出给 JoinQuant，非交易时间不会进入模拟盘下单。
+- 买入必须当前价达到或高于建议入场价，且涨幅低于 9.8%。
+- 卖出必须先确认 JoinQuant 同步持仓里已有该股票；未持仓股票不会导出卖出计划。
+- 卖出每轮由服务器风控重新确认；最新信号里没有卖出，JoinQuant 就不会按历史计划卖出。
+- T+1、停牌、涨跌停、休市、撮合失败由 JoinQuant 模拟盘处理，并通过执行回报回传。
+
+如果服务器前面有 HTTPS 反向代理，就把 URL 换成 HTTPS 域名。
+
+## 页面和报告
+
+持仓网页：
+
+```text
+http://你的服务器IP:8000
+```
+
+JoinQuant readiness 报告：
+
+```bash
+ls output/joinquant_readiness_*.md
+cat output/joinquant_readiness_$(date +%Y%m%d).md
+```
+
+ML 基础复盘报告：
+```bash
+cat output/ml_signal_review.md
+```
+
+ML 样本日志：
+```bash
+tail -n 5 cache/ml/signal_samples.jsonl
+```
+
+盘后信号追踪：
+```bash
+cat cache/signal_watchlist.json
+```
+
+盘后复盘会基于已推送信号补充 D+N 快照、当日高低收、是否入场、是否触及止盈/止损、最大浮盈、最大回撤，并输出按模式/题材/市场状态的轻量策略质量统计。
+
+## 修改配置
+
+```bash
+nano /opt/stock-analysis/stock-analysis.env
+bash /opt/stock-analysis/run_ubuntu.sh restart-all
+```

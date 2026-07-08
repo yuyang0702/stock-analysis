@@ -1,0 +1,86 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import joinquant_signal_server
+
+
+class JoinQuantSignalServerTest(unittest.TestCase):
+    def test_rejects_bad_token_and_serves_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal_file = Path(tmp) / "signals.json"
+            account_file = Path(tmp) / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            client = app.test_client()
+
+            self.assertEqual(client.get("/joinquant/signals?token=bad").status_code, 403)
+
+            response = client.get("/joinquant/signals?token=secret")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["schema_version"], 1)
+
+    def test_accepts_valid_account_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal_file = Path(tmp) / "signals.json"
+            account_file = Path(tmp) / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            client = app.test_client()
+            payload = {
+                "schema_version": 1,
+                "trade_date": "2026-07-07",
+                "generated_at": "2026-07-07 15:05:00",
+                "source": "joinquant",
+                "cash": 1000,
+                "total_value": 2000,
+                "positions": [{"code": "600000", "jq_code": "600000.XSHG", "qty": 100}],
+                "trades": [],
+            }
+
+            response = client.post("/joinquant/account_snapshot?token=secret", json=payload)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(json.loads(account_file.read_text(encoding="utf-8"))["source"], "joinquant")
+
+    def test_builds_mobile_execution_markdown_from_orders(self) -> None:
+        payload = {
+            "generated_at": "2026-07-07 15:05:00",
+            "cash": 1000,
+            "total_value": 2000,
+            "positions": [{"code": "600000"}],
+            "orders": [
+                {
+                    "action": "buy",
+                    "jq_code": "600000.XSHG",
+                    "name": "PF Bank",
+                    "status": "held",
+                    "filled": 100,
+                    "amount": 100,
+                    "target_pct": 12.5,
+                },
+                {
+                    "action": "buy",
+                    "jq_code": "000001.XSHE",
+                    "name": "PA Bank",
+                    "status": "failed",
+                    "reason": "limit_up_or_suspended",
+                },
+            ],
+        }
+
+        md = joinquant_signal_server.build_execution_markdown(payload)
+
+        self.assertIn("JoinQuant 模拟盘", md)
+        self.assertIn("执行回报", md)
+        self.assertIn("委托 2", md)
+        self.assertIn("成功 1", md)
+        self.assertIn("失败 1", md)
+        self.assertIn("600000.XSHG", md)
+        self.assertIn("limit_up_or_suspended", md)
+
+
+if __name__ == "__main__":
+    unittest.main()

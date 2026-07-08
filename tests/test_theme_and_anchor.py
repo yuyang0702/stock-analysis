@@ -1,0 +1,90 @@
+import unittest
+
+import pandas as pd
+
+import a_share_strategy as strat
+
+
+class DummyCache:
+    def __init__(self):
+        self.db = {}
+
+    def get(self, key, ttl_sec=None):
+        return self.db.get(key)
+
+    def set(self, key, value):
+        self.db[key] = value
+
+
+class ThemeAndAnchorTests(unittest.TestCase):
+    def test_infer_theme_label_falls_back_to_confirmation(self):
+        row = pd.Series(
+            {
+                "industry": "未识别",
+                "news_tags": "",
+                "news_hits": "",
+                "entry_reason": "",
+                "history_replay": "",
+                "trade_playbook": "",
+                "name": "测试票",
+            }
+        )
+        self.assertEqual(strat.infer_theme_label(row), "题材待确认")
+
+    def test_theme_heat_prefers_policy_and_money(self):
+        row = pd.Series(
+            {
+                "amount_rank_pct": 0.92,
+                "news_score": 9,
+                "news_tags": "公司公告:政策,公司公告:业绩",
+                "news_hits": "政策 | 业绩",
+                "lhb_tag": "机构参与",
+                "limit_quality": "封板较强",
+                "pressure_label": "突破/新高",
+            }
+        )
+        heat = strat.build_theme_heat_bundle(row, "题材催化偏强")
+        self.assertEqual(heat["theme_heat_level"], "高")
+        self.assertGreater(float(heat["theme_heat_score"]), 6)
+
+    def test_signal_anchor_locks_initial_entry(self):
+        cache = DummyCache()
+        first = pd.Series(
+            {
+                "code": "600000",
+                "mode": "mid",
+                "price": 10.0,
+                "entry_price": 10.0,
+                "stop_loss": 9.0,
+                "take_profit": 13.0,
+                "risk_reward": 3.0,
+                "position_pct": 5.0,
+                "risk_reason": "回踩型",
+                "risk_confidence": 0.8,
+                "buy_state": "已到买点",
+                "buy_reason": "价格到位",
+                "theme_label": "机器人",
+                "theme_heat_level": "高",
+                "theme_heat_reason": "资金活跃，政策催化",
+                "signal_first_seen": "2026-07-06",
+                "signal_state": "fresh",
+                "signal_action": "continue",
+                "has_holding": False,
+            }
+        )
+        second = first.copy()
+        second["price"] = 8.5
+        second["entry_price"] = 8.2
+        second["stop_loss"] = 7.6
+        second["take_profit"] = 11.0
+
+        anchored_first = strat.build_signal_anchor_bundle(first, cache)
+        anchored_second = strat.build_signal_anchor_bundle(second, cache)
+
+        self.assertEqual(float(anchored_first["entry_price"]), 10.0)
+        self.assertEqual(float(anchored_second["entry_price"]), 10.0)
+        self.assertTrue(bool(anchored_second["signal_anchor_locked"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
