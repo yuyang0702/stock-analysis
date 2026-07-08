@@ -291,3 +291,31 @@ cat cache/signal_watchlist.json
 nano /opt/stock-analysis/stock-analysis.env
 bash /opt/stock-analysis/run_ubuntu.sh restart-all
 ```
+## 2026-07-09 阶段 1 补齐后的运维命令
+
+健康检查现在会同时生成和读取这些文件：
+
+- `cache/joinquant/api_events.jsonl`：JoinQuant 拉信号、访问 latest、回传快照和异常请求日志。
+- `cache/joinquant/health_history.jsonl`：每次健康检查结果，用于连续交易日稳定性观察。
+- `cache/notify_failed_queue.jsonl`：企业微信发送失败后的重试队列。
+- `output/joinquant_health_YYYYMMDD.md`：手机可读的健康日报，包含 API 拉取/回传次数、失败原因拆分、持仓一致性和稳定性评分。
+
+常用命令：
+
+```bash
+cd /opt/stock-analysis
+bash run_ubuntu.sh health
+bash run_ubuntu.sh notify-retry
+bash run_ubuntu.sh status-all
+```
+
+`stock-joinquant-health.timer` 每 5 分钟运行健康检查；`stock-notify-retry.timer` 每 5 分钟重试失败的企业微信推送。
+
+更新到包含新 timer 的版本后，需要刷新 systemd：
+
+```bash
+cd /opt/stock-analysis
+git pull origin main
+bash run_ubuntu.sh install --skip-install --skip-ocr
+bash run_ubuntu.sh status-all
+```

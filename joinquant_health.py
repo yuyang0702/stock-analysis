@@ -53,7 +53,7 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _read_history(path: Path) -> list[dict[str, Any]]:
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
@@ -74,6 +74,10 @@ def _snapshot_time(payload: dict[str, Any]) -> str:
     return str(payload.get("received_at") or payload.get("generated_at") or "").strip()
 
 
+def _event_time(payload: dict[str, Any]) -> str:
+    return str(payload.get("received_at") or payload.get("ts") or payload.get("generated_at") or "").strip()
+
+
 def _orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raw = payload.get("orders", [])
     return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
@@ -81,6 +85,95 @@ def _orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _failed_orders(payload: dict[str, Any]) -> int:
     return sum(1 for item in _orders(payload) if str(item.get("status", "")).lower() in FAILED_STATUSES)
+
+
+def _failed_order_breakdown(snapshots: list[dict[str, Any]]) -> dict[str, int]:
+    breakdown: dict[str, int] = {}
+    for snapshot in snapshots:
+        for order in _orders(snapshot):
+            if str(order.get("status", "")).lower() not in FAILED_STATUSES:
+                continue
+            action = str(order.get("action") or "unknown").lower()
+            reason = str(order.get("reason") or order.get("status") or "unknown").strip().lower()
+            key = f"{action}:{reason}"
+            breakdown[key] = breakdown.get(key, 0) + 1
+    return dict(sorted(breakdown.items()))
+
+
+def _code(value: Any) -> str:
+    digits = "".join(filter(str.isdigit, str(value or "")))[:6]
+    return digits.zfill(6) if digits else ""
+
+
+def _qty(value: Any) -> int:
+    return int(_num(value, 0) or 0)
+
+
+def _position_map(payload: dict[str, Any]) -> dict[str, int]:
+    positions = payload.get("positions", [])
+    result: dict[str, int] = {}
+    if not isinstance(positions, list):
+        return result
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        code = _code(item.get("code") or item.get("jq_code"))
+        qty = _qty(item.get("qty") or item.get("amount") or item.get("total_amount"))
+        if code and qty > 0:
+            result[code] = qty
+    return result
+
+
+def _position_consistency(snapshot_payload: dict[str, Any], positions_file: Path) -> tuple[str, list[str]]:
+    if not positions_file.exists():
+        return "missing", []
+    local_payload, error = _load_json(positions_file)
+    if error:
+        return "invalid", []
+    snapshot_positions = _position_map(snapshot_payload)
+    local_positions = _position_map(local_payload)
+    mismatches: list[str] = []
+    for code in sorted(set(snapshot_positions) | set(local_positions)):
+        if snapshot_positions.get(code, 0) != local_positions.get(code, 0):
+            mismatches.append(code)
+    return ("ok" if not mismatches else "mismatch"), mismatches
+
+
+def _api_counts(events: list[dict[str, Any]], today: str) -> dict[str, int]:
+    counts = {
+        "signal_pull_count_today": 0,
+        "latest_pull_count_today": 0,
+        "snapshot_post_count_today": 0,
+        "api_error_count_today": 0,
+    }
+    for event in events:
+        if _event_time(event)[:10] != today:
+            continue
+        endpoint = str(event.get("endpoint") or "")
+        status = int(_num(event.get("status_code"), 0) or 0)
+        if endpoint == "signals" and status < 400:
+            counts["signal_pull_count_today"] += 1
+        elif endpoint == "latest" and status < 400:
+            counts["latest_pull_count_today"] += 1
+        elif endpoint == "account_snapshot" and status < 400:
+            counts["snapshot_post_count_today"] += 1
+        if status >= 400:
+            counts["api_error_count_today"] += 1
+    return counts
+
+
+def _stability_score(issue_codes: list[str], failed_orders_today: int, api_error_count_today: int) -> int:
+    score = 100
+    score -= 20 * len(issue_codes)
+    score -= min(20, failed_orders_today * 3)
+    score -= min(20, api_error_count_today * 5)
+    return max(0, min(100, score))
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
 
 
 def build_health_report(
@@ -93,11 +186,17 @@ def build_health_report(
     signal_max_age_min: int | None = None,
     snapshot_max_age_min: int | None = None,
     failed_order_limit: int | None = None,
+    api_event_file: Path | None = None,
+    positions_file: Path | None = None,
+    health_history_file: Path | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now()
     signal_file = signal_file or app_config.JOINQUANT_SIGNAL_FILE
     snapshot_file = snapshot_file or app_config.JOINQUANT_ACCOUNT_FILE
     history_file = history_file or snapshot_file.parent / "account_snapshot_history.jsonl"
+    api_event_file = api_event_file or snapshot_file.parent / "api_events.jsonl"
+    positions_file = positions_file or app_config.POSITIONS_FILE
+    health_history_file = health_history_file or snapshot_file.parent / "health_history.jsonl"
     report_file = report_file or app_config.OUTPUT_DIR / f"joinquant_health_{now.strftime('%Y%m%d')}.md"
     signal_max_age_min = (
         app_config.JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN_DEFAULT
@@ -117,16 +216,19 @@ def build_health_report(
 
     signal_payload, signal_error = _load_json(signal_file)
     snapshot_payload, snapshot_error = _load_json(snapshot_file)
-    history = _read_history(history_file)
+    history = _read_jsonl(history_file)
+    api_events = _read_jsonl(api_event_file)
     today = now.date().isoformat()
     history_today = [row for row in history if _snapshot_time(row)[:10] == today]
-    signal_time = signal_payload.get("generated_at")
-    snapshot_time = _snapshot_time(snapshot_payload)
-    signal_age = _age_minutes(signal_time, now)
-    snapshot_age = _age_minutes(snapshot_time, now)
+    snapshots_for_orders = history_today if history_today else ([snapshot_payload] if snapshot_payload else [])
+    signal_age = _age_minutes(signal_payload.get("generated_at"), now)
+    snapshot_age = _age_minutes(_snapshot_time(snapshot_payload), now)
     signals = signal_payload.get("signals", []) if isinstance(signal_payload.get("signals"), list) else []
     positions = snapshot_payload.get("positions", []) if isinstance(snapshot_payload.get("positions"), list) else []
-    failed_orders_today = sum(_failed_orders(row) for row in history_today) + _failed_orders(snapshot_payload)
+    failed_orders_today = sum(_failed_orders(row) for row in snapshots_for_orders)
+    failed_order_breakdown = _failed_order_breakdown(snapshots_for_orders)
+    api_counts = _api_counts(api_events, today)
+    position_consistency, position_mismatches = _position_consistency(snapshot_payload, positions_file)
     issues: list[str] = []
     issue_codes: list[str] = []
 
@@ -160,7 +262,19 @@ def build_health_report(
         issue_codes.append("failed_orders_high")
         issues.append(f"今日失败/跳过订单 {failed_orders_today} 笔，超过阈值 {failed_order_limit}")
 
+    if position_consistency == "mismatch":
+        issue_codes.append("position_mismatch")
+        issues.append(f"JoinQuant 快照与本地持仓不一致：{','.join(position_mismatches[:8])}")
+    elif position_consistency == "invalid":
+        issue_codes.append("position_file_invalid")
+        issues.append("本地持仓文件异常，无法和 JoinQuant 快照对账")
+
+    if api_counts["api_error_count_today"] > 0:
+        issue_codes.append("api_errors")
+        issues.append(f"今日 JoinQuant API 异常请求 {api_counts['api_error_count_today']} 次")
+
     status = "ok" if not issues else "critical"
+    stability_score = _stability_score(issue_codes, failed_orders_today, api_counts["api_error_count_today"])
     result = {
         "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         "status": status,
@@ -171,12 +285,22 @@ def build_health_report(
         "snapshot_age_min": round(snapshot_age, 1) if snapshot_age is not None else None,
         "snapshot_count_today": len(history_today),
         "failed_orders_today": failed_orders_today,
+        "failed_order_breakdown": failed_order_breakdown,
         "position_count": len(positions),
+        "position_consistency": position_consistency,
+        "position_mismatches": position_mismatches,
+        "signal_pull_count_today": api_counts["signal_pull_count_today"],
+        "latest_pull_count_today": api_counts["latest_pull_count_today"],
+        "snapshot_post_count_today": api_counts["snapshot_post_count_today"],
+        "api_error_count_today": api_counts["api_error_count_today"],
+        "stability_score": stability_score,
+        "stable_gate_pass": status == "ok" and stability_score >= 80,
         "latest_total_value": _num(snapshot_payload.get("total_value")),
         "latest_cash": _num(snapshot_payload.get("cash")),
     }
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text(build_report_markdown(result), encoding="utf-8")
+    _append_jsonl(health_history_file, result)
     return result
 
 
@@ -187,11 +311,18 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         "",
         f"- 生成时间：{result.get('generated_at')}",
         f"- 状态：{status_text}",
+        f"- 稳定性评分：{result.get('stability_score', 0)}",
+        f"- 实盘准入：{'通过' if result.get('stable_gate_pass') else '不通过'}",
         f"- 信号数量：{result.get('signal_count', 0)}",
         f"- 信号年龄：{result.get('signal_age_min')} 分钟",
         f"- 快照年龄：{result.get('snapshot_age_min')} 分钟",
+        f"- 今日信号拉取：{result.get('signal_pull_count_today', 0)} 次",
+        f"- 今日摘要访问：{result.get('latest_pull_count_today', 0)} 次",
+        f"- 今日快照回传：{result.get('snapshot_post_count_today', 0)} 次",
+        f"- 今日 API 异常：{result.get('api_error_count_today', 0)} 次",
         f"- 今日快照：{result.get('snapshot_count_today', 0)} 次",
         f"- 今日失败订单：{result.get('failed_orders_today', 0)} 笔",
+        f"- 持仓一致性：{result.get('position_consistency', '-')}",
         f"- 持仓数量：{result.get('position_count', 0)}",
         f"- 总资产：{_num(result.get('latest_total_value')):.2f}",
         f"- 现金：{_num(result.get('latest_cash')):.2f}",
@@ -200,10 +331,12 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         "",
     ]
     issues = result.get("issues") or []
-    if issues:
-        lines.extend(f"- {item}" for item in issues)
-    else:
-        lines.append("- 暂无异常。")
+    lines.extend(f"- {item}" for item in issues) if issues else lines.append("- 暂无异常。")
+
+    breakdown = result.get("failed_order_breakdown") or {}
+    if breakdown:
+        lines.extend(["", "## 失败原因统计", ""])
+        lines.extend(f"- {key}: {value}" for key, value in breakdown.items())
     return "\n".join(lines) + "\n"
 
 
@@ -212,8 +345,10 @@ def build_alert_markdown(result: dict[str, Any]) -> str:
         "#### 【JoinQuant】健康异常",
         f"> 时间：{result.get('generated_at', '-')}",
         f"> 状态：{result.get('status', '-')}",
+        f"> 评分：{result.get('stability_score', 0)} | 准入：{'通过' if result.get('stable_gate_pass') else '不通过'}",
+        f"> 拉取：{result.get('signal_pull_count_today', 0)} | 回传：{result.get('snapshot_post_count_today', 0)} | API异常：{result.get('api_error_count_today', 0)}",
         f"> 快照年龄：{result.get('snapshot_age_min')} 分钟 | 信号年龄：{result.get('signal_age_min')} 分钟",
-        f"> 今日快照：{result.get('snapshot_count_today', 0)} | 失败订单：{result.get('failed_orders_today', 0)}",
+        f"> 失败订单：{result.get('failed_orders_today', 0)} | 持仓一致性：{result.get('position_consistency', '-')}",
         f"> 总资产：{_num(result.get('latest_total_value')):.2f} | 现金：{_num(result.get('latest_cash')):.2f} | 持仓：{result.get('position_count', 0)}",
     ]
     for issue in result.get("issues") or []:
@@ -239,6 +374,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signal-file", type=Path, default=app_config.JOINQUANT_SIGNAL_FILE)
     parser.add_argument("--snapshot-file", type=Path, default=app_config.JOINQUANT_ACCOUNT_FILE)
     parser.add_argument("--history-file", type=Path)
+    parser.add_argument("--api-event-file", type=Path)
+    parser.add_argument("--positions-file", type=Path)
     parser.add_argument("--report-file", type=Path)
     parser.add_argument("--notify", action=argparse.BooleanOptionalAction, default=True)
     return parser
@@ -246,7 +383,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    result = build_health_report(args.signal_file, args.snapshot_file, args.history_file, args.report_file)
+    result = build_health_report(
+        args.signal_file,
+        args.snapshot_file,
+        args.history_file,
+        args.report_file,
+        api_event_file=args.api_event_file,
+        positions_file=args.positions_file,
+    )
     if args.notify:
         notify_if_needed(result)
     print(json.dumps(result, ensure_ascii=False, indent=2))

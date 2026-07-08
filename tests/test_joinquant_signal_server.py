@@ -45,6 +45,49 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(json.loads(account_file.read_text(encoding="utf-8"))["source"], "joinquant")
 
+    def test_writes_api_event_log_for_signal_pull_and_snapshot_post(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            event_file = base / "api_events.jsonl"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "generated_at": "2026-07-09 09:40:00", "signals": [{"id": "s1"}]}),
+                encoding="utf-8",
+            )
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file, event_file)
+            client = app.test_client()
+
+            self.assertEqual(client.get("/joinquant/signals?token=secret").status_code, 200)
+            self.assertEqual(
+                client.post(
+                    "/joinquant/account_snapshot?token=secret",
+                    json={"schema_version": 1, "positions": [], "trades": [], "orders": []},
+                ).status_code,
+                200,
+            )
+
+            rows = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["endpoint"] for row in rows], ["signals", "account_snapshot"])
+            self.assertEqual(rows[0]["signal_count"], 1)
+            self.assertEqual(rows[1]["status_code"], 200)
+
+    def test_writes_api_error_event_for_bad_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            event_file = base / "api_events.jsonl"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file, event_file)
+            client = app.test_client()
+
+            self.assertEqual(client.get("/joinquant/signals?token=bad").status_code, 403)
+
+            rows = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(rows[0]["endpoint"], "signals")
+            self.assertEqual(rows[0]["status_code"], 403)
+
     def test_builds_mobile_execution_markdown_from_orders(self) -> None:
         payload = {
             "generated_at": "2026-07-07 15:05:00",

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, abort, jsonify, request
+from flask import Flask, abort, g, jsonify, request
 
 import config as app_config
 from notifier import WeComNotifier
@@ -28,6 +28,20 @@ def _read_json(path: Path) -> dict[str, Any]:
     except Exception:
         return {"schema_version": 1, "signals": [], "stale": True, "error": "invalid_json"}
     return raw if isinstance(raw, dict) else {"schema_version": 1, "signals": [], "stale": True}
+
+
+def _append_api_event(path: Path, endpoint: str, status_code: int, **extra: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "endpoint": endpoint,
+        "status_code": status_code,
+        "remote_addr": request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip(),
+    }
+    payload.update(extra)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    g.api_event_logged = True
 
 
 def _check_token(expected: str) -> None:
@@ -123,28 +137,42 @@ def create_app(
     token: str | None = None,
     signal_file: Path | None = None,
     account_file: Path | None = None,
+    api_event_file: Path | None = None,
 ) -> Flask:
     app = Flask(__name__)
     expected_token = token if token is not None else app_config.JOINQUANT_SYNC_TOKEN
     signal_path = signal_file or app_config.JOINQUANT_SIGNAL_FILE
     account_path = account_file or app_config.JOINQUANT_ACCOUNT_FILE
+    event_path = api_event_file or account_path.parent / "api_events.jsonl"
+
+    @app.after_request
+    def log_api_error(response):
+        if request.path.startswith("/joinquant/") and not getattr(g, "api_event_logged", False):
+            endpoint = request.path.rsplit("/", 1)[-1] or "unknown"
+            _append_api_event(event_path, endpoint, response.status_code)
+        return response
 
     @app.get("/joinquant/signals")
     def signals():
         _check_token(expected_token)
-        return jsonify(_read_json(signal_path))
+        payload = _read_json(signal_path)
+        signal_count = len(payload.get("signals", [])) if isinstance(payload.get("signals"), list) else 0
+        _append_api_event(event_path, "signals", 200, signal_count=signal_count)
+        return jsonify(payload)
 
     @app.get("/joinquant/latest")
     def latest():
         _check_token(expected_token)
         payload = _read_json(signal_path)
+        signal_count = len(payload.get("signals", [])) if isinstance(payload.get("signals"), list) else 0
+        _append_api_event(event_path, "latest", 200, signal_count=signal_count)
         return jsonify(
             {
                 "schema_version": payload.get("schema_version", 1),
                 "generated_at": payload.get("generated_at"),
                 "trade_date": payload.get("trade_date"),
                 "run_id": payload.get("run_id"),
-                "signal_count": len(payload.get("signals", [])) if isinstance(payload.get("signals"), list) else 0,
+                "signal_count": signal_count,
                 "stale": bool(payload.get("stale", False)),
             }
         )
@@ -165,6 +193,13 @@ def create_app(
         except Exception as exc:
             print(f"ML order label update skipped: {exc}", flush=True)
         _notify_execution(payload)
+        _append_api_event(
+            event_path,
+            "account_snapshot",
+            200,
+            position_count=len(payload.get("positions", [])),
+            order_count=len(payload.get("orders", [])),
+        )
         return jsonify({"ok": True, "positions": len(payload.get("positions", []))})
 
     return app

@@ -202,3 +202,15 @@ JoinQuant 回传后补充以下标签：
 - 不急于接入强化学习。当前样本量、交易成本、市场噪声都不适合一开始就做强化学习。
 - 不急于让机器学习直接覆盖买卖规则。先做辅助评分和复盘，稳定后再扩大权限。
 - 不恢复本地模拟盘。当前主模拟盘以 JoinQuant 为准，方便在 JoinQuant 网站查看具体操作。
+
+## 2026-07-09 阶段 1 补齐状态
+
+阶段 1 当前已补齐为“JoinQuant 模拟盘稳定性闭环”：
+
+- `joinquant_signal_server.py` 会记录 `cache/joinquant/api_events.jsonl`，包括 JoinQuant 拉取信号、访问 latest、回传账户快照，以及 403/400/503 等异常请求。
+- `joinquant_health.py` 会生成 `output/joinquant_health_YYYYMMDD.md`，统计信号新鲜度、账户快照新鲜度、今日信号拉取次数、今日快照回传次数、API 异常次数、失败/跳过订单数、失败原因拆分、持仓一致性和稳定性评分。
+- `joinquant_health.py` 会追加 `cache/joinquant/health_history.jsonl`，用于后续观察连续交易日稳定性。
+- `notifier.py` 已加入失败推送队列；企业微信发送失败会写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 会定时重试。
+- `run_ubuntu.sh` 是统一入口，新增 `notify-retry` 菜单和命令；安装时会统一写入健康检查和微信重试的 systemd timer。
+
+阶段 1 的实盘前观察标准：连续 10 个交易日稳定运行，`joinquant_health` 报告无 critical，信号拉取和快照回传稳定，失败订单原因可解释，微信异常通知可以收到或被重试补发。本地模拟盘仍为废弃功能，不作为当前模拟交易依据。

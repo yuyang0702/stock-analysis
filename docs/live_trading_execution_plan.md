@@ -411,3 +411,16 @@ KILL_SWITCH 已实现并验证
 弱市不买，是减少亏损的第一优先级。
 盈利保护，是策略能长期活下来的第一优先级。
 ```
+## 2026-07-09 阶段 1 实现更新
+
+阶段 1 已从“第一版健康检查”升级为“模拟盘稳定性闭环”：
+
+- API 访问审计：`joinquant_signal_server.py` 写入 `cache/joinquant/api_events.jsonl`，记录 `/joinquant/signals`、`/joinquant/latest`、`/joinquant/account_snapshot` 的成功和异常访问。
+- 每日稳定性报告：`joinquant_health.py` 输出 `output/joinquant_health_YYYYMMDD.md`，包含拉取次数、回传次数、API 异常、信号/快照年龄、订单失败原因、持仓一致性和稳定性评分。
+- 连续观察数据：`joinquant_health.py` 写入 `cache/joinquant/health_history.jsonl`，后续可以用来判断连续交易日是否达标。
+- 失败原因归因：报告会按 `buy:reason`、`sell:reason` 聚合失败、拒单、取消和跳过原因，便于区分涨停、停牌、T+1、余额不足或风控限制。
+- 持仓一致性：报告会比较 JoinQuant 最新快照和本地同步后的 `cache/portfolio_web/positions.json`，发现数量或代码不一致会标记 critical。
+- 通知兜底：`notifier.py` 会把发送失败的企业微信消息写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 每 5 分钟重试。
+- 统一运维入口：`run_ubuntu.sh` 新增 `notify-retry` 命令和菜单项，`install` 会统一安装健康检查、持仓同步、微信重试、readiness、ML 复盘等 timer。
+
+阶段 1 剩余工作不再是代码功能缺口，而是线上观察：至少连续 10 个交易日检查健康报告、执行回报、微信提醒和 JoinQuant 网站委托记录是否一致。达到稳定标准后再推进阶段 2 的完整历史回测和阶段 3 的实盘级风控。
