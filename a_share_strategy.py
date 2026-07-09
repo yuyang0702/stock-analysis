@@ -84,6 +84,7 @@ class Config:
     joinquant: bool = app_config.JOINQUANT_ENABLE_DEFAULT
     joinquant_dry_run: bool = app_config.JOINQUANT_DRY_RUN_DEFAULT
     joinquant_min_score: float = app_config.JOINQUANT_MIN_SCORE_DEFAULT
+    sector_context_only: bool = False
 
 
 class DiskCache:
@@ -905,7 +906,7 @@ def load_sector_market_context(path: Path = SECTOR_MARKET_CONTEXT_FILE) -> dict[
     return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
 
 
-def fetch_sector_market_context(
+def refresh_sector_market_context(
     loaders: Iterable[Any] | None = None,
     cache_path: Path = SECTOR_MARKET_CONTEXT_FILE,
 ) -> dict[str, dict[str, Any]]:
@@ -943,8 +944,27 @@ def fetch_sector_market_context(
     }
 
 
+def load_sector_market_context_for_scan(cache_path: Path = SECTOR_MARKET_CONTEXT_FILE) -> dict[str, dict[str, Any]]:
+    cached = load_sector_market_context(cache_path)
+    if cached:
+        cached["_status"] = "cache"
+        cached["_reason"] = "使用最近一次成功板块行情缓存"
+        return cached
+    return {
+        "_status": "missing",
+        "_reason": "板块行情未更新，按中性处理",
+    }
+
+
+def fetch_sector_market_context(
+    loaders: Iterable[Any] | None = None,
+    cache_path: Path = SECTOR_MARKET_CONTEXT_FILE,
+) -> dict[str, dict[str, Any]]:
+    return refresh_sector_market_context(loaders=loaders, cache_path=cache_path)
+
+
 def build_sector_position_bundle(row: pd.Series, sector_context: dict[str, dict[str, Any]]) -> pd.Series:
-    if sector_context.get("_status") == "error":
+    if sector_context.get("_status") in {"error", "missing"}:
         return pd.Series(
             {
                 "sector_pct_chg": 0.0,
@@ -2966,7 +2986,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     market_state = market_info["state"]
     market_news_state = analyze_market_news(market_news)
     portfolio_positions = load_portfolio_positions()
-    sector_context = fetch_sector_market_context()
+    sector_context = load_sector_market_context_for_scan()
     client, model = get_ai_client() if cfg.ai else (None, None)
 
     for idx, (_, row) in enumerate(pool.iterrows()):
@@ -3344,6 +3364,7 @@ def parse_args() -> Config:
     parser.add_argument("--joinquant", action=argparse.BooleanOptionalAction, default=app_config.JOINQUANT_ENABLE_DEFAULT)
     parser.add_argument("--joinquant-dry-run", action=argparse.BooleanOptionalAction, default=app_config.JOINQUANT_DRY_RUN_DEFAULT)
     parser.add_argument("--joinquant-min-score", type=float, default=app_config.JOINQUANT_MIN_SCORE_DEFAULT)
+    parser.add_argument("--sector-context-only", action="store_true", default=False)
     args = parser.parse_args()
 
     return Config(
@@ -3386,6 +3407,7 @@ def parse_args() -> Config:
         joinquant=args.joinquant,
         joinquant_dry_run=args.joinquant_dry_run,
         joinquant_min_score=args.joinquant_min_score,
+        sector_context_only=args.sector_context_only,
     )
 
 
@@ -3603,6 +3625,16 @@ def print_console_report(result: pd.DataFrame, market_info: dict[str, Any], mark
 def main() -> None:
     cfg = parse_args()
     CACHE_DIR.mkdir(exist_ok=True)
+    if cfg.sector_context_only:
+        context = refresh_sector_market_context()
+        status = context.get("_status", "unknown")
+        reason = context.get("_reason", "")
+        boards = len([key for key in context if not str(key).startswith("_")])
+        print(f"Sector market context status={status} boards={boards} file={SECTOR_MARKET_CONTEXT_FILE}")
+        if reason:
+            print(reason)
+        return
+
     cache = DiskCache(CACHE_DIR / "scan_cache.json")
     notifier = WeComNotifier(
         webhook_url=cfg.notify_webhook,

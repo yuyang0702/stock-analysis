@@ -22,12 +22,14 @@ ML_REPORT_SERVICE="stock-ml-report.service"
 ML_REPORT_TIMER="stock-ml-report.timer"
 GLOBAL_CONTEXT_SERVICE="stock-global-context.service"
 GLOBAL_CONTEXT_TIMER="stock-global-context.timer"
+SECTOR_CONTEXT_SERVICE="stock-sector-context.service"
+SECTOR_CONTEXT_TIMER="stock-sector-context.timer"
 STRATEGY_COMPARE_SERVICE="stock-strategy-compare.service"
 STRATEGY_COMPARE_TIMER="stock-strategy-compare.timer"
 STRATEGY_COMPARE_WEEKLY_SERVICE="stock-strategy-compare-weekly.service"
 STRATEGY_COMPARE_WEEKLY_TIMER="stock-strategy-compare-weekly.timer"
 ALL_SERVICES=("${STRATEGY_SERVICE}" "${WEB_SERVICE}" "${JQ_SIGNAL_SERVICE}")
-ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}" "${STRATEGY_COMPARE_TIMER}" "${STRATEGY_COMPARE_WEEKLY_TIMER}")
+ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}" "${SECTOR_CONTEXT_TIMER}" "${STRATEGY_COMPARE_TIMER}" "${STRATEGY_COMPARE_WEEKLY_TIMER}")
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -40,7 +42,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|notify-retry|readiness|ml-report|global-context|strategy-compare|strategy-compare-weekly|backtest|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|test|show-env
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -498,6 +500,35 @@ Unit=${GLOBAL_CONTEXT_SERVICE}
 WantedBy=timers.target
 EOF
 
+  sudo tee "${SYSTEMD_DIR}/${SECTOR_CONTEXT_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Refresh A-share sector market context cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${py} ${APP_DIR}/a_share_strategy.py --sector-context-only
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${SECTOR_CONTEXT_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Refresh A-share sector market context cache at low frequency
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:20:00
+OnCalendar=Mon..Fri *-*-* 10:30:00
+OnCalendar=Mon..Fri *-*-* 13:00:00
+OnCalendar=Mon..Fri *-*-* 14:30:00
+Persistent=true
+Unit=${SECTOR_CONTEXT_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
   sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_SERVICE}" >/dev/null <<EOF
 [Unit]
 Description=Build original vs shadow strategy compare report
@@ -630,6 +661,7 @@ JoinQuant health: signal_max_age=$(env_value JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN
 ML samples: $(env_value ML_SIGNAL_SAMPLE_FILE "${APP_DIR}/cache/ml/signal_samples.jsonl")
 ML report: $(env_value ML_REVIEW_REPORT_FILE "${APP_DIR}/output/ml_signal_review.md")
 Global context: $(env_value GLOBAL_MARKET_CONTEXT_FILE "${APP_DIR}/cache/market/global_context.json")
+Sector context: ${APP_DIR}/cache/market/sector_context.json
 Strategy compare: $(env_value STRATEGY_COMPARE_REPORT_FILE "${APP_DIR}/output/strategy_compare_report.md")
 Backtest report: ${APP_DIR}/output/backtest_report.md
 Notify retry queue: ${APP_DIR}/cache/notify_failed_queue.jsonl
@@ -679,6 +711,7 @@ handle_command() {
     readiness) run_foreground joinquant_readiness_report.py ;;
     ml-report) run_foreground ml_dataset.py ;;
     global-context) run_foreground global_market_context.py ;;
+    sector-context) run_foreground a_share_strategy.py --sector-context-only ;;
     strategy-compare) run_foreground strategy_compare_report.py ;;
     strategy-compare-weekly) run_foreground strategy_compare_report.py --notify --weekly ;;
     backtest) run_foreground backtest_engine.py ;;

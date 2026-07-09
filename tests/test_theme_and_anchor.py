@@ -108,6 +108,26 @@ class ThemeAndAnchorTests(unittest.TestCase):
         self.assertEqual(bundle["sector_rank_pct"], -1.0)
         self.assertIn("板块行情获取失败", bundle["sector_position_reason"])
 
+    def test_scan_sector_context_reads_cache_without_calling_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "sector_context.json"
+            strat.save_sector_market_context(
+                {"人工智能": {"sector_pct_chg": 3.2, "sector_rank_pct": 0.95, "sector_hot_level": "强"}},
+                cache_path,
+            )
+
+            context = strat.load_sector_market_context_for_scan(cache_path)
+
+            self.assertEqual(context["人工智能"]["sector_hot_level"], "强")
+            self.assertEqual(context["_status"], "cache")
+
+    def test_scan_sector_context_is_neutral_when_cache_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = strat.load_sector_market_context_for_scan(Path(tmp) / "missing.json")
+
+            self.assertEqual(context["_status"], "missing")
+            self.assertIn("板块行情未更新", context["_reason"])
+
     def test_signal_anchor_locks_initial_entry(self):
         cache = DummyCache()
         first = pd.Series(

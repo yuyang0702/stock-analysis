@@ -155,7 +155,7 @@ flowchart LR
 
 - 生成 JoinQuant 信号时，会把信号样本追加到 `cache/ml/signal_samples.jsonl`。
 - `shadow_score.py` 会基于原策略分、消息催化、题材热度、板块位置、市场情绪、交易质量和海外风险生成 `enhanced_score`、`shadow_adjust_score`、`original_rank`、`shadow_rank`、`shadow_rank_change` 和 `shadow_reason`，只用于对照复盘。
-- `a_share_strategy.py` 会通过 AkShare 东方财富行业/概念板块行情补充板块位置，并把最近一次成功结果写入 `cache/market/sector_context.json`；板块接口断开时优先复用缓存，没有缓存才按板块中性处理并在依据里提示失败原因。
+- 板块行情改为独立低频刷新：`a_share_strategy.py --sector-context-only` 或 `bash run_ubuntu.sh sector-context` 会通过 AkShare 东方财富行业/概念板块行情刷新 `cache/market/sector_context.json`；日常扫描只读取该缓存，不在每轮扫描时主动请求板块接口。刷新失败时优先保留最近成功缓存，没有缓存才按板块中性处理并在依据里提示失败原因。
 - `global_market_context.py` 会通过 AkShare 东方财富主源抓取美股、日本、韩国主要指数并写入 `cache/market/global_context.json`；主源失败时切到 Sina 备用源，备用源也失败时优先复用 24 小时内最近一次成功缓存，仍不可用才按海外风险中性处理，不阻塞扫描。
 - 日常微信扫描汇总、单票提醒和 JoinQuant 下单计划会显示原策略分、影子分、影子调整和原排名到影子排名的变化；影子分不是百分制，允许超过 100，只用于观察，不参与下单。
 - JoinQuant 回传订单后，会把订单状态、失败原因、订单号、数量、成交量和价格回填到样本中。
@@ -177,7 +177,7 @@ flowchart LR
 | ML-3 复盘报表 | 已实现 | 可生成 `output/ml_signal_review.md` 和 `output/strategy_compare_report.md`，统计样本、订单状态、原策略分布、影子评分分布和策略对照结果；不训练模型、不参与下单。 |
 | ML-4 信号回测 | 已实现第一版 | 基于已生成信号输出收益、回撤、胜率和交易明细，为后续模型训练提供对照基线；完整历史重跑策略仍待补充。 |
 | ML-5 完整历史回测 | 待实现 | 接入历史行情源，按历史交易日逐日重跑当前策略，生成 6 个月/1 年级别的净值曲线和策略质量分组。 |
-| ML-6 影子模型 | 已实现第一版 | 当前不是训练模型，而是规则型影子评分；已纳入消息催化、题材热度、实时板块位置、市场情绪、交易质量和海外风险；`enhanced_score = final_score + shadow_adjust_score`，不再按 100 封顶，并输出原排名、影子排名和排名变化；实时板块位置有最近成功缓存兜底；不影响真实下单，用来和原策略做对照。 |
+| ML-6 影子模型 | 已实现第一版 | 当前不是训练模型，而是规则型影子评分；已纳入消息催化、题材热度、板块位置缓存、市场情绪、交易质量和海外风险；`enhanced_score = final_score + shadow_adjust_score`，不再按 100 封顶，并输出原排名、影子排名和排名变化；板块位置由独立 timer 低频刷新，扫描只读最近成功缓存；不影响真实下单，用来和原策略做对照。 |
 | ML-7 策略辅助 | 待实现 | 只允许机器学习做排序、过滤或小幅仓位调整，止损、单票上限、总仓位上限仍由硬规则控制。 |
 | ML-8 自动优化 | 待实现 | 在样本足够后，定期训练、回测、模拟盘对照，只有通过门槛才更新线上参数。 |
 
