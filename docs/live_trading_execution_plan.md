@@ -319,7 +319,7 @@ JoinQuant 实盘服务（如果确认可用）
 
 ```text
 shadow_score.py 已生成影子增强分 enhanced_score、shadow_rank 和 shadow_reason。
-global_market_context.py 会读取 cache/market/global_context.json；没有该文件时海外风险按中性处理。
+global_market_context.py 会通过 AkShare 抓取美股、日本、韩国主要指数并写入 cache/market/global_context.json；抓取失败或文件缺失时海外风险按中性处理。
 现阶段只进入扫描结果、CSV 和 ML 样本复盘，不改变 final_score 排序、不改变 JoinQuant 下单、不改变 position_pct。
 ```
 
@@ -440,7 +440,7 @@ KILL_SWITCH 已实现并验证
 - 失败原因归因：报告会按 `buy:reason`、`sell:reason` 聚合失败、拒单、取消和跳过原因，便于区分涨停、停牌、T+1、余额不足或风控限制。
 - 持仓一致性：报告会比较 JoinQuant 最新快照和本地同步后的 `cache/portfolio_web/positions.json`，发现数量或代码不一致会标记 critical。
 - 模板版本自检：`joinquant_strategy.py` 回传 `strategy_template_version`，`joinquant_health.py` 对比 `JOINQUANT_TEMPLATE_VERSION`，不一致时标记 `template_version_mismatch` 并提示 JoinQuant 网站模板未更新。
-- 影子评分第一版：`shadow_score.py` 基于原策略分、消息催化、题材热度、市场情绪、交易质量和海外风险生成 `enhanced_score`、`shadow_rank` 和 `shadow_reason`；`global_market_context.py` 读取 `cache/market/global_context.json`，缺失时按中性处理；`a_share_strategy.py` 写入扫描结果，`ml_dataset.py` 写入样本复盘，但 JoinQuant 下单仍使用原 `final_score` 和原仓位。
+- 影子评分第一版：`shadow_score.py` 基于原策略分、消息催化、题材热度、市场情绪、交易质量和海外风险生成 `enhanced_score`、`shadow_rank` 和 `shadow_reason`；`global_market_context.py` 通过 AkShare 抓取美股、日本、韩国主要指数并写入 `cache/market/global_context.json`，抓取失败或缺失时按中性处理；`a_share_strategy.py` 写入扫描结果，`ml_dataset.py` 写入样本复盘，但 JoinQuant 下单仍使用原 `final_score` 和原仓位。
 - 通知兜底：`notifier.py` 会把发送失败的企业微信消息写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 每 5 分钟重试。
 - 统一运维入口：`run_ubuntu.sh` 新增 `notify-retry` 命令和菜单项，`install` 会统一安装健康检查、持仓同步、微信重试、readiness、ML 复盘等 timer。
 

@@ -20,8 +20,10 @@ NOTIFY_RETRY_SERVICE="stock-notify-retry.service"
 NOTIFY_RETRY_TIMER="stock-notify-retry.timer"
 ML_REPORT_SERVICE="stock-ml-report.service"
 ML_REPORT_TIMER="stock-ml-report.timer"
+GLOBAL_CONTEXT_SERVICE="stock-global-context.service"
+GLOBAL_CONTEXT_TIMER="stock-global-context.timer"
 ALL_SERVICES=("${STRATEGY_SERVICE}" "${WEB_SERVICE}" "${JQ_SIGNAL_SERVICE}")
-ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}")
+ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}")
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -34,7 +36,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|notify-retry|readiness|ml-report|backtest|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|notify-retry|readiness|ml-report|global-context|backtest|test|show-env
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -60,10 +62,11 @@ show_menu() {
  11) 重试失败微信推送
  12) 生成 readiness 报告
  13) 生成 ML 复盘报告
- 14) 运行本地信号回测
- 15) 查看当前配置
- 16) 运行测试
- 17) 首次安装/重写配置
+ 14) 更新美日韩市场上下文
+ 15) 运行本地信号回测
+ 16) 查看当前配置
+ 17) 运行测试
+ 18) 首次安装/重写配置
   h) 帮助
   q) 退出
 
@@ -120,10 +123,11 @@ menu_loop() {
       11) handle_command notify-retry ;;
       12) handle_command readiness ;;
       13) handle_command ml-report ;;
-      14) handle_command backtest ;;
-      15) handle_command show-env ;;
-      16) handle_command test ;;
-      17) menu_install ;;
+      14) handle_command global-context ;;
+      15) handle_command backtest ;;
+      16) handle_command show-env ;;
+      17) handle_command test ;;
+      18) menu_install ;;
       h|H) usage ;;
       q|Q|"") break ;;
       *) warn "未知选项：${choice}" ;;
@@ -190,7 +194,7 @@ require_project_files() {
   for file in \
     a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
     joinquant_health.py notify_retry.py backtest_engine.py \
-    joinquant_readiness_report.py ml_dataset.py requirements.txt; do
+    joinquant_readiness_report.py ml_dataset.py global_market_context.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
   done
 }
@@ -268,6 +272,7 @@ write_env_file() {
   set_env "JOINQUANT_HEALTH_FAILED_ORDER_LIMIT" "3"
   set_env "ML_SIGNAL_SAMPLE_FILE" "${APP_DIR}/cache/ml/signal_samples.jsonl"
   set_env "ML_REVIEW_REPORT_FILE" "${APP_DIR}/output/ml_signal_review.md"
+  set_env "GLOBAL_MARKET_CONTEXT_FILE" "${APP_DIR}/cache/market/global_context.json"
   set_env "ENABLE_AI" "0"
   set_env "ARK_API_KEY" ""
   set_env "ARK_MODEL" ""
@@ -458,6 +463,32 @@ Unit=${ML_REPORT_SERVICE}
 WantedBy=timers.target
 EOF
 
+  sudo tee "${SYSTEMD_DIR}/${GLOBAL_CONTEXT_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Fetch US Japan Korea market context
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${py} ${APP_DIR}/global_market_context.py
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${GLOBAL_CONTEXT_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Fetch US Japan Korea market context before A-share open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:55:00
+Persistent=true
+Unit=${GLOBAL_CONTEXT_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
   sudo systemctl daemon-reload
   sudo systemctl enable "${ALL_SERVICES[@]}" "${ALL_TIMERS[@]}"
 }
@@ -541,6 +572,7 @@ JoinQuant: $(env_value JOINQUANT_ENABLE 0), dry_run=$(env_value JOINQUANT_DRY_RU
 JoinQuant health: signal_max_age=$(env_value JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN 30)m, snapshot_max_age=$(env_value JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN 15)m
 ML samples: $(env_value ML_SIGNAL_SAMPLE_FILE "${APP_DIR}/cache/ml/signal_samples.jsonl")
 ML report: $(env_value ML_REVIEW_REPORT_FILE "${APP_DIR}/output/ml_signal_review.md")
+Global context: $(env_value GLOBAL_MARKET_CONTEXT_FILE "${APP_DIR}/cache/market/global_context.json")
 Backtest report: ${APP_DIR}/output/backtest_report.md
 Notify retry queue: ${APP_DIR}/cache/notify_failed_queue.jsonl
 Holdings web port: $(env_value PORTFOLIO_WEB_PORT 8000)
@@ -588,6 +620,7 @@ handle_command() {
     notify-retry) run_foreground notify_retry.py ;;
     readiness) run_foreground joinquant_readiness_report.py ;;
     ml-report) run_foreground ml_dataset.py ;;
+    global-context) run_foreground global_market_context.py ;;
     backtest) run_foreground backtest_engine.py ;;
     test) cd "${APP_DIR}"; "$(python_bin)" -m unittest discover -s tests -v ;;
     show-env) show_env_summary ;;
