@@ -155,7 +155,7 @@ flowchart LR
 
 - 生成 JoinQuant 信号时，会把信号样本追加到 `cache/ml/signal_samples.jsonl`。
 - `shadow_score.py` 会基于原策略分、消息催化、题材热度、市场情绪、交易质量和海外风险生成 `enhanced_score`、`shadow_rank` 和 `shadow_reason`，只用于对照复盘。
-- `global_market_context.py` 会通过 AkShare 抓取美股、日本、韩国主要指数并写入 `cache/market/global_context.json`；抓取失败或文件缺失时按海外风险中性处理，不阻塞扫描。
+- `global_market_context.py` 会通过 AkShare 东方财富主源抓取美股、日本、韩国主要指数并写入 `cache/market/global_context.json`；主源失败时切到 Sina 备用源，备用源也失败时优先复用 24 小时内最近一次成功缓存，仍不可用才按海外风险中性处理，不阻塞扫描。
 - 日常微信扫描汇总、单票提醒和 JoinQuant 下单计划会显示原策略分和影子分；影子分标注为仅观察，不参与下单。
 - JoinQuant 回传订单后，会把订单状态、失败原因、订单号、数量、成交量和价格回填到样本中。
 - `ml_dataset.py` 可生成 `output/ml_signal_review.md`，用于查看样本数、买卖数量、订单状态、原策略分布和影子评分分布。

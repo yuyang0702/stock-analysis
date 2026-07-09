@@ -13,6 +13,7 @@ import config as app_config
 
 
 DEFAULT_GLOBAL_CONTEXT_FILE = app_config.GLOBAL_MARKET_CONTEXT_FILE
+MAX_CACHE_AGE_HOURS = 24
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -74,14 +75,13 @@ def build_global_context(us_pct: float = 0.0, japan_pct: float = 0.0, korea_pct:
     }
 
 
-def fetch_global_context(fetcher: Any | None = None) -> dict[str, Any]:
-    fetcher = fetcher or ak.index_global_spot_em
-    df = fetcher()
+def _context_from_frame(df: pd.DataFrame, source: str) -> dict[str, Any]:
     if df is None or df.empty:
         return {
             **build_global_context(),
             "global_reason": "美日韩指数抓取为空，按中性处理",
             "fetch_status": "empty",
+            "source": source,
         }
     name_col = _find_col(df, ["名称", "name", "指数名称", "代码名称"])
     pct_col = _find_col(df, ["涨跌幅", "涨跌幅%", "change_pct", "pct_chg", "最新涨跌幅"])
@@ -90,6 +90,7 @@ def fetch_global_context(fetcher: Any | None = None) -> dict[str, Any]:
             **build_global_context(),
             "global_reason": "美日韩指数字段缺失，按中性处理",
             "fetch_status": "bad_schema",
+            "source": source,
         }
     us_pct, us_names = _avg_pct(df, name_col, pct_col, ["纳斯达克", "NASDAQ", "标普", "S&P", "道琼斯", "DOW"])
     japan_pct, japan_names = _avg_pct(df, name_col, pct_col, ["日经", "NIKKEI", "TOPIX", "东证"])
@@ -98,7 +99,7 @@ def fetch_global_context(fetcher: Any | None = None) -> dict[str, Any]:
     context.update(
         {
             "fetch_status": "ok",
-            "source": "ak.index_global_spot_em",
+            "source": source,
             "us_indices": us_names,
             "japan_indices": japan_names,
             "korea_indices": korea_names,
@@ -110,6 +111,93 @@ def fetch_global_context(fetcher: Any | None = None) -> dict[str, Any]:
         }
     )
     return context
+
+
+def _pct_from_history(df: pd.DataFrame) -> float | None:
+    if df is None or len(df) < 2 or "close" not in df.columns:
+        return None
+    closes = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(closes) < 2:
+        return None
+    prev = float(closes.iloc[-2])
+    latest = float(closes.iloc[-1])
+    if prev == 0:
+        return None
+    return (latest - prev) / prev * 100
+
+
+def fetch_sina_global_snapshot() -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for name, getter in [
+        ("标普500", lambda: ak.index_us_stock_sina(symbol=".INX")),
+        ("纳斯达克", lambda: ak.index_us_stock_sina(symbol=".IXIC")),
+        ("日经225", lambda: ak.index_global_hist_sina(symbol="日经225指数")),
+        ("KOSPI", lambda: ak.index_global_hist_sina(symbol="首尔综合指数")),
+    ]:
+        try:
+            pct = _pct_from_history(getter())
+        except Exception:
+            pct = None
+        if pct is not None:
+            rows.append({"名称": name, "涨跌幅": pct})
+    return pd.DataFrame(rows)
+
+
+def _fresh_cached_context(path: Path | None, max_age_hours: int) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    context = load_global_context(path)
+    if context.get("fetch_status") != "ok":
+        return None
+    generated_at = str(context.get("generated_at") or "")
+    try:
+        age_hours = (datetime.now() - datetime.strptime(generated_at, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600
+    except Exception:
+        return None
+    if age_hours > max_age_hours:
+        return None
+    return {
+        **context,
+        "fetch_status": "reused_cache",
+        "global_reason": f"复用最近成功海外数据：{context.get('global_reason', '')}",
+    }
+
+
+def fetch_global_context(
+    fetcher: Any | None = None,
+    fetchers: list[tuple[str, Any]] | None = None,
+    previous_path: Path | None = None,
+    max_cache_age_hours: int = MAX_CACHE_AGE_HOURS,
+) -> dict[str, Any]:
+    if fetchers is None:
+        fetchers = [("ak.index_global_spot_em", fetcher or ak.index_global_spot_em)]
+        if fetcher is None:
+            fetchers.append(("ak.sina_global_history", fetch_sina_global_snapshot))
+
+    errors: list[str] = []
+    for source, source_fetcher in fetchers:
+        try:
+            context = _context_from_frame(source_fetcher(), source)
+        except Exception as exc:
+            errors.append(f"{source}: {exc}")
+            continue
+        if context.get("fetch_status") == "ok":
+            if errors:
+                context["fallback_errors"] = errors
+            return context
+        errors.append(f"{source}: {context.get('fetch_status')}")
+
+    cached = _fresh_cached_context(previous_path, max_cache_age_hours)
+    if cached is not None:
+        cached["fallback_errors"] = errors
+        return cached
+
+    return {
+        **build_global_context(),
+        "global_reason": f"美日韩指数抓取失败，按中性处理：{'; '.join(errors) or 'unknown'}",
+        "fetch_status": "error",
+        "fallback_errors": errors,
+    }
 
 
 def save_global_context(context: dict[str, Any], path: Path | None = None) -> Path:
@@ -151,14 +239,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch US/Japan/Korea market context for shadow scoring")
     parser.add_argument("--output", type=Path, default=DEFAULT_GLOBAL_CONTEXT_FILE)
     args = parser.parse_args()
-    try:
-        context = fetch_global_context()
-    except Exception as exc:
-        context = {
-            **build_global_context(),
-            "global_reason": f"美日韩指数抓取失败，按中性处理：{exc}",
-            "fetch_status": "error",
-        }
+    context = fetch_global_context(previous_path=args.output)
     path = save_global_context(context, args.output)
     print(f"Global market context saved: {path}")
     print(context.get("global_reason", ""))
