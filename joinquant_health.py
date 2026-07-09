@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +11,35 @@ from notifier import WeComNotifier
 
 
 FAILED_STATUSES = {"failed", "rejected", "cancelled", "skipped"}
+NON_TRADING_NOISE_ISSUES = {
+    "signal_file_error",
+    "signal_time_missing",
+    "signal_stale",
+    "snapshot_file_error",
+    "snapshot_time_missing",
+    "snapshot_stale",
+}
+
+
+def _is_a_share_trading_day(now: datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    return now.strftime("%Y-%m-%d") not in app_config.A_SHARE_HOLIDAYS_DEFAULT
+
+
+def _is_a_share_trading_time(now: datetime) -> bool:
+    if not _is_a_share_trading_day(now):
+        return False
+    current = now.time()
+    return (time(9, 30) <= current <= time(11, 30)) or (time(13, 0) <= current <= time(15, 0))
+
+
+def _alert_required(issue_codes: list[str], now: datetime) -> bool:
+    if not issue_codes:
+        return False
+    if _is_a_share_trading_time(now):
+        return True
+    return any(code not in NON_TRADING_NOISE_ISSUES for code in issue_codes)
 
 
 def _load_json(path: Path) -> tuple[dict[str, Any], str]:
@@ -274,10 +303,14 @@ def build_health_report(
         issues.append(f"今日 JoinQuant API 异常请求 {api_counts['api_error_count_today']} 次")
 
     status = "ok" if not issues else "critical"
+    is_trading_time = _is_a_share_trading_time(now)
+    alert_required = _alert_required(issue_codes, now)
     stability_score = _stability_score(issue_codes, failed_orders_today, api_counts["api_error_count_today"])
     result = {
         "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         "status": status,
+        "is_trading_time": is_trading_time,
+        "alert_required": alert_required,
         "issues": issues,
         "issue_codes": issue_codes,
         "signal_count": len(signals),
@@ -311,6 +344,8 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         "",
         f"- 生成时间：{result.get('generated_at')}",
         f"- 状态：{status_text}",
+        f"- 当前交易时段：{'是' if result.get('is_trading_time') else '否'}",
+        f"- 是否触发微信报警：{'是' if result.get('alert_required') else '否'}",
         f"- 稳定性评分：{result.get('stability_score', 0)}",
         f"- 实盘准入：{'通过' if result.get('stable_gate_pass') else '不通过'}",
         f"- 信号数量：{result.get('signal_count', 0)}",
@@ -357,7 +392,7 @@ def build_alert_markdown(result: dict[str, Any]) -> str:
 
 
 def notify_if_needed(result: dict[str, Any]) -> bool:
-    if result.get("status") == "ok" or not app_config.WECOM_WEBHOOK_URL:
+    if not result.get("alert_required") or not app_config.WECOM_WEBHOOK_URL:
         return False
     notifier = WeComNotifier(
         webhook_url=app_config.WECOM_WEBHOOK_URL,

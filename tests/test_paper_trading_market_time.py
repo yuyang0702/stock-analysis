@@ -11,8 +11,14 @@ class PaperTradingMarketTimeTest(unittest.TestCase):
     def test_a_share_trading_time_requires_weekday_and_session(self) -> None:
         self.assertTrue(a_share_strategy.is_a_share_trading_time(datetime(2026, 7, 7, 10, 0)))
         self.assertTrue(a_share_strategy.is_a_share_trading_time(datetime(2026, 7, 7, 13, 30)))
+        self.assertFalse(a_share_strategy.is_a_share_trading_time(datetime(2026, 7, 7, 9, 29)))
+        self.assertTrue(a_share_strategy.is_a_share_trading_time(datetime(2026, 7, 7, 9, 30)))
         self.assertFalse(a_share_strategy.is_a_share_trading_time(datetime(2026, 7, 7, 12, 0)))
         self.assertFalse(a_share_strategy.is_a_share_trading_time(datetime(2026, 7, 11, 10, 0)))
+
+    def test_runtime_phase_does_not_treat_call_auction_as_intraday(self) -> None:
+        self.assertEqual(a_share_strategy.resolve_runtime_phase(datetime(2026, 7, 7, 9, 29)), "pre")
+        self.assertEqual(a_share_strategy.resolve_runtime_phase(datetime(2026, 7, 7, 9, 30)), "intraday")
 
     def test_local_paper_trading_skips_outside_trading_time(self) -> None:
         cfg = a_share_strategy.Config()

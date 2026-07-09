@@ -76,6 +76,29 @@ class AlertMarkdownTest(unittest.TestCase):
         self.assertIn("止盈：无有效空间", md)
         self.assertIn("上方空间不足", md)
 
+    def test_summary_marks_invalid_take_profit_when_not_above_entry(self) -> None:
+        rows = pd.DataFrame(
+            [
+                {
+                    "code": "600000",
+                    "name": "PF Bank",
+                    "mode": "intraday",
+                    "entry_price": 10.0,
+                    "stop_loss": 9.5,
+                    "take_profit": 10.0,
+                    "position_pct": 10,
+                    "has_holding": False,
+                    "risk_reason": "上方压力太近",
+                }
+            ]
+        )
+
+        md = a_share_strategy.build_summary_markdown(rows, {"state": "强势进攻"}, "无", a_share_strategy.Config())
+
+        self.assertIn("止盈 无有效空间", md)
+        self.assertIn("上方空间不足", md)
+        self.assertNotIn("止盈 10.00", md)
+
     def test_intraday_buy_rows_exclude_limit_up_candidates(self) -> None:
         rows = pd.DataFrame(
             [

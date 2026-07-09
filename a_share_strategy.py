@@ -2357,11 +2357,11 @@ def resolve_runtime_phase(now: datetime | None = None) -> str:
     """把当前时间映射成脚本运行阶段。"""
     now = now or datetime.now()
     hhmm = now.strftime("%H:%M")
-    if "09:15" <= hhmm <= "11:35" or "13:00" <= hhmm <= "15:10":
+    if ("09:30" <= hhmm <= "11:30") or ("13:00" <= hhmm <= "15:00"):
         return "intraday"
-    if "11:35" < hhmm < "13:00":
+    if "11:30" < hhmm < "13:00":
         return "lunch"
-    if hhmm < "09:15":
+    if hhmm < "09:30":
         return "pre"
     return "after"
 
@@ -3234,7 +3234,7 @@ def build_summary_markdown(
             lines.append(
                 f"{idx}. {row.get('code', '')} {row.get('name', '')} | "
                 f"{row.get('mode', 'mid')} | 入场 {_fmt_num(row.get('entry_price'))} | "
-                f"止损 {_fmt_num(row.get('stop_loss'))} | 止盈 {_fmt_num(row.get('take_profit'))} | "
+                f"止损 {_fmt_num(row.get('stop_loss'))} | 止盈 {_take_profit_text(row)} | "
                 f"仓位 {_fmt_num(row.get('position_pct'), 1)}% | {holding_flag}"
             )
             lines.append(f"> 理由：{compact_text(row.get('risk_reason') or row.get('buy_reason') or row.get('entry_reason') or '', 72)}")

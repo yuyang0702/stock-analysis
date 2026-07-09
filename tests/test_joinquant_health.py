@@ -50,6 +50,8 @@ class JoinQuantHealthTest(unittest.TestCase):
             )
 
             self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["is_trading_time"])
+            self.assertFalse(result["alert_required"])
             self.assertEqual(result["snapshot_count_today"], 1)
             self.assertEqual(result["position_count"], 1)
             self.assertIn("JoinQuant 健康检查", report_file.read_text(encoding="utf-8"))
@@ -86,6 +88,43 @@ class JoinQuantHealthTest(unittest.TestCase):
             )
 
             self.assertEqual(result["status"], "critical")
+            self.assertTrue(result["alert_required"])
+            self.assertIn("snapshot_stale", result["issue_codes"])
+
+    def test_stale_snapshot_outside_trading_time_does_not_require_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account_snapshot.json"
+            report_file = base / "health.md"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "generated_at": "2026-07-09 15:20:00", "signals": []}),
+                encoding="utf-8",
+            )
+            snapshot_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "received_at": "2026-07-09 15:20:00",
+                        "positions": [],
+                        "orders": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                base / "missing_history.jsonl",
+                report_file,
+                now=datetime(2026, 7, 9, 21, 0, 0),
+                snapshot_max_age_min=15,
+            )
+
+            self.assertEqual(result["status"], "critical")
+            self.assertFalse(result["is_trading_time"])
+            self.assertFalse(result["alert_required"])
             self.assertIn("snapshot_stale", result["issue_codes"])
 
     def test_counts_failed_orders_from_today_history(self) -> None:
