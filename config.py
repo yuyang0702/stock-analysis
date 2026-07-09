@@ -259,6 +259,7 @@ JOINQUANT_TEMPLATE_VERSION = "2026-07-09.2-order-target-value"
 ML_SIGNAL_SAMPLE_FILE = Path(_env_text("ML_SIGNAL_SAMPLE_FILE", str(CACHE_DIR / "ml" / "signal_samples.jsonl")))
 ML_REVIEW_REPORT_FILE = Path(_env_text("ML_REVIEW_REPORT_FILE", str(OUTPUT_DIR / "ml_signal_review.md")))
 GLOBAL_MARKET_CONTEXT_FILE = Path(_env_text("GLOBAL_MARKET_CONTEXT_FILE", str(CACHE_DIR / "market" / "global_context.json")))
+STRATEGY_COMPARE_REPORT_FILE = Path(_env_text("STRATEGY_COMPARE_REPORT_FILE", str(OUTPUT_DIR / "strategy_compare_report.md")))
 
 
 # =============================

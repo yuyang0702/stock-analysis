@@ -19,6 +19,7 @@ class JoinQuantNotificationTest(unittest.TestCase):
                     "position_pct": 12.5,
                     "price": 10.1,
                     "final_score": 88,
+                    "enhanced_score": 91.5,
                     "reason": "signal",
                 },
                 {
@@ -40,6 +41,8 @@ class JoinQuantNotificationTest(unittest.TestCase):
         self.assertIn("计划买入", md)
         self.assertIn("计划卖出", md)
         self.assertIn("600000.XSHG", md)
+        self.assertIn("分数 88", md)
+        self.assertIn("影子 91.5", md)
 
     def test_local_paper_markdown_has_distinct_marker(self) -> None:
         account = paper_trading.new_account(100_000)

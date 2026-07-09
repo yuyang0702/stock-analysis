@@ -2717,9 +2717,10 @@ def build_joinquant_dry_run_markdown(payload: dict[str, Any]) -> str:
         price = item.get("price", "-")
         reason = compact_text(item.get("reason", ""), 48)
         if item.get("action") == "buy":
+            shadow = f" | 影子 {item.get('enhanced_score')}" if item.get("enhanced_score") not in (None, "") else ""
             lines.append(
                 f"- {action} {code} {name} | 目标仓位 {item.get('position_pct', 0)}% | "
-                f"价格 {price} | 分数 {item.get('final_score', '-')}"
+                f"价格 {price} | 分数 {item.get('final_score', '-')}{shadow}"
             )
         else:
             lines.append(f"- {action} {code} {name} | 价格 {price}")
@@ -3255,6 +3256,9 @@ def build_summary_markdown(
                 f"止损 {_fmt_num(row.get('stop_loss'))} | 止盈 {_take_profit_text(row)} | "
                 f"仓位 {_fmt_num(row.get('position_pct'), 1)}% | {holding_flag}"
             )
+            score_text = _score_pair_text(row)
+            if score_text:
+                lines.append(f"> {score_text}")
             lines.append(f"> 理由：{compact_text(row.get('risk_reason') or row.get('buy_reason') or row.get('entry_reason') or '', 72)}")
             lines.append(
                 f"> 题材：{compact_text(row.get('theme_label', '题材待确认'), 18)} | "
@@ -3292,6 +3296,20 @@ def _take_profit_text(row: pd.Series) -> str:
     return _fmt_num(row.get("take_profit"))
 
 
+def _score_pair_text(row: pd.Series) -> str:
+    final_score = _fmt_num(row.get("final_score"), 1)
+    enhanced_score = _fmt_num(row.get("enhanced_score"), 1)
+    shadow_rank = _fmt_num(row.get("shadow_rank"), 0)
+    if final_score == "-" and enhanced_score == "-":
+        return ""
+    parts = [f"原分 {final_score}"]
+    if enhanced_score != "-":
+        parts.append(f"影子 {enhanced_score}")
+    if shadow_rank != "-":
+        parts.append(f"影子排名 {shadow_rank}")
+    return " | ".join(parts)
+
+
 def build_alert_markdown(row: pd.Series, kind: str, market_info: dict[str, Any], market_news_state: str, mode: str) -> str:
     """生成单只股票的手机友好提醒卡片。"""
 
@@ -3313,6 +3331,12 @@ def build_alert_markdown(row: pd.Series, kind: str, market_info: dict[str, Any],
     ]
     if entry_status:
         lines.insert(7, f"- {entry_status}")
+    if _fmt_num(row.get("final_score"), 1) != "-":
+        lines.append(f"- 原策略分：{_fmt_num(row.get('final_score'), 1)}")
+    if _fmt_num(row.get("enhanced_score"), 1) != "-":
+        lines.append(f"- 影子评分：{_fmt_num(row.get('enhanced_score'), 1)}（仅观察，不参与下单）")
+    if safe_text(row.get("shadow_reason")):
+        lines.append(f"- 影子依据：{compact_text(row.get('shadow_reason'), 88)}")
     if safe_text(row.get("theme_heat_reason")):
         lines.append(f"- 热度依据：{compact_text(row.get('theme_heat_reason'), 88)}")
     lines.append(

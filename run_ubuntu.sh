@@ -22,8 +22,12 @@ ML_REPORT_SERVICE="stock-ml-report.service"
 ML_REPORT_TIMER="stock-ml-report.timer"
 GLOBAL_CONTEXT_SERVICE="stock-global-context.service"
 GLOBAL_CONTEXT_TIMER="stock-global-context.timer"
+STRATEGY_COMPARE_SERVICE="stock-strategy-compare.service"
+STRATEGY_COMPARE_TIMER="stock-strategy-compare.timer"
+STRATEGY_COMPARE_WEEKLY_SERVICE="stock-strategy-compare-weekly.service"
+STRATEGY_COMPARE_WEEKLY_TIMER="stock-strategy-compare-weekly.timer"
 ALL_SERVICES=("${STRATEGY_SERVICE}" "${WEB_SERVICE}" "${JQ_SIGNAL_SERVICE}")
-ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}")
+ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}" "${STRATEGY_COMPARE_TIMER}" "${STRATEGY_COMPARE_WEEKLY_TIMER}")
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -36,7 +40,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|notify-retry|readiness|ml-report|global-context|backtest|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|notify-retry|readiness|ml-report|global-context|strategy-compare|strategy-compare-weekly|backtest|test|show-env
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -63,10 +67,12 @@ show_menu() {
  12) 生成 readiness 报告
  13) 生成 ML 复盘报告
  14) 更新美日韩市场上下文
- 15) 运行本地信号回测
- 16) 查看当前配置
- 17) 运行测试
- 18) 首次安装/重写配置
+ 15) 生成策略对照复盘
+ 16) 推送策略对照周报
+ 17) 运行本地信号回测
+ 18) 查看当前配置
+ 19) 运行测试
+ 20) 首次安装/重写配置
   h) 帮助
   q) 退出
 
@@ -124,10 +130,12 @@ menu_loop() {
       12) handle_command readiness ;;
       13) handle_command ml-report ;;
       14) handle_command global-context ;;
-      15) handle_command backtest ;;
-      16) handle_command show-env ;;
-      17) handle_command test ;;
-      18) menu_install ;;
+      15) handle_command strategy-compare ;;
+      16) handle_command strategy-compare-weekly ;;
+      17) handle_command backtest ;;
+      18) handle_command show-env ;;
+      19) handle_command test ;;
+      20) menu_install ;;
       h|H) usage ;;
       q|Q|"") break ;;
       *) warn "未知选项：${choice}" ;;
@@ -194,7 +202,7 @@ require_project_files() {
   for file in \
     a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
     joinquant_health.py notify_retry.py backtest_engine.py \
-    joinquant_readiness_report.py ml_dataset.py global_market_context.py requirements.txt; do
+    joinquant_readiness_report.py ml_dataset.py global_market_context.py strategy_compare_report.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
   done
 }
@@ -273,6 +281,7 @@ write_env_file() {
   set_env "ML_SIGNAL_SAMPLE_FILE" "${APP_DIR}/cache/ml/signal_samples.jsonl"
   set_env "ML_REVIEW_REPORT_FILE" "${APP_DIR}/output/ml_signal_review.md"
   set_env "GLOBAL_MARKET_CONTEXT_FILE" "${APP_DIR}/cache/market/global_context.json"
+  set_env "STRATEGY_COMPARE_REPORT_FILE" "${APP_DIR}/output/strategy_compare_report.md"
   set_env "ENABLE_AI" "0"
   set_env "ARK_API_KEY" ""
   set_env "ARK_MODEL" ""
@@ -489,6 +498,54 @@ Unit=${GLOBAL_CONTEXT_SERVICE}
 WantedBy=timers.target
 EOF
 
+  sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Build original vs shadow strategy compare report
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${py} ${APP_DIR}/strategy_compare_report.py
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Build strategy compare report after market close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:35:00
+Persistent=true
+Unit=${STRATEGY_COMPARE_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_WEEKLY_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Send weekly original vs shadow strategy compare report
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${py} ${APP_DIR}/strategy_compare_report.py --notify --weekly
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_WEEKLY_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Send weekly strategy compare report after Friday close
+
+[Timer]
+OnCalendar=Fri *-*-* 15:45:00
+Persistent=true
+Unit=${STRATEGY_COMPARE_WEEKLY_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
   sudo systemctl daemon-reload
   sudo systemctl enable "${ALL_SERVICES[@]}" "${ALL_TIMERS[@]}"
 }
@@ -573,6 +630,7 @@ JoinQuant health: signal_max_age=$(env_value JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN
 ML samples: $(env_value ML_SIGNAL_SAMPLE_FILE "${APP_DIR}/cache/ml/signal_samples.jsonl")
 ML report: $(env_value ML_REVIEW_REPORT_FILE "${APP_DIR}/output/ml_signal_review.md")
 Global context: $(env_value GLOBAL_MARKET_CONTEXT_FILE "${APP_DIR}/cache/market/global_context.json")
+Strategy compare: $(env_value STRATEGY_COMPARE_REPORT_FILE "${APP_DIR}/output/strategy_compare_report.md")
 Backtest report: ${APP_DIR}/output/backtest_report.md
 Notify retry queue: ${APP_DIR}/cache/notify_failed_queue.jsonl
 Holdings web port: $(env_value PORTFOLIO_WEB_PORT 8000)
@@ -621,6 +679,8 @@ handle_command() {
     readiness) run_foreground joinquant_readiness_report.py ;;
     ml-report) run_foreground ml_dataset.py ;;
     global-context) run_foreground global_market_context.py ;;
+    strategy-compare) run_foreground strategy_compare_report.py ;;
+    strategy-compare-weekly) run_foreground strategy_compare_report.py --notify --weekly ;;
     backtest) run_foreground backtest_engine.py ;;
     test) cd "${APP_DIR}"; "$(python_bin)" -m unittest discover -s tests -v ;;
     show-env) show_env_summary ;;

@@ -89,6 +89,9 @@ class AlertMarkdownTest(unittest.TestCase):
                     "position_pct": 10,
                     "has_holding": False,
                     "risk_reason": "上方压力太近",
+                    "final_score": 82,
+                    "enhanced_score": 88.5,
+                    "shadow_rank": 1,
                 }
             ]
         )
@@ -97,7 +100,35 @@ class AlertMarkdownTest(unittest.TestCase):
 
         self.assertIn("止盈 无有效空间", md)
         self.assertIn("上方空间不足", md)
+        self.assertIn("原分 82.0 | 影子 88.5 | 影子排名 1", md)
         self.assertNotIn("止盈 10.00", md)
+
+    def test_buy_alert_shows_original_and_shadow_scores(self) -> None:
+        row = pd.Series(
+            {
+                "code": "600000",
+                "name": "PF Bank",
+                "price": 10.12,
+                "entry_price": 10.10,
+                "stop_loss": 9.80,
+                "take_profit": 11.20,
+                "position_pct": 10,
+                "risk_reward": 2.3,
+                "risk_confidence": 0.72,
+                "risk_reason": "测试",
+                "theme_label": "银行",
+                "theme_heat_level": "中",
+                "final_score": 82,
+                "enhanced_score": 88.5,
+                "shadow_reason": "消息+3.2；题材+4.0；市场+3.0",
+            }
+        )
+
+        md = a_share_strategy.build_alert_markdown(row, "买点", {"state": "强势进攻"}, "无", "intraday")
+
+        self.assertIn("原策略分：82.0", md)
+        self.assertIn("影子评分：88.5（仅观察，不参与下单）", md)
+        self.assertIn("影子依据：消息+3.2；题材+4.0；市场+3.0", md)
 
     def test_intraday_buy_rows_exclude_limit_up_candidates(self) -> None:
         rows = pd.DataFrame(

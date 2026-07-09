@@ -23,6 +23,7 @@ class JoinQuantExporterTest(unittest.TestCase):
                         "take_profit": 11.0,
                         "position_pct": 12,
                         "final_score": 90,
+                        "enhanced_score": 94,
                         "signal_action": "continue",
                         "pct_chg": 2.1,
                     },
@@ -56,6 +57,7 @@ class JoinQuantExporterTest(unittest.TestCase):
             self.assertEqual(payload["run_id"], "run-1")
             self.assertEqual([item["action"] for item in payload["signals"]], ["buy", "sell"])
             self.assertEqual(payload["signals"][0]["jq_code"], "600000.XSHG")
+            self.assertEqual(payload["signals"][0]["enhanced_score"], 94)
             self.assertEqual(payload["signals"][1]["jq_code"], "000001.XSHE")
 
     def test_empty_export_keeps_contract(self) -> None:

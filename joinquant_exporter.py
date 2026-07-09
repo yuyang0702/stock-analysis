@@ -116,6 +116,7 @@ def _buy_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, Any
         "take_profit": round(take, 2) if take > 0 else None,
         "position_pct": round(_num(row.get("position_pct")), 2),
         "final_score": round(_num(row.get("final_score")), 1),
+        "enhanced_score": round(_num(row.get("enhanced_score")), 1) if _num(row.get("enhanced_score")) else None,
         "signal_type": _text(row.get("mode")) or _text(row.get("buy_state")) or "signal",
         "reason": _text(row.get("risk_reason") or row.get("buy_reason") or row.get("entry_reason")),
     }
