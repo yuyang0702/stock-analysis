@@ -65,7 +65,8 @@ def build_shadow_score(row: pd.Series, global_risk_score: float = 0.0) -> dict[s
     market_bonus = _market_bonus(row)
     trade_bonus = _clip((_num(row.get("trade_score")) - 70.0) / 10.0, -3.0, 3.0)
     global_bonus = _clip(float(global_risk_score), -5.0, 5.0)
-    enhanced = _clip(base + news_bonus + theme_bonus + sector_bonus + market_bonus + trade_bonus + global_bonus, 0.0, 100.0)
+    adjust = news_bonus + theme_bonus + sector_bonus + market_bonus + trade_bonus + global_bonus
+    enhanced = max(0.0, base + adjust)
 
     parts = [
         f"消息{news_bonus:+.1f}",
@@ -78,6 +79,7 @@ def build_shadow_score(row: pd.Series, global_risk_score: float = 0.0) -> dict[s
     return {
         "shadow_base_score": round(base, 2),
         "enhanced_score": round(enhanced, 2),
+        "shadow_adjust_score": round(adjust, 2),
         "news_catalyst_score": round(news_bonus, 2),
         "theme_heat_adjust_score": round(theme_bonus, 2),
         "sector_position_score": round(sector_bonus, 2),
@@ -94,5 +96,7 @@ def apply_shadow_scores(df: pd.DataFrame, global_risk_score: float = 0.0) -> pd.
     shadow = result.apply(lambda row: build_shadow_score(row, global_risk_score), axis=1, result_type="expand")
     for col in shadow.columns:
         result[col] = shadow[col]
+    result["original_rank"] = result["final_score"].rank(method="min", ascending=False).astype(int)
     result["shadow_rank"] = result["enhanced_score"].rank(method="min", ascending=False).astype(int)
+    result["shadow_rank_change"] = result["original_rank"] - result["shadow_rank"]
     return result

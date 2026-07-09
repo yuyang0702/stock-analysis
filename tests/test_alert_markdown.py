@@ -91,7 +91,10 @@ class AlertMarkdownTest(unittest.TestCase):
                     "risk_reason": "上方压力太近",
                     "final_score": 82,
                     "enhanced_score": 88.5,
+                    "shadow_adjust_score": 6.5,
+                    "original_rank": 3,
                     "shadow_rank": 1,
+                    "shadow_rank_change": 2,
                 }
             ]
         )
@@ -100,7 +103,7 @@ class AlertMarkdownTest(unittest.TestCase):
 
         self.assertIn("止盈 无有效空间", md)
         self.assertIn("上方空间不足", md)
-        self.assertIn("原分 82.0 | 影子 88.5 | 影子排名 1", md)
+        self.assertIn("原分 82.0 | 影子 88.5 | 调整 +6.5 | 排名 3->1 | 变化 +2", md)
         self.assertNotIn("止盈 10.00", md)
 
     def test_buy_alert_shows_original_and_shadow_scores(self) -> None:
@@ -120,6 +123,10 @@ class AlertMarkdownTest(unittest.TestCase):
                 "theme_heat_level": "中",
                 "final_score": 82,
                 "enhanced_score": 88.5,
+                "shadow_adjust_score": 6.5,
+                "original_rank": 3,
+                "shadow_rank": 1,
+                "shadow_rank_change": 2,
                 "shadow_reason": "消息+3.2；题材+4.0；市场+3.0",
             }
         )
@@ -128,6 +135,8 @@ class AlertMarkdownTest(unittest.TestCase):
 
         self.assertIn("原策略分：82.0", md)
         self.assertIn("影子评分：88.5（仅观察，不参与下单）", md)
+        self.assertIn("影子调整：+6.5", md)
+        self.assertIn("排名变化：3 -> 1 (+2)", md)
         self.assertIn("影子依据：消息+3.2；题材+4.0；市场+3.0", md)
 
     def test_intraday_buy_rows_exclude_limit_up_candidates(self) -> None:

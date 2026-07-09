@@ -2346,7 +2346,10 @@ def save_outputs(
             "score",
             "final_score",
             "enhanced_score",
+            "shadow_adjust_score",
+            "original_rank",
             "shadow_rank",
+            "shadow_rank_change",
             "shadow_reason",
             "news_catalyst_score",
             "theme_heat_adjust_score",
@@ -3425,14 +3428,23 @@ def _take_profit_text(row: pd.Series) -> str:
 def _score_pair_text(row: pd.Series) -> str:
     final_score = _fmt_num(row.get("final_score"), 1)
     enhanced_score = _fmt_num(row.get("enhanced_score"), 1)
+    shadow_adjust = _fmt_num(row.get("shadow_adjust_score"), 1)
+    original_rank = _fmt_num(row.get("original_rank"), 0)
     shadow_rank = _fmt_num(row.get("shadow_rank"), 0)
+    rank_change = _fmt_num(row.get("shadow_rank_change"), 0)
     if final_score == "-" and enhanced_score == "-":
         return ""
     parts = [f"原分 {final_score}"]
     if enhanced_score != "-":
         parts.append(f"影子 {enhanced_score}")
-    if shadow_rank != "-":
+    if shadow_adjust != "-":
+        parts.append(f"调整 {float(row.get('shadow_adjust_score') or 0):+.1f}")
+    if original_rank != "-" and shadow_rank != "-":
+        parts.append(f"排名 {original_rank}->{shadow_rank}")
+    elif shadow_rank != "-":
         parts.append(f"影子排名 {shadow_rank}")
+    if rank_change != "-":
+        parts.append(f"变化 {int(float(row.get('shadow_rank_change') or 0)):+d}")
     return " | ".join(parts)
 
 
@@ -3461,6 +3473,13 @@ def build_alert_markdown(row: pd.Series, kind: str, market_info: dict[str, Any],
         lines.append(f"- 原策略分：{_fmt_num(row.get('final_score'), 1)}")
     if _fmt_num(row.get("enhanced_score"), 1) != "-":
         lines.append(f"- 影子评分：{_fmt_num(row.get('enhanced_score'), 1)}（仅观察，不参与下单）")
+    if _fmt_num(row.get("shadow_adjust_score"), 1) != "-":
+        lines.append(f"- 影子调整：{float(row.get('shadow_adjust_score') or 0):+.1f}")
+    if _fmt_num(row.get("original_rank"), 0) != "-" and _fmt_num(row.get("shadow_rank"), 0) != "-":
+        lines.append(
+            f"- 排名变化：{_fmt_num(row.get('original_rank'), 0)} -> {_fmt_num(row.get('shadow_rank'), 0)} "
+            f"({int(float(row.get('shadow_rank_change') or 0)):+d})"
+        )
     if safe_text(row.get("shadow_reason")):
         lines.append(f"- 影子依据：{compact_text(row.get('shadow_reason'), 88)}")
     if safe_text(row.get("theme_heat_reason")):

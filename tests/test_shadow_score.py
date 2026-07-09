@@ -9,7 +9,7 @@ class ShadowScoreTest(unittest.TestCase):
     def test_builds_shadow_score_without_replacing_final_score(self) -> None:
         row = pd.Series(
             {
-                "final_score": 82,
+                "final_score": 126,
                 "news_score": 6,
                 "theme_heat_level": "高",
                 "theme_heat_score": 7,
@@ -20,8 +20,10 @@ class ShadowScoreTest(unittest.TestCase):
 
         result = build_shadow_score(row, global_risk_score=-1)
 
-        self.assertEqual(result["shadow_base_score"], 82.0)
-        self.assertGreater(result["enhanced_score"], 82.0)
+        self.assertEqual(result["shadow_base_score"], 126.0)
+        self.assertGreater(result["enhanced_score"], 126.0)
+        self.assertGreater(result["enhanced_score"], 100.0)
+        self.assertAlmostEqual(result["enhanced_score"], result["shadow_base_score"] + result["shadow_adjust_score"])
         self.assertEqual(result["global_risk_score"], -1.0)
         self.assertIn("消息+", result["shadow_reason"])
         self.assertIn("题材+", result["shadow_reason"])
@@ -41,6 +43,30 @@ class ShadowScoreTest(unittest.TestCase):
         self.assertIn("shadow_rank", enriched.columns)
         self.assertLess(enriched.loc[0, "enhanced_score"], enriched.loc[1, "enhanced_score"])
         self.assertEqual(enriched.loc[1, "shadow_rank"], 1)
+
+    def test_shadow_rank_change_compares_original_and_shadow_order(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"code": "600000", "final_score": 100, "news_score": 0, "theme_heat_level": "待确认", "market_state": "震荡", "trade_score": 70},
+                {
+                    "code": "000001",
+                    "final_score": 90,
+                    "news_score": 10,
+                    "theme_heat_level": "高",
+                    "market_state": "强势进攻",
+                    "trade_score": 100,
+                    "sector_rank_pct": 0.95,
+                    "sector_hot_level": "强",
+                },
+            ]
+        )
+
+        enriched = apply_shadow_scores(frame, global_risk_score=5)
+
+        self.assertEqual(enriched.loc[0, "original_rank"], 1)
+        self.assertEqual(enriched.loc[1, "original_rank"], 2)
+        self.assertEqual(enriched.loc[1, "shadow_rank"], 1)
+        self.assertEqual(enriched.loc[1, "shadow_rank_change"], 1)
 
     def test_sector_position_adjusts_shadow_score_only(self) -> None:
         strong = pd.Series(
