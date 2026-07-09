@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 
@@ -78,6 +80,33 @@ class ThemeAndAnchorTests(unittest.TestCase):
         self.assertGreater(context["人工智能"]["sector_rank_pct"], context["煤炭"]["sector_rank_pct"])
         self.assertEqual(context["人工智能"]["sector_hot_level"], "强")
         self.assertEqual(context["煤炭"]["sector_hot_level"], "弱")
+
+    def test_fetch_sector_context_reuses_cache_when_source_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "sector_context.json"
+            strat.save_sector_market_context(
+                {"人工智能": {"sector_pct_chg": 3.2, "sector_rank_pct": 0.95, "sector_hot_level": "强"}},
+                cache_path,
+            )
+
+            def fail_loader():
+                raise RuntimeError("remote disconnected")
+
+            context = strat.fetch_sector_market_context(loaders=[fail_loader], cache_path=cache_path)
+
+            self.assertEqual(context["人工智能"]["sector_hot_level"], "强")
+            self.assertEqual(context["_status"], "cache")
+            self.assertIn("remote disconnected", context["_reason"])
+
+    def test_sector_position_reports_neutral_when_context_failed(self):
+        context = {"_status": "error", "_reason": "板块行情获取失败，按中性处理：remote disconnected"}
+        row = pd.Series({"industry": "半导体", "theme_label": "半导体"})
+
+        bundle = strat.build_sector_position_bundle(row, context)
+
+        self.assertEqual(bundle["sector_hot_level"], "中性")
+        self.assertEqual(bundle["sector_rank_pct"], -1.0)
+        self.assertIn("板块行情获取失败", bundle["sector_position_reason"])
 
     def test_signal_anchor_locks_initial_entry(self):
         cache = DummyCache()

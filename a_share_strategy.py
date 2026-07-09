@@ -40,6 +40,7 @@ OUTPUT_DIR = app_config.OUTPUT_DIR
 CACHE_DIR = app_config.CACHE_DIR
 INDUSTRY_CACHE = app_config.INDUSTRY_CACHE
 SIGNAL_WATCHLIST_FILE = CACHE_DIR / "signal_watchlist.json"
+SECTOR_MARKET_CONTEXT_FILE = CACHE_DIR / "market" / "sector_context.json"
 
 
 @dataclass
@@ -884,21 +885,76 @@ def build_sector_market_context(frames: Iterable[pd.DataFrame]) -> dict[str, dic
     return context
 
 
-def fetch_sector_market_context() -> dict[str, dict[str, Any]]:
+def save_sector_market_context(context: dict[str, dict[str, Any]], path: Path = SECTOR_MARKET_CONTEXT_FILE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {key: value for key, value in context.items() if not key.startswith("_")}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_sector_market_context(path: Path = SECTOR_MARKET_CONTEXT_FILE) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+
+
+def fetch_sector_market_context(
+    loaders: Iterable[Any] | None = None,
+    cache_path: Path = SECTOR_MARKET_CONTEXT_FILE,
+) -> dict[str, dict[str, Any]]:
     frames: list[pd.DataFrame] = []
-    for loader in (ak.stock_board_industry_name_em, getattr(ak, "stock_board_concept_name_em", None)):
+    errors: list[str] = []
+    loaders = list(loaders or (ak.stock_board_industry_name_em, getattr(ak, "stock_board_concept_name_em", None)))
+    for loader in loaders:
         if loader is None:
             continue
         try:
             frame = loader()
             if frame is not None and not frame.empty:
                 frames.append(frame)
-        except Exception:
+        except Exception as exc:
+            errors.append(str(exc))
             continue
-    return build_sector_market_context(frames)
+    context = build_sector_market_context(frames)
+    if context:
+        context["_status"] = "ok"
+        try:
+            save_sector_market_context(context, cache_path)
+        except Exception as exc:
+            context["_reason"] = f"板块缓存写入失败：{exc}"
+        return context
+
+    cached = load_sector_market_context(cache_path)
+    if cached:
+        cached["_status"] = "cache"
+        cached["_reason"] = f"板块行情获取失败，复用最近成功缓存：{'; '.join(errors) or 'empty'}"
+        return cached
+
+    return {
+        "_status": "error",
+        "_reason": f"板块行情获取失败，按中性处理：{'; '.join(errors) or 'empty'}",
+    }
 
 
 def build_sector_position_bundle(row: pd.Series, sector_context: dict[str, dict[str, Any]]) -> pd.Series:
+    if sector_context.get("_status") == "error":
+        return pd.Series(
+            {
+                "sector_pct_chg": 0.0,
+                "sector_rank_pct": -1.0,
+                "sector_amount_rank_pct": 0.0,
+                "sector_hot_level": "中性",
+                "sector_position_reason": safe_text(sector_context.get("_reason")) or "板块行情获取失败，按中性处理",
+            }
+        )
+
     candidates = [safe_text(row.get("theme_label")), safe_text(row.get("industry"))]
     matched_name = ""
     matched = None
