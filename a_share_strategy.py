@@ -834,6 +834,114 @@ def fetch_spot_data() -> pd.DataFrame:
     return df.dropna(subset=["price", "pct_chg", "amount"]).copy()
 
 
+def build_sector_market_context(frames: Iterable[pd.DataFrame]) -> dict[str, dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        name_col = pick_col(frame, ["板块名称", "名称", "行业名称", "题材名称"])
+        pct_col = pick_col(frame, ["涨跌幅", "涨跌幅%", "change_pct", "pct_chg"])
+        amount_col = pick_col(frame, ["成交额", "成交金额", "amount"])
+        if not name_col or not pct_col:
+            continue
+        for _, row in frame.iterrows():
+            name = safe_text(row.get(name_col))
+            if not name:
+                continue
+            rows.append(
+                {
+                    "sector_name": name,
+                    "sector_pct_chg": _float_value(row.get(pct_col)),
+                    "sector_amount": _float_value(row.get(amount_col)) if amount_col else 0.0,
+                }
+            )
+
+    if not rows:
+        return {}
+
+    result = pd.DataFrame(rows).drop_duplicates(subset=["sector_name"], keep="first")
+    result["sector_rank_pct"] = result["sector_pct_chg"].rank(pct=True).fillna(0)
+    result["sector_amount_rank_pct"] = result["sector_amount"].rank(pct=True).fillna(0)
+
+    context: dict[str, dict[str, Any]] = {}
+    for _, row in result.iterrows():
+        rank_pct = float(row.get("sector_rank_pct") or 0)
+        pct_chg = float(row.get("sector_pct_chg") or 0)
+        if rank_pct >= 0.85 or pct_chg >= 2:
+            level = "强"
+        elif rank_pct >= 0.65 or pct_chg >= 0.8:
+            level = "偏强"
+        elif rank_pct <= 0.3 or pct_chg < 0:
+            level = "弱"
+        else:
+            level = "中性"
+        context[safe_text(row.get("sector_name"))] = {
+            "sector_pct_chg": round(pct_chg, 2),
+            "sector_rank_pct": round(rank_pct, 4),
+            "sector_amount_rank_pct": round(float(row.get("sector_amount_rank_pct") or 0), 4),
+            "sector_hot_level": level,
+        }
+    return context
+
+
+def fetch_sector_market_context() -> dict[str, dict[str, Any]]:
+    frames: list[pd.DataFrame] = []
+    for loader in (ak.stock_board_industry_name_em, getattr(ak, "stock_board_concept_name_em", None)):
+        if loader is None:
+            continue
+        try:
+            frame = loader()
+            if frame is not None and not frame.empty:
+                frames.append(frame)
+        except Exception:
+            continue
+    return build_sector_market_context(frames)
+
+
+def build_sector_position_bundle(row: pd.Series, sector_context: dict[str, dict[str, Any]]) -> pd.Series:
+    candidates = [safe_text(row.get("theme_label")), safe_text(row.get("industry"))]
+    matched_name = ""
+    matched = None
+    for candidate in candidates:
+        if not candidate or candidate in {"未识别", "热点题材", "热点概念", "未识别题材", "题材待确认"}:
+            continue
+        if candidate in sector_context:
+            matched_name = candidate
+            matched = sector_context[candidate]
+            break
+        for name, info in sector_context.items():
+            if candidate in name or name in candidate:
+                matched_name = name
+                matched = info
+                break
+        if matched is not None:
+            break
+
+    if not matched:
+        return pd.Series(
+            {
+                "sector_pct_chg": 0.0,
+                "sector_rank_pct": -1.0,
+                "sector_amount_rank_pct": 0.0,
+                "sector_hot_level": "未匹配",
+                "sector_position_reason": "未匹配到实时板块行情",
+            }
+        )
+
+    return pd.Series(
+        {
+            "sector_pct_chg": matched.get("sector_pct_chg", 0.0),
+            "sector_rank_pct": matched.get("sector_rank_pct", -1.0),
+            "sector_amount_rank_pct": matched.get("sector_amount_rank_pct", 0.0),
+            "sector_hot_level": matched.get("sector_hot_level", "中性"),
+            "sector_position_reason": (
+                f"{matched_name} 涨幅{float(matched.get('sector_pct_chg', 0) or 0):+.2f}% "
+                f"排名{float(matched.get('sector_rank_pct', 0) or 0):.0%}"
+            ),
+        }
+    )
+
+
 def market_sentiment(spot_df: pd.DataFrame | None = None) -> dict[str, Any]:
     """用上证指数和市场宽度给当天环境打一个粗分。"""
     result = {
@@ -2241,7 +2349,13 @@ def save_outputs(
             "shadow_rank",
             "shadow_reason",
             "news_catalyst_score",
+            "theme_heat_adjust_score",
             "sector_position_score",
+            "sector_pct_chg",
+            "sector_rank_pct",
+            "sector_amount_rank_pct",
+            "sector_hot_level",
+            "sector_position_reason",
             "market_emotion_score",
             "global_risk_score",
             "amount_rank_pct",
@@ -2793,6 +2907,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     market_state = market_info["state"]
     market_news_state = analyze_market_news(market_news)
     portfolio_positions = load_portfolio_positions()
+    sector_context = fetch_sector_market_context()
     client, model = get_ai_client() if cfg.ai else (None, None)
 
     for idx, (_, row) in enumerate(pool.iterrows()):
@@ -2877,6 +2992,9 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     theme_frame = result.apply(lambda row: build_theme_heat_bundle(row, market_news_state), axis=1, result_type="expand")
     for col in theme_frame.columns:
         result[col] = theme_frame[col]
+    sector_frame = result.apply(lambda row: build_sector_position_bundle(row, sector_context), axis=1, result_type="expand")
+    for col in sector_frame.columns:
+        result[col] = sector_frame[col]
     history_frame = result.apply(
         lambda row: build_history_playbook(row, market_info, cache),
         axis=1,
@@ -2955,6 +3073,9 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
             watch_theme_frame = watch_result.apply(lambda row: build_theme_heat_bundle(row, market_news_state), axis=1, result_type="expand")
             for col in watch_theme_frame.columns:
                 watch_result[col] = watch_theme_frame[col]
+            watch_sector_frame = watch_result.apply(lambda row: build_sector_position_bundle(row, sector_context), axis=1, result_type="expand")
+            for col in watch_sector_frame.columns:
+                watch_result[col] = watch_sector_frame[col]
             watch_history = watch_result.apply(
                 lambda row: build_history_playbook(row, market_info, cache),
                 axis=1,
@@ -3266,6 +3387,11 @@ def build_summary_markdown(
             )
             if safe_text(row.get("theme_heat_reason")):
                 lines.append(f"> 热度依据：{compact_text(row.get('theme_heat_reason'), 48)}")
+            if safe_text(row.get("sector_position_reason")):
+                lines.append(
+                    f"> 板块：{compact_text(row.get('sector_hot_level', '未匹配'), 8)} | "
+                    f"{compact_text(row.get('sector_position_reason'), 48)}"
+                )
             lines.append(
                 f"> 信号：{compact_text(row.get('signal_state', 'fresh'), 12)} / "
                 f"{compact_text(row.get('signal_action', 'continue'), 12)} | "
@@ -3339,6 +3465,11 @@ def build_alert_markdown(row: pd.Series, kind: str, market_info: dict[str, Any],
         lines.append(f"- 影子依据：{compact_text(row.get('shadow_reason'), 88)}")
     if safe_text(row.get("theme_heat_reason")):
         lines.append(f"- 热度依据：{compact_text(row.get('theme_heat_reason'), 88)}")
+    if safe_text(row.get("sector_position_reason")):
+        lines.append(
+            f"- 板块位置：{compact_text(row.get('sector_hot_level', '未匹配'), 8)} | "
+            f"{compact_text(row.get('sector_position_reason'), 88)}"
+        )
     lines.append(
         f"- 信号：{compact_text(row.get('signal_state', 'fresh'), 12)} / "
         f"{compact_text(row.get('signal_action', 'continue'), 12)}"

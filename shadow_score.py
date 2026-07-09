@@ -45,18 +45,32 @@ def _market_bonus(row: pd.Series) -> float:
     return 0.0
 
 
+def _sector_bonus(row: pd.Series) -> float:
+    rank_pct = _num(row.get("sector_rank_pct"), default=-1.0)
+    level = _text(row.get("sector_hot_level"))
+    if rank_pct >= 0.85 or level in {"强", "领涨"}:
+        return 3.0
+    if rank_pct >= 0.65 or level == "偏强":
+        return 1.5
+    if 0 <= rank_pct <= 0.3 or level == "弱":
+        return -3.0
+    return 0.0
+
+
 def build_shadow_score(row: pd.Series, global_risk_score: float = 0.0) -> dict[str, Any]:
     base = _num(row.get("final_score"))
     news_bonus = _clip(_num(row.get("news_score")) * 0.8, -8.0, 8.0)
     theme_bonus = _theme_bonus(row)
+    sector_bonus = _sector_bonus(row)
     market_bonus = _market_bonus(row)
     trade_bonus = _clip((_num(row.get("trade_score")) - 70.0) / 10.0, -3.0, 3.0)
     global_bonus = _clip(float(global_risk_score), -5.0, 5.0)
-    enhanced = _clip(base + news_bonus + theme_bonus + market_bonus + trade_bonus + global_bonus, 0.0, 100.0)
+    enhanced = _clip(base + news_bonus + theme_bonus + sector_bonus + market_bonus + trade_bonus + global_bonus, 0.0, 100.0)
 
     parts = [
         f"消息{news_bonus:+.1f}",
         f"题材{theme_bonus:+.1f}",
+        f"板块{sector_bonus:+.1f}",
         f"市场{market_bonus:+.1f}",
         f"交易{trade_bonus:+.1f}",
         f"海外{global_bonus:+.1f}",
@@ -65,7 +79,8 @@ def build_shadow_score(row: pd.Series, global_risk_score: float = 0.0) -> dict[s
         "shadow_base_score": round(base, 2),
         "enhanced_score": round(enhanced, 2),
         "news_catalyst_score": round(news_bonus, 2),
-        "sector_position_score": round(theme_bonus, 2),
+        "theme_heat_adjust_score": round(theme_bonus, 2),
+        "sector_position_score": round(sector_bonus, 2),
         "market_emotion_score": round(market_bonus, 2),
         "global_risk_score": round(global_bonus, 2),
         "shadow_reason": "；".join(parts),

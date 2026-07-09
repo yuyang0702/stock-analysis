@@ -47,6 +47,38 @@ class ThemeAndAnchorTests(unittest.TestCase):
         self.assertEqual(heat["theme_heat_level"], "高")
         self.assertGreater(float(heat["theme_heat_score"]), 6)
 
+    def test_sector_position_bundle_matches_theme_or_industry(self):
+        sector_context = {
+            "人工智能": {
+                "sector_pct_chg": 3.2,
+                "sector_rank_pct": 0.95,
+                "sector_amount_rank_pct": 0.9,
+                "sector_hot_level": "强",
+            }
+        }
+        row = pd.Series({"industry": "软件开发", "theme_label": "人工智能"})
+
+        bundle = strat.build_sector_position_bundle(row, sector_context)
+
+        self.assertEqual(bundle["sector_hot_level"], "强")
+        self.assertEqual(bundle["sector_pct_chg"], 3.2)
+        self.assertEqual(bundle["sector_rank_pct"], 0.95)
+        self.assertIn("人工智能", bundle["sector_position_reason"])
+
+    def test_build_sector_context_ranks_strong_board_higher(self):
+        frame = pd.DataFrame(
+            [
+                {"板块名称": "人工智能", "涨跌幅": 4.2, "成交额": 2000000000},
+                {"板块名称": "煤炭", "涨跌幅": -1.0, "成交额": 500000000},
+            ]
+        )
+
+        context = strat.build_sector_market_context([frame])
+
+        self.assertGreater(context["人工智能"]["sector_rank_pct"], context["煤炭"]["sector_rank_pct"])
+        self.assertEqual(context["人工智能"]["sector_hot_level"], "强")
+        self.assertEqual(context["煤炭"]["sector_hot_level"], "弱")
+
     def test_signal_anchor_locks_initial_entry(self):
         cache = DummyCache()
         first = pd.Series(
