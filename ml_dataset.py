@@ -20,6 +20,14 @@ FEATURE_COLUMNS = [
     "market_cap",
     "score",
     "final_score",
+    "enhanced_score",
+    "shadow_rank",
+    "shadow_base_score",
+    "news_catalyst_score",
+    "sector_position_score",
+    "market_emotion_score",
+    "global_risk_score",
+    "shadow_reason",
     "trade_score",
     "news_score",
     "risk_reward",
@@ -216,6 +224,7 @@ def build_review_report(sample_path: Path | None = None, report_path: Path | Non
     actions = Counter(_text(row.get("signal", {}).get("action")) for row in rows)
     statuses = Counter(_text(row.get("labels", {}).get("order_status")) for row in rows)
     score_buckets = Counter(_bucket(row.get("features", {}).get("final_score")) for row in rows)
+    shadow_buckets = Counter(_bucket(row.get("features", {}).get("enhanced_score")) for row in rows)
     success = sum(statuses.get(key, 0) for key in ("filled", "submitted", "held", "open", "done"))
     failed = sum(statuses.get(key, 0) for key in ("failed", "rejected", "cancelled", "skipped"))
 
@@ -231,10 +240,14 @@ def build_review_report(sample_path: Path | None = None, report_path: Path | Non
     for key in ("90+", "80-90", "70-80", "<70", "未知"):
         if score_buckets.get(key):
             lines.append(f"- {key}: {score_buckets[key]}")
+    lines.extend(["", "## 影子评分分布"])
+    for key in ("90+", "80-90", "70-80", "<70", "未知"):
+        if shadow_buckets.get(key):
+            lines.append(f"- {key}: {shadow_buckets[key]}")
     lines.extend(["", "## 订单状态"])
     for key, count in statuses.most_common():
         lines.append(f"- {key or '未标注'}: {count}")
-    lines.extend(["", "> 当前是 ML-3 基础复盘：只统计样本和订单标签，不训练模型，不参与下单。"])
+    lines.extend(["", "> 当前是 ML-3/ML-6 影子复盘：只统计样本、原分和影子分，不训练模型，不参与下单。"])
     md = "\n".join(lines)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(md, encoding="utf-8")

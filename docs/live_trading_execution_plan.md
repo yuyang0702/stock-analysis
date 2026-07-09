@@ -315,6 +315,14 @@ JoinQuant 实盘服务（如果确认可用）
 
 仓位不应只看固定 `position_pct`，应根据环境和风险调整。
 
+当前实现：
+
+```text
+shadow_score.py 已生成影子增强分 enhanced_score、shadow_rank 和 shadow_reason。
+global_market_context.py 会读取 cache/market/global_context.json；没有该文件时海外风险按中性处理。
+现阶段只进入扫描结果、CSV 和 ML 样本复盘，不改变 final_score 排序、不改变 JoinQuant 下单、不改变 position_pct。
+```
+
 建议公式：
 
 ```text
@@ -330,6 +338,15 @@ JoinQuant 实盘服务（如果确认可用）
 离止损越远，仓位越低
 同题材已有持仓，降低新仓
 连续亏损后，自动降仓
+```
+
+影子评分验收口径：
+
+```text
+连续观察至少 20 个交易日
+比较原策略 Top 5 和影子评分 Top 5 的 D+3/D+5 平均收益
+比较高影子分和低影子分的止损率、最大回撤和失败订单比例
+只有影子评分连续优于原策略，才允许进入下单过滤或仓位调整
 ```
 
 ### 5. 股票池风险过滤
@@ -423,6 +440,7 @@ KILL_SWITCH 已实现并验证
 - 失败原因归因：报告会按 `buy:reason`、`sell:reason` 聚合失败、拒单、取消和跳过原因，便于区分涨停、停牌、T+1、余额不足或风控限制。
 - 持仓一致性：报告会比较 JoinQuant 最新快照和本地同步后的 `cache/portfolio_web/positions.json`，发现数量或代码不一致会标记 critical。
 - 模板版本自检：`joinquant_strategy.py` 回传 `strategy_template_version`，`joinquant_health.py` 对比 `JOINQUANT_TEMPLATE_VERSION`，不一致时标记 `template_version_mismatch` 并提示 JoinQuant 网站模板未更新。
+- 影子评分第一版：`shadow_score.py` 基于原策略分、消息催化、题材热度、市场情绪、交易质量和海外风险生成 `enhanced_score`、`shadow_rank` 和 `shadow_reason`；`global_market_context.py` 读取 `cache/market/global_context.json`，缺失时按中性处理；`a_share_strategy.py` 写入扫描结果，`ml_dataset.py` 写入样本复盘，但 JoinQuant 下单仍使用原 `final_score` 和原仓位。
 - 通知兜底：`notifier.py` 会把发送失败的企业微信消息写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 每 5 分钟重试。
 - 统一运维入口：`run_ubuntu.sh` 新增 `notify-retry` 命令和菜单项，`install` 会统一安装健康检查、持仓同步、微信重试、readiness、ML 复盘等 timer。
 

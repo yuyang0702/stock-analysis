@@ -215,6 +215,10 @@ class JoinQuantExporterTest(unittest.TestCase):
                         "take_profit": 11.0,
                         "position_pct": 12,
                         "final_score": 90,
+                        "enhanced_score": 94,
+                        "shadow_rank": 1,
+                        "global_risk_score": 0,
+                        "shadow_reason": "消息+3.2；题材+4.0",
                         "trade_score": 83,
                         "news_score": 4,
                         "risk_reward": 2.5,
@@ -254,6 +258,9 @@ class JoinQuantExporterTest(unittest.TestCase):
             self.assertEqual(samples[0]["signal"]["action"], "buy")
             self.assertEqual(samples[0]["signal"]["id"], "run-ml-600000-buy-0000")
             self.assertEqual(samples[0]["features"]["final_score"], 90.0)
+            self.assertEqual(samples[0]["features"]["enhanced_score"], 94.0)
+            self.assertEqual(samples[0]["features"]["shadow_rank"], 1)
+            self.assertEqual(samples[0]["features"]["shadow_reason"], "消息+3.2；题材+4.0")
             self.assertEqual(samples[0]["features"]["market_state"], "强势进攻")
             self.assertEqual(samples[0]["features"]["ma5"], 9.8)
             self.assertEqual(samples[0]["labels"]["order_status"], "")

@@ -50,13 +50,23 @@ class MlDatasetTest(unittest.TestCase):
                 {
                     "sample_version": 1,
                     "signal": {"action": "buy", "code": "600000"},
-                    "features": {"final_score": 91.0, "theme_heat_level": "高", "market_state": "强势进攻"},
+                    "features": {
+                        "final_score": 91.0,
+                        "enhanced_score": 94.0,
+                        "theme_heat_level": "高",
+                        "market_state": "强势进攻",
+                    },
                     "labels": {"order_status": "filled"},
                 },
                 {
                     "sample_version": 1,
                     "signal": {"action": "sell", "code": "000001"},
-                    "features": {"final_score": 78.0, "theme_heat_level": "中", "market_state": "弱势震荡"},
+                    "features": {
+                        "final_score": 78.0,
+                        "enhanced_score": 70.0,
+                        "theme_heat_level": "中",
+                        "market_state": "弱势震荡",
+                    },
                     "labels": {"order_status": "failed"},
                 },
             ]
@@ -72,6 +82,8 @@ class MlDatasetTest(unittest.TestCase):
             self.assertIn("买入 1", md)
             self.assertIn("成交/提交 1", md)
             self.assertIn("失败/跳过 1", md)
+            self.assertIn("## 影子评分分布", md)
+            self.assertIn("90+: 1", md)
             self.assertTrue(report_path.exists())
 
 

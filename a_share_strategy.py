@@ -18,8 +18,10 @@ import akshare as ak
 import pandas as pd
 
 import config as app_config
+from global_market_context import load_global_context
 from paper_trading import apply_paper_trades, build_paper_trade_markdown, load_account, save_account
 from risk_engine import RiskDecision, build_risk_decision, build_signal_lifecycle, classify_trade_mode
+from shadow_score import apply_shadow_scores
 from strategy_profile import build_strategy_profile
 from notifier import WeComNotifier
 
@@ -2235,6 +2237,13 @@ def save_outputs(
             "amount",
             "score",
             "final_score",
+            "enhanced_score",
+            "shadow_rank",
+            "shadow_reason",
+            "news_catalyst_score",
+            "sector_position_score",
+            "market_emotion_score",
+            "global_risk_score",
             "amount_rank_pct",
             "limit_quality",
             "pressure_pct",
@@ -2275,18 +2284,21 @@ def save_outputs(
     lines.append(f"- 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"- 大盘状态：{market_info['state']}")
     lines.append(f"- 新闻状态：{market_news_state}")
+    if market_info.get("global_reason"):
+        lines.append(f"- 海外市场：{market_info.get('global_reason')}")
     if ai_overview:
         lines.append(f"- AI汇总：{compact_text(ai_overview, 140)}")
     lines.append(f"- 上证指数：{market_info.get('sh_price') or '未知'}")
     lines.append(f"- 上证涨跌幅：{market_info.get('sh_pct') if market_info.get('sh_pct') is not None else '未知'}")
     lines.append("")
-    lines.append("| 代码 | 名称 | 行业 | 涨幅 | 成交额(亿) | 评分 | 买点 | 历史 | 卖出 |")
-    lines.append("|---|---|---|---:|---:|---:|---|---|---|")
+    lines.append("| 代码 | 名称 | 行业 | 涨幅 | 成交额(亿) | 原分 | 影子分 | 买点 | 历史 | 卖出 |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---|---|---|")
     for _, row in result.iterrows():
         lines.append(
             f"| {row['code']} | {row['name']} | {row.get('industry', '')} | "
             f"{row['pct_chg']:.2f}% | {row['amount'] / 1e8:.2f} | "
             f"{row.get('final_score', row.get('score', 0)):.2f} | "
+            f"{row.get('enhanced_score', row.get('final_score', row.get('score', 0))):.2f} | "
             f"{safe_text(row.get('buy_state', ''))} | "
             f"{safe_text(row.get('history_replay', ''))} | "
             f"{safe_text(row.get('exit_plan', ''))} |"
@@ -2750,6 +2762,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     spot = fetch_spot_data()
     print("读取大盘状态...", flush=True)
     market_info = market_sentiment(spot)
+    market_info.update(load_global_context())
     print("加载行业缓存...", flush=True)
     industry = IndustryMapper(refresh=cfg.refresh_industry)
     seeded = industry.seed_from_frame(spot)
@@ -2888,6 +2901,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     anchor_frame = result.apply(lambda row: build_signal_anchor_bundle(row, cache), axis=1, result_type="expand")
     for col in anchor_frame.columns:
         result[col] = anchor_frame[col]
+    result = apply_shadow_scores(result, global_risk_score=float(market_info.get("global_risk_score", 0) or 0))
     pending_theme_mask = result["theme_label"].isin(["未识别题材", "题材待确认"])
     industry.note_pending(result[pending_theme_mask][["code", "name", "theme_label"]].copy())
 
@@ -2965,6 +2979,10 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
             watch_anchor_frame = watch_result.apply(lambda row: build_signal_anchor_bundle(row, cache), axis=1, result_type="expand")
             for col in watch_anchor_frame.columns:
                 watch_result[col] = watch_anchor_frame[col]
+            watch_result = apply_shadow_scores(
+                watch_result,
+                global_risk_score=float(market_info.get("global_risk_score", 0) or 0),
+            )
             watch_result = watch_result.sort_values("final_score", ascending=False).reset_index(drop=True)
             watch_pending_theme_mask = watch_result["theme_label"].isin(["未识别题材", "题材待确认"])
             industry.note_pending(watch_result[watch_pending_theme_mask][["code", "name", "theme_label"]].copy())
