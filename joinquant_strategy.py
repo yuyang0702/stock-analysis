@@ -22,6 +22,7 @@ STARTUP_SELF_TEST = True
 MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_TOTAL_POSITION_PCT = 80.0
+STRATEGY_TEMPLATE_VERSION = "2026-07-09.2-order-target-value"
 
 
 def initialize(context):
@@ -223,6 +224,7 @@ def post_account_snapshot(context):
         "trade_date": datetime.now().strftime("%Y-%m-%d"),
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "joinquant",
+        "strategy_template_version": STRATEGY_TEMPLATE_VERSION,
         "cash": context.portfolio.cash,
         "total_value": context.portfolio.total_value,
         "positions": positions,

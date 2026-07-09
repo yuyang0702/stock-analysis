@@ -30,6 +30,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                 "schema_version": 1,
                 "generated_at": "2026-07-09 09:58:00",
                 "received_at": "2026-07-09 09:58:10",
+                "strategy_template_version": "2026-07-09.2-order-target-value",
                 "cash": 90000,
                 "total_value": 101000,
                 "positions": [{"code": "600000"}],
@@ -71,6 +72,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 09:20:00",
+                        "strategy_template_version": "2026-07-09.2-order-target-value",
                         "positions": [],
                         "orders": [],
                     }
@@ -106,6 +108,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 15:20:00",
+                        "strategy_template_version": "2026-07-09.2-order-target-value",
                         "positions": [],
                         "orders": [],
                     }
@@ -138,7 +141,15 @@ class JoinQuantHealthTest(unittest.TestCase):
                 encoding="utf-8",
             )
             snapshot_file.write_text(
-                json.dumps({"schema_version": 1, "received_at": "2026-07-09 09:59:00", "positions": [], "orders": []}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "received_at": "2026-07-09 09:59:00",
+                        "strategy_template_version": "2026-07-09.2-order-target-value",
+                        "positions": [],
+                        "orders": [],
+                    }
+                ),
                 encoding="utf-8",
             )
             history_file.write_text(
@@ -191,6 +202,7 @@ class JoinQuantHealthTest(unittest.TestCase):
             snapshot = {
                 "schema_version": 1,
                 "received_at": "2026-07-09 15:25:00",
+                "strategy_template_version": "2026-07-09.2-order-target-value",
                 "cash": 90000,
                 "total_value": 101000,
                 "positions": [{"code": "600000", "qty": 100}],
@@ -251,6 +263,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 10:00:00",
+                        "strategy_template_version": "2026-07-09.2-order-target-value",
                         "positions": [{"code": "600000", "qty": 100}],
                         "orders": [],
                     }
@@ -273,6 +286,42 @@ class JoinQuantHealthTest(unittest.TestCase):
 
             self.assertEqual(result["position_consistency"], "mismatch")
             self.assertIn("position_mismatch", result["issue_codes"])
+
+    def test_reports_template_version_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account_snapshot.json"
+            report_file = base / "health.md"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "generated_at": "2026-07-09 10:00:00", "signals": []}),
+                encoding="utf-8",
+            )
+            snapshot_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "received_at": "2026-07-09 10:00:00",
+                        "strategy_template_version": "2026-07-09.1-old",
+                        "positions": [],
+                        "orders": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                base / "missing_history.jsonl",
+                report_file,
+                now=datetime(2026, 7, 9, 10, 1, 0),
+            )
+
+            self.assertEqual(result["expected_template_version"], "2026-07-09.2-order-target-value")
+            self.assertEqual(result["strategy_template_version"], "2026-07-09.1-old")
+            self.assertIn("template_version_mismatch", result["issue_codes"])
+            self.assertIn("JoinQuant 网站模板未更新", "\n".join(result["issues"]))
 
     def test_alert_markdown_is_mobile_friendly(self) -> None:
         md = joinquant_health.build_alert_markdown(

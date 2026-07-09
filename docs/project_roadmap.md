@@ -40,7 +40,7 @@ flowchart LR
 | JoinQuant 策略模板 | 已实现 | JoinQuant 平台运行 `joinquant_strategy.py`，默认使用模拟盘真实下单模式，不是 dry-run。 |
 | JoinQuant 执行回报 | 已实现 | 买入、卖出、跳过、失败等结果会通过回调进入服务器，并推送到微信。 |
 | JoinQuant 持仓同步 | 已实现 | 本地持仓展示读取 JoinQuant 回传结果，作为模拟盘主数据来源。 |
-| JoinQuant 健康检查与异常报警 | 已实现 | `joinquant_health.py` 会检查信号文件、账户快照、API 拉取/回传次数、失败原因、持仓一致性和稳定性评分，生成 `output/joinquant_health_YYYYMMDD.md`；非交易时段的信号/快照过期只记录报告，不刷微信报警。 |
+| JoinQuant 健康检查与异常报警 | 已实现 | `joinquant_health.py` 会检查信号文件、账户快照、API 拉取/回传次数、失败原因、持仓一致性、JoinQuant 网站模板版本和稳定性评分，生成 `output/joinquant_health_YYYYMMDD.md`；非交易时段的信号/快照过期只记录报告，不刷微信报警。 |
 | 企业微信失败重试 | 已实现 | 推送失败会进入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 会定时重试。 |
 | 节假日推送静默 | 已实现 | 非 A 股交易日默认不推普通扫描、买点提醒和 JoinQuant 空计划；可用 `NOTIFY_NON_TRADING_DAY=1` 临时打开联调。 |
 | 盘后信号追踪复盘 | 已实现 | 对已推送信号记录推送价、入场/止损/止盈、分数、题材和市场状态；盘后补充 D+N 快照、高低收、入场、止盈止损、最大浮盈、最大回撤和策略质量分组。 |
@@ -231,6 +231,7 @@ JoinQuant 回传后补充以下标签：
 
 - `joinquant_signal_server.py` 会记录 `cache/joinquant/api_events.jsonl`，包括 JoinQuant 拉取信号、访问 latest、回传账户快照，以及 403/400/503 等异常请求。
 - `joinquant_health.py` 会生成 `output/joinquant_health_YYYYMMDD.md`，统计信号新鲜度、账户快照新鲜度、今日信号拉取次数、今日快照回传次数、API 异常次数、失败/跳过订单数、失败原因拆分、持仓一致性和稳定性评分。
+- `joinquant_strategy.py` 会在账户快照中回传 `strategy_template_version`；`joinquant_health.py` 会和服务器期望版本对比，发现 JoinQuant 网站仍使用旧模板时标记 `template_version_mismatch`。
 - `joinquant_health.py` 会追加 `cache/joinquant/health_history.jsonl`，用于后续观察连续交易日稳定性。
 - `notifier.py` 已加入失败推送队列；企业微信发送失败会写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 会定时重试。
 - `run_ubuntu.sh` 是统一入口，新增 `notify-retry` 菜单和命令；安装时会统一写入健康检查和微信重试的 systemd timer。

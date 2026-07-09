@@ -22,6 +22,12 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         self.assertIn("record order", text)
         self.assertIn("post snapshot ok", text)
 
+    def test_template_posts_version_with_snapshot(self) -> None:
+        text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
+
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-09.2-order-target-value"', text)
+        self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
+
     def test_template_retries_pending_order_event_callback(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
 

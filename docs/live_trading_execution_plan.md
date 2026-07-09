@@ -35,7 +35,7 @@
 
 目标：确认 JoinQuant 模拟盘链路能在真实交易日连续稳定运行。
 
-当前状态：阶段 1 的代码功能已补齐。服务器已具备 JoinQuant 通信、API 访问日志、健康检查、交易时段告警门槛、异常微信报警、失败推送重试、失败原因拆分、持仓一致性检查、稳定性评分和统一 run 脚本定时器。
+当前状态：阶段 1 的代码功能已补齐。服务器已具备 JoinQuant 通信、API 访问日志、健康检查、交易时段告警门槛、异常微信报警、失败推送重试、失败原因拆分、持仓一致性检查、网站模板版本自检、稳定性评分和统一 run 脚本定时器。
 
 已实现：
 
@@ -52,6 +52,7 @@
 10. health_history.jsonl 连续观察记录
 11. 09:30-11:30、13:00-15:00 连续竞价口径，09:29 不再当成可下单盘中
 12. 非交易时段信号/快照 stale 只记报告，不反复推微信异常
+13. JoinQuant 网站模板版本回传和服务器期望版本对比，防止网站仍运行旧模板
 ```
 
 仍需做的是线上验收观察，不是代码功能补充：
@@ -421,6 +422,7 @@ KILL_SWITCH 已实现并验证
 - 连续观察数据：`joinquant_health.py` 写入 `cache/joinquant/health_history.jsonl`，后续可以用来判断连续交易日是否达标。
 - 失败原因归因：报告会按 `buy:reason`、`sell:reason` 聚合失败、拒单、取消和跳过原因，便于区分涨停、停牌、T+1、余额不足或风控限制。
 - 持仓一致性：报告会比较 JoinQuant 最新快照和本地同步后的 `cache/portfolio_web/positions.json`，发现数量或代码不一致会标记 critical。
+- 模板版本自检：`joinquant_strategy.py` 回传 `strategy_template_version`，`joinquant_health.py` 对比 `JOINQUANT_TEMPLATE_VERSION`，不一致时标记 `template_version_mismatch` 并提示 JoinQuant 网站模板未更新。
 - 通知兜底：`notifier.py` 会把发送失败的企业微信消息写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 每 5 分钟重试。
 - 统一运维入口：`run_ubuntu.sh` 新增 `notify-retry` 命令和菜单项，`install` 会统一安装健康检查、持仓同步、微信重试、readiness、ML 复盘等 timer。
 

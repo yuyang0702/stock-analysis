@@ -254,6 +254,8 @@ def build_health_report(
     snapshot_age = _age_minutes(_snapshot_time(snapshot_payload), now)
     signals = signal_payload.get("signals", []) if isinstance(signal_payload.get("signals"), list) else []
     positions = snapshot_payload.get("positions", []) if isinstance(snapshot_payload.get("positions"), list) else []
+    expected_template_version = app_config.JOINQUANT_TEMPLATE_VERSION
+    strategy_template_version = str(snapshot_payload.get("strategy_template_version") or "").strip()
     failed_orders_today = sum(_failed_orders(row) for row in snapshots_for_orders)
     failed_order_breakdown = _failed_order_breakdown(snapshots_for_orders)
     api_counts = _api_counts(api_events, today)
@@ -302,6 +304,11 @@ def build_health_report(
         issue_codes.append("api_errors")
         issues.append(f"今日 JoinQuant API 异常请求 {api_counts['api_error_count_today']} 次")
 
+    if strategy_template_version != expected_template_version:
+        issue_codes.append("template_version_mismatch")
+        actual = strategy_template_version or "missing"
+        issues.append(f"JoinQuant 网站模板未更新：当前 {actual}，期望 {expected_template_version}")
+
     status = "ok" if not issues else "critical"
     is_trading_time = _is_a_share_trading_time(now)
     alert_required = _alert_required(issue_codes, now)
@@ -322,6 +329,8 @@ def build_health_report(
         "position_count": len(positions),
         "position_consistency": position_consistency,
         "position_mismatches": position_mismatches,
+        "strategy_template_version": strategy_template_version,
+        "expected_template_version": expected_template_version,
         "signal_pull_count_today": api_counts["signal_pull_count_today"],
         "latest_pull_count_today": api_counts["latest_pull_count_today"],
         "snapshot_post_count_today": api_counts["snapshot_post_count_today"],
@@ -358,6 +367,8 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         f"- 今日快照：{result.get('snapshot_count_today', 0)} 次",
         f"- 今日失败订单：{result.get('failed_orders_today', 0)} 笔",
         f"- 持仓一致性：{result.get('position_consistency', '-')}",
+        f"- JoinQuant 模板版本：{result.get('strategy_template_version') or 'missing'}",
+        f"- 期望模板版本：{result.get('expected_template_version')}",
         f"- 持仓数量：{result.get('position_count', 0)}",
         f"- 总资产：{_num(result.get('latest_total_value')):.2f}",
         f"- 现金：{_num(result.get('latest_cash')):.2f}",
@@ -384,6 +395,7 @@ def build_alert_markdown(result: dict[str, Any]) -> str:
         f"> 拉取：{result.get('signal_pull_count_today', 0)} | 回传：{result.get('snapshot_post_count_today', 0)} | API异常：{result.get('api_error_count_today', 0)}",
         f"> 快照年龄：{result.get('snapshot_age_min')} 分钟 | 信号年龄：{result.get('signal_age_min')} 分钟",
         f"> 失败订单：{result.get('failed_orders_today', 0)} | 持仓一致性：{result.get('position_consistency', '-')}",
+        f"> 模板：{result.get('strategy_template_version') or 'missing'} | 期望：{result.get('expected_template_version')}",
         f"> 总资产：{_num(result.get('latest_total_value')):.2f} | 现金：{_num(result.get('latest_cash')):.2f} | 持仓：{result.get('position_count', 0)}",
     ]
     for issue in result.get("issues") or []:
