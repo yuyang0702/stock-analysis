@@ -181,7 +181,8 @@ def execute_signals(context):
             _record_order(signal, "dry_run", "not_submitted")
         elif action == "buy":
             try:
-                order = order_target_percent(jq_code, float(signal.get("position_pct") or 0) / 100.0)
+                target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+                order = order_target_value(jq_code, target_value)
                 if order is None:
                     _record_order(signal, "failed", "limit_up_or_suspended_or_rejected")
                 else:

@@ -254,7 +254,7 @@ JoinQuant 策略脚本执行信号前必须校验：
 
 建议 JoinQuant 使用：
 
-- 买入：`order_target_percent(jq_code, position_pct / 100)`
+- 买入：`order_target_value(jq_code, context.portfolio.total_value * position_pct / 100)`
 - 卖出：`order_target(jq_code, 0)`
 
 第一版不支持复杂加仓、减仓、条件单和撤单管理。
