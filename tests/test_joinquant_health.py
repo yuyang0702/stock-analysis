@@ -30,7 +30,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                 "schema_version": 1,
                 "generated_at": "2026-07-09 09:58:00",
                 "received_at": "2026-07-09 09:58:10",
-                "strategy_template_version": "2026-07-09.2-order-target-value",
+                "strategy_template_version": "2026-07-10.1-periodic-snapshot",
                 "cash": 90000,
                 "total_value": 101000,
                 "positions": [{"code": "600000"}],
@@ -72,7 +72,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 09:20:00",
-                        "strategy_template_version": "2026-07-09.2-order-target-value",
+                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
                         "positions": [],
                         "orders": [],
                     }
@@ -108,7 +108,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 15:20:00",
-                        "strategy_template_version": "2026-07-09.2-order-target-value",
+                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
                         "positions": [],
                         "orders": [],
                     }
@@ -145,7 +145,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 09:59:00",
-                        "strategy_template_version": "2026-07-09.2-order-target-value",
+                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
                         "positions": [],
                         "orders": [],
                     }
@@ -202,7 +202,7 @@ class JoinQuantHealthTest(unittest.TestCase):
             snapshot = {
                 "schema_version": 1,
                 "received_at": "2026-07-09 15:25:00",
-                "strategy_template_version": "2026-07-09.2-order-target-value",
+                "strategy_template_version": "2026-07-10.1-periodic-snapshot",
                 "cash": 90000,
                 "total_value": 101000,
                 "positions": [{"code": "600000", "qty": 100}],
@@ -263,7 +263,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 10:00:00",
-                        "strategy_template_version": "2026-07-09.2-order-target-value",
+                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
                         "positions": [{"code": "600000", "qty": 100}],
                         "orders": [],
                     }
@@ -318,7 +318,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                 now=datetime(2026, 7, 9, 10, 1, 0),
             )
 
-            self.assertEqual(result["expected_template_version"], "2026-07-09.2-order-target-value")
+            self.assertEqual(result["expected_template_version"], "2026-07-10.1-periodic-snapshot")
             self.assertEqual(result["strategy_template_version"], "2026-07-09.1-old")
             self.assertIn("template_version_mismatch", result["issue_codes"])
             self.assertIn("JoinQuant 网站模板未更新", "\n".join(result["issues"]))
@@ -358,7 +358,7 @@ class JoinQuantHealthTest(unittest.TestCase):
             snapshot = {
                 "schema_version": 1,
                 "received_at": "2026-07-09 10:01:00",
-                "strategy_template_version": "2026-07-09.2-order-target-value",
+                "strategy_template_version": "2026-07-10.1-periodic-snapshot",
                 "positions": [],
                 "orders": [
                     {"action": "buy", "status": "failed", "reason": "limit_up_or_suspended"},

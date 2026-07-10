@@ -22,7 +22,7 @@ STARTUP_SELF_TEST = True
 MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-09.2-order-target-value"
+STRATEGY_TEMPLATE_VERSION = "2026-07-10.1-periodic-snapshot"
 
 
 def initialize(context):
@@ -36,13 +36,12 @@ def initialize(context):
 
 def handle_data(context, data):
     fetch_and_execute(context)
+    post_account_snapshot(context)
 
 
 def fetch_and_execute(context):
     fetch_signals(context)
-    event_count = execute_signals(context)
-    if event_count or getattr(g, "order_events", []):
-        post_account_snapshot(context)
+    return execute_signals(context)
 
 
 def startup_self_test(context):

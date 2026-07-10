@@ -27,13 +27,14 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
     def test_template_posts_version_with_snapshot(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
 
-        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-09.2-order-target-value"', text)
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-10.1-periodic-snapshot"', text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
 
     def test_template_retries_pending_order_event_callback(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
 
-        self.assertIn('if event_count or getattr(g, "order_events", []):', text)
+        self.assertIn("fetch_and_execute(context)\n    post_account_snapshot(context)", text)
+        self.assertIn("return execute_signals(context)", text)
 
     def test_template_posts_startup_self_test_without_orders(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")

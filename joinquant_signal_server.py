@@ -192,7 +192,8 @@ def create_app(
             update_order_labels(app_config.ML_SIGNAL_SAMPLE_FILE, payload)
         except Exception as exc:
             print(f"ML order label update skipped: {exc}", flush=True)
-        _notify_execution(payload)
+        if payload.get("orders"):
+            _notify_execution(payload)
         _append_api_event(
             event_path,
             "account_snapshot",
