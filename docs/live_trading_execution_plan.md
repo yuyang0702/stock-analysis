@@ -323,7 +323,7 @@ a_share_strategy.py 的板块行情改为独立低频刷新：a_share_strategy.p
 global_market_context.py 会通过 AkShare 东方财富主源抓取美股、日本、韩国主要指数并写入 cache/market/global_context.json；主源失败时切到 Sina 备用源，备用源也失败时优先复用 24 小时内最近一次成功缓存，仍不可用才按海外风险中性处理。
 日常微信扫描汇总、单票提醒和 JoinQuant 下单计划会显示原策略分、影子分、影子调整和原排名到影子排名的变化；影子分标注为仅观察，不参与下单。
 JoinQuant 执行保护已补齐：买入信号导出前检查是否至少够买 100 股，不足一手时记录 buy_too_small_for_board_lot 并过滤；订单状态在账户快照回传前统一转成字符串，避免 OrderStatus 无法 JSON 序列化；普通 skipped 订单仍保留在失败原因明细中，但不再计入硬失败阈值；设置 JOINQUANT_ENFORCE_HEALTH_GATE=1 后，健康准入不通过会停止新买单导出，但已有持仓的卖出、止损和止盈仍允许。
-JoinQuant 网站模板在交易时间每次 handle_data 后都会回传账户快照，成交后的现金、总资产和持仓通常下一分钟即可更新；服务器 stock-joinquant-sync.timer 每 60 秒同步到本地。无订单的周期快照只落盘和同步，不触发企业微信执行回报。
+JoinQuant 网站模板在交易时间每次 handle_data 后都会回传账户快照，成交后的现金、总资产和持仓通常下一分钟即可更新；服务器 stock-joinquant-sync.timer 每 60 秒同步到本地。周期快照和完整订单事件仍会落盘并同步；只有 `buy/sell` 且 `filled > 0` 的完整或部分成交才触发企业微信执行回报，零成交、失败和跳过不推送。
 strategy_compare_report.py 每天 15:35 生成 output/strategy_compare_report.md，每周五 15:45 推送策略对照微信摘要。
 现阶段不改变 final_score 排序、不改变 JoinQuant 下单、不改变 position_pct。
 ```

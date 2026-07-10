@@ -170,6 +170,64 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             self.assertEqual(notified["source"], "joinquant")
             self.assertTrue(notified["received_at"])
 
+    def test_zero_filled_orders_do_not_notify_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            client = app.test_client()
+
+            payload = {
+                "schema_version": 1,
+                "positions": [],
+                "trades": [],
+                "orders": [
+                    {"action": "buy", "code": "600000", "status": "submitted", "filled": 0},
+                    {"action": "sell", "code": "000001", "status": "failed", "filled": 0},
+                    {"action": "buy", "code": "000002", "status": "skipped"},
+                ],
+            }
+            with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
+                response = client.post("/joinquant/account_snapshot?token=secret", json=payload)
+
+            self.assertEqual(response.status_code, 200)
+            notify.assert_not_called()
+
+    def test_mixed_orders_notify_only_positive_filled_buy_and_sell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            client = app.test_client()
+
+            filled_buy = {"action": "buy", "code": "600000", "status": "held", "filled": 100}
+            filled_sell = {"action": "sell", "code": "000001", "status": "filled", "filled": "50"}
+            payload = {
+                "schema_version": 1,
+                "positions": [],
+                "trades": [],
+                "orders": [
+                    filled_buy,
+                    {"action": "buy", "code": "000002", "status": "submitted", "filled": 0},
+                    {"action": "sell", "code": "000003", "status": "failed", "filled": 0},
+                    {"action": "hold", "code": "000004", "status": "filled", "filled": 100},
+                    filled_sell,
+                ],
+            }
+            with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
+                response = client.post("/joinquant/account_snapshot?token=secret", json=payload)
+
+            self.assertEqual(response.status_code, 200)
+            notify.assert_called_once()
+            notified = notify.call_args.args[0]
+            self.assertEqual(notified["orders"], [filled_buy, filled_sell])
+            saved = json.loads(account_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved["orders"], payload["orders"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,6 +81,16 @@ def _short(value: Any, limit: int = 36) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _filled_trade_orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in payload.get("orders", [])
+        if isinstance(item, dict)
+        and str(item.get("action") or "").strip().lower() in {"buy", "sell"}
+        and _num(item.get("filled")) > 0
+    ]
+
+
 def build_execution_markdown(payload: dict[str, Any]) -> str:
     orders = [item for item in payload.get("orders", []) if isinstance(item, dict)]
     positions = payload.get("positions", []) if isinstance(payload.get("positions"), list) else []
@@ -192,8 +202,11 @@ def create_app(
             update_order_labels(app_config.ML_SIGNAL_SAMPLE_FILE, payload)
         except Exception as exc:
             print(f"ML order label update skipped: {exc}", flush=True)
-        if payload.get("orders"):
-            _notify_execution(payload)
+        filled_orders = _filled_trade_orders(payload)
+        if filled_orders:
+            notification_payload = dict(payload)
+            notification_payload["orders"] = filled_orders
+            _notify_execution(notification_payload)
         _append_api_event(
             event_path,
             "account_snapshot",

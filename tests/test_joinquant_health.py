@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+import config as app_config
 import joinquant_health
 
 
@@ -30,7 +31,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                 "schema_version": 1,
                 "generated_at": "2026-07-09 09:58:00",
                 "received_at": "2026-07-09 09:58:10",
-                "strategy_template_version": "2026-07-10.1-periodic-snapshot",
+                "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
                 "cash": 90000,
                 "total_value": 101000,
                 "positions": [{"code": "600000"}],
@@ -48,6 +49,9 @@ class JoinQuantHealthTest(unittest.TestCase):
                 signal_max_age_min=30,
                 snapshot_max_age_min=15,
                 failed_order_limit=1,
+                api_event_file=base / "missing_api_events.jsonl",
+                positions_file=base / "missing_positions.json",
+                health_history_file=base / "health_history.jsonl",
             )
 
             self.assertEqual(result["status"], "ok")
@@ -72,7 +76,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 09:20:00",
-                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
+                        "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
                         "positions": [],
                         "orders": [],
                     }
@@ -87,6 +91,9 @@ class JoinQuantHealthTest(unittest.TestCase):
                 report_file,
                 now=datetime(2026, 7, 9, 10, 0, 0),
                 snapshot_max_age_min=15,
+                api_event_file=base / "missing_api_events.jsonl",
+                positions_file=base / "missing_positions.json",
+                health_history_file=base / "health_history.jsonl",
             )
 
             self.assertEqual(result["status"], "critical")
@@ -108,7 +115,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 15:20:00",
-                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
+                        "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
                         "positions": [],
                         "orders": [],
                     }
@@ -123,6 +130,9 @@ class JoinQuantHealthTest(unittest.TestCase):
                 report_file,
                 now=datetime(2026, 7, 9, 21, 0, 0),
                 snapshot_max_age_min=15,
+                api_event_file=base / "missing_api_events.jsonl",
+                positions_file=base / "missing_positions.json",
+                health_history_file=base / "health_history.jsonl",
             )
 
             self.assertEqual(result["status"], "critical")
@@ -145,7 +155,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 09:59:00",
-                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
+                        "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
                         "positions": [],
                         "orders": [],
                     }
@@ -181,6 +191,9 @@ class JoinQuantHealthTest(unittest.TestCase):
                 base / "health.md",
                 now=datetime(2026, 7, 9, 10, 0, 0),
                 failed_order_limit=1,
+                api_event_file=base / "missing_api_events.jsonl",
+                positions_file=base / "missing_positions.json",
+                health_history_file=base / "health_history.jsonl",
             )
 
             self.assertEqual(result["failed_orders_today"], 2)
@@ -202,7 +215,7 @@ class JoinQuantHealthTest(unittest.TestCase):
             snapshot = {
                 "schema_version": 1,
                 "received_at": "2026-07-09 15:25:00",
-                "strategy_template_version": "2026-07-10.1-periodic-snapshot",
+                "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
                 "cash": 90000,
                 "total_value": 101000,
                 "positions": [{"code": "600000", "qty": 100}],
@@ -239,6 +252,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                 api_event_file=api_event_file,
                 positions_file=positions_file,
                 failed_order_limit=5,
+                health_history_file=base / "health_history.jsonl",
             )
 
             self.assertEqual(result["signal_pull_count_today"], 2)
@@ -263,7 +277,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                     {
                         "schema_version": 1,
                         "received_at": "2026-07-09 10:00:00",
-                        "strategy_template_version": "2026-07-10.1-periodic-snapshot",
+                        "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
                         "positions": [{"code": "600000", "qty": 100}],
                         "orders": [],
                     }
@@ -282,6 +296,8 @@ class JoinQuantHealthTest(unittest.TestCase):
                 base / "health.md",
                 now=datetime(2026, 7, 9, 10, 1, 0),
                 positions_file=positions_file,
+                api_event_file=base / "missing_api_events.jsonl",
+                health_history_file=base / "health_history.jsonl",
             )
 
             self.assertEqual(result["position_consistency"], "mismatch")
@@ -316,9 +332,12 @@ class JoinQuantHealthTest(unittest.TestCase):
                 base / "missing_history.jsonl",
                 report_file,
                 now=datetime(2026, 7, 9, 10, 1, 0),
+                api_event_file=base / "missing_api_events.jsonl",
+                positions_file=base / "missing_positions.json",
+                health_history_file=base / "health_history.jsonl",
             )
 
-            self.assertEqual(result["expected_template_version"], "2026-07-10.1-periodic-snapshot")
+            self.assertEqual(result["expected_template_version"], app_config.JOINQUANT_TEMPLATE_VERSION)
             self.assertEqual(result["strategy_template_version"], "2026-07-09.1-old")
             self.assertIn("template_version_mismatch", result["issue_codes"])
             self.assertIn("JoinQuant 网站模板未更新", "\n".join(result["issues"]))
@@ -358,7 +377,7 @@ class JoinQuantHealthTest(unittest.TestCase):
             snapshot = {
                 "schema_version": 1,
                 "received_at": "2026-07-09 10:01:00",
-                "strategy_template_version": "2026-07-10.1-periodic-snapshot",
+                "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
                 "positions": [],
                 "orders": [
                     {"action": "buy", "status": "failed", "reason": "limit_up_or_suspended"},
@@ -375,6 +394,9 @@ class JoinQuantHealthTest(unittest.TestCase):
                 base / "health.md",
                 now=datetime(2026, 7, 9, 10, 2, 0),
                 failed_order_limit=5,
+                api_event_file=base / "missing_api_events.jsonl",
+                positions_file=base / "missing_positions.json",
+                health_history_file=base / "health_history.jsonl",
             )
 
             self.assertEqual(result["failed_orders_today"], 1)
