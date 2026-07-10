@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS strategy_runs (
 CREATE TABLE IF NOT EXISTS signals (
     signal_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES strategy_runs(run_id),
+    trade_date TEXT NOT NULL,
     stock_code TEXT NOT NULL,
     jq_code TEXT NOT NULL,
     action TEXT NOT NULL,
@@ -72,7 +73,8 @@ CREATE TABLE IF NOT EXISTS risk_decisions (
 CREATE TABLE IF NOT EXISTS system_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_runs_trade_date ON strategy_runs(trade_date);
 CREATE INDEX IF NOT EXISTS idx_signals_action ON signals(action);
@@ -86,6 +88,29 @@ class StoreHealth:
     ok: bool
     schema_version: int
     error: str = ""
+
+
+@dataclass(frozen=True)
+class StrategyRunRecord:
+    run_id: str
+    trade_date: str
+    started_at: str
+    strategy_version: str
+    parameter_version: str
+
+
+@dataclass(frozen=True)
+class SignalRecord:
+    signal_id: str
+    run_id: str
+    trade_date: str
+    code: str
+    jq_code: str
+    action: str
+    position_pct: float
+    generated_at: str
+    expires_at: str
+    raw_json: str
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -135,3 +160,51 @@ class TradingStore:
             return StoreHealth(ok=version == SCHEMA_VERSION, schema_version=version)
         except Exception as exc:
             return StoreHealth(ok=False, schema_version=0, error=str(exc))
+
+    def record_strategy_run(self, conn: sqlite3.Connection, run: StrategyRunRecord) -> None:
+        conn.execute(
+            """
+            INSERT INTO strategy_runs(
+                run_id, trade_date, started_at, strategy_version, parameters_version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(run_id) DO NOTHING
+            """,
+            (run.run_id, run.trade_date, run.started_at, run.strategy_version, run.parameter_version),
+        )
+
+    def record_signal(self, conn: sqlite3.Connection, signal: SignalRecord) -> bool:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO signals(
+                signal_id, run_id, trade_date, stock_code, jq_code, action,
+                target_position, generated_at, expires_at, raw_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                signal.signal_id, signal.run_id, signal.trade_date, signal.code,
+                signal.jq_code, signal.action, signal.position_pct, signal.generated_at,
+                signal.expires_at, signal.raw_json,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def set_system_state(
+        self, conn: sqlite3.Connection, key: str, value: str, reason: str
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO system_state(key, value, updated_at, reason)
+            VALUES (?, ?, datetime('now'), ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at,
+                reason = excluded.reason
+            """,
+            (key, value, reason),
+        )
+
+    def get_system_state(self, key: str, default: str = "") -> str:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
+        return default if row is None else str(row[0])
