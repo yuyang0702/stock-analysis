@@ -162,13 +162,14 @@ class SignalWatchlistTest(unittest.TestCase):
                 )
                 notifier = FakeNotifier()
 
-                strat.dispatch_notifications(
-                    strat.Config(mode="after", notify_top=3, notify_min_score=75),
-                    notifier,
-                    result,
-                    {"state": "强势进攻", "sh_pct": 1.2},
-                    "题材催化偏强",
-                )
+                with patch("a_share_strategy.is_a_share_trading_day", return_value=True):
+                    strat.dispatch_notifications(
+                        strat.Config(mode="after", notify_top=3, notify_min_score=75),
+                        notifier,
+                        result,
+                        {"state": "强势进攻", "sh_pct": 1.2},
+                        "题材催化偏强",
+                    )
 
                 self.assertTrue(all(title.startswith("【盘后】") for title, _, _ in notifier.sent))
                 data = strat.load_signal_watchlist(strat.SIGNAL_WATCHLIST_FILE)
