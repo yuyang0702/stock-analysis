@@ -53,7 +53,7 @@ def _has_holding(row: pd.Series) -> bool:
     return _text(row.get("hold_status")).lower() in {"holding", "partial_sell"}
 
 
-def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True) -> str:
+def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True, account_total_value: float = 0.0) -> str:
     if not allow_buy:
         return "buy_disabled"
     code = clean_code(row.get("code"))
@@ -74,6 +74,10 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True)
         return "buy_near_limit_up"
     if price < entry:
         return "buy_not_reached_entry"
+    if account_total_value > 0:
+        target_value = account_total_value * _num(row.get("position_pct")) / 100.0
+        if target_value < entry * 100:
+            return "buy_too_small_for_board_lot"
     return ""
 
 
@@ -147,6 +151,7 @@ def export_signals(
     output_path: Path | None = None,
     ml_sample_path: Path | None = None,
     allow_buy: bool = True,
+    account_total_value: float = 0.0,
 ) -> Path:
     dry_run = app_config.JOINQUANT_DRY_RUN_DEFAULT if dry_run is None else dry_run
     min_score = app_config.JOINQUANT_MIN_SCORE_DEFAULT if min_score is None else min_score
@@ -158,7 +163,7 @@ def export_signals(
         sample_rows: list[tuple[pd.Series, dict[str, Any]]] = []
         reject_reasons: Counter[str] = Counter()
         for index, (_, row) in enumerate(df.iterrows()):
-            buy_reject_reason = _buy_reject_reason(row, min_score, allow_buy=allow_buy)
+            buy_reject_reason = _buy_reject_reason(row, min_score, allow_buy=allow_buy, account_total_value=account_total_value)
             if not buy_reject_reason:
                 signal = _buy_signal(row, run_id, index)
                 signals.append(signal)
@@ -177,6 +182,7 @@ def export_signals(
             "candidate_count": int(len(df)),
             "allow_buy": bool(allow_buy),
             "min_score": float(min_score),
+            "account_total_value": float(account_total_value or 0.0),
             "reject_reasons": dict(reject_reasons),
         }
         try:

@@ -213,6 +213,32 @@ def load_portfolio_positions() -> dict[str, dict[str, Any]]:
     return db
 
 
+def load_portfolio_account_total_value(default: float = 100000.0) -> float:
+    path = app_config.POSITIONS_FILE
+    if not path.exists():
+        return default
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    account = raw.get("account") if isinstance(raw, dict) else None
+    if isinstance(account, dict):
+        total_value = _float_value(account.get("total_value"))
+        if total_value > 0:
+            return total_value
+    return default
+
+
+def joinquant_health_gate_pass() -> bool:
+    path = app_config.OUTPUT_DIR / f"joinquant_health_{datetime.now().strftime('%Y%m%d')}.md"
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    return "实盘准入：通过" in text or "准入：通过" in text
+
 def enrich_portfolio_frame(df: pd.DataFrame, portfolio: dict[str, dict[str, Any]]) -> pd.DataFrame:
     """把网页端持仓状态挂到候选股上，方便盘中推送显示是否已经持仓。"""
     if df.empty or "code" not in df.columns:
@@ -2928,13 +2954,17 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
     from joinquant_exporter import export_signals
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    allow_buy = is_a_share_trading_time()
+    if app_config.JOINQUANT_ENFORCE_HEALTH_GATE_DEFAULT and allow_buy:
+        allow_buy = joinquant_health_gate_pass()
     path = export_signals(
         result,
         run_id=run_id,
         trade_date=datetime.now().strftime("%Y-%m-%d"),
         dry_run=cfg.joinquant_dry_run,
         min_score=cfg.joinquant_min_score,
-        allow_buy=is_a_share_trading_time(),
+        allow_buy=allow_buy,
+        account_total_value=load_portfolio_account_total_value(cfg.paper_trade_cash),
     )
     print(f"JoinQuant signals exported: {path}", flush=True)
     if notifier and notifier.enabled and (cfg.notify_non_trading_day or is_a_share_trading_day()):

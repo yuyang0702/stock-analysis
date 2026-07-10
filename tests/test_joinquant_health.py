@@ -345,5 +345,40 @@ class JoinQuantHealthTest(unittest.TestCase):
         self.assertIn("快照年龄", md)
 
 
+    def test_skipped_t_plus_one_does_not_count_as_failed_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account_snapshot.json"
+            history_file = base / "account_snapshot_history.jsonl"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "generated_at": "2026-07-09 10:00:00", "signals": []}),
+                encoding="utf-8",
+            )
+            snapshot = {
+                "schema_version": 1,
+                "received_at": "2026-07-09 10:01:00",
+                "strategy_template_version": "2026-07-09.2-order-target-value",
+                "positions": [],
+                "orders": [
+                    {"action": "buy", "status": "failed", "reason": "limit_up_or_suspended"},
+                    {"action": "sell", "status": "skipped", "reason": "t_plus_1"},
+                ],
+            }
+            snapshot_file.write_text(json.dumps(snapshot), encoding="utf-8")
+            history_file.write_text(json.dumps(snapshot, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                history_file,
+                base / "health.md",
+                now=datetime(2026, 7, 9, 10, 2, 0),
+                failed_order_limit=5,
+            )
+
+            self.assertEqual(result["failed_orders_today"], 1)
+            self.assertEqual(result["failed_order_breakdown"]["buy:limit_up_or_suspended"], 1)
+            self.assertEqual(result["failed_order_breakdown"]["sell:t_plus_1"], 1)
 if __name__ == "__main__":
     unittest.main()

@@ -320,5 +320,34 @@ class JoinQuantExporterTest(unittest.TestCase):
             self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
 
 
+    def test_buy_signal_rejects_target_value_below_board_lot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            rows = pd.DataFrame(
+                [
+                    {
+                        "code": "688347",
+                        "name": "High Price",
+                        "price": 120.0,
+                        "entry_price": 120.0,
+                        "position_pct": 5,
+                        "final_score": 95,
+                        "signal_action": "continue",
+                        "pct_chg": 2.1,
+                    }
+                ]
+            )
+
+            result = joinquant_exporter.export_signals(
+                rows,
+                run_id="run-1",
+                trade_date="2026-07-07",
+                output_path=output_path,
+                account_total_value=100000,
+            )
+
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(payload["diagnostics"]["reject_reasons"]["buy_too_small_for_board_lot"], 1)
 if __name__ == "__main__":
     unittest.main()

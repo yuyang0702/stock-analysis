@@ -21,6 +21,8 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         self.assertIn('"orders":', text)
         self.assertIn("record order", text)
         self.assertIn("post snapshot ok", text)
+        self.assertIn("default=str", text)
+        self.assertIn("_order_status_text", text)
 
     def test_template_posts_version_with_snapshot(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")

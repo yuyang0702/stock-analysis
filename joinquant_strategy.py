@@ -61,7 +61,7 @@ def _get_json(url):
 
 
 def _post_json(url, payload):
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
     request = urllib.request.Request(
         _url(url),
         data=data,
@@ -132,6 +132,15 @@ def _order_attr(order, name, default=None):
             return default
 
 
+def _order_status_text(value):
+    if value is None:
+        return ""
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+    return text.split(".")[-1].lower() if text else ""
+
 def _record_order(signal, status, reason="", order=None):
     event = {
         "id": signal.get("id"),
@@ -141,7 +150,7 @@ def _record_order(signal, status, reason="", order=None):
         "jq_code": signal.get("jq_code"),
         "name": signal.get("name"),
         "target_pct": signal.get("position_pct"),
-        "status": status,
+        "status": _order_status_text(status) or str(status or ""),
         "reason": reason,
         "order_id": _order_attr(order, "order_id"),
         "amount": _order_attr(order, "amount"),

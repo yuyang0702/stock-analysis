@@ -272,6 +272,7 @@ write_env_file() {
   set_env "JOINQUANT_ENABLE" "1"
   set_env "JOINQUANT_SYNC_TOKEN" "${token}"
   set_env "JOINQUANT_DRY_RUN" "false"
+  set_env "JOINQUANT_ENFORCE_HEALTH_GATE" "1"
   set_env "JOINQUANT_MIN_SCORE" "75"
   set_env "JOINQUANT_MAX_SIGNAL_AGE_MIN" "20"
   set_env "JOINQUANT_MAX_POSITIONS" "5"
@@ -656,7 +657,7 @@ Env file: ${ENV_FILE}
 Webhook configured: $(if [[ -f "${ENV_FILE}" ]] && grep -Eq '^WECOM_WEBHOOK_URL=.+$' "${ENV_FILE}"; then echo yes; else echo no; fi)
 Scanner mode: $(env_value SCAN_MODE auto)
 Paper trading: $(env_value PAPER_TRADE_ENABLE 0), cash=$(env_value PAPER_TRADE_CASH 100000)
-JoinQuant: $(env_value JOINQUANT_ENABLE 0), dry_run=$(env_value JOINQUANT_DRY_RUN true)
+JoinQuant: $(env_value JOINQUANT_ENABLE 0), dry_run=$(env_value JOINQUANT_DRY_RUN true), enforce_health_gate=$(env_value JOINQUANT_ENFORCE_HEALTH_GATE 0)
 JoinQuant health: signal_max_age=$(env_value JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN 30)m, snapshot_max_age=$(env_value JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN 15)m
 ML samples: $(env_value ML_SIGNAL_SAMPLE_FILE "${APP_DIR}/cache/ml/signal_samples.jsonl")
 ML report: $(env_value ML_REVIEW_REPORT_FILE "${APP_DIR}/output/ml_signal_review.md")

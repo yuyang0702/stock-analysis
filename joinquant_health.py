@@ -10,7 +10,8 @@ import config as app_config
 from notifier import WeComNotifier
 
 
-FAILED_STATUSES = {"failed", "rejected", "cancelled", "skipped"}
+FAILED_STATUSES = {"failed", "rejected", "cancelled"}
+REPORTED_STATUSES = FAILED_STATUSES | {"skipped"}
 NON_TRADING_NOISE_ISSUES = {
     "signal_file_error",
     "signal_time_missing",
@@ -120,7 +121,7 @@ def _failed_order_breakdown(snapshots: list[dict[str, Any]]) -> dict[str, int]:
     breakdown: dict[str, int] = {}
     for snapshot in snapshots:
         for order in _orders(snapshot):
-            if str(order.get("status", "")).lower() not in FAILED_STATUSES:
+            if str(order.get("status", "")).lower() not in REPORTED_STATUSES:
                 continue
             action = str(order.get("action") or "unknown").lower()
             reason = str(order.get("reason") or order.get("status") or "unknown").strip().lower()
