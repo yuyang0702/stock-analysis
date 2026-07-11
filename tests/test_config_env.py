@@ -2,13 +2,29 @@ import importlib
 import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import config
 
 
 class ConfigEnvTest(unittest.TestCase):
     def test_observation_risk_defaults(self) -> None:
-        self.assertEqual(config.RISK_MODE, "observe")
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                reloaded = importlib.reload(config)
+                self.assertEqual(reloaded.RISK_MODE, "observe")
+                self.assertEqual(reloaded.MAX_SINGLE_POSITION_PCT, 30)
+                self.assertEqual(reloaded.MAX_TOTAL_POSITION_PCT, 95)
+        finally:
+            importlib.reload(config)
+
+    def test_unsupported_risk_mode_is_rejected(self) -> None:
+        try:
+            with patch.dict(os.environ, {"RISK_MODE": "BLOCK"}, clear=True):
+                with self.assertRaisesRegex(ValueError, "Unsupported RISK_MODE"):
+                    importlib.reload(config)
+        finally:
+            importlib.reload(config)
 
     def test_observation_risk_environment_values(self) -> None:
         updates = {

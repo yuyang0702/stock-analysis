@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -28,6 +29,11 @@ class PortfolioState:
     daily_pnl_pct: float = 0
     account_drawdown_pct: float = 0
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "sector_exposure_pct", MappingProxyType(dict(self.sector_exposure_pct))
+        )
+
     @classmethod
     def empty(cls) -> "PortfolioState":
         return cls()
@@ -39,6 +45,9 @@ class RiskCheckResult:
     hard_blocks: tuple[str, ...]
     soft_warnings: tuple[str, ...]
     metrics: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
 
 
 def _positive_number(value: Any) -> bool:
@@ -53,7 +62,7 @@ def evaluate_observation(
     price = signal.get("price")
     invalid = (
         action not in {"buy", "sell"}
-        or not _positive_number(position_pct)
+        or (action == "buy" and not _positive_number(position_pct))
         or (price is not None and not _positive_number(price))
     )
     hard_blocks = ("INVALID_ORDER_INPUT",) if invalid else ()
