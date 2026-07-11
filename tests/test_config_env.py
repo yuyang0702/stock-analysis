@@ -1,11 +1,53 @@
 import importlib
 import os
 import unittest
+from pathlib import Path
 
 import config
 
 
 class ConfigEnvTest(unittest.TestCase):
+    def test_observation_risk_defaults(self) -> None:
+        self.assertEqual(config.RISK_MODE, "observe")
+
+    def test_observation_risk_environment_values(self) -> None:
+        updates = {
+            "RISK_MODE": "OBSERVE", "MAX_SINGLE_POSITION_PCT": "31",
+            "MAX_TOTAL_POSITION_PCT": "96", "MIN_CASH_RESERVE_PCT": "6",
+            "MAX_SECTOR_EXPOSURE_PCT": "61", "MAX_NEW_POSITIONS_PER_DAY": "11",
+            "MAX_ORDERS_PER_DAY": "51", "MAX_DAILY_TURNOVER_PCT": "201",
+            "DAILY_LOSS_WARN_PCT": "6", "ACCOUNT_DRAWDOWN_WARN_PCT": "16",
+            "MAX_CONSECUTIVE_ORDER_FAILURES": "6", "ACCOUNT_SNAPSHOT_MAX_AGE_SEC": "301",
+            "SIGNAL_MAX_AGE_SEC": "1201", "RECONCILIATION_POSITION_TOLERANCE": "1.5",
+            "TRADING_DB_FILE": "custom/trading.db",
+        }
+        old_values = {key: os.environ.get(key) for key in updates}
+        try:
+            os.environ.update(updates)
+            reloaded = importlib.reload(config)
+            self.assertEqual(reloaded.RISK_MODE, "observe")
+            self.assertEqual(reloaded.MAX_SINGLE_POSITION_PCT, 31)
+            self.assertEqual(reloaded.MAX_TOTAL_POSITION_PCT, 96)
+            self.assertEqual(reloaded.MIN_CASH_RESERVE_PCT, 6)
+            self.assertEqual(reloaded.MAX_SECTOR_EXPOSURE_PCT, 61)
+            self.assertEqual(reloaded.MAX_NEW_POSITIONS_PER_DAY, 11)
+            self.assertEqual(reloaded.MAX_ORDERS_PER_DAY, 51)
+            self.assertEqual(reloaded.MAX_DAILY_TURNOVER_PCT, 201)
+            self.assertEqual(reloaded.DAILY_LOSS_WARN_PCT, 6)
+            self.assertEqual(reloaded.ACCOUNT_DRAWDOWN_WARN_PCT, 16)
+            self.assertEqual(reloaded.MAX_CONSECUTIVE_ORDER_FAILURES, 6)
+            self.assertEqual(reloaded.ACCOUNT_SNAPSHOT_MAX_AGE_SEC, 301)
+            self.assertEqual(reloaded.SIGNAL_MAX_AGE_SEC, 1201)
+            self.assertEqual(reloaded.RECONCILIATION_POSITION_TOLERANCE, 1.5)
+            self.assertEqual(reloaded.TRADING_DB_FILE, Path("custom/trading.db"))
+        finally:
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            importlib.reload(config)
+
     def test_linux_env_file_values_override_defaults(self) -> None:
         updates = {
             "WECOM_WEBHOOK_URL": "https://example.invalid/webhook",
