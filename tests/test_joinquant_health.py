@@ -16,7 +16,22 @@ class JoinQuantHealthTest(unittest.TestCase):
         with store.transaction() as conn:
             conn.execute("INSERT INTO strategy_runs(run_id, trade_date, started_at, created_at, updated_at) VALUES ('r1', '2026-07-09', '2026-07-09 09:30:00', datetime('now'), datetime('now'))")
             for signal_id in signal_ids:
-                conn.execute("INSERT INTO signals(signal_id, run_id, trade_date, stock_code, jq_code, action, generated_at, raw_json, created_at) VALUES (?, 'r1', '2026-07-09', '600000', '600000.XSHG', 'buy', '2026-07-09 09:59:00', '{}', datetime('now'))", (signal_id,))
+                conn.execute("INSERT INTO signals(signal_id, run_id, trade_date, stock_code, jq_code, action, generated_at, raw_json, created_at) VALUES (?, 'r1', '2026-07-09', '600000', '600000.XSHG', 'buy', '2026-07-09 09:59:00', ?, datetime('now'))", (signal_id, json.dumps({"id": signal_id})))
+
+    def test_reports_content_mismatch_for_same_signal_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "generated_at": "2026-07-09 09:59:00", "signals": [{"id": "s1", "action": "buy", "price": 11}]}), encoding="utf-8")
+            db_file = base / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            with store.transaction() as conn:
+                conn.execute("INSERT INTO strategy_runs(run_id, trade_date, started_at, created_at, updated_at) VALUES ('r1', '2026-07-09', '2026-07-09 09:30:00', datetime('now'), datetime('now'))")
+                conn.execute("INSERT INTO signals(signal_id, run_id, trade_date, stock_code, jq_code, action, generated_at, raw_json, created_at) VALUES ('s1', 'r1', '2026-07-09', '600000', '600000.XSHG', 'buy', '2026-07-09 09:59:00', ?, datetime('now'))", (json.dumps({"id": "s1", "action": "buy", "price": 10}),))
+            result = joinquant_health.build_health_report(signal_file, base / "missing.json", report_file=base / "report.md", now=datetime(2026, 7, 9, 10, 0), db_file=db_file, health_history_file=base / "health.jsonl")
+            self.assertFalse(result["ledger_json_parity"])
+            self.assertIn("ledger_json_signal_mismatch", result["issue_codes"])
 
     def test_reports_healthy_when_ledger_and_json_signal_ids_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

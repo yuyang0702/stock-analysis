@@ -51,22 +51,16 @@ def _sanitize_ledger_error(value: str) -> str:
     return " ".join(str(value).replace("\r", " ").replace("\n", " ").split())[:240]
 
 
-def _ledger_status(db_file: Path, signal_ids: set[str]) -> tuple[bool, int, int, bool, str]:
+def _ledger_status(db_file: Path, signals: list[dict[str, Any]]) -> tuple[bool, int, int, bool, str]:
     store = TradingStore(db_file)
     health = store.health()
     if not health.ok:
         return False, health.schema_version, 0, False, _sanitize_ledger_error(health.error)
-    if not signal_ids:
+    if not signals:
         return True, health.schema_version, 0, True, ""
     try:
-        placeholders = ",".join("?" for _ in signal_ids)
-        with store.connect() as conn:
-            rows = conn.execute(
-                f"SELECT signal_id FROM signals WHERE signal_id IN ({placeholders})",
-                tuple(sorted(signal_ids)),
-            ).fetchall()
-        ledger_ids = {str(row[0]) for row in rows}
-        return True, health.schema_version, len(ledger_ids), ledger_ids == signal_ids, ""
+        count, parity = store.current_signal_parity(signals)
+        return True, health.schema_version, count, parity, ""
     except Exception as exc:
         return False, health.schema_version, 0, False, _sanitize_ledger_error(str(exc))
 
@@ -285,7 +279,7 @@ def build_health_report(
     snapshot_age = _age_minutes(_snapshot_time(snapshot_payload), now)
     signals = signal_payload.get("signals", []) if isinstance(signal_payload.get("signals"), list) else []
     signal_ids = {str(item.get("id")) for item in signals if isinstance(item, dict) and item.get("id")}
-    ledger_ok, ledger_schema_version, ledger_signal_count, ledger_json_parity, ledger_error = _ledger_status(db_file, signal_ids)
+    ledger_ok, ledger_schema_version, ledger_signal_count, ledger_json_parity, ledger_error = _ledger_status(db_file, signals)
     positions = snapshot_payload.get("positions", []) if isinstance(snapshot_payload.get("positions"), list) else []
     expected_template_version = app_config.JOINQUANT_TEMPLATE_VERSION
     strategy_template_version = str(snapshot_payload.get("strategy_template_version") or "").strip()

@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from trading_store import SignalRecord, StrategyRunRecord, TradingStore
+from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore
 
 
 class TradingStoreTest(unittest.TestCase):
@@ -27,6 +27,31 @@ class TradingStoreTest(unittest.TestCase):
             with store.connect() as conn:
                 count = conn.execute("SELECT COUNT(*) FROM signals WHERE signal_id='sig-1'").fetchone()[0]
             self.assertEqual(count, 1)
+
+    def test_signal_replay_with_changed_payload_raises_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            run = StrategyRunRecord("run-1", "2026-07-11", "2026-07-11 09:30:00", "v1", "p1")
+            original = SignalRecord("sig-1", "run-1", "2026-07-11", "600000", "600000.XSHG", "buy", 10.0, "2026-07-11 09:31:00", "", '{"id":"sig-1","price":10}')
+            changed = SignalRecord("sig-1", "run-1", "2026-07-11", "600000", "600000.XSHG", "buy", 10.0, "2026-07-11 09:31:00", "", '{"price":11,"id":"sig-1"}')
+            with store.transaction() as conn:
+                store.record_strategy_run(conn, run)
+                self.assertTrue(store.record_signal(conn, original))
+                with self.assertRaises(SignalConflictError):
+                    store.record_signal(conn, changed)
+
+    def test_signal_replay_with_equivalent_canonical_json_is_idempotent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            run = StrategyRunRecord("run-1", "2026-07-11", "2026-07-11 09:30:00", "v1", "p1")
+            first = SignalRecord("sig-1", "run-1", "2026-07-11", "600000", "600000.XSHG", "buy", 10.0, "2026-07-11 09:31:00", "", '{"id":"sig-1","price":10}')
+            repeat = SignalRecord("sig-1", "run-1", "2026-07-11", "600000", "600000.XSHG", "buy", 10.0, "2026-07-11 09:31:00", "", '{ "price": 10, "id": "sig-1" }')
+            with store.transaction() as conn:
+                store.record_strategy_run(conn, run)
+                self.assertTrue(store.record_signal(conn, first))
+                self.assertFalse(store.record_signal(conn, repeat))
 
     def test_system_state_records_latest_value_and_reason(self) -> None:
         with TemporaryDirectory() as tmp:

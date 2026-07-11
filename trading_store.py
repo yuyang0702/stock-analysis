@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,15 @@ from typing import Iterator
 
 
 SCHEMA_VERSION = 1
+
+
+class SignalConflictError(RuntimeError):
+    """Raised when an immutable signal ID is reused for different content."""
+
+
+def canonical_json(value: str | dict) -> str:
+    parsed = json.loads(value) if isinstance(value, str) else value
+    return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -187,7 +197,38 @@ class TradingStore:
                 signal.expires_at, signal.raw_json,
             ),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount == 1:
+            return True
+        row = conn.execute(
+            """SELECT run_id, trade_date, stock_code, jq_code, action, target_position,
+                      generated_at, expires_at, raw_json FROM signals WHERE signal_id = ?""",
+            (signal.signal_id,),
+        ).fetchone()
+        expected = (
+            signal.run_id, signal.trade_date, signal.code, signal.jq_code, signal.action,
+            signal.position_pct, signal.generated_at, signal.expires_at, canonical_json(signal.raw_json),
+        )
+        actual = tuple(row[:8]) + (canonical_json(row[8]),) if row is not None else ()
+        if actual != expected:
+            raise SignalConflictError(f"immutable signal conflict: {signal.signal_id}")
+        return False
+
+    def current_signal_parity(self, signals: list[dict]) -> tuple[int, bool]:
+        """Compare only current JSON signals with ledger rows; never scan history."""
+        expected = {str(item.get("id")): canonical_json(item) for item in signals if item.get("id")}
+        if not expected:
+            return 0, True
+        found: dict[str, str] = {}
+        ids = sorted(expected)
+        with self.connect() as conn:
+            for offset in range(0, len(ids), 500):
+                chunk = ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT signal_id, raw_json FROM signals WHERE signal_id IN ({placeholders})", chunk
+                ).fetchall()
+                found.update((str(row[0]), canonical_json(row[1])) for row in rows)
+        return len(found), found == expected
 
     def set_system_state(
         self, conn: sqlite3.Connection, key: str, value: str, reason: str

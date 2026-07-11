@@ -13,6 +13,32 @@ from trading_store import TradingStore
 
 
 class JoinQuantExporterTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._ledger_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._ledger_tmp.cleanup)
+        self._db_patch = patch.object(
+            joinquant_exporter.app_config,
+            "TRADING_DB_FILE",
+            Path(self._ledger_tmp.name) / "trading.db",
+        )
+        self._db_patch.start()
+        self.addCleanup(self._db_patch.stop)
+
+    def test_conflicting_signal_id_blocks_buy_and_preserves_sell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            first = pd.DataFrame([{"code": "600000", "price": 10, "position_pct": 12, "final_score": 90, "signal_action": "continue"}])
+            joinquant_exporter.export_signals(first, run_id="run-1", trade_date="2026-07-07", output_path=base / "first.json", store=store)
+            changed = pd.DataFrame([
+                {"code": "600000", "price": 11, "position_pct": 12, "final_score": 90, "signal_action": "continue"},
+                {"code": "000001", "price": 12, "final_score": 80, "signal_action": "sell", "has_holding": True},
+            ])
+            result = joinquant_exporter.export_signals(changed, run_id="run-1", trade_date="2026-07-07", output_path=base / "second.json", store=store)
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
+            self.assertTrue(payload["diagnostics"]["buy_publication_blocked"])
+            self.assertIn("immutable signal conflict", payload["diagnostics"]["ledger_error"])
     def test_ledger_and_json_signal_ids_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "signals.json"

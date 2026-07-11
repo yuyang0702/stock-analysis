@@ -35,6 +35,19 @@ class JoinQuantReadinessReportTest(unittest.TestCase):
 
             self.assertTrue(result["ledger_ok"])
             self.assertIn("SQLite 交易账本: 正常", (base / "report.md").read_text(encoding="utf-8"))
+    def test_populated_json_with_empty_ledger_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": [{"id": "s1", "action": "buy"}]}), encoding="utf-8")
+            snapshot_file.write_text(json.dumps({"schema_version": 1, "positions": []}), encoding="utf-8")
+            db_file = base / "trading.db"
+            TradingStore(db_file).initialize()
+            result = joinquant_readiness_report.build_report(signal_file, snapshot_file, base / "report.md", db_file=db_file)
+            self.assertFalse(result["ledger_json_parity"])
+            self.assertEqual(result["conclusion"], "keep_dry_run")
+
     def test_reports_basic_readiness_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             signal_file = Path(tmp) / "signals.json"

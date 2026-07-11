@@ -36,6 +36,11 @@ def build_report(
     snapshot_payload, snapshot_error = _load(snapshot_file)
 
     signals = signals_payload.get("signals", []) if not signal_error else []
+    try:
+        ledger_signal_count, ledger_json_parity = TradingStore(db_file).current_signal_parity(signals) if ledger_health.ok else (0, False)
+    except Exception as exc:
+        ledger_signal_count, ledger_json_parity = 0, False
+        ledger_health = type(ledger_health)(False, ledger_health.schema_version, str(exc))
     positions = snapshot_payload.get("positions", []) if not snapshot_error else []
     duplicate_ids = len(signals) - len({item.get("id") for item in signals if isinstance(item, dict)})
     over_position = [
@@ -54,9 +59,11 @@ def build_report(
         "position_violation_count": len(over_position),
         "ledger_ok": ledger_health.ok,
         "ledger_schema_version": ledger_health.schema_version,
+        "ledger_signal_count": ledger_signal_count,
+        "ledger_json_parity": ledger_json_parity,
         "ledger_error": " ".join(ledger_health.error.replace("\r", " ").replace("\n", " ").split())[:240],
     }
-    if result["signal_ok"] and result["snapshot_ok"] and result["ledger_ok"] and duplicate_ids == 0 and not over_position:
+    if result["signal_ok"] and result["snapshot_ok"] and result["ledger_ok"] and ledger_json_parity and duplicate_ids == 0 and not over_position:
         conclusion = "can_small_position_trial"
     else:
         conclusion = "keep_dry_run"

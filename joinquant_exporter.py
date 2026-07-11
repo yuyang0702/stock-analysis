@@ -11,7 +11,7 @@ import pandas as pd
 
 import config as app_config
 from pre_trade_check import PortfolioState, RiskLimits, evaluate_observation
-from trading_store import SignalRecord, StrategyRunRecord, TradingStore
+from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore, canonical_json
 
 
 def clean_code(value: Any) -> str:
@@ -226,7 +226,7 @@ def export_signals(
                     jq_code=signal["jq_code"], action=signal["action"],
                     position_pct=float(signal.get("position_pct") or 0),
                     generated_at=payload["generated_at"], expires_at="",
-                    raw_json=json.dumps(signal, ensure_ascii=False, default=str),
+                    raw_json=canonical_json(signal),
                 )))
                 metrics = decision.metrics
                 conn.execute(
@@ -248,7 +248,7 @@ def export_signals(
                 )
         payload["diagnostics"]["ledger_ok"] = True
         payload["diagnostics"]["ledger_signal_count"] = inserted_signal_count
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, SignalConflictError) as exc:
         had_buys = any(signal["action"] == "buy" for signal in payload["signals"])
         payload["signals"] = [signal for signal in payload["signals"] if signal["action"] == "sell"]
         payload["diagnostics"]["ledger_error"] = str(exc)
