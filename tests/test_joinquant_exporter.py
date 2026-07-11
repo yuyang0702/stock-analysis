@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -41,6 +42,49 @@ class JoinQuantExporterTest(unittest.TestCase):
             self.assertTrue(payload["diagnostics"]["ledger_ok"])
             self.assertEqual(payload["diagnostics"]["ledger_signal_count"], 2)
 
+    def test_ledger_signal_count_reports_only_new_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            store = TradingStore(Path(tmp) / "trading.db")
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10, "take_profit": 11,
+                "position_pct": 12, "final_score": 90, "signal_action": "continue",
+            }])
+            first = joinquant_exporter.export_signals(
+                rows, run_id="run-1", trade_date="2026-07-07",
+                output_path=output_path, store=store,
+            )
+            self.assertEqual(json.loads(first.read_text(encoding="utf-8"))["diagnostics"]["ledger_signal_count"], 1)
+
+            second = joinquant_exporter.export_signals(
+                rows, run_id="run-1", trade_date="2026-07-07",
+                output_path=output_path, store=store,
+            )
+            self.assertEqual(json.loads(second.read_text(encoding="utf-8"))["diagnostics"]["ledger_signal_count"], 0)
+
+    def test_observation_decision_uses_configured_warning_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            store = TradingStore(Path(tmp) / "trading.db")
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10, "take_profit": 11,
+                "position_pct": 12, "final_score": 90, "signal_action": "continue",
+            }])
+            with (
+                patch.object(joinquant_exporter.app_config, "MIN_CASH_RESERVE_PCT", 101),
+                patch.object(joinquant_exporter.app_config, "DAILY_LOSS_WARN_PCT", 0),
+                patch.object(joinquant_exporter.app_config, "ACCOUNT_DRAWDOWN_WARN_PCT", 0),
+            ):
+                joinquant_exporter.export_signals(
+                    rows, run_id="run-limits", trade_date="2026-07-07",
+                    output_path=output_path, store=store,
+                )
+            with store.connect() as conn:
+                raw = json.loads(conn.execute("SELECT raw_json FROM risk_decisions").fetchone()[0])
+            self.assertIn("CASH_RESERVE_LIMIT", raw["soft_warnings"])
+            self.assertIn("DAILY_LOSS_WARNING", raw["soft_warnings"])
+            self.assertIn("ACCOUNT_DRAWDOWN_WARNING", raw["soft_warnings"])
+
     def test_ledger_error_publishes_sells_and_blocks_buys(self) -> None:
         class LockedStore:
             def initialize(self) -> None:
@@ -66,6 +110,7 @@ class JoinQuantExporterTest(unittest.TestCase):
             payload = json.loads(result.read_text(encoding="utf-8"))
             self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
             self.assertFalse(payload["diagnostics"]["ledger_ok"])
+            self.assertEqual(payload["diagnostics"]["ledger_signal_count"], 0)
             self.assertTrue(payload["diagnostics"]["buy_publication_blocked"])
             self.assertIn("database is locked", payload["diagnostics"]["ledger_error"])
 

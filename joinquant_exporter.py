@@ -198,15 +198,19 @@ def export_signals(
     limits = RiskLimits(
         max_single_position_pct=app_config.MAX_SINGLE_POSITION_PCT,
         max_total_position_pct=app_config.MAX_TOTAL_POSITION_PCT,
+        min_cash_reserve_pct=app_config.MIN_CASH_RESERVE_PCT,
         max_sector_exposure_pct=app_config.MAX_SECTOR_EXPOSURE_PCT,
         max_new_positions_per_day=app_config.MAX_NEW_POSITIONS_PER_DAY,
         max_orders_per_day=app_config.MAX_ORDERS_PER_DAY,
         max_daily_turnover_pct=app_config.MAX_DAILY_TURNOVER_PCT,
+        daily_loss_warn_pct=app_config.DAILY_LOSS_WARN_PCT,
+        account_drawdown_warn_pct=app_config.ACCOUNT_DRAWDOWN_WARN_PCT,
     )
     decisions = [(signal, evaluate_observation(signal, PortfolioState.empty(), limits)) for signal in payload["signals"]]
     ledger_run_id = run_id or f"export-{payload['generated_at'].replace(' ', 'T')}"
     try:
         store.initialize()
+        inserted_signal_count = 0
         with store.transaction() as conn:
             store.record_strategy_run(conn, StrategyRunRecord(
                 run_id=ledger_run_id,
@@ -216,14 +220,14 @@ def export_signals(
                 parameter_version="risk-observe-v1",
             ))
             for signal, decision in decisions:
-                store.record_signal(conn, SignalRecord(
+                inserted_signal_count += int(store.record_signal(conn, SignalRecord(
                     signal_id=signal["id"], run_id=ledger_run_id,
                     trade_date=payload["trade_date"], code=signal["code"],
                     jq_code=signal["jq_code"], action=signal["action"],
                     position_pct=float(signal.get("position_pct") or 0),
                     generated_at=payload["generated_at"], expires_at="",
                     raw_json=json.dumps(signal, ensure_ascii=False, default=str),
-                ))
+                )))
                 metrics = decision.metrics
                 conn.execute(
                     """INSERT INTO risk_decisions(
@@ -243,7 +247,7 @@ def export_signals(
                      payload["generated_at"]),
                 )
         payload["diagnostics"]["ledger_ok"] = True
-        payload["diagnostics"]["ledger_signal_count"] = len(payload["signals"])
+        payload["diagnostics"]["ledger_signal_count"] = inserted_signal_count
     except (sqlite3.Error, OSError) as exc:
         had_buys = any(signal["action"] == "buy" for signal in payload["signals"])
         payload["signals"] = [signal for signal in payload["signals"] if signal["action"] == "sell"]
