@@ -75,8 +75,8 @@ SIGNAL_MAX_AGE_SEC = _env_int("SIGNAL_MAX_AGE_SEC", 1200)
 RECONCILIATION_POSITION_TOLERANCE = _env_float("RECONCILIATION_POSITION_TOLERANCE", 0)
 TRADING_DB_FILE = Path(_env_text("TRADING_DB_FILE", str(CACHE_DIR / "trading" / "trading.db")))
 
-# 行业映射缓存文件，首次同步后会生成，后续直接复用。
-INDUSTRY_CACHE = BASE_DIR / "stock_industry_db.json"
+# 行业映射属于运行数据，统一放入 cache，避免污染 Git 工作区。
+INDUSTRY_CACHE = CACHE_DIR / "industry" / "stock_industry_db.json"
 
 
 # =============================

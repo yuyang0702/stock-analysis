@@ -628,9 +628,23 @@ class IndustryMapper:
     def __init__(self, cache_file: Path = INDUSTRY_CACHE, refresh: bool = False):
         self.cache_file = cache_file
         self.pending_file = self.cache_file.with_name("industry_pending.json")
+        self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_files()
         self.db = self._load()
         if refresh or not self.db:
             self.sync()
+
+    def _migrate_legacy_files(self) -> None:
+        """兼容旧版本根目录中的行业运行数据，目标文件存在时绝不覆盖。"""
+        legacy_dir = app_config.BASE_DIR
+        for target in (self.cache_file, self.pending_file):
+            legacy = legacy_dir / target.name
+            if target.exists() or not legacy.exists() or legacy == target:
+                continue
+            try:
+                target.write_bytes(legacy.read_bytes())
+            except OSError as exc:
+                print(f"行业缓存迁移失败，继续读取新路径：{exc}", flush=True)
 
     def _load(self) -> dict[str, str]:
         if not self.cache_file.exists():
