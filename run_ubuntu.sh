@@ -42,7 +42,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|test|show-env
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -281,6 +281,21 @@ write_env_file() {
   set_env "JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN" "30"
   set_env "JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN" "15"
   set_env "JOINQUANT_HEALTH_FAILED_ORDER_LIMIT" "3"
+  set_env "RISK_MODE" "observe"
+  set_env "MAX_SINGLE_POSITION_PCT" "30"
+  set_env "MAX_TOTAL_POSITION_PCT" "95"
+  set_env "MIN_CASH_RESERVE_PCT" "5"
+  set_env "MAX_SECTOR_EXPOSURE_PCT" "60"
+  set_env "MAX_NEW_POSITIONS_PER_DAY" "10"
+  set_env "MAX_ORDERS_PER_DAY" "50"
+  set_env "MAX_DAILY_TURNOVER_PCT" "200"
+  set_env "DAILY_LOSS_WARN_PCT" "5"
+  set_env "ACCOUNT_DRAWDOWN_WARN_PCT" "15"
+  set_env "MAX_CONSECUTIVE_ORDER_FAILURES" "5"
+  set_env "ACCOUNT_SNAPSHOT_MAX_AGE_SEC" "300"
+  set_env "SIGNAL_MAX_AGE_SEC" "1200"
+  set_env "RECONCILIATION_POSITION_TOLERANCE" "0"
+  set_env "TRADING_DB_FILE" "${APP_DIR}/cache/trading/trading.db"
   set_env "ML_SIGNAL_SAMPLE_FILE" "${APP_DIR}/cache/ml/signal_samples.jsonl"
   set_env "ML_REVIEW_REPORT_FILE" "${APP_DIR}/output/ml_signal_review.md"
   set_env "GLOBAL_MARKET_CONTEXT_FILE" "${APP_DIR}/cache/market/global_context.json"
@@ -607,6 +622,7 @@ install_all() {
   done
 
   require_project_files
+  mkdir -p "${APP_DIR}/cache/trading"
   [[ -n "${token}" ]] || token="$(generate_token)"
   if [[ "${skip_install}" == "no" ]]; then
     install_system_packages "${install_ocr}"
@@ -678,6 +694,12 @@ run_foreground() {
   "$(python_bin)" "${APP_DIR}/${file}" "$@"
 }
 
+ledger_check() {
+  load_env
+  cd "${APP_DIR}"
+  "$(python_bin)" -c 'import config; from trading_store import SCHEMA_VERSION, TradingStore; store = TradingStore(config.TRADING_DB_FILE); store.initialize(); health = store.health(); assert health.ok and health.schema_version == SCHEMA_VERSION, health; probe = "ledger_check_probe"; exec("with store.transaction() as conn:\n store.set_system_state(conn, probe, \"ok\", \"deployment writable probe\")\n conn.execute(\"DELETE FROM system_state WHERE key = ?\", (probe,))"); print(f"schema_version={health.schema_version} health=ok writable_probe=ok")'
+}
+
 handle_command() {
   case "${1:-help}" in
     install)
@@ -707,6 +729,7 @@ handle_command() {
     run-web) run_foreground holdings_web.py ;;
     run-joinquant-api) run_foreground joinquant_signal_server.py --host 0.0.0.0 --port "$(env_value JOINQUANT_SIGNAL_PORT 8010)" ;;
     sync-joinquant) run_foreground joinquant_sync.py ;;
+    ledger-check) ledger_check ;;
     health) run_foreground joinquant_health.py ;;
     notify-retry) run_foreground notify_retry.py ;;
     readiness) run_foreground joinquant_readiness_report.py ;;

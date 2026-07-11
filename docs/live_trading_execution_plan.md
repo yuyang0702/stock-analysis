@@ -450,3 +450,12 @@ KILL_SWITCH 已实现并验证
 - 统一运维入口：`run_ubuntu.sh` 新增 `notify-retry`、`global-context`、`sector-context`、`strategy-compare` 和 `strategy-compare-weekly` 命令；`install` 会统一安装健康检查、持仓同步、微信重试、readiness、ML 复盘、海外上下文、板块行情缓存和策略对照等 timer。
 
 阶段 1 剩余工作不再是代码功能缺口，而是线上观察：至少连续 10 个交易日检查健康报告、执行回报、微信提醒和 JoinQuant 网站委托记录是否一致。达到稳定标准后再推进阶段 2 的完整历史回测和阶段 3 的实盘级风控。
+
+## 2026-07-11 Batch 1 账本部署检查点
+
+Batch 1 代码已实现，待服务器部署和 1 个交易日双写观察；不得把本节视为服务器部署或观察验收已经完成。项目状态仍以 `docs/project_roadmap.md` 为唯一主文档，五批次专项设计从属于该主文档。
+
+- 完整验证命令：`.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py" -v`（Linux 服务器使用虚拟环境中的 `python -m unittest discover -s tests -p "test_*.py" -v`）。
+- 正式数据库：`cache/trading/trading.db`，部署后先执行 `bash run_ubuntu.sh ledger-check`，只接受 schema version `1` 且写入后删除探针事务成功。
+- 观察模式：`RISK_MODE=observe`；Batch 1 的仓位、集中度、换手和回撤软阈值只记录告警，不抑制原有有效信号。
+- 一个交易日验收：收盘后逐一核对当前 JSON 信号 ID 与 SQLite；确认 JoinQuant 委托行为与 Batch 1 前一致；确认无重复信号；归档 readiness 和 health 报告；health 不得出现 `ledger_unavailable` 或 `ledger_json_signal_mismatch`。全部满足前不得开始 Batch 2 订单状态机计划。
