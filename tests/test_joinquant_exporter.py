@@ -1,14 +1,99 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
 
 import joinquant_exporter
+from trading_store import TradingStore
 
 
 class JoinQuantExporterTest(unittest.TestCase):
+    def test_ledger_and_json_signal_ids_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            store = TradingStore(Path(tmp) / "trading.db")
+            rows = pd.DataFrame([
+                {"code": "600000", "price": 10, "entry_price": 10, "take_profit": 11,
+                 "position_pct": 12, "final_score": 90, "signal_action": "continue"},
+                {"code": "000001", "price": 12, "final_score": 80,
+                 "signal_action": "sell", "has_holding": True},
+            ])
+
+            result = joinquant_exporter.export_signals(
+                rows, run_id="run-1", trade_date="2026-07-07",
+                output_path=output_path, store=store,
+            )
+
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["id"] for item in payload["signals"]],
+                ["run-1-600000-buy-0000", "run-1-000001-sell-0001"],
+            )
+            with store.connect() as conn:
+                db_ids = [row[0] for row in conn.execute("SELECT signal_id FROM signals ORDER BY signal_id")]
+                decision_count = conn.execute("SELECT COUNT(*) FROM risk_decisions").fetchone()[0]
+            self.assertEqual(db_ids, sorted(item["id"] for item in payload["signals"]))
+            self.assertEqual(decision_count, 2)
+            self.assertTrue(payload["diagnostics"]["ledger_ok"])
+            self.assertEqual(payload["diagnostics"]["ledger_signal_count"], 2)
+
+    def test_ledger_error_publishes_sells_and_blocks_buys(self) -> None:
+        class LockedStore:
+            def initialize(self) -> None:
+                pass
+
+            @contextmanager
+            def transaction(self):
+                raise sqlite3.OperationalError("database is locked")
+                yield
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            rows = pd.DataFrame([
+                {"code": "600000", "price": 10, "entry_price": 10, "take_profit": 11,
+                 "position_pct": 12, "final_score": 90, "signal_action": "continue"},
+                {"code": "000001", "price": 12, "final_score": 80,
+                 "signal_action": "sell", "has_holding": True},
+            ])
+            result = joinquant_exporter.export_signals(
+                rows, run_id="run-1", trade_date="2026-07-07",
+                output_path=output_path, store=LockedStore(),
+            )
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
+            self.assertFalse(payload["diagnostics"]["ledger_ok"])
+            self.assertTrue(payload["diagnostics"]["buy_publication_blocked"])
+            self.assertIn("database is locked", payload["diagnostics"]["ledger_error"])
+
+    def test_ledger_error_replaces_prior_buy_file_with_empty_signals(self) -> None:
+        class LockedStore:
+            def initialize(self) -> None:
+                pass
+
+            @contextmanager
+            def transaction(self):
+                raise sqlite3.OperationalError("database is locked")
+                yield
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            output_path.write_text('{"signals":[{"action":"buy"}]}', encoding="utf-8")
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10, "take_profit": 11,
+                "position_pct": 12, "final_score": 90, "signal_action": "continue",
+            }])
+            result = joinquant_exporter.export_signals(
+                rows, run_id="run-1", trade_date="2026-07-07",
+                output_path=output_path, store=LockedStore(),
+            )
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertTrue(payload["diagnostics"]["buy_publication_blocked"])
+
     def test_exports_buy_and_sell_signals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "signals.json"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 import pandas as pd
 
 import config as app_config
+from pre_trade_check import PortfolioState, RiskLimits, evaluate_observation
+from trading_store import SignalRecord, StrategyRunRecord, TradingStore
 
 
 def clean_code(value: Any) -> str:
@@ -152,16 +155,17 @@ def export_signals(
     ml_sample_path: Path | None = None,
     allow_buy: bool = True,
     account_total_value: float = 0.0,
+    store: TradingStore | None = None,
 ) -> Path:
     dry_run = app_config.JOINQUANT_DRY_RUN_DEFAULT if dry_run is None else dry_run
     min_score = app_config.JOINQUANT_MIN_SCORE_DEFAULT if min_score is None else min_score
     output_path = output_path or app_config.JOINQUANT_SIGNAL_FILE
     payload = _base_payload(run_id, trade_date, dry_run)
 
+    sample_rows: list[tuple[pd.Series, dict[str, Any]]] = []
+    reject_reasons: Counter[str] = Counter()
     if df is not None and not df.empty:
         signals: list[dict[str, Any]] = []
-        sample_rows: list[tuple[pd.Series, dict[str, Any]]] = []
-        reject_reasons: Counter[str] = Counter()
         for index, (_, row) in enumerate(df.iterrows()):
             buy_reject_reason = _buy_reject_reason(row, min_score, allow_buy=allow_buy, account_total_value=account_total_value)
             if not buy_reject_reason:
@@ -178,19 +182,84 @@ def export_signals(
             else:
                 reject_reasons[buy_reject_reason] += 1
         payload["signals"] = signals
-        payload["diagnostics"] = {
-            "candidate_count": int(len(df)),
-            "allow_buy": bool(allow_buy),
-            "min_score": float(min_score),
-            "account_total_value": float(account_total_value or 0.0),
-            "reject_reasons": dict(reject_reasons),
-        }
-        try:
-            from ml_dataset import append_signal_samples
+    payload["diagnostics"] = {
+        "candidate_count": int(len(df)) if df is not None else 0,
+        "allow_buy": bool(allow_buy),
+        "min_score": float(min_score),
+        "account_total_value": float(account_total_value or 0.0),
+        "reject_reasons": dict(reject_reasons),
+        "ledger_ok": False,
+        "ledger_signal_count": 0,
+        "ledger_error": "",
+        "buy_publication_blocked": False,
+    }
 
-            append_signal_samples(sample_rows, payload, ml_sample_path)
-        except Exception as exc:
-            print(f"ML sample append skipped: {exc}", flush=True)
+    store = store or TradingStore(app_config.TRADING_DB_FILE)
+    limits = RiskLimits(
+        max_single_position_pct=app_config.MAX_SINGLE_POSITION_PCT,
+        max_total_position_pct=app_config.MAX_TOTAL_POSITION_PCT,
+        max_sector_exposure_pct=app_config.MAX_SECTOR_EXPOSURE_PCT,
+        max_new_positions_per_day=app_config.MAX_NEW_POSITIONS_PER_DAY,
+        max_orders_per_day=app_config.MAX_ORDERS_PER_DAY,
+        max_daily_turnover_pct=app_config.MAX_DAILY_TURNOVER_PCT,
+    )
+    decisions = [(signal, evaluate_observation(signal, PortfolioState.empty(), limits)) for signal in payload["signals"]]
+    ledger_run_id = run_id or f"export-{payload['generated_at'].replace(' ', 'T')}"
+    try:
+        store.initialize()
+        with store.transaction() as conn:
+            store.record_strategy_run(conn, StrategyRunRecord(
+                run_id=ledger_run_id,
+                trade_date=payload["trade_date"],
+                started_at=payload["generated_at"],
+                strategy_version="a_share_strategy",
+                parameter_version="risk-observe-v1",
+            ))
+            for signal, decision in decisions:
+                store.record_signal(conn, SignalRecord(
+                    signal_id=signal["id"], run_id=ledger_run_id,
+                    trade_date=payload["trade_date"], code=signal["code"],
+                    jq_code=signal["jq_code"], action=signal["action"],
+                    position_pct=float(signal.get("position_pct") or 0),
+                    generated_at=payload["generated_at"], expires_at="",
+                    raw_json=json.dumps(signal, ensure_ascii=False, default=str),
+                ))
+                metrics = decision.metrics
+                conn.execute(
+                    """INSERT INTO risk_decisions(
+                    signal_id, risk_mode, allowed, hard_block_code, shadow_codes,
+                    current_single_exposure, projected_single_exposure,
+                    current_portfolio_exposure, projected_portfolio_exposure,
+                    current_industry_exposure, projected_industry_exposure,
+                    daily_profit_loss, account_drawdown, turnover_rate, snapshot_at,
+                    raw_json, decided_at) VALUES (?, 'observe', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (signal["id"], int(decision.allowed), ",".join(decision.hard_blocks) or None,
+                     json.dumps(decision.soft_warnings), metrics.get("position_pct") or 0,
+                     metrics.get("position_pct") or 0, 0, metrics.get("total_position_pct") or 0,
+                     0, metrics.get("sector_exposure_pct") or 0, metrics.get("daily_pnl_pct") or 0,
+                     metrics.get("account_drawdown_pct") or 0, metrics.get("daily_turnover_pct") or 0,
+                     payload["generated_at"], json.dumps({"hard_blocks": decision.hard_blocks,
+                     "soft_warnings": decision.soft_warnings, "metrics": dict(metrics)}, default=str),
+                     payload["generated_at"]),
+                )
+        payload["diagnostics"]["ledger_ok"] = True
+        payload["diagnostics"]["ledger_signal_count"] = len(payload["signals"])
+    except (sqlite3.Error, OSError) as exc:
+        had_buys = any(signal["action"] == "buy" for signal in payload["signals"])
+        payload["signals"] = [signal for signal in payload["signals"] if signal["action"] == "sell"]
+        payload["diagnostics"]["ledger_error"] = str(exc)
+        payload["diagnostics"]["buy_publication_blocked"] = had_buys
+
+    try:
+        from ml_dataset import append_signal_samples
+
+        published_ids = {signal["id"] for signal in payload["signals"]}
+        append_signal_samples(
+            [(row, signal) for row, signal in sample_rows if signal["id"] in published_ids],
+            payload, ml_sample_path,
+        )
+    except Exception as exc:
+        print(f"ML sample append skipped: {exc}", flush=True)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
