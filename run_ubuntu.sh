@@ -697,7 +697,7 @@ run_foreground() {
 ledger_check() {
   load_env
   cd "${APP_DIR}"
-  "$(python_bin)" -c 'import config; from trading_store import SCHEMA_VERSION, TradingStore; store = TradingStore(config.TRADING_DB_FILE); store.initialize(); health = store.health(); assert health.ok and health.schema_version == SCHEMA_VERSION, health; probe = "ledger_check_probe"; exec("with store.transaction() as conn:\n store.set_system_state(conn, probe, \"ok\", \"deployment writable probe\")\n conn.execute(\"DELETE FROM system_state WHERE key = ?\", (probe,))"); print(f"schema_version={health.schema_version} health=ok writable_probe=ok")'
+  "$(python_bin)" -c 'import config, uuid; from trading_store import SCHEMA_VERSION, TradingStore; store = TradingStore(config.TRADING_DB_FILE); store.initialize(); health = store.health(); assert health.ok and health.schema_version == SCHEMA_VERSION, health; probe = f"ledger_check_probe_{uuid.uuid4().hex}"; exec("with store.transaction() as conn:\n store.set_system_state(conn, probe, \"ok\", \"deployment writable probe\")\n conn.execute(\"DELETE FROM system_state WHERE key = ?\", (probe,))"); print(f"schema_version={health.schema_version} health=ok writable_probe=ok")'
 }
 
 handle_command() {
