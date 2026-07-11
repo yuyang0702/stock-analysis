@@ -1,6 +1,7 @@
 # Repository guidance
 
 - `docs/project_roadmap.md` is the unique main project document. If another document conflicts with it, follow the roadmap.
+- For a new machine or conversation, read `docs/project_handoff.md` after the roadmap; treat it as a time-point snapshot and re-verify external state.
 - Before changing business behavior, read the roadmap, `docs/live_trading_execution_plan.md`, and the relevant specification or plan.
 - Follow `docs/data_storage_policy.md` for every new or changed persistent file, log, cache, snapshot, report, JSONL stream, or database table.
 - A persistence feature is incomplete unless it defines bounded growth, retention, rotation or compaction, efficient reads, backup/recovery, privacy, and tests.
