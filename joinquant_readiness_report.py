@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import config as app_config
+from trading_store import TradingStore
 
 
 def _load(path: Path) -> tuple[dict[str, Any], str]:
@@ -23,10 +24,14 @@ def build_report(
     signal_file: Path | None = None,
     snapshot_file: Path | None = None,
     report_file: Path | None = None,
+    *,
+    db_file: Path | None = None,
 ) -> dict[str, Any]:
     signal_file = signal_file or app_config.JOINQUANT_SIGNAL_FILE
     snapshot_file = snapshot_file or app_config.JOINQUANT_ACCOUNT_FILE
     report_file = report_file or app_config.OUTPUT_DIR / f"joinquant_readiness_{datetime.now().strftime('%Y%m%d')}.md"
+    db_file = db_file or app_config.TRADING_DB_FILE
+    ledger_health = TradingStore(db_file).health()
     signals_payload, signal_error = _load(signal_file)
     snapshot_payload, snapshot_error = _load(snapshot_file)
 
@@ -47,8 +52,11 @@ def build_report(
         "position_count": len(positions),
         "duplicate_signal_ids": duplicate_ids,
         "position_violation_count": len(over_position),
+        "ledger_ok": ledger_health.ok,
+        "ledger_schema_version": ledger_health.schema_version,
+        "ledger_error": " ".join(ledger_health.error.replace("\r", " ").replace("\n", " ").split())[:240],
     }
-    if result["signal_ok"] and result["snapshot_ok"] and duplicate_ids == 0 and not over_position:
+    if result["signal_ok"] and result["snapshot_ok"] and result["ledger_ok"] and duplicate_ids == 0 and not over_position:
         conclusion = "can_small_position_trial"
     else:
         conclusion = "keep_dry_run"
@@ -65,11 +73,15 @@ def build_report(
         f"- position_count: {result['position_count']}",
         f"- duplicate_signal_ids: {duplicate_ids}",
         f"- position_violation_count: {len(over_position)}",
+        f"- SQLite 交易账本: {'正常' if result['ledger_ok'] else '未就绪'}",
+        f"- ledger_schema_version: {result['ledger_schema_version']}",
     ]
     if signal_error:
         lines.append(f"- signal_error: {signal_error}")
     if snapshot_error:
         lines.append(f"- snapshot_error: {snapshot_error}")
+    if result["ledger_error"]:
+        lines.append(f"- ledger_error: {result['ledger_error']}")
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return result

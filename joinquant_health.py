@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import config as app_config
+from trading_store import TradingStore
 from notifier import WeComNotifier
 
 
@@ -20,6 +21,7 @@ NON_TRADING_NOISE_ISSUES = {
     "snapshot_time_missing",
     "snapshot_stale",
 }
+NON_TRADING_NOISE_ISSUES.update({"ledger_unavailable", "ledger_json_signal_mismatch"})
 
 
 def _is_a_share_trading_day(now: datetime) -> bool:
@@ -35,12 +37,38 @@ def _is_a_share_trading_time(now: datetime) -> bool:
     return (time(9, 30) <= current <= time(11, 30)) or (time(13, 0) <= current <= time(15, 0))
 
 
-def _alert_required(issue_codes: list[str], now: datetime) -> bool:
+def _alert_required(issue_codes: list[str], now: datetime, fresh_executable_buy: bool = False) -> bool:
     if not issue_codes:
         return False
     if _is_a_share_trading_time(now):
         return True
+    if fresh_executable_buy and any(code in {"ledger_unavailable", "ledger_json_signal_mismatch"} for code in issue_codes):
+        return True
     return any(code not in NON_TRADING_NOISE_ISSUES for code in issue_codes)
+
+
+def _sanitize_ledger_error(value: str) -> str:
+    return " ".join(str(value).replace("\r", " ").replace("\n", " ").split())[:240]
+
+
+def _ledger_status(db_file: Path, signal_ids: set[str]) -> tuple[bool, int, int, bool, str]:
+    store = TradingStore(db_file)
+    health = store.health()
+    if not health.ok:
+        return False, health.schema_version, 0, False, _sanitize_ledger_error(health.error)
+    if not signal_ids:
+        return True, health.schema_version, 0, True, ""
+    try:
+        placeholders = ",".join("?" for _ in signal_ids)
+        with store.connect() as conn:
+            rows = conn.execute(
+                f"SELECT signal_id FROM signals WHERE signal_id IN ({placeholders})",
+                tuple(sorted(signal_ids)),
+            ).fetchall()
+        ledger_ids = {str(row[0]) for row in rows}
+        return True, health.schema_version, len(ledger_ids), ledger_ids == signal_ids, ""
+    except Exception as exc:
+        return False, health.schema_version, 0, False, _sanitize_ledger_error(str(exc))
 
 
 def _load_json(path: Path) -> tuple[dict[str, Any], str]:
@@ -219,6 +247,7 @@ def build_health_report(
     api_event_file: Path | None = None,
     positions_file: Path | None = None,
     health_history_file: Path | None = None,
+    db_file: Path | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now()
     signal_file = signal_file or app_config.JOINQUANT_SIGNAL_FILE
@@ -227,6 +256,7 @@ def build_health_report(
     api_event_file = api_event_file or snapshot_file.parent / "api_events.jsonl"
     positions_file = positions_file or app_config.POSITIONS_FILE
     health_history_file = health_history_file or snapshot_file.parent / "health_history.jsonl"
+    db_file = db_file or app_config.TRADING_DB_FILE
     report_file = report_file or app_config.OUTPUT_DIR / f"joinquant_health_{now.strftime('%Y%m%d')}.md"
     signal_max_age_min = (
         app_config.JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN_DEFAULT
@@ -254,6 +284,8 @@ def build_health_report(
     signal_age = _age_minutes(signal_payload.get("generated_at"), now)
     snapshot_age = _age_minutes(_snapshot_time(snapshot_payload), now)
     signals = signal_payload.get("signals", []) if isinstance(signal_payload.get("signals"), list) else []
+    signal_ids = {str(item.get("id")) for item in signals if isinstance(item, dict) and item.get("id")}
+    ledger_ok, ledger_schema_version, ledger_signal_count, ledger_json_parity, ledger_error = _ledger_status(db_file, signal_ids)
     positions = snapshot_payload.get("positions", []) if isinstance(snapshot_payload.get("positions"), list) else []
     expected_template_version = app_config.JOINQUANT_TEMPLATE_VERSION
     strategy_template_version = str(snapshot_payload.get("strategy_template_version") or "").strip()
@@ -263,6 +295,13 @@ def build_health_report(
     position_consistency, position_mismatches = _position_consistency(snapshot_payload, positions_file)
     issues: list[str] = []
     issue_codes: list[str] = []
+
+    if not ledger_ok:
+        issue_codes.append("ledger_unavailable")
+        issues.append(f"SQLite 交易账本不可用：{ledger_error or '未初始化'}")
+    elif not ledger_json_parity:
+        issue_codes.append("ledger_json_signal_mismatch")
+        issues.append("SQLite 与 JSON 信号 ID 不一致")
 
     if signal_error:
         issue_codes.append("signal_file_error")
@@ -312,7 +351,11 @@ def build_health_report(
 
     status = "ok" if not issues else "critical"
     is_trading_time = _is_a_share_trading_time(now)
-    alert_required = _alert_required(issue_codes, now)
+    fresh_executable_buy = signal_age is not None and signal_age <= signal_max_age_min and any(
+        isinstance(item, dict) and str(item.get("action") or "").lower() == "buy"
+        for item in signals
+    )
+    alert_required = _alert_required(issue_codes, now, fresh_executable_buy)
     stability_score = _stability_score(issue_codes, failed_orders_today, api_counts["api_error_count_today"])
     result = {
         "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -322,6 +365,12 @@ def build_health_report(
         "issues": issues,
         "issue_codes": issue_codes,
         "signal_count": len(signals),
+        "ledger_ok": ledger_ok,
+        "ledger_schema_version": ledger_schema_version,
+        "ledger_signal_count": ledger_signal_count,
+        "json_signal_count": len(signal_ids),
+        "ledger_json_parity": ledger_json_parity,
+        "ledger_error": ledger_error,
         "signal_age_min": round(signal_age, 1) if signal_age is not None else None,
         "snapshot_age_min": round(snapshot_age, 1) if snapshot_age is not None else None,
         "snapshot_count_today": len(history_today),
@@ -359,6 +408,10 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         f"- 稳定性评分：{result.get('stability_score', 0)}",
         f"- 实盘准入：{'通过' if result.get('stable_gate_pass') else '不通过'}",
         f"- 信号数量：{result.get('signal_count', 0)}",
+        f"- SQLite 交易账本：{'正常' if result.get('ledger_ok') else '未就绪'}",
+        f"- SQLite schema_version：{result.get('ledger_schema_version', 0)}",
+        f"- SQLite/JSON 信号一致：{'是' if result.get('ledger_json_parity') else '否'}",
+        f"- SQLite 错误：{_sanitize_ledger_error(result.get('ledger_error') or '') or '-'}",
         f"- 信号年龄：{result.get('signal_age_min')} 分钟",
         f"- 快照年龄：{result.get('snapshot_age_min')} 分钟",
         f"- 今日信号拉取：{result.get('signal_pull_count_today', 0)} 次",

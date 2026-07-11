@@ -4,9 +4,37 @@ import unittest
 from pathlib import Path
 
 import joinquant_readiness_report
+from trading_store import TradingStore
 
 
 class JoinQuantReadinessReportTest(unittest.TestCase):
+    def test_missing_ledger_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            snapshot_file.write_text(json.dumps({"schema_version": 1, "positions": []}), encoding="utf-8")
+
+            result = joinquant_readiness_report.build_report(signal_file, snapshot_file, base / "report.md", db_file=base / "missing" / "trading.db")
+
+            self.assertFalse(result["ledger_ok"])
+            self.assertIn("SQLite 交易账本: 未就绪", (base / "report.md").read_text(encoding="utf-8"))
+
+    def test_initialized_v1_ledger_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            snapshot_file.write_text(json.dumps({"schema_version": 1, "positions": []}), encoding="utf-8")
+            db_file = base / "trading.db"
+            TradingStore(db_file).initialize()
+
+            result = joinquant_readiness_report.build_report(signal_file, snapshot_file, base / "report.md", db_file=db_file)
+
+            self.assertTrue(result["ledger_ok"])
+            self.assertIn("SQLite 交易账本: 正常", (base / "report.md").read_text(encoding="utf-8"))
     def test_reports_basic_readiness_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             signal_file = Path(tmp) / "signals.json"

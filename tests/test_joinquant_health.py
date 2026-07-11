@@ -6,9 +6,61 @@ from pathlib import Path
 
 import config as app_config
 import joinquant_health
+from trading_store import TradingStore
 
 
 class JoinQuantHealthTest(unittest.TestCase):
+    def _ledger_with_signal_ids(self, path: Path, signal_ids: list[str]) -> None:
+        store = TradingStore(path)
+        store.initialize()
+        with store.transaction() as conn:
+            conn.execute("INSERT INTO strategy_runs(run_id, trade_date, started_at, created_at, updated_at) VALUES ('r1', '2026-07-09', '2026-07-09 09:30:00', datetime('now'), datetime('now'))")
+            for signal_id in signal_ids:
+                conn.execute("INSERT INTO signals(signal_id, run_id, trade_date, stock_code, jq_code, action, generated_at, raw_json, created_at) VALUES (?, 'r1', '2026-07-09', '600000', '600000.XSHG', 'buy', '2026-07-09 09:59:00', '{}', datetime('now'))", (signal_id,))
+
+    def test_reports_healthy_when_ledger_and_json_signal_ids_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "generated_at": "2026-07-09 09:59:00", "signals": [{"id": "s1"}, {"id": "s2"}]}), encoding="utf-8")
+            db_file = base / "trading.db"
+            self._ledger_with_signal_ids(db_file, ["s1", "s2"])
+
+            result = joinquant_health.build_health_report(signal_file, base / "missing-account.json", report_file=base / "report.md", now=datetime(2026, 7, 9, 10, 0), db_file=db_file, health_history_file=base / "health.jsonl")
+
+            self.assertTrue(result["ledger_ok"])
+            self.assertTrue(result["ledger_json_parity"])
+            self.assertNotIn("ledger_unavailable", result["issue_codes"])
+            self.assertNotIn("ledger_json_signal_mismatch", result["issue_codes"])
+
+    def test_reports_unavailable_ledger_as_trading_hours_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "generated_at": "2026-07-09 09:59:00", "signals": []}), encoding="utf-8")
+
+            result = joinquant_health.build_health_report(signal_file, base / "missing-account.json", report_file=base / "report.md", now=datetime(2026, 7, 9, 10, 0), db_file=base / "missing" / "trading.db", health_history_file=base / "health.jsonl")
+
+            self.assertFalse(result["ledger_ok"])
+            self.assertIn("ledger_unavailable", result["issue_codes"])
+            self.assertTrue(result["alert_required"])
+
+    def test_reports_bounded_signal_id_mismatch_but_no_off_hours_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "generated_at": "2026-07-09 16:00:00", "signals": [{"id": "json-only", "action": "sell"}]}), encoding="utf-8")
+            db_file = base / "trading.db"
+            self._ledger_with_signal_ids(db_file, ["ledger-only"])
+            snapshot_file = base / "account.json"
+            snapshot_file.write_text(json.dumps({"schema_version": 1, "received_at": "2026-07-09 16:00:00", "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION, "positions": []}), encoding="utf-8")
+            positions_file = base / "positions.json"
+            positions_file.write_text('{"positions": []}', encoding="utf-8")
+
+            result = joinquant_health.build_health_report(signal_file, snapshot_file, report_file=base / "report.md", now=datetime(2026, 7, 9, 16, 1), db_file=db_file, positions_file=positions_file, health_history_file=base / "health.jsonl")
+
+            self.assertIn("ledger_json_signal_mismatch", result["issue_codes"])
+            self.assertFalse(result["alert_required"])
     def test_reports_ok_when_signal_and_snapshot_are_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -39,6 +91,8 @@ class JoinQuantHealthTest(unittest.TestCase):
             }
             snapshot_file.write_text(json.dumps(snapshot), encoding="utf-8")
             history_file.write_text(json.dumps(snapshot, ensure_ascii=False) + "\n", encoding="utf-8")
+            db_file = base / "trading.db"
+            self._ledger_with_signal_ids(db_file, ["s1"])
 
             result = joinquant_health.build_health_report(
                 signal_file,
@@ -52,6 +106,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                 api_event_file=base / "missing_api_events.jsonl",
                 positions_file=base / "missing_positions.json",
                 health_history_file=base / "health_history.jsonl",
+                db_file=db_file,
             )
 
             self.assertEqual(result["status"], "ok")
