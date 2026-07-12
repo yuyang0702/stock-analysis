@@ -277,6 +277,8 @@ class JoinQuantHealthTest(unittest.TestCase):
             history_file = base / "account_snapshot_history.jsonl"
             api_event_file = base / "api_events.jsonl"
             positions_file = base / "positions.json"
+            db_file = base / "trading.db"
+            TradingStore(db_file).initialize()
             now = datetime(2026, 7, 9, 15, 30, 0)
             signal_file.write_text(
                 json.dumps({"schema_version": 1, "generated_at": "2026-07-09 15:20:00", "signals": []}),
@@ -323,6 +325,7 @@ class JoinQuantHealthTest(unittest.TestCase):
                 positions_file=positions_file,
                 failed_order_limit=5,
                 health_history_file=base / "health_history.jsonl",
+                db_file=db_file,
             )
 
             self.assertEqual(result["signal_pull_count_today"], 2)
