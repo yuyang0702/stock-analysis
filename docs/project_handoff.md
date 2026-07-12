@@ -85,12 +85,12 @@ git ls-remote origin refs/heads/main
 | JoinQuant信号与模拟下单 | deployed | 信号拉取、委托和网站策略状态。 |
 | 订单回报与持仓同步 | deployed | 快照回传、实际成交和持仓一致性。 |
 | 健康检查和微信异常报警 | deployed | timer、报告、告警和失败重试。 |
-| SQLite Batch 1 | deployed | schema、健康、双写和交易日一致性。 |
+| SQLite Batch 1 | deployed | 服务器已运行 schema version 1；待部署后首个有效交易日确认双写和交易日一致性。 |
 | SQLite订单/成交/账户/权益账本 | planned | 不得误判为已完成。 |
 | 完整历史回测 | planned | 当前仅有已生成信号的信号级回测。 |
 | 实盘级强制风控 | planned | 当前风险层以观察和信号过滤为主。 |
 
-阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。
+阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。
 
 ## 5. SQLite实际范围
 

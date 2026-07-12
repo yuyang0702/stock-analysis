@@ -322,6 +322,8 @@ SQLite WAL持续异常增长：warning
 
 ## 14. 当前文件治理优先级
 
+当前状态快照（2026-07-12）：本规范已经生效，但运行治理能力仍为部分实现。服务器上的 `health_history.jsonl` 和 `api_events.jsonl` 仍是单文件，盘中扫描仍持续生成独立 CSV/Markdown；月度轮转、盘中报告保留、统一归档、SQLite 在线备份和恢复演练尚未完成。不得因规范文档存在而把这些运行能力标记为 implemented、deployed 或 validated。
+
 ### Batch A：低风险性能优化
 
 1. 健康历史按月轮转。

@@ -453,9 +453,10 @@ KILL_SWITCH 已实现并验证
 
 ## 2026-07-11 Batch 1 账本部署检查点
 
-Batch 1 代码已实现，待服务器部署和 1 个交易日双写观察；不得把本节视为服务器部署或观察验收已经完成。项目状态仍以 `docs/project_roadmap.md` 为唯一主文档，五批次专项设计从属于该主文档。
+Batch 1 代码已实现并已部署服务器，待部署后的首个有效交易日双写观察；不得把服务器部署、非交易日静态检查或 readiness 结论视为交易日观察验收已经完成。2026-07-12 只读核验确认服务器与本地 SHA 均为 `54eaaf423f690dda84776304c4ec87846aa8cf66`，SQLite schema version 为 `1`，核心服务和现有定时器已运行。项目状态仍以 `docs/project_roadmap.md` 为唯一主文档，五批次专项设计从属于该主文档。
 
 - 完整验证命令：`.venv/Scripts/python.exe -m unittest discover -s tests -p "test_*.py" -v`（Linux 服务器使用虚拟环境中的 `python -m unittest discover -s tests -p "test_*.py" -v`）。
 - 正式数据库：`cache/trading/trading.db`，部署后先执行 `bash run_ubuntu.sh ledger-check`，只接受 schema version `1` 且写入后删除探针事务成功。
 - 观察模式：`RISK_MODE=observe`；Batch 1 的仓位、集中度、换手和回撤软阈值只记录告警，不抑制原有有效信号。
 - 一个交易日验收：收盘后逐一核对当前 JSON 信号 ID 与 SQLite；确认 JoinQuant 委托行为与 Batch 1 前一致；确认无重复信号；归档 readiness 和 health 报告；health 不得出现 `ledger_unavailable` 或 `ledger_json_signal_mismatch`。全部满足前不得开始 Batch 2 订单状态机计划。
+- 阶段门槛：阶段 1 基础稳定性继续使用连续 10 个有效交易日；专项设计的完整账本与策略验证使用 20 个有效交易日。10 日通过不自动代表 20 日专项完成。

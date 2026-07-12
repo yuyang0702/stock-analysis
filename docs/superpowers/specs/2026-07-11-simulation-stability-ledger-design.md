@@ -8,7 +8,7 @@
 >
 > 执行从文档：`docs/live_trading_execution_plan.md`。
 >
-> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。本文件描述的是已批准但尚未实现的设计目标；只有代码、测试和线上验收完成后，相关能力才能在主文档中标记为已实现。
+> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。本文件描述已批准的五批次设计目标；其中 Batch 1 已实现并部署，待部署后首个有效交易日双写观察，Batch 2-5 仍为待实现目标。只有代码、测试、部署和对应线上验收完成后，相关能力才能提升到 implemented、deployed、observed 或 validated。
 
 ## 1. 目标与范围
 
