@@ -36,6 +36,10 @@ class ConfigEnvTest(unittest.TestCase):
             "MAX_CONSECUTIVE_ORDER_FAILURES": "6", "ACCOUNT_SNAPSHOT_MAX_AGE_SEC": "301",
             "SIGNAL_MAX_AGE_SEC": "1201", "RECONCILIATION_POSITION_TOLERANCE": "1.5",
             "TRADING_DB_FILE": "custom/trading.db",
+            "TRADING_BACKUP_DIR": "custom/backups",
+            "TRADING_BACKUP_DAILY_KEEP": "8",
+            "TRADING_BACKUP_WEEKLY_KEEP": "5",
+            "TRADING_BACKUP_MONTHLY_KEEP": "13",
         }
         old_values = {key: os.environ.get(key) for key in updates}
         try:
@@ -56,6 +60,10 @@ class ConfigEnvTest(unittest.TestCase):
             self.assertEqual(reloaded.SIGNAL_MAX_AGE_SEC, 1201)
             self.assertEqual(reloaded.RECONCILIATION_POSITION_TOLERANCE, 1.5)
             self.assertEqual(reloaded.TRADING_DB_FILE, Path("custom/trading.db"))
+            self.assertEqual(reloaded.TRADING_BACKUP_DIR, Path("custom/backups"))
+            self.assertEqual(reloaded.TRADING_BACKUP_DAILY_KEEP, 8)
+            self.assertEqual(reloaded.TRADING_BACKUP_WEEKLY_KEEP, 5)
+            self.assertEqual(reloaded.TRADING_BACKUP_MONTHLY_KEEP, 13)
         finally:
             for key, value in old_values.items():
                 if value is None:
@@ -98,6 +106,11 @@ class ConfigEnvTest(unittest.TestCase):
             "JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN": "12",
             "JOINQUANT_HEALTH_FAILED_ORDER_LIMIT": "2",
             "JOINQUANT_ENFORCE_HEALTH_GATE": "1",
+            "JOINQUANT_PORTFOLIO_RISK_ENABLE": "0",
+            "JOINQUANT_TRADABILITY_FILTER_ENABLE": "0",
+            "JOINQUANT_REGIME_CONFIRM_ENABLE": "0",
+            "JOINQUANT_EXIT_COOLDOWN_ENABLE": "0",
+            "JOINQUANT_LAYERED_EXIT_ENABLE": "0",
         }
         old_values = {key: os.environ.get(key) for key in updates}
         try:
@@ -136,6 +149,11 @@ class ConfigEnvTest(unittest.TestCase):
             self.assertEqual(reloaded.JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN_DEFAULT, 12)
             self.assertEqual(reloaded.JOINQUANT_HEALTH_FAILED_ORDER_LIMIT_DEFAULT, 2)
             self.assertTrue(reloaded.JOINQUANT_ENFORCE_HEALTH_GATE_DEFAULT)
+            self.assertFalse(reloaded.JOINQUANT_PORTFOLIO_RISK_ENABLE_DEFAULT)
+            self.assertFalse(reloaded.JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT)
+            self.assertFalse(reloaded.JOINQUANT_REGIME_CONFIRM_ENABLE_DEFAULT)
+            self.assertFalse(reloaded.JOINQUANT_EXIT_COOLDOWN_ENABLE_DEFAULT)
+            self.assertFalse(reloaded.JOINQUANT_LAYERED_EXIT_ENABLE_DEFAULT)
         finally:
             for key, value in old_values.items():
                 if value is None:

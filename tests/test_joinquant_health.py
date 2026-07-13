@@ -18,6 +18,20 @@ class JoinQuantHealthTest(unittest.TestCase):
             for signal_id in signal_ids:
                 conn.execute("INSERT INTO signals(signal_id, run_id, trade_date, stock_code, jq_code, action, generated_at, raw_json, created_at) VALUES (?, 'r1', '2026-07-09', '600000', '600000.XSHG', 'buy', '2026-07-09 09:59:00', ?, datetime('now'))", (signal_id, json.dumps({"id": signal_id})))
 
+    def test_detects_completed_quantity_with_stale_active_exit_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_file = Path(tmp) / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            with store.transaction() as conn:
+                store.upsert_exit_intent(conn, "sell-1", "600000", 500, "take_profit_1", "2026-07-13 10:00:00")
+
+            mismatches = joinquant_health._exit_intent_mismatches(
+                db_file, {"positions": [{"code": "600000", "qty": 500}]},
+            )
+
+            self.assertEqual(mismatches, ["600000"])
+
     def test_reports_content_mismatch_for_same_signal_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

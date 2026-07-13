@@ -6,6 +6,7 @@ import json
 import os
 import random
 import socket
+import sqlite3
 import time
 import uuid
 import warnings
@@ -18,12 +19,14 @@ import akshare as ak
 import pandas as pd
 
 import config as app_config
+from exit_policy import PositionExitState, evaluate_exit, market_regime
 from global_market_context import load_global_context
 from paper_trading import apply_paper_trades, build_paper_trade_markdown, load_account, save_account
 from risk_engine import RiskDecision, build_risk_decision, build_signal_lifecycle, classify_trade_mode
 from shadow_score import apply_shadow_scores
 from strategy_profile import build_strategy_profile
 from notifier import WeComNotifier
+from trading_store import TradingStore
 
 try:
     from openai import OpenAI
@@ -229,6 +232,27 @@ def load_portfolio_account_total_value(default: float = 100000.0) -> float:
     return default
 
 
+def load_portfolio_available_cash(default: float) -> float:
+    try:
+        raw = json.loads(app_config.POSITIONS_FILE.read_text(encoding="utf-8"))
+        account = raw.get("account", {}) if isinstance(raw, dict) else {}
+        return _float_value(account.get("available_cash"), _float_value(account.get("cash"), default))
+    except Exception:
+        return default
+
+
+def load_portfolio_account_metrics() -> dict[str, float]:
+    try:
+        raw = json.loads(app_config.POSITIONS_FILE.read_text(encoding="utf-8"))
+        account = raw.get("account", {}) if isinstance(raw, dict) else {}
+        return {key: _float_value(account.get(key)) for key in (
+            "daily_turnover_pct", "daily_pnl_pct", "account_drawdown_pct", "consecutive_losses",
+            "pending_buy_position_pct", "pending_buy_risk_pct",
+        )}
+    except Exception:
+        return {}
+
+
 def joinquant_health_gate_pass() -> bool:
     path = app_config.OUTPUT_DIR / f"joinquant_health_{datetime.now().strftime('%Y%m%d')}.md"
     if not path.exists():
@@ -263,6 +287,117 @@ def enrich_portfolio_frame(df: pd.DataFrame, portfolio: dict[str, dict[str, Any]
     df["has_holding"] = df["hold_status"].isin(["holding", "partial_sell"])
     df["holding_brief"] = df.apply(build_holding_brief, axis=1)
     return df
+
+
+def merge_holding_stop_loss_rows(
+    source: pd.DataFrame,
+    spot: pd.DataFrame,
+    portfolio: dict[str, dict[str, Any]],
+    cycles: dict[str, dict[str, Any]] | None = None,
+    market_state: str = "NORMAL",
+    current_day: date | None = None,
+) -> pd.DataFrame:
+    """把全持仓退出动作合并到 JoinQuant 导出源。"""
+    cycles = cycles or {}
+    current_day = current_day or datetime.now().date()
+    quotes = {
+        clean_code(row.get("code")): row
+        for _, row in spot.iterrows()
+    } if spot is not None and not spot.empty and "code" in spot.columns else {}
+    stops: list[dict[str, Any]] = []
+    for portfolio_code, item in portfolio.items():
+        raw_code = "".join(filter(str.isdigit, str(item.get("code") or portfolio_code)))[:6]
+        if len(raw_code) != 6:
+            continue
+        code = clean_code(raw_code)
+        quote = quotes.get(code)
+        snapshot_price = _float_value(item.get("current_price"))
+        if quote is not None:
+            quote_price = _float_value(quote.get("price"))
+            if _float_value(quote.get("quote_age_sec")) > 120:
+                print(f"SELL_GUARD quote_stale code={code}", flush=True)
+                continue
+            if snapshot_price > 0 and abs(quote_price / snapshot_price - 1) > 0.25:
+                print(f"SELL_GUARD price_deviation code={code} quote={quote_price:.2f} trusted={snapshot_price:.2f}", flush=True)
+                continue
+            price = quote_price
+        else:
+            price = snapshot_price
+        stop_price = _float_value(item.get("stop_price"))
+        qty = _float_value(item.get("qty"))
+        status = safe_text(item.get("status"))
+        if status not in {"holding", "partial_sell"} or qty <= 0 or price <= 0:
+            continue
+        cycle = cycles.get(code)
+        action = ""
+        target_qty = 0
+        exit_signal_id = ""
+        note = ""
+        effective_stop = stop_price
+        if cycle:
+            if safe_text(cycle.get("mode")) == "legacy_fixed":
+                if price <= _float_value(cycle.get("initial_stop_price"), stop_price):
+                    action = "hard_stop"
+                    note = "旧持仓触及冻结固定硬止损"
+                    exit_signal_id = f"{cycle.get('position_cycle_id')}-hard_stop-0"
+                if not action:
+                    continue
+                effective_stop = _float_value(cycle.get("initial_stop_price"), stop_price)
+            else:
+                opened_raw = safe_text(cycle.get("opened_at"))[:10]
+                try:
+                    opened_day = date.fromisoformat(opened_raw)
+                except ValueError:
+                    opened_day = current_day
+                holding_trade_days = sum(
+                    1 for offset in range((current_day - opened_day).days + 1)
+                    if (opened_day + timedelta(days=offset)).weekday() < 5
+                    and (opened_day + timedelta(days=offset)).isoformat() not in app_config.A_SHARE_HOLIDAYS_DEFAULT
+                )
+                decision = evaluate_exit(PositionExitState(
+                    code=code, mode=safe_text(cycle.get("mode")) or "mid",
+                    initial_qty=int(_float_value(cycle.get("initial_qty"))), current_qty=int(qty),
+                    entry_price=_float_value(cycle.get("entry_price")),
+                    initial_stop_price=_float_value(cycle.get("initial_stop_price"), stop_price),
+                    highest_price=max(_float_value(cycle.get("highest_price")), price),
+                    atr14=_float_value(cycle.get("atr14")),
+                    take_profit_stage=int(_float_value(cycle.get("take_profit_stage"))),
+                    holding_trade_days=holding_trade_days,
+                ), price, market_state)
+                if decision.action != "hold":
+                    action = decision.action
+                    target_qty = int(decision.target_qty or 0)
+                    effective_stop = decision.initial_stop_price
+                    note = decision.reason
+                    exit_signal_id = f"{cycle.get('position_cycle_id')}-{decision.action}-{cycle.get('take_profit_stage', 0)}"
+        elif stop_price > 0 and price <= stop_price:
+            action = "stop_loss"
+            note = f"现价{price:.2f}已触及持仓止损价{stop_price:.2f}"
+        if action:
+            stops.append({
+                "code": code,
+                "name": safe_text(item.get("name")),
+                "price": price,
+                "signal_action": action,
+                "signal_state": "stop_hit" if action in {"hard_stop", "stop_loss"} else action,
+                "signal_note": note,
+                "exit_signal_id": exit_signal_id,
+                "target_qty": target_qty,
+                "has_holding": True,
+                "hold_status": status,
+                "hold_qty": qty,
+                "hold_cost_price": item.get("cost_price"),
+                "hold_stop_price": effective_stop,
+                "hold_take_price": item.get("take_price"),
+            })
+    if not stops:
+        return source
+    stop_frame = pd.DataFrame(stops)
+    base = source if source is not None else pd.DataFrame()
+    if not base.empty and "code" in base.columns:
+        stop_codes = set(stop_frame["code"])
+        base = base[~base["code"].map(clean_code).isin(stop_codes)]
+    return pd.concat([base, stop_frame], ignore_index=True, sort=False)
 
 
 def build_holding_brief(row: pd.Series) -> str:
@@ -2971,6 +3106,41 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
     allow_buy = is_a_share_trading_time()
     if app_config.JOINQUANT_ENFORCE_HEALTH_GATE_DEFAULT and allow_buy:
         allow_buy = joinquant_health_gate_pass()
+    account_total_value = load_portfolio_account_total_value(cfg.paper_trade_cash)
+    available_cash = load_portfolio_available_cash(account_total_value)
+    positions = load_portfolio_positions()
+    current_position_pct = (
+        sum(_float_value(item.get("market_value")) for item in positions.values())
+        / account_total_value * 100 if account_total_value > 0 else 0
+    )
+    store = TradingStore(app_config.TRADING_DB_FILE)
+    try:
+        store.initialize()
+        cycles = store.get_active_position_cycles()
+        cooldown_codes = store.active_cooldown_codes(datetime.now().strftime("%Y-%m-%d")) if app_config.JOINQUANT_EXIT_COOLDOWN_ENABLE_DEFAULT else set()
+        new_positions_today, orders_today = store.daily_activity(datetime.now().strftime("%Y-%m-%d"))
+    except (OSError, sqlite3.Error):
+        cycles = {}
+        cooldown_codes = set()
+        new_positions_today, orders_today = 0, 0
+    account_metrics = load_portfolio_account_metrics()
+    current_position_pct += account_metrics.get("pending_buy_position_pct", 0)
+    current_open_risk_pct = sum(
+        _float_value(cycle.get("current_qty")) * max(
+            _float_value(cycle.get("entry_price")) - _float_value(cycle.get("initial_stop_price")), 0,
+        ) / account_total_value * 100
+        for cycle in cycles.values()
+    ) if account_total_value > 0 else 0
+    current_open_risk_pct += account_metrics.get("pending_buy_risk_pct", 0)
+    sector_exposure_pct: dict[str, float] = {}
+    theme_exposure_pct: dict[str, float] = {}
+    for item in positions.values():
+        sector = safe_text(item.get("industry") or item.get("sector"))
+        if sector and account_total_value > 0:
+            sector_exposure_pct[sector] = sector_exposure_pct.get(sector, 0) + _float_value(item.get("market_value")) / account_total_value * 100
+        theme = safe_text(item.get("theme") or item.get("concept"))
+        if theme and account_total_value > 0:
+            theme_exposure_pct[theme] = theme_exposure_pct.get(theme, 0) + _float_value(item.get("market_value")) / account_total_value * 100
     path = export_signals(
         result,
         run_id=run_id,
@@ -2978,7 +3148,19 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
         dry_run=cfg.joinquant_dry_run,
         min_score=cfg.joinquant_min_score,
         allow_buy=allow_buy,
-        account_total_value=load_portfolio_account_total_value(cfg.paper_trade_cash),
+        account_total_value=account_total_value,
+        current_position_pct=current_position_pct,
+        current_open_risk_pct=current_open_risk_pct,
+        sector_exposure_pct=sector_exposure_pct,
+        theme_exposure_pct=theme_exposure_pct,
+        cooldown_codes=cooldown_codes,
+        available_cash=available_cash,
+        new_positions_today=new_positions_today,
+        orders_today=orders_today,
+        daily_turnover_pct=account_metrics.get("daily_turnover_pct", 0),
+        daily_pnl_pct=account_metrics.get("daily_pnl_pct", 0),
+        account_drawdown_pct=account_metrics.get("account_drawdown_pct", 0),
+        consecutive_losses=int(account_metrics.get("consecutive_losses", 0)),
     )
     print(f"JoinQuant signals exported: {path}", flush=True)
     if notifier and notifier.enabled and (cfg.notify_non_trading_day or is_a_share_trading_day()):
@@ -3237,6 +3419,24 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     save_outputs(result, market_info, market_news_state, ai_overview=ai_overview)
     if cfg.joinquant:
         export_source = watch_result if cfg.mode == "intraday" and not watch_result.empty else result
+        position_cycles: dict[str, dict[str, Any]] = {}
+        confirmed_regime = market_regime(str(market_info.get("state") or ""))
+        try:
+            trading_store = TradingStore(app_config.TRADING_DB_FILE)
+            trading_store.initialize()
+            position_cycles = trading_store.get_active_position_cycles() if app_config.JOINQUANT_LAYERED_EXIT_ENABLE_DEFAULT else {}
+            if app_config.JOINQUANT_REGIME_CONFIRM_ENABLE_DEFAULT:
+                confirmed_regime = trading_store.confirm_market_regime(confirmed_regime)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            print(f"Position cycle load skipped; fixed holding stops remain active: {exc}", flush=True)
+        export_source = merge_holding_stop_loss_rows(
+            export_source,
+            spot,
+            portfolio_positions,
+            cycles=position_cycles,
+            market_state=confirmed_regime,
+            current_day=date.today(),
+        )
         run_joinquant_export(cfg, export_source, notifier if cfg.notify else None)
     if cfg.paper_trade:
         paper_source = watch_result if cfg.mode == "intraday" and not watch_result.empty else result

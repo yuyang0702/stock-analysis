@@ -28,8 +28,12 @@ STRATEGY_COMPARE_SERVICE="stock-strategy-compare.service"
 STRATEGY_COMPARE_TIMER="stock-strategy-compare.timer"
 STRATEGY_COMPARE_WEEKLY_SERVICE="stock-strategy-compare-weekly.service"
 STRATEGY_COMPARE_WEEKLY_TIMER="stock-strategy-compare-weekly.timer"
+TRADING_BACKUP_SERVICE="stock-trading-backup.service"
+TRADING_BACKUP_TIMER="stock-trading-backup.timer"
+TRADING_BACKUP_DRILL_SERVICE="stock-trading-backup-drill.service"
+TRADING_BACKUP_DRILL_TIMER="stock-trading-backup-drill.timer"
 ALL_SERVICES=("${STRATEGY_SERVICE}" "${WEB_SERVICE}" "${JQ_SIGNAL_SERVICE}")
-ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}" "${SECTOR_CONTEXT_TIMER}" "${STRATEGY_COMPARE_TIMER}" "${STRATEGY_COMPARE_WEEKLY_TIMER}")
+ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}" "${SECTOR_CONTEXT_TIMER}" "${STRATEGY_COMPARE_TIMER}" "${STRATEGY_COMPARE_WEEKLY_TIMER}" "${TRADING_BACKUP_TIMER}" "${TRADING_BACKUP_DRILL_TIMER}")
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -42,7 +46,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|backup|backup-drill|backup-status|test|show-env
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -75,6 +79,9 @@ show_menu() {
  18) 查看当前配置
  19) 运行测试
  20) 首次安装/重写配置
+ 21) 立即执行SQLite备份
+ 22) 执行SQLite恢复演练
+ 23) 查看SQLite备份状态
   h) 帮助
   q) 退出
 
@@ -138,6 +145,9 @@ menu_loop() {
       18) handle_command show-env ;;
       19) handle_command test ;;
       20) menu_install ;;
+      21) handle_command backup ;;
+      22) handle_command backup-drill ;;
+      23) handle_command backup-status ;;
       h|H) usage ;;
       q|Q|"") break ;;
       *) warn "未知选项：${choice}" ;;
@@ -203,7 +213,7 @@ env_value() {
 require_project_files() {
   for file in \
     a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
-    joinquant_health.py notify_retry.py backtest_engine.py \
+    joinquant_health.py notify_retry.py backtest_engine.py trading_backup.py \
     joinquant_readiness_report.py ml_dataset.py global_market_context.py strategy_compare_report.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
   done
@@ -273,6 +283,11 @@ write_env_file() {
   set_env "JOINQUANT_SYNC_TOKEN" "${token}"
   set_env "JOINQUANT_DRY_RUN" "false"
   set_env "JOINQUANT_ENFORCE_HEALTH_GATE" "1"
+  set_env "JOINQUANT_PORTFOLIO_RISK_ENABLE" "1"
+  set_env "JOINQUANT_TRADABILITY_FILTER_ENABLE" "1"
+  set_env "JOINQUANT_REGIME_CONFIRM_ENABLE" "1"
+  set_env "JOINQUANT_EXIT_COOLDOWN_ENABLE" "1"
+  set_env "JOINQUANT_LAYERED_EXIT_ENABLE" "1"
   set_env "JOINQUANT_MIN_SCORE" "75"
   set_env "JOINQUANT_MAX_SIGNAL_AGE_MIN" "20"
   set_env "JOINQUANT_MAX_POSITIONS" "5"
@@ -292,10 +307,20 @@ write_env_file() {
   set_env "DAILY_LOSS_WARN_PCT" "5"
   set_env "ACCOUNT_DRAWDOWN_WARN_PCT" "15"
   set_env "MAX_CONSECUTIVE_ORDER_FAILURES" "5"
+  set_env "MAX_CONSECUTIVE_LOSSES" "3"
+  set_env "MAX_OPEN_RISK_NORMAL_PCT" "4"
+  set_env "MAX_OPEN_RISK_CAUTION_PCT" "2"
+  set_env "MAX_INDUSTRY_POSITION_PCT" "25"
+  set_env "MAX_THEME_POSITION_PCT" "20"
+  set_env "MAX_UNCATEGORIZED_POSITION_PCT" "10"
   set_env "ACCOUNT_SNAPSHOT_MAX_AGE_SEC" "300"
   set_env "SIGNAL_MAX_AGE_SEC" "1200"
   set_env "RECONCILIATION_POSITION_TOLERANCE" "0"
   set_env "TRADING_DB_FILE" "${APP_DIR}/cache/trading/trading.db"
+  set_env "TRADING_BACKUP_DIR" "/opt/stock-analysis-backups"
+  set_env "TRADING_BACKUP_DAILY_KEEP" "7"
+  set_env "TRADING_BACKUP_WEEKLY_KEEP" "4"
+  set_env "TRADING_BACKUP_MONTHLY_KEEP" "12"
   set_env "ML_SIGNAL_SAMPLE_FILE" "${APP_DIR}/cache/ml/signal_samples.jsonl"
   set_env "ML_REVIEW_REPORT_FILE" "${APP_DIR}/output/ml_signal_review.md"
   set_env "GLOBAL_MARKET_CONTEXT_FILE" "${APP_DIR}/cache/market/global_context.json"
@@ -593,6 +618,54 @@ Unit=${STRATEGY_COMPARE_WEEKLY_SERVICE}
 WantedBy=timers.target
 EOF
 
+  sudo tee "${SYSTEMD_DIR}/${TRADING_BACKUP_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Create verified SQLite trading ledger backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${py} ${APP_DIR}/trading_backup.py backup
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${TRADING_BACKUP_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Create verified SQLite trading ledger backup daily
+
+[Timer]
+OnCalendar=*-*-* 16:30:00 Asia/Shanghai
+Persistent=true
+Unit=${TRADING_BACKUP_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${TRADING_BACKUP_DRILL_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Run isolated SQLite trading ledger restore drill
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${py} ${APP_DIR}/trading_backup.py drill
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${TRADING_BACKUP_DRILL_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Run quarterly SQLite trading ledger restore drill
+
+[Timer]
+OnCalendar=Sun *-01,04,07,10-01..07 03:30:00 Asia/Shanghai
+Persistent=true
+Unit=${TRADING_BACKUP_DRILL_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
   sudo systemctl daemon-reload
   sudo systemctl enable "${ALL_SERVICES[@]}" "${ALL_TIMERS[@]}"
 }
@@ -623,6 +696,7 @@ install_all() {
 
   require_project_files
   mkdir -p "${APP_DIR}/cache/trading"
+  sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "/opt/stock-analysis-backups"
   [[ -n "${token}" ]] || token="$(generate_token)"
   if [[ "${skip_install}" == "no" ]]; then
     install_system_packages "${install_ocr}"
@@ -681,6 +755,7 @@ Global context: $(env_value GLOBAL_MARKET_CONTEXT_FILE "${APP_DIR}/cache/market/
 Sector context: ${APP_DIR}/cache/market/sector_context.json
 Strategy compare: $(env_value STRATEGY_COMPARE_REPORT_FILE "${APP_DIR}/output/strategy_compare_report.md")
 Backtest report: ${APP_DIR}/output/backtest_report.md
+SQLite backup: $(env_value TRADING_BACKUP_DIR /opt/stock-analysis-backups), keep=$(env_value TRADING_BACKUP_DAILY_KEEP 7)/$(env_value TRADING_BACKUP_WEEKLY_KEEP 4)/$(env_value TRADING_BACKUP_MONTHLY_KEEP 12)
 Notify retry queue: ${APP_DIR}/cache/notify_failed_queue.jsonl
 Holdings web port: $(env_value PORTFOLIO_WEB_PORT 8000)
 EOF
@@ -739,6 +814,9 @@ handle_command() {
     strategy-compare) run_foreground strategy_compare_report.py ;;
     strategy-compare-weekly) run_foreground strategy_compare_report.py --notify --weekly ;;
     backtest) run_foreground backtest_engine.py ;;
+    backup) run_foreground trading_backup.py backup ;;
+    backup-drill) run_foreground trading_backup.py drill ;;
+    backup-status) run_foreground trading_backup.py status ;;
     test) cd "${APP_DIR}"; "$(python_bin)" -m unittest discover -s tests -v ;;
     show-env) show_env_summary ;;
     help|-h|--help) usage ;;

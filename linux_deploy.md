@@ -137,6 +137,8 @@ stock-joinquant-health.timer
 stock-notify-retry.timer
 stock-joinquant-readiness.timer
 stock-ml-report.timer
+stock-trading-backup.timer
+stock-trading-backup-drill.timer
 ```
 
 默认安全模式：
@@ -184,7 +186,7 @@ cd /opt/stock-analysis
 bash run_ubuntu.sh
 ```
 
-常用菜单项包括查看状态、重启服务、查看日志、前台跑策略、同步 JoinQuant、生成健康检查、重试失败微信推送、生成 readiness、生成 ML 复盘、运行本地信号回测和运行测试。
+常用菜单项包括查看状态、重启服务、查看日志、前台跑策略、同步 JoinQuant、生成健康检查、重试失败微信推送、生成 readiness、生成 ML 复盘、运行本地信号回测、执行或检查 SQLite 备份和运行测试。
 
 命令方式：
 ```bash
@@ -197,6 +199,9 @@ bash run_ubuntu.sh show-env
 bash run_ubuntu.sh health
 bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh backtest
+bash run_ubuntu.sh backup
+bash run_ubuntu.sh backup-drill
+bash run_ubuntu.sh backup-status
 bash run_ubuntu.sh test
 ```
 
@@ -212,7 +217,45 @@ bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh readiness
 bash run_ubuntu.sh ml-report
 bash run_ubuntu.sh backtest
+bash run_ubuntu.sh backup
+bash run_ubuntu.sh backup-drill
+bash run_ubuntu.sh backup-status
 ```
+
+## SQLite 自动备份与恢复演练
+
+默认备份目录位于项目外：
+
+```text
+/opt/stock-analysis-backups
+```
+
+`stock-trading-backup.timer` 每天 `16:30 Asia/Shanghai` 使用 SQLite 在线备份 API 生成一致性副本，校验 SHA-256、`PRAGMA integrity_check`、schema 和核心表计数，并按 7 份每日、4 份每周、12 份每月轮转。`stock-trading-backup-drill.timer` 在每季度第一个周日凌晨复制最新有效备份到隔离临时目录进行恢复校验；它不会替换或写入正在使用的主库。
+
+部署或数据库迁移前先手工执行：
+
+```bash
+cd /opt/stock-analysis
+bash run_ubuntu.sh backup
+bash run_ubuntu.sh backup-status
+```
+
+检查 timer 和报告：
+
+```bash
+systemctl status stock-trading-backup.timer stock-trading-backup-drill.timer
+cat output/trading_backup_latest.md
+ls -la /opt/stock-analysis-backups/daily
+```
+
+手工恢复演练只验证副本，不执行主库恢复：
+
+```bash
+bash run_ubuntu.sh backup-drill
+cat output/trading_backup_drill_$(date +%Y)-Q$((($(date +%-m)-1)/3+1)).md
+```
+
+如需改变目录或保留数量，只允许修改 `stock-analysis.env` 中的 `TRADING_BACKUP_DIR`、`TRADING_BACKUP_DAILY_KEEP`、`TRADING_BACKUP_WEEKLY_KEEP` 和 `TRADING_BACKUP_MONTHLY_KEEP`；备份目录必须位于项目外并保证运行 systemd service 的用户可写。任何主库替换仍需停机、人工确认和单独恢复流程，本命令不会自动执行。
 
 ## JoinQuant 平台配置
 

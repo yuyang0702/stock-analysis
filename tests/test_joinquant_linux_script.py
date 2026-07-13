@@ -11,7 +11,7 @@ from trading_store import TradingStore
 
 
 class JoinQuantLinuxScriptTest(unittest.TestCase):
-    def run_ledger_check(self, db_path: Path, *, schema_version: int = 1) -> subprocess.CompletedProcess[str]:
+    def run_ledger_check(self, db_path: Path, *, schema_version: int = 5) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             app_dir = Path(temp_dir)
             for name in ("run_ubuntu.sh", "config.py", "trading_store.py"):
@@ -27,7 +27,7 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
                 f"TRADING_DB_FILE={db_path.as_posix()}\nRISK_MODE=observe\n",
                 encoding="utf-8",
             )
-            if schema_version != 1:
+            if schema_version != 5:
                 with sqlite3.connect(db_path) as conn:
                     conn.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
                     conn.execute("INSERT INTO schema_migrations VALUES (?, datetime('now'))", (schema_version,))
@@ -57,6 +57,11 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn('set_env "RISK_MODE" "observe"', text)
         self.assertIn('set_env "MAX_TOTAL_POSITION_PCT" "95"', text)
         self.assertIn('set_env "ACCOUNT_SNAPSHOT_MAX_AGE_SEC" "300"', text)
+        self.assertIn('set_env "JOINQUANT_PORTFOLIO_RISK_ENABLE" "1"', text)
+        self.assertIn('set_env "JOINQUANT_TRADABILITY_FILTER_ENABLE" "1"', text)
+        self.assertIn('set_env "JOINQUANT_REGIME_CONFIRM_ENABLE" "1"', text)
+        self.assertIn('set_env "JOINQUANT_EXIT_COOLDOWN_ENABLE" "1"', text)
+        self.assertIn('set_env "JOINQUANT_LAYERED_EXIT_ENABLE" "1"', text)
         self.assertIn('mkdir -p "${APP_DIR}/cache/trading"', text)
         self.assertIn("stock-joinquant-signal.service", text)
         self.assertIn("stock-joinquant-sync.timer", text)
@@ -64,6 +69,8 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn("stock-notify-retry.timer", text)
         self.assertIn("stock-ml-report.timer", text)
         self.assertIn("stock-sector-context.timer", text)
+        self.assertIn("stock-trading-backup.timer", text)
+        self.assertIn("stock-trading-backup-drill.timer", text)
         self.assertIn("joinquant_signal_server.py", text)
         self.assertIn("joinquant_sync.py", text)
         self.assertIn("joinquant_health.py", text)
@@ -71,6 +78,12 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn("ml_dataset.py", text)
         self.assertIn("--sector-context-only", text)
         self.assertIn("backtest_engine.py", text)
+        self.assertIn("trading_backup.py", text)
+        self.assertIn("trading_backup.py backup", text)
+        self.assertIn("trading_backup.py drill", text)
+        self.assertIn('set_env "TRADING_BACKUP_DIR" "/opt/stock-analysis-backups"', text)
+        self.assertIn("OnCalendar=*-*-* 16:30:00 Asia/Shanghai", text)
+        self.assertIn("OnCalendar=Sun *-01,04,07,10-01..07 03:30:00 Asia/Shanghai", text)
         self.assertIn("health)", text)
         self.assertIn("notify-retry)", text)
         self.assertIn("生成 JoinQuant 健康检查", text)
@@ -91,17 +104,17 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertFalse(Path("start_linux_all.sh").exists())
         self.assertFalse(Path("start_joinquant_linux.sh").exists())
 
-    def test_ledger_check_routes_and_probes_version_one_database(self) -> None:
+    def test_ledger_check_routes_and_probes_version_five_database(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "trading.db"
             result = self.run_ledger_check(db_path)
 
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("schema_version=1 health=ok writable_probe=ok", result.stdout)
+            self.assertIn("schema_version=5 health=ok writable_probe=ok", result.stdout)
 
     def test_ledger_check_rejects_schema_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            result = self.run_ledger_check(Path(temp_dir) / "trading.db", schema_version=2)
+            result = self.run_ledger_check(Path(temp_dir) / "trading.db", schema_version=6)
 
             self.assertNotEqual(0, result.returncode)
 

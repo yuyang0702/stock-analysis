@@ -22,13 +22,19 @@ STARTUP_SELF_TEST = True
 MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-10.1-periodic-snapshot"
+STRATEGY_TEMPLATE_VERSION = "2026-07-13.3-risk-controls"
 
 
 def initialize(context):
     g.signals = []
     g.executed_signal_ids = set()
     g.order_events = []
+    g.order_signal_ids = {}
+    g.metrics_trade_date = datetime.now().strftime("%Y-%m-%d")
+    g.day_start_value = float(context.portfolio.total_value or 0)
+    g.peak_value = g.day_start_value
+    g.last_total_value = g.day_start_value
+    g.consecutive_losses = 0
     run_daily(post_account_snapshot, time="15:05")
     if STARTUP_SELF_TEST:
         startup_self_test(context)
@@ -94,7 +100,9 @@ def _signal_is_fresh(signal):
         generated_at = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
     except Exception:
         return False
-    return datetime.now() - generated_at <= timedelta(minutes=MAX_SIGNAL_AGE_MIN)
+    return datetime.now() - generated_at <= timedelta(
+        minutes=int(signal.get("max_age_min") or MAX_SIGNAL_AGE_MIN)
+    )
 
 
 def _can_execute(context, signal):
@@ -112,6 +120,35 @@ def _can_execute(context, signal):
     jq_code = signal.get("jq_code")
     if not jq_code:
         return False, "missing_code"
+    try:
+        quote = get_current_data()[jq_code]
+        current_price = float(_order_attr(quote, "last_price", 0) or 0)
+        if bool(_order_attr(quote, "paused", False)):
+            return False, "suspended"
+        if current_price <= 0:
+            return False, "price_invalid"
+        if signal.get("action") == "sell" and current_price <= float(_order_attr(quote, "low_limit", 0) or 0):
+            return False, "limit_down"
+        if signal.get("action") == "buy":
+            if current_price >= float(_order_attr(quote, "high_limit", float("inf")) or float("inf")):
+                return False, "limit_up"
+            target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+            if target_value > float(_position_attr(context.portfolio, "available_cash", context.portfolio.cash) or 0):
+                return False, "insufficient_cash"
+            entry = float(signal.get("entry_price") or signal.get("price") or 0)
+            atr = float(signal.get("atr14") or 0)
+            max_move = min(0.02, 0.5 * atr / entry if entry > 0 and atr > 0 else 0.02)
+            if entry > 0 and current_price > entry * (1 + max_move):
+                return False, "price_moved"
+    except Exception:
+        return False, "quote_unavailable"
+    try:
+        open_orders = get_open_orders()
+    except Exception:
+        open_orders = {}
+    for order in open_orders.values():
+        if str(_order_attr(order, "security", "")) == jq_code:
+            return False, "pending_order"
     if signal.get("action") == "buy" and jq_code in context.portfolio.positions:
         return False, "already_holding"
     if signal.get("action") == "sell" and jq_code not in context.portfolio.positions:
@@ -131,6 +168,21 @@ def _order_attr(order, name, default=None):
             return default
 
 
+def _position_attr(position, name, default=0):
+    return _order_attr(position, name, default)
+
+
+def _attainable_sell_target(position, requested_target):
+    current = int(_position_attr(position, "total_amount", 0) or 0)
+    closeable = int(_position_attr(position, "closeable_amount", 0) or 0)
+    target = max(0, int(requested_target or 0))
+    required = max(0, current - target)
+    if required and closeable <= 0:
+        return None, "t_plus_one"
+    sell_qty = min(required, closeable)
+    return current - sell_qty, "partial_sellable" if sell_qty < required else ""
+
+
 def _order_status_text(value):
     if value is None:
         return ""
@@ -138,7 +190,8 @@ def _order_status_text(value):
         text = str(value)
     except Exception:
         return ""
-    return text.split(".")[-1].lower() if text else ""
+    status = text.split(".")[-1].lower() if text else ""
+    return {"held": "submitted", "canceled": "cancelled"}.get(status, status)
 
 def _record_order(signal, status, reason="", order=None):
     event = {
@@ -149,6 +202,7 @@ def _record_order(signal, status, reason="", order=None):
         "jq_code": signal.get("jq_code"),
         "name": signal.get("name"),
         "target_pct": signal.get("position_pct"),
+        "target_qty": signal.get("target_qty"),
         "status": _order_status_text(status) or str(status or ""),
         "reason": reason,
         "order_id": _order_attr(order, "order_id"),
@@ -157,6 +211,8 @@ def _record_order(signal, status, reason="", order=None):
         "price": _order_attr(order, "price"),
     }
     g.order_events.append(event)
+    if event.get("order_id"):
+        g.order_signal_ids[str(event["order_id"])] = signal.get("id")
     log.info(
         "record order %s %s status=%s filled=%s amount=%s reason=%s"
         % (
@@ -178,8 +234,9 @@ def execute_signals(context):
             if reason == "duplicate":
                 continue
             log.info("skip %s: %s" % (signal.get("id"), reason))
-            _record_order(signal, "skipped", reason)
-            if signal.get("id"):
+            explicit = {"suspended", "limit_down", "limit_up", "t_plus_one", "insufficient_cash", "price_moved"}
+            _record_order(signal, reason if reason in explicit else "skipped", reason)
+            if signal.get("action") == "buy" and signal.get("id"):
                 g.executed_signal_ids.add(signal["id"])
             event_count += 1
             continue
@@ -200,14 +257,23 @@ def execute_signals(context):
                 _record_order(signal, "failed", str(exc))
         elif action == "sell":
             try:
-                order = order_target(jq_code, 0)
+                target_qty = signal.get("target_qty")
+                target_qty, reason = _attainable_sell_target(
+                    context.portfolio.positions[jq_code], target_qty,
+                )
+                if reason == "t_plus_one":
+                    _record_order(signal, "t_plus_one", reason)
+                    event_count += 1
+                    continue
+                order = order_target(jq_code, target_qty)
                 if order is None:
                     _record_order(signal, "failed", "suspended_or_rejected")
                 else:
                     _record_order(signal, _order_attr(order, "status", "submitted"), order=order)
             except Exception as exc:
                 _record_order(signal, "failed", str(exc))
-        g.executed_signal_ids.add(signal["id"])
+        if action == "buy":
+            g.executed_signal_ids.add(signal["id"])
         event_count += 1
     return event_count
 
@@ -221,12 +287,17 @@ def post_account_snapshot(context):
                 "jq_code": jq_code,
                 "name": str(pos.security),
                 "qty": pos.total_amount,
+                "closeable_amount": _position_attr(pos, "closeable_amount", 0),
+                "locked_amount": _position_attr(pos, "locked_amount", 0),
+                "today_amount": _position_attr(pos, "today_amount", 0),
                 "avg_cost": pos.avg_cost,
                 "price": pos.price,
                 "market_value": pos.value,
                 "pnl": pos.value - pos.avg_cost * pos.total_amount,
             }
         )
+    metrics = _account_metrics(context)
+    order_events = list(getattr(g, "order_events", [])) + _platform_order_events()
     payload = {
         "schema_version": 1,
         "trade_date": datetime.now().strftime("%Y-%m-%d"),
@@ -234,9 +305,16 @@ def post_account_snapshot(context):
         "source": "joinquant",
         "strategy_template_version": STRATEGY_TEMPLATE_VERSION,
         "cash": context.portfolio.cash,
+        "available_cash": _position_attr(context.portfolio, "available_cash", context.portfolio.cash),
         "total_value": context.portfolio.total_value,
+        "daily_turnover_pct": metrics["daily_turnover_pct"],
+        "daily_pnl_pct": metrics["daily_pnl_pct"],
+        "account_drawdown_pct": metrics["account_drawdown_pct"],
+        "consecutive_losses": metrics["consecutive_losses"],
+        "pending_buy_position_pct": metrics["pending_buy_position_pct"],
+        "pending_buy_risk_pct": metrics["pending_buy_risk_pct"],
         "positions": positions,
-        "orders": list(getattr(g, "order_events", [])),
+        "orders": order_events,
         "trades": [],
     }
     try:
@@ -245,3 +323,81 @@ def post_account_snapshot(context):
         g.order_events = []
     except Exception as exc:
         log.warn("post snapshot failed: %s" % exc)
+
+
+def _platform_order_events():
+    try:
+        orders = get_orders().values()
+    except Exception:
+        try:
+            orders = get_open_orders().values()
+        except Exception:
+            return []
+    events = []
+    for order in orders:
+        order_id = str(_order_attr(order, "order_id", "") or "")
+        security = str(_order_attr(order, "security", "") or "")
+        is_buy = bool(_order_attr(order, "is_buy", False))
+        amount = abs(float(_order_attr(order, "amount", 0) or 0))
+        filled = abs(float(_order_attr(order, "filled", 0) or 0))
+        status = _order_status_text(_order_attr(order, "status", "unknown"))
+        if 0 < filled < amount:
+            status = "partial"
+        elif amount > 0 and filled >= amount:
+            status = "filled"
+        events.append({
+            "id": getattr(g, "order_signal_ids", {}).get(order_id) or "jq-order-" + order_id,
+            "datetime": str(_order_attr(order, "add_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
+            "action": "buy" if is_buy else "sell",
+            "code": security[:6],
+            "jq_code": security,
+            "status": status,
+            "reason": str(_order_attr(order, "message", "") or ""),
+            "order_id": order_id,
+            "amount": amount,
+            "filled": filled,
+            "price": _order_attr(order, "price", 0),
+        })
+    return events
+
+
+def _account_metrics(context):
+    today = datetime.now().strftime("%Y-%m-%d")
+    total_value = float(context.portfolio.total_value or 0)
+    if getattr(g, "metrics_trade_date", today) != today:
+        previous_start = float(getattr(g, "day_start_value", total_value) or total_value)
+        previous_end = float(getattr(g, "last_total_value", total_value) or total_value)
+        if previous_start > 0 and previous_end < previous_start:
+            g.consecutive_losses = int(getattr(g, "consecutive_losses", 0)) + 1
+        else:
+            g.consecutive_losses = 0
+        g.metrics_trade_date = today
+        g.day_start_value = total_value
+    g.last_total_value = total_value
+    g.peak_value = max(float(getattr(g, "peak_value", total_value) or total_value), total_value)
+    start_value = float(getattr(g, "day_start_value", total_value) or total_value)
+    try:
+        turnover_value = sum(
+            abs(float(_order_attr(trade, "amount", 0) or 0) * float(_order_attr(trade, "price", 0) or 0))
+            for trade in get_trades().values()
+            if str(_order_attr(trade, "time", ""))[:10] == today
+        )
+    except Exception:
+        turnover_value = 0
+    pending_buy_value = 0
+    try:
+        for order in get_open_orders().values():
+            if not bool(_order_attr(order, "is_buy", False)):
+                continue
+            remaining = max(0, float(_order_attr(order, "amount", 0) or 0) - float(_order_attr(order, "filled", 0) or 0))
+            pending_buy_value += remaining * float(_order_attr(order, "price", 0) or 0)
+    except Exception:
+        pending_buy_value = 0
+    return {
+        "daily_turnover_pct": turnover_value / start_value * 100 if start_value > 0 else 0,
+        "daily_pnl_pct": (total_value / start_value - 1) * 100 if start_value > 0 else 0,
+        "account_drawdown_pct": (total_value / g.peak_value - 1) * 100 if g.peak_value > 0 else 0,
+        "consecutive_losses": int(getattr(g, "consecutive_losses", 0)),
+        "pending_buy_position_pct": pending_buy_value / total_value * 100 if total_value > 0 else 0,
+        "pending_buy_risk_pct": pending_buy_value / total_value * 9 if total_value > 0 else 0,
+    }

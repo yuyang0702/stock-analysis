@@ -1,5 +1,15 @@
 # 项目接管与新环境恢复说明
 
+> 2026-07-13 增量状态：本地未提交工作区已实现分层退出、执行安全、组合风控、SQLite schema version 5和 JoinQuant `target_qty` 模板；尚未提交、推送、部署、观察或验证。服务器最近确认仍为 `aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1。接管时不得把本地实现状态当成服务器事实，详细边界以主文档 `docs/project_roadmap.md` 为准。
+
+> 同日计划调整：用户要求一次补齐的买入、卖出和执行闭环现已在本地 `implemented`，仍未提交、推送、部署、观察或验证。
+
+> 2026-07-14 计划补充：Batch G 已明确为半自动参数复核，即自动生成证据、人工按候选 ID/哈希批准、另行授权发布和版本化回滚。相关设计与实施计划已写入文档，但候选登记、评价准入、批准、激活和回滚代码均为 `planned`，不能从现有 ML 报表或 `parameter_version` 字段推断为已经实现。
+
+> 2026-07-14 备份增量：`trading_backup.py`、项目外每日在线备份、SHA-256/完整性/schema/核心计数校验、7/4/12 轮转、隔离季度恢复演练、报告、告警复用和 systemd 模板已在本地 `implemented`。尚未提交、推送或安装到服务器，故仍为 `not deployed / not observed / not validated`；服务器最近确认状态不因本地代码变化而改变。
+
+> ML 状态边界：当前 `shadow_score.py` 是规则型影子评分，不是训练模型。ML-7 训练型模型和 ML-8/Batch G 参数复核是两条独立的 `planned` 路线；二者未来都必须自动分析止于候选、人工批准、显式发布和版本化回滚。
+
 > 本文件用于新电脑、新Codex对话和跨环境交接，是一个可提交到Git的时间点快照。`docs/project_roadmap.md`仍是唯一主文档；如两者冲突，以主文档为准。服务器、JoinQuant和运行数据状态必须重新验证，不能仅凭本文件认定为当前事实。
 
 ## 1. 接管目标
@@ -86,9 +96,11 @@ git ls-remote origin refs/heads/main
 | 订单回报与持仓同步 | deployed | 快照回传、实际成交和持仓一致性。 |
 | 健康检查和微信异常报警 | deployed | timer、报告、告警和失败重试。 |
 | SQLite Batch 1 | deployed | 服务器已运行 schema version 1；待部署后首个有效交易日确认双写和交易日一致性。 |
-| SQLite订单/成交/账户/权益账本 | planned | 不得误判为已完成。 |
+| SQLite schema 5执行账本扩展 | implemented（仅本地） | 已含持仓周期、委托事件、退出意图和冷却；服务器仍为schema 1。 |
+| SQLite完整成交/账户/权益曲线账本 | planned | 当前扩展不等于完整逐笔成交与权益账本。 |
 | 完整历史回测 | planned | 当前仅有已生成信号的信号级回测。 |
-| 实盘级强制风控 | planned | 当前风险层以观察和信号过滤为主。 |
+| 模拟盘买卖强制风控 | implemented（仅本地） | 尚未部署、观察或验证；真实资金级风控仍为planned。 |
+| 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。
 
@@ -117,19 +129,19 @@ Batch 1当前主要保存：
 - 权益曲线。
 - 手续费和滑点账本。
 - 信号到订单、成交和收益的完整关联。
+- 参数候选、评价、人工决定、激活和回滚记录；这些表属于 2026-07-14 Batch G 计划，不属于服务器 schema 1 或本地 schema 5 的当前实际范围。
 
 ## 6. 关键文档读取顺序
 
-新Codex对话在行动前应完整读取：
+新 Codex 对话在行动前应完整读取：
 
 1. `AGENTS.md`
 2. `docs/project_roadmap.md`
 3. `docs/project_handoff.md`
-4. `docs/live_trading_execution_plan.md`
-5. `docs/codex_simulation_observation_plan.md`
-6. `docs/data_storage_policy.md`
-7. `docs/superpowers/specs/2026-07-11-simulation-stability-ledger-design.md`
-8. 与当前任务直接相关的spec、plan、测试和最近Git提交
+4. 主文档“当前有效从文档索引”中与任务直接相关的从文档
+5. 与当前任务直接相关的代码、测试和最近 20 条 Git 提交
+
+专项读取规则：修改交易、策略或风控时读取实盘执行方案和当前分层风险 spec/plan；修改账本或对账时读取稳定性账本设计；修改持久化数据时读取数据存储规范；执行 Codex 自动审核或服务器只读诊断时读取 Codex 观察方案；参数复核任务读取对应 spec/plan。`docs/archive/` 只在追溯历史决策时读取，不属于默认必读资料。
 
 读取后必须先区分：
 
@@ -176,11 +188,10 @@ git pull --ff-only origin main
 1. AGENTS.md
 2. docs/project_roadmap.md
 3. docs/project_handoff.md
-4. docs/live_trading_execution_plan.md
-5. docs/codex_simulation_observation_plan.md
-6. docs/data_storage_policy.md
-7. docs/superpowers/specs/2026-07-11-simulation-stability-ledger-design.md
-8. 与当前任务相关的专项spec、plan、测试和最近20条Git提交
+4. 主文档“当前有效从文档索引”中与当前任务相关的从文档
+5. 与当前任务相关的代码、测试和最近20条Git提交
+
+归档目录只用于追溯历史，不作为默认必读或当前状态依据。
 
 请先不要修改文件，不要提交、推送、部署或重启服务。
 
@@ -296,6 +307,7 @@ stockmonitor
 - 自动清理、归档或移动服务器数据。
 - 自动改变买卖、仓位和风控逻辑。
 - 自动操作订单和持仓。
+- 为参数候选写入批准/拒绝决定，或激活、回滚任何参数版本。
 
 即使用户授权实施某项修改，提交、推送和部署仍按用户当次明确授权范围执行，不从历史聊天推断长期授权。
 
@@ -334,6 +346,7 @@ stockmonitor
 3. JoinQuant信号拉取、账户快照、委托、成交和持仓同步。
 4. 阶段1有效观察日和连续稳定日。
 5. 健康历史、API事件、快照历史、扫描输出和缓存增长基线。
+6. Batch A-E 部署并完成执行安全观察后，再部署并观察已本地实现的自动备份恢复，随后检查完整账本和 Batch G 数据就绪门。
 
 当前推荐顺序仍是：
 
@@ -341,7 +354,9 @@ stockmonitor
 只读审核员接入
 → 连续交易日基线
 → 阶段1验收
-→ 再决定完整账本、存储Batch A或完整历史回测的实施顺序
+→ Batch A-E模拟盘部署与Batch F执行安全观察
+→ 完整账本、存储治理和完整历史回测
+→ Batch G半自动参数复核（自动分析、人工批准、另行授权发布）
 ```
 
 ## 16. 快照维护规则

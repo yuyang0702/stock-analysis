@@ -10,8 +10,10 @@ from typing import Any
 import pandas as pd
 
 import config as app_config
+from exit_policy import board_type, initial_stop_price, market_regime, risk_position_pct
 from pre_trade_check import PortfolioState, RiskLimits, evaluate_observation
 from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore, canonical_json
+from trade_safety import tradability_reject_reason
 
 
 def clean_code(value: Any) -> str:
@@ -47,7 +49,10 @@ def _text(value: Any) -> str:
 
 def _is_sell(row: pd.Series) -> bool:
     action = _text(row.get("signal_action")).lower()
-    return action in {"sell", "stop_loss", "take_profit", "time_stop"} or "sell" in action
+    return action in {
+        "sell", "stop_loss", "hard_stop", "take_profit", "take_profit_1",
+        "trailing_stop", "time_stop",
+    } or "sell" in action
 
 
 def _has_holding(row: pd.Series) -> bool:
@@ -56,10 +61,33 @@ def _has_holding(row: pd.Series) -> bool:
     return _text(row.get("hold_status")).lower() in {"holding", "partial_sell"}
 
 
-def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True, account_total_value: float = 0.0) -> str:
+def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True, account_total_value: float = 0.0,
+                       current_position_pct: float = 0.0, current_open_risk_pct: float = 0.0,
+                       sector_exposure_pct: dict[str, float] | None = None,
+                       theme_exposure_pct: dict[str, float] | None = None,
+                       cooldown_codes: set[str] | None = None, available_cash: float | None = None,
+                       new_positions_today: int = 0, orders_today: int = 0,
+                       daily_turnover_pct: float = 0.0, daily_pnl_pct: float = 0.0,
+                       account_drawdown_pct: float = 0.0, consecutive_losses: int = 0) -> str:
     if not allow_buy:
         return "buy_disabled"
+    risk_enabled = app_config.JOINQUANT_PORTFOLIO_RISK_ENABLE_DEFAULT
+    if risk_enabled:
+        if new_positions_today >= app_config.MAX_NEW_POSITIONS_PER_DAY:
+            return "buy_daily_new_positions_limit"
+        if orders_today >= app_config.MAX_ORDERS_PER_DAY:
+            return "buy_daily_orders_limit"
+        if daily_turnover_pct >= app_config.MAX_DAILY_TURNOVER_PCT:
+            return "buy_daily_turnover_limit"
+        if daily_pnl_pct <= -app_config.DAILY_LOSS_WARN_PCT:
+            return "buy_daily_loss_limit"
+        if account_drawdown_pct <= -app_config.ACCOUNT_DRAWDOWN_WARN_PCT:
+            return "buy_account_drawdown_limit"
+        if consecutive_losses >= app_config.MAX_CONSECUTIVE_LOSSES:
+            return "buy_consecutive_loss_limit"
     code = clean_code(row.get("code"))
+    if app_config.JOINQUANT_EXIT_COOLDOWN_ENABLE_DEFAULT and code in (cooldown_codes or set()):
+        return "buy_cooldown"
     price = _num(row.get("price"))
     entry = _num(row.get("entry_price"), price)
     take = _num(row.get("take_profit"))
@@ -69,7 +97,14 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
         return "buy_invalid_take_profit"
     if _is_sell(row):
         return "not_buy_sell_signal"
-    if _num(row.get("final_score")) < min_score:
+    tradability_reason = tradability_reject_reason(row) if app_config.JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT else ""
+    if tradability_reason:
+        return tradability_reason
+    regime = market_regime(_text(row.get("market_state")))
+    if regime == "RISK_OFF":
+        return "buy_disabled"
+    required_score = max(min_score, 85.0) if regime == "CAUTION" else min_score
+    if _num(row.get("final_score")) < required_score:
         return "buy_low_score"
     if _num(row.get("position_pct")) <= 0:
         return "buy_bad_position"
@@ -77,10 +112,30 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
         return "buy_near_limit_up"
     if price < entry:
         return "buy_not_reached_entry"
+    atr14 = _num(row.get("atr14"))
+    board = board_type(code, entry, atr14)
+    stop = initial_stop_price(entry, _num(row.get("support_level")), atr14, board)
+    adjusted_position_pct = risk_position_pct(entry, stop, board, _num(row.get("position_pct")), regime)
+    sector = _text(row.get("industry") or row.get("sector"))
+    theme = _text(row.get("theme") or row.get("concept"))
+    if not sector and not theme:
+        adjusted_position_pct = min(adjusted_position_pct, app_config.MAX_UNCATEGORIZED_POSITION_PCT)
+    added_risk = adjusted_position_pct * max(entry - stop, 0) / entry if entry > 0 else 0
+    open_risk_limit = app_config.MAX_OPEN_RISK_CAUTION_PCT if regime == "CAUTION" else app_config.MAX_OPEN_RISK_NORMAL_PCT
+    if risk_enabled and current_open_risk_pct + added_risk > open_risk_limit:
+        return "buy_open_risk_limit"
+    if risk_enabled and sector and (sector_exposure_pct or {}).get(sector, 0) + adjusted_position_pct > app_config.MAX_INDUSTRY_POSITION_PCT:
+        return "buy_sector_limit"
+    if risk_enabled and theme and (theme_exposure_pct or {}).get(theme, 0) + adjusted_position_pct > app_config.MAX_THEME_POSITION_PCT:
+        return "buy_theme_limit"
     if account_total_value > 0:
-        target_value = account_total_value * _num(row.get("position_pct")) / 100.0
+        target_value = account_total_value * adjusted_position_pct / 100.0
+        if available_cash is not None and target_value > available_cash:
+            return "buy_insufficient_available_cash"
         if target_value < entry * 100:
             return "buy_too_small_for_board_lot"
+        if risk_enabled and current_position_pct + adjusted_position_pct > app_config.MAX_TOTAL_POSITION_PCT:
+            return "buy_total_position_limit"
     return ""
 
 
@@ -109,8 +164,16 @@ def _buy_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, Any
     code = clean_code(row.get("code"))
     price = _num(row.get("price"))
     entry = _num(row.get("entry_price"), price)
-    stop = _num(row.get("stop_loss"))
-    take = _num(row.get("take_profit"))
+    atr14 = _num(row.get("atr14"))
+    board = board_type(code, entry, atr14)
+    stop = initial_stop_price(entry, _num(row.get("support_level")), atr14, board)
+    take = round(entry + max(entry - stop, 0) * 2, 2)
+    regime = market_regime(_text(row.get("market_state")))
+    position_pct = risk_position_pct(
+        entry, stop, board, _num(row.get("position_pct")), regime,
+    )
+    if not _text(row.get("industry") or row.get("sector")) and not _text(row.get("theme") or row.get("concept")):
+        position_pct = min(position_pct, app_config.MAX_UNCATEGORIZED_POSITION_PCT)
     return {
         "id": _signal_id(run_id, code, "buy", index),
         "code": code,
@@ -121,11 +184,15 @@ def _buy_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, Any
         "entry_price": round(entry, 2),
         "stop_loss": round(stop, 2) if stop > 0 else None,
         "take_profit": round(take, 2) if take > 0 else None,
-        "position_pct": round(_num(row.get("position_pct")), 2),
+        "position_pct": position_pct,
         "final_score": round(_num(row.get("final_score")), 1),
         "enhanced_score": round(_num(row.get("enhanced_score")), 1) if _num(row.get("enhanced_score")) else None,
         "signal_type": _text(row.get("mode")) or _text(row.get("buy_state")) or "signal",
+        "max_age_min": 5 if (_text(row.get("mode")) or "").lower() == "short" else 20,
         "reason": _text(row.get("risk_reason") or row.get("buy_reason") or row.get("entry_reason")),
+        "atr14": round(atr14, 4) if atr14 > 0 else None,
+        "board_type": board,
+        "market_regime": regime,
     }
 
 
@@ -134,8 +201,8 @@ def _sell_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, An
     price = _num(row.get("price"))
     if not code or price <= 0:
         return None
-    return {
-        "id": _signal_id(run_id, code, "sell", index),
+    signal = {
+        "id": _text(row.get("exit_signal_id")) or _signal_id(run_id, code, "sell", index),
         "code": code,
         "jq_code": to_jq_code(code),
         "name": _text(row.get("name")),
@@ -143,6 +210,9 @@ def _sell_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, An
         "price": round(price, 2),
         "reason": _text(row.get("risk_reason") or row.get("signal_note") or row.get("buy_reason")),
     }
+    if row.get("target_qty") is not None and not pd.isna(row.get("target_qty")):
+        signal["target_qty"] = max(0, int(_num(row.get("target_qty"))))
+    return signal
 
 
 def export_signals(
@@ -155,6 +225,18 @@ def export_signals(
     ml_sample_path: Path | None = None,
     allow_buy: bool = True,
     account_total_value: float = 0.0,
+    current_position_pct: float = 0.0,
+    current_open_risk_pct: float = 0.0,
+    sector_exposure_pct: dict[str, float] | None = None,
+    theme_exposure_pct: dict[str, float] | None = None,
+    cooldown_codes: set[str] | None = None,
+    available_cash: float | None = None,
+    new_positions_today: int = 0,
+    orders_today: int = 0,
+    daily_turnover_pct: float = 0.0,
+    daily_pnl_pct: float = 0.0,
+    account_drawdown_pct: float = 0.0,
+    consecutive_losses: int = 0,
     store: TradingStore | None = None,
 ) -> Path:
     dry_run = app_config.JOINQUANT_DRY_RUN_DEFAULT if dry_run is None else dry_run
@@ -166,11 +248,40 @@ def export_signals(
     reject_reasons: Counter[str] = Counter()
     if df is not None and not df.empty:
         signals: list[dict[str, Any]] = []
-        for index, (_, row) in enumerate(df.iterrows()):
-            buy_reject_reason = _buy_reject_reason(row, min_score, allow_buy=allow_buy, account_total_value=account_total_value)
+        ordered_rows = [row for _, row in df.iterrows()]
+        if not any(_is_sell(row) for row in ordered_rows):
+            ordered_rows.sort(key=lambda row: -_num(row.get("final_score")))
+        for index, row in enumerate(ordered_rows):
+            buy_reject_reason = _buy_reject_reason(
+                row, min_score, allow_buy=allow_buy, account_total_value=account_total_value,
+                current_position_pct=current_position_pct, current_open_risk_pct=current_open_risk_pct,
+                sector_exposure_pct=sector_exposure_pct,
+                theme_exposure_pct=theme_exposure_pct,
+                cooldown_codes=cooldown_codes,
+                available_cash=available_cash,
+                new_positions_today=new_positions_today, orders_today=orders_today,
+                daily_turnover_pct=daily_turnover_pct, daily_pnl_pct=daily_pnl_pct,
+                account_drawdown_pct=account_drawdown_pct,
+                consecutive_losses=consecutive_losses,
+            )
             if not buy_reject_reason:
                 signal = _buy_signal(row, run_id, index)
                 signals.append(signal)
+                current_position_pct += float(signal.get("position_pct") or 0)
+                entry = float(signal.get("entry_price") or 0)
+                current_open_risk_pct += float(signal.get("position_pct") or 0) * max(
+                    entry - float(signal.get("stop_loss") or entry), 0,
+                ) / entry if entry > 0 else 0
+                sector = _text(row.get("industry") or row.get("sector"))
+                if sector:
+                    sector_exposure_pct = dict(sector_exposure_pct or {})
+                    sector_exposure_pct[sector] = sector_exposure_pct.get(sector, 0) + float(signal.get("position_pct") or 0)
+                theme = _text(row.get("theme") or row.get("concept"))
+                if theme:
+                    theme_exposure_pct = dict(theme_exposure_pct or {})
+                    theme_exposure_pct[theme] = theme_exposure_pct.get(theme, 0) + float(signal.get("position_pct") or 0)
+                if available_cash is not None:
+                    available_cash -= account_total_value * float(signal.get("position_pct") or 0) / 100.0
                 sample_rows.append((row, signal))
             elif _is_sell(row) and _has_holding(row):
                 sell = _sell_signal(row, run_id, index)
@@ -228,6 +339,11 @@ def export_signals(
                     generated_at=payload["generated_at"], expires_at="",
                     raw_json=canonical_json(signal),
                 )))
+                if signal["action"] == "sell":
+                    store.upsert_exit_intent(
+                        conn, signal["id"], signal["code"], int(signal.get("target_qty") or 0),
+                        str(signal.get("reason") or "sell"), payload["generated_at"],
+                    )
                 metrics = decision.metrics
                 conn.execute(
                     """INSERT INTO risk_decisions(

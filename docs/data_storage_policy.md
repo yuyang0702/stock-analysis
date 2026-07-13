@@ -81,6 +81,8 @@
 - 必须有在线备份、完整性检查和恢复演练。
 - 任何删除或压缩必须基于明确的审计和策略验证要求。
 
+Batch G 半自动参数复核计划使用同一 SQLite 保存不可变参数版本、聚合评价、人工决定和激活/回滚事件。该范围当前仅为 `planned`，不属于服务器 schema version 1 或本地 schema version 5。报告不是审批事实源，`output/parameter_review_latest.md` 只允许原子覆盖；不得为每轮扫描或每个参数组合新增 JSONL/独立文件。
+
 ### 3.3 事件历史
 
 示例：
@@ -177,6 +179,8 @@ output/
 | 盘中扫描文件 | 30天 | 180天压缩 | 每日最终版长期 |
 | 策略信号样本 | 长期 | 定期备份 | 逐步迁入SQLite |
 | SQLite交易账本 | 长期 | 多级备份 | 不按日志清理 |
+| 参数版本、评价和人工决定 | 长期 | 随SQLite多级备份 | 低频审计数据；每次最多5个候选，不复制全量行情/订单 |
+| 参数复核latest报告 | 当前版本 | 无需单独归档 | 原子覆盖；状态变化和阶段验收才生成低频归档 |
 | 通知失败队列 | 成功后移除 | 保存失败摘要 | 不无限保留正文 |
 | 行业和市场缓存 | 按TTL | 少量备份 | 可重建 |
 
@@ -322,7 +326,14 @@ SQLite WAL持续异常增长：warning
 
 ## 14. 当前文件治理优先级
 
-当前状态快照（2026-07-12）：本规范已经生效，但运行治理能力仍为部分实现。服务器上的 `health_history.jsonl` 和 `api_events.jsonl` 仍是单文件，盘中扫描仍持续生成独立 CSV/Markdown；月度轮转、盘中报告保留、统一归档、SQLite 在线备份和恢复演练尚未完成。不得因规范文档存在而把这些运行能力标记为 implemented、deployed 或 validated。
+### 14.1 2026-07-13 持仓周期账本增量
+
+本地 SQLite schema version 5新增 `position_cycles`、`order_events`、`exit_intents`和`trade_cooldowns`，属于低频、长期、可审计交易状态。按每年约250个交易日、每天最多50条委托事件、每行连同索引保守按4KB估算，年增量不超过约50MB。
+
+`TradingStore.backup_to`、目标连接显式关闭、项目外路径保护、原子发布、SHA-256、`PRAGMA integrity_check`、schema/核心计数、7份每日/4份每周/12份每月保留、保守清理、隔离季度恢复演练、latest/季度报告、告警复用和 systemd 模板已在本地 `implemented`。服务器尚未安装 timer 或产生自动证据，因此保持 `not deployed / not observed / not validated`；原“运行治理能力部分实现”的结论不变。
+当前状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。服务器上的 `health_history.jsonl` 和 `api_events.jsonl` 仍是单文件，盘中扫描仍持续生成独立 CSV/Markdown；月度轮转、盘中报告保留和统一归档尚未完成；SQLite 自动备份与恢复演练虽已本地实现，但尚未部署、观察或验证。不得因本地测试通过而把服务器能力标记为 deployed 或 validated。
+
+2026-07-14 计划增量：半自动参数复核的年度新增 SQLite 聚合数据目标低于约 30 MB；超过 50 MB/年、单次评价明细超过 5 MB、单次候选超过 5 个或出现逐扫描持久化时必须报警并暂停扩展评审。自动 SQLite 备份、轮转和恢复演练是其发布前置；当前仅本地 `implemented`，在完成服务器部署、至少7个自然日观察和季度恢复验收前，参数复核仍不能标为可发布。
 
 ### Batch A：低风险性能优化
 

@@ -65,6 +65,16 @@ def _ledger_status(db_file: Path, signals: list[dict[str, Any]]) -> tuple[bool, 
         return False, health.schema_version, 0, False, _sanitize_ledger_error(str(exc))
 
 
+def _exit_intent_mismatches(db_file: Path, snapshot: dict[str, Any]) -> list[str]:
+    try:
+        intents = TradingStore(db_file).get_open_exit_intents()
+    except Exception:
+        return []
+    quantities = _position_map(snapshot)
+    return sorted(code for code, intent in intents.items()
+                  if quantities.get(code, 0) <= int(intent.get("target_qty") or 0))
+
+
 def _load_json(path: Path) -> tuple[dict[str, Any], str]:
     if not path.exists():
         return {}, "missing"
@@ -287,6 +297,7 @@ def build_health_report(
     failed_order_breakdown = _failed_order_breakdown(snapshots_for_orders)
     api_counts = _api_counts(api_events, today)
     position_consistency, position_mismatches = _position_consistency(snapshot_payload, positions_file)
+    exit_intent_mismatches = _exit_intent_mismatches(db_file, snapshot_payload) if ledger_ok else []
     issues: list[str] = []
     issue_codes: list[str] = []
 
@@ -334,6 +345,10 @@ def build_health_report(
         issue_codes.append("position_file_invalid")
         issues.append("本地持仓文件异常，无法和 JoinQuant 快照对账")
 
+    if exit_intent_mismatches:
+        issue_codes.append("exit_intent_position_mismatch")
+        issues.append(f"Exit intent already reached target but remains active: {','.join(exit_intent_mismatches[:8])}")
+
     if api_counts["api_error_count_today"] > 0:
         issue_codes.append("api_errors")
         issues.append(f"今日 JoinQuant API 异常请求 {api_counts['api_error_count_today']} 次")
@@ -373,6 +388,7 @@ def build_health_report(
         "position_count": len(positions),
         "position_consistency": position_consistency,
         "position_mismatches": position_mismatches,
+        "exit_intent_mismatches": exit_intent_mismatches,
         "strategy_template_version": strategy_template_version,
         "expected_template_version": expected_template_version,
         "signal_pull_count_today": api_counts["signal_pull_count_today"],
