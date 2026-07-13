@@ -169,6 +169,26 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertIn("固定硬止损", report)
             self.assertTrue(migration_file.exists())
 
+    def test_sync_defaults_missing_consecutive_losses_to_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_file = root / "account.json"
+            positions_file = root / "positions.json"
+            account_file.write_text(
+                json.dumps({"schema_version": 1, "positions": []}), encoding="utf-8"
+            )
+
+            joinquant_sync.sync_account_snapshot(
+                account_file,
+                positions_file,
+                root / "events.jsonl",
+                store=TradingStore(root / "trading.db"),
+                migration_report_file=root / "migration.md",
+            )
+
+            payload = json.loads(positions_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload["account"]["consecutive_losses"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -305,7 +305,7 @@ def sync_account_snapshot(
             "daily_turnover_pct": _num(snapshot.get("daily_turnover_pct")),
             "daily_pnl_pct": _num(snapshot.get("daily_pnl_pct")),
             "account_drawdown_pct": _num(snapshot.get("account_drawdown_pct")),
-            "consecutive_losses": int(_num(snapshot.get("consecutive_losses"))),
+            "consecutive_losses": int(_num(snapshot.get("consecutive_losses"), 0) or 0),
             "pending_buy_position_pct": _num(snapshot.get("pending_buy_position_pct")),
             "pending_buy_risk_pct": _num(snapshot.get("pending_buy_risk_pct")),
             "trade_date": snapshot.get("trade_date"),
