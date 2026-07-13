@@ -1,6 +1,6 @@
 ﻿# SQLite Automatic Backup and Recovery Implementation Plan
 
-> **状态：** Tasks 1–5 本地 `implemented`，核心计数已兼容 schema 6 完整账本；尚未提交、推送、部署、观察或验证。Linux systemd 模板只有静态检查证据，仍需服务器执行测试与 timer 安装确认。
+> **状态：** Tasks 1–5 已随本地提交 `9f4c12d` 完成 `implemented`，核心计数已兼容 schema 6 完整账本；尚未推送、部署、观察或验证。Linux systemd 模板只有静态检查证据，仍需服务器执行测试与 timer 安装确认。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
@@ -120,6 +120,8 @@ Create `trading_backup.py` with:
 CORE_TABLES = (
     "schema_migrations", "strategy_runs", "signals", "risk_decisions", "system_state",
     "position_cycles", "order_events", "exit_intents", "trade_cooldowns",
+    "orders", "fills", "account_snapshots", "position_snapshots", "daily_equity",
+    "reconciliation_runs", "reconciliation_items", "control_events",
 )
 
 def database_facts(db_file: Path) -> dict[str, object]:

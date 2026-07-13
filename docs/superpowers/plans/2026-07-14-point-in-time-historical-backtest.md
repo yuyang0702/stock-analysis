@@ -4,7 +4,7 @@
 
 **Goal:** Build an independent, deterministic A-share daily backtest that supports honest `strict` point-in-time evidence and explicitly labeled `price_core` proxy evidence without changing the existing signal-level backtest.
 
-**Local completion evidence (2026-07-14):** Framework `implemented` in the isolated worktree. Fresh verification passed 254 platform-independent tests, 2 Linux static entrypoint tests, module compilation, and `git diff --check`. No commit, push, deployment, server write, real 6/12-month dataset run, observation, or validation occurred.
+**Local completion evidence (2026-07-14):** Framework `implemented` and committed locally as `9f4c12d`. Pre-commit verification passed 254 platform-independent tests, 2 Linux static entrypoint tests, module compilation, and `git diff --check`. No push, deployment, server write, real 6/12-month dataset run, observation, or validation occurred.
 
 **Architecture:** `historical_data.py` owns a separate SQLite history database, imports and quality gates. `historical_strategy.py` generates deterministic candidates without realtime calls. `historical_backtest.py` owns next-open matching, account state, walk-forward metrics, CLI and atomic outputs. Existing `exit_policy.py` supplies layered exit decisions; the formal trading ledger remains untouched.
 
@@ -19,7 +19,7 @@
 - `strict` rejects missing, conflicting, future, survivorship-biased, or version-mixed inputs; it never fills them silently.
 - `price_core` always reports `proxy_only=true` and cannot satisfy the complete-history gate.
 - Default matching is close decision at T and open execution at T+1; T+1, suspensions, price limits, fees, slippage, lots and cash limits are mandatory.
-- No commit, push, deployment, timer, service restart, server write, or JoinQuant mutation without separate user authorization.
+- No further commit, push, deployment, timer, service restart, server write, or JoinQuant mutation without separate user authorization.
 
 ---
 
@@ -408,4 +408,4 @@ Expected: all platform-independent and Linux static tests pass. Record the three
 
 - [x] **Step 5: Verify status without Git mutation**
 
-Confirm no commit, push, deployment, server write, service restart, timer installation, real-data observation or validation occurred. Mark this plan locally complete only after every preceding command has fresh passing evidence.
+Confirm that implementation was committed locally only after separate authorization; no push, deployment, server write, service restart, timer installation, real-data observation or validation occurred. Mark this plan locally complete only after every preceding command has fresh passing evidence.

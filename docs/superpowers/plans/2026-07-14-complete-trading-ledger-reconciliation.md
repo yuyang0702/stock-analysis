@@ -1,6 +1,6 @@
 # Complete Trading Ledger and Reconciliation Implementation Plan
 
-> **Status (2026-07-14):** Tasks 1–8 are locally `implemented` in the isolated worktree. Platform-independent verification passes; the three Bash execution tests remain reserved for Linux because Bash is unavailable on this Windows host. Nothing in this worktree is committed, pushed, deployed, observed, or validated.
+> **Status (2026-07-14):** Tasks 1–8 are locally `implemented` and committed as `9f4c12d`. Pre-commit platform-independent verification passed; the Bash execution tests remain reserved for Linux because Bash was unavailable on this Windows host. The commit is not pushed, deployed, observed, or validated.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
@@ -545,4 +545,4 @@ Confirm schema migration, immutable fills, callback ordering, reconciliation cat
 
 - [x] **Step 7: Stop before Git or deployment operations**
 
-Report modified files, exact verification output, remaining Linux/server/JoinQuant checks, and current Git status. Await separate authorization for commit, push, server migration, JoinQuant website update, service restart, or live observation.
+Report modified files, exact verification output, remaining Linux/server/JoinQuant checks, and current Git status. This checkpoint was followed by separate authorization for the local commit `9f4c12d`; push, server migration, JoinQuant website update, service restart, and live observation remain unauthorized and undone.

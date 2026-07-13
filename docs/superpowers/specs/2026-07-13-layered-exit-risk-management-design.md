@@ -6,7 +6,7 @@
 
 ## 1. 状态边界
 
-当前本地工作区已 `implemented`：分层退出、全持仓硬止损、持仓周期、执行安全、真实组合买入风控、可交易性过滤、市场状态滞后和退出冷却。它们尚未提交、推送、部署、观察或验证；服务器最近确认仍为 SQLite schema version 1，不能把本地 schema version 5 或网站模板 `2026-07-13.3-risk-controls` 写成服务器事实。
+本地提交 `9f4c12d` 已 `implemented`：分层退出、全持仓硬止损、持仓周期、执行安全、真实组合买入风控、可交易性过滤、市场状态滞后和退出冷却。它尚未推送、部署、观察或验证；服务器最近确认仍为 SQLite schema version 1，不能把本地 schema version 6 或网站模板 `2026-07-14.1-ledger-v6` 写成服务器事实。
 
 状态含义固定为：
 
@@ -100,7 +100,7 @@ R = 入场价 - 冻结初始止损价
 
 ## 6. 持仓周期与执行状态
 
-SQLite 本地 schema version 5 包含：
+SQLite 本地 schema version 6 保留以下 schema 5 持仓与执行状态表，并在完整账本专项中增加订单、成交、快照、权益、对账和控制审计表：
 
 - `position_cycles`：买入信号、首次成交、加权成本、初始数量、冻结止损、初始 R、ATR、建仓市场状态、最高可信价和止盈阶段。
 - `order_events`：委托 ID、状态、数量、成交量、失败原因和回调幂等。
@@ -131,7 +131,7 @@ SQLite 本地 schema version 5 包含：
 
 ## 9. JoinQuant 契约与安全降级
 
-信号 JSON 保持 schema version 1，并使用可选 `target_qty` 表达部分卖出。JoinQuant 模板 `2026-07-13.3-risk-controls` 使用 `order_target` 执行目标数量，检查可卖数量、冻结数量、未完成委托和当前价格。
+信号 JSON 保持 schema version 1，并使用可选 `target_qty` 表达部分卖出。JoinQuant 模板 `2026-07-14.1-ledger-v6` 使用 `order_target` 执行目标数量，检查可卖数量、冻结数量、未完成委托和当前价格，并回传逐笔成交。
 
 安全降级原则：
 
@@ -142,6 +142,6 @@ SQLite 本地 schema version 5 包含：
 
 ## 10. 存储与验证
 
-持仓周期、委托事件、退出意图和冷却属于长期审计数据，不按日志清理。`TradingStore.backup_to`、恢复副本读取和 `PRAGMA integrity_check` 已在本地 `implemented`；自动定时备份、7日/4周/12月轮转和服务器恢复演练仍为 `planned`。
+持仓周期、委托事件、退出意图和冷却属于长期审计数据，不按日志清理。自动在线备份、7日/4周/12月轮转、隔离恢复演练、报告和 systemd 模板已在本地 `implemented`；服务器 timer 安装、自动运行观察和季度恢复验收仍为 `not deployed / not observed / not validated`。
 
 部署与验证必须分层：本地测试完成只代表 `implemented`；服务器与 JoinQuant 模板同步后是 `deployed`；首个有效交易日逐笔一致才是 `observed`；连续 3 日执行安全和至少 20 日策略观察达到门槛后，相关能力才能人工标为 `validated`。

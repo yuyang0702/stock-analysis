@@ -335,7 +335,7 @@ SQLite WAL持续异常增长：warning
 高频账户摘要保留366天热数据；订单、逐笔成交、日权益、控制事件、异常对账及其引用快照长期保留。清理每日最多运行一次，只删除超过热保留期且没有异常对账引用的账户快照与无差异摘要；未来压缩或扩大清理范围必须另行设计、dry-run并人工授权。
 
 `TradingStore.backup_to`、目标连接显式关闭、项目外路径保护、原子发布、SHA-256、`PRAGMA integrity_check`、schema/核心计数、7份每日/4份每周/12份每月保留、保守清理、隔离季度恢复演练、latest/季度报告、告警复用和 systemd 模板已在本地 `implemented`。服务器尚未安装 timer 或产生自动证据，因此保持 `not deployed / not observed / not validated`；原“运行治理能力部分实现”的结论不变。
-当前状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。schema 6完整账本、366天热保留、自动对账、控制审计以及自动备份/恢复演练均仅本地 `implemented`；服务器上的 `health_history.jsonl` 和 `api_events.jsonl` 仍是单文件，盘中扫描仍持续生成独立 CSV/Markdown。上述能力尚未提交、部署、观察或验证，不得因本地测试通过标记为 deployed 或 validated。
+当前状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。schema 6完整账本、366天热保留、自动对账、控制审计以及自动备份/恢复演练均已在本地提交 `9f4c12d` 并为 `implemented`；服务器上的 `health_history.jsonl` 和 `api_events.jsonl` 仍是单文件，盘中扫描仍持续生成独立 CSV/Markdown。上述能力尚未推送、部署、观察或验证，不得因本地测试通过标记为 deployed 或 validated。
 
 2026-07-14 计划增量：半自动参数复核的年度新增 SQLite 聚合数据目标低于约 30 MB；超过 50 MB/年、单次评价明细超过 5 MB、单次候选超过 5 个或出现逐扫描持久化时必须报警并暂停扩展评审。自动 SQLite 备份、轮转和恢复演练是其发布前置；当前仅本地 `implemented`，在完成服务器部署、至少7个自然日观察和季度恢复验收前，参数复核仍不能标为可发布。
 

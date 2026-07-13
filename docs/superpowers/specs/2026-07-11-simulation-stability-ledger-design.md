@@ -8,17 +8,17 @@
 >
 > 执行从文档：`docs/live_trading_execution_plan.md`。
 >
-> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。原 Batch 1 schema 1 已部署事实保持不变；完整账本与自动对账现已在隔离工作树本地 `implemented`，但尚未提交、推送、部署、观察或验证。只有服务器和 JoinQuant 同步及对应线上验收完成后，才能提升到 `deployed / observed / validated`。
+> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。原 Batch 1 schema 1 已部署事实保持不变；完整账本与自动对账已随本地提交 `9f4c12d` 完成 `implemented`，但尚未推送、部署、观察或验证。只有服务器和 JoinQuant 同步及对应线上验收完成后，才能提升到 `deployed / observed / validated`。
 
 ## 0. 当前增量状态
 
-原 Batch 1 的服务器已部署事实仍指 schema version 1 的策略运行、信号、观察型风险和系统状态账本。GitHub `main` 的提交 `8e35d03c90af2592921c81347bddf8b5af41ba94` 包含 schema version 5 基础；当前隔离工作树在其上实现 schema version 6。服务器最近确认仍为 `aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1；该外部状态必须重新只读核验，不能从本地代码或 GitHub 状态推断为已部署。
+原 Batch 1 的服务器已部署事实仍指 schema version 1 的策略运行、信号、观察型风险和系统状态账本。本地远端跟踪引用 `origin/main` 的提交 `8e35d03c90af2592921c81347bddf8b5af41ba94` 包含 schema version 5 基础；本地提交 `9f4c12d` 在其上实现 schema version 6。服务器最近确认仍为 `aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1；GitHub 实时引用和服务器外部状态都必须重新核验，不能从本地代码推断为已部署。
 
-下述“完整账本与自动对账增量”已获用户设计批准并在本地 `implemented`：schema version 6、订单/逐笔成交、账户与持仓检查点、日权益、自动对账、控制审计、企业微信摘要和人工解锁入口均有自动化证据。当前仍为 `not committed / not pushed / not deployed / not observed / not validated`。
+下述“完整账本与自动对账增量”已获用户设计批准并在本地 `implemented`：schema version 6、订单/逐笔成交、账户与持仓检查点、日权益、自动对账、控制审计、企业微信摘要和人工解锁入口均有自动化证据。当前已提交为 `9f4c12d`，仍为 `not pushed / not deployed / not observed / not validated`。
 
 ### 0.1 完整账本与自动对账增量
 
-本增量先完成模拟盘证据闭环，不改变选股、评分、买卖、仓位、止盈止损或 JoinQuant 撮合语义。完整历史回测是其后的独立子项目，不与本次 schema migration 混合实施。
+本增量先完成模拟盘证据闭环，不改变选股、评分、买卖、仓位、止盈止损或 JoinQuant 撮合语义。完整历史回测已作为独立模块实现，仍与本次 schema migration、正式交易账本和部署状态分离。
 
 采用标准库和现有 SQLite 单库扩展方案：在一个向前兼容 migration 中增加正式订单、逐笔成交、账户摘要、持仓检查点、权益日线、对账批次、差异项和人工控制审计表；保留现有 `order_events` 作为原始状态事件，不复制成第二套无关事件流。JoinQuant 每分钟回传当前账户、平台订单和逐笔成交，服务器在同一事务内幂等入账并完成增量对账。
 
@@ -142,7 +142,11 @@ bash run_ubuntu.sh resume-buy --reason "..."
 
 本地代码和测试通过只代表 `implemented`；服务器 schema、服务和 JoinQuant 模板同步后是 `deployed`；真实模拟盘交易日出现订单、成交、对账和控制证据后是 `observed`；连续 3 个有效交易日无重复成交、无不可解释差异且人工解除演练通过，才可把执行与对账标为 `validated`。策略有效性仍按 20 个有效交易日评价。
 
-## 1. 目标与范围
+## 1. 原始基线设计（保留追溯）
+
+本节至第 17 节保留 2026-07-11 的 Batch 1 原始设计和观察口径，用于解释 schema 1 的服务器历史检查点；当前本地 schema 6、强制模拟盘风险规则、部署顺序和历史回测状态分别以第 0 节、分层退出专项 spec/plan、完整账本 plan 和逐日历史回测 spec/plan 为准。旧基线中的“后续、未实现或观察模式”不得覆盖这些当前文档。
+
+### 1.1 目标与范围
 
 本阶段保留现有“A 股扫描与信号生成 -> JoinQuant 模拟盘执行 -> 账户与订单回传 -> 企业微信通知和复盘”主链路，用 20 个有效交易日验证策略表现和执行稳定性。
 
@@ -624,8 +628,8 @@ bash run_ubuntu.sh reconcile
 
 1. 是否调整现有策略评分、买点、卖点或仓位；
 2. 哪些影子风控规则值得转为正式阻断；
-3. 是否进入完整逐日历史回测；
+3. 是否导入 strict 时点数据并完成完整逐日历史回测运行与验证；
 4. 是否延长模拟验证；
 5. 是否开始单独设计小资金实盘适配层。
 
-未完成完整历史回测、订单对账和实盘级风控前，不接入真实资金。
+未完成 strict 历史回测验证、订单对账和实盘级风控前，不接入真实资金。

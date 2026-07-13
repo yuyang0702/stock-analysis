@@ -1,6 +1,6 @@
 # SQLite 自动备份与恢复演练设计
 
-> 状态：本地 `implemented`，服务器 `not deployed / not observed / not validated`。`trading_backup.py`、7/4/12 轮转、隔离恢复演练、状态报告、告警复用和 systemd 模板已通过本地测试；核心计数现已覆盖 schema 6 完整账本表。服务器安装、自动运行证据和季度演练验收仍需单独授权与真实观察。
+> 状态：已随本地提交 `9f4c12d` 完成 `implemented`，服务器 `not deployed / not observed / not validated`。`trading_backup.py`、7/4/12 轮转、隔离恢复演练、状态报告、告警复用和 systemd 模板已通过本地测试；核心计数现已覆盖 schema 6 完整账本表。服务器安装、自动运行证据和季度演练验收仍需单独授权与真实观察。
 
 ## 1. 目标
 
@@ -110,7 +110,7 @@ output/trading_backup_latest.md
 
 ## 7. 核心计数与兼容性
 
-首版核心计数仅覆盖当前 schema version 5 已存在且足以验证结构可读性的表：
+当前核心计数覆盖 schema version 6 的基础账本、持仓周期和完整执行账本表：
 
 ```text
 schema_migrations
@@ -122,6 +122,14 @@ position_cycles
 order_events
 exit_intents
 trade_cooldowns
+orders
+fills
+account_snapshots
+position_snapshots
+daily_equity
+reconciliation_runs
+reconciliation_items
+control_events
 ```
 
 读取时先检查 `sqlite_master`；未来新增表不要求旧备份包含。manifest 记录备份自身 schema version，演练按该版本的实际表集合核对，不对历史备份自动迁移。
@@ -165,7 +173,7 @@ manifest、报告和通知只保存截断后的错误摘要，不包含环境变
 
 自动测试至少覆盖：
 
-- 在线备份可恢复 schema version 5 和核心计数；
+- 在线备份可恢复 schema version 6 和上述核心计数；
 - 临时文件与 manifest 只有全部校验成功后才原子发布；
 - 损坏副本和 SHA-256 不一致被拒绝；
 - 同日重复执行只保留最后一个成功槽位，失败不替换已有有效副本；

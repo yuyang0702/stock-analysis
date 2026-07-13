@@ -7,11 +7,13 @@ import sys
 import tempfile
 import unittest
 
-from trading_store import TradingStore
+from trading_store import SCHEMA_VERSION, TradingStore
 
 
 class JoinQuantLinuxScriptTest(unittest.TestCase):
-    def run_ledger_check(self, db_path: Path, *, schema_version: int = 5) -> subprocess.CompletedProcess[str]:
+    def run_ledger_check(
+        self, db_path: Path, *, schema_version: int = SCHEMA_VERSION
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             app_dir = Path(temp_dir)
             for name in ("run_ubuntu.sh", "config.py", "trading_store.py"):
@@ -27,7 +29,7 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
                 f"TRADING_DB_FILE={db_path.as_posix()}\nRISK_MODE=observe\n",
                 encoding="utf-8",
             )
-            if schema_version != 5:
+            if schema_version != SCHEMA_VERSION:
                 with sqlite3.connect(db_path) as conn:
                     conn.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
                     conn.execute("INSERT INTO schema_migrations VALUES (?, datetime('now'))", (schema_version,))
@@ -115,17 +117,21 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertFalse(Path("start_linux_all.sh").exists())
         self.assertFalse(Path("start_joinquant_linux.sh").exists())
 
-    def test_ledger_check_routes_and_probes_version_five_database(self) -> None:
+    def test_ledger_check_routes_and_probes_current_schema_database(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "trading.db"
             result = self.run_ledger_check(db_path)
 
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("schema_version=5 health=ok writable_probe=ok", result.stdout)
+            self.assertIn(
+                f"schema_version={SCHEMA_VERSION} health=ok writable_probe=ok", result.stdout
+            )
 
     def test_ledger_check_rejects_schema_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            result = self.run_ledger_check(Path(temp_dir) / "trading.db", schema_version=6)
+            result = self.run_ledger_check(
+                Path(temp_dir) / "trading.db", schema_version=SCHEMA_VERSION + 1
+            )
 
             self.assertNotEqual(0, result.returncode)
 

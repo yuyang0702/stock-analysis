@@ -17,7 +17,7 @@
 1. Batch A-E 已部署到 JoinQuant 模拟盘，并完成 Batch F 首日逐笔核对和连续 3 个有效交易日执行安全观察。
 2. SQLite 完整订单、成交、费用、持仓周期和收益关联足以复算评价指标；缺口未补齐时先完成账本工作。
 3. 自动 SQLite 备份、保留轮转和恢复演练已实现，不能只依赖本地 `backup_to` 单元测试。
-4. 完整历史回测若尚未实现，候选只能保持 `research_only`，直到满足 60 个有效模拟盘交易日的替代门槛。
+4. 逐日历史回测框架已本地实现，但在真实 strict 数据、3 个 walk-forward 窗口和人工复算形成可用证据前，候选只能保持 `research_only`；否则需满足 60 个有效模拟盘交易日的替代门槛。
 5. 基线参数版本已经冻结，服务器、JoinQuant 和账本中的版本一致。
 
 实施顺序固定为：数据契约 → 只读评价 → 候选与报告 → 人工决定 → 显式激活/回滚 → 调度与健康检查 → 模拟盘观察。不得先实现自动发布再补权限保护。
@@ -60,7 +60,7 @@ Expected: focused tests pass。
 
 **Step 1: Write failing migration and constraint tests**
 
-覆盖从当前 schema version 5 原位迁移且旧数据不丢失；创建 `parameter_sets`、`parameter_evaluations`、`parameter_decisions`、`parameter_activations`；版本、哈希、评价窗口和决定幂等；候选内容不可更新；外键和唯一约束生效；重复迁移安全；在线备份和恢复副本可读取新表。
+覆盖从当前 schema version 6 原位迁移且旧数据不丢失；创建 `parameter_sets`、`parameter_evaluations`、`parameter_decisions`、`parameter_activations`；版本、哈希、评价窗口和决定幂等；候选内容不可更新；外键和唯一约束生效；重复迁移安全；在线备份和恢复副本可读取新表。
 
 **Step 2: Run the focused test**
 
@@ -120,7 +120,7 @@ Expected: deterministic tests pass，且现有 backtest tests 无回归。
 
 **Step 1: Write failing candidate tests**
 
-覆盖：每次最多 5 个候选、每族最多 2 个、单候选单参数族、有限步长、同输入同 ID/哈希；样本不足只返回 `insufficient_data`；完整历史回测缺失且不足 60 日时只能 `research_only`；2/3 窗口、PF +5%、净收益、回撤、离群交易、分层灾难性退化和执行失败率门槛逐项可解释。
+覆盖：每次最多 5 个候选、每族最多 2 个、单候选单参数族、有限步长、同输入同 ID/哈希；样本不足只返回 `insufficient_data`；缺少可用 strict 历史回测证据且不足 60 日时只能 `research_only`；2/3 窗口、PF +5%、净收益、回撤、离群交易、分层灾难性退化和执行失败率门槛逐项可解释。
 
 **Step 2: Run focused tests**
 
