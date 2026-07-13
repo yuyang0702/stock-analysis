@@ -26,8 +26,10 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
 
     def test_template_posts_version_with_snapshot(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
+        config_text = Path("config.py").read_text(encoding="utf-8")
 
         self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-14.1-ledger-v6"', text)
+        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-14.1-ledger-v6"', config_text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
 
     def test_template_retries_pending_order_event_callback(self) -> None:
