@@ -25,6 +25,14 @@ CORE_TABLES = (
     "order_events",
     "exit_intents",
     "trade_cooldowns",
+    "orders",
+    "fills",
+    "account_snapshots",
+    "position_snapshots",
+    "daily_equity",
+    "reconciliation_runs",
+    "reconciliation_items",
+    "control_events",
 )
 
 

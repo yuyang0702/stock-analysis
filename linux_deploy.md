@@ -202,8 +202,15 @@ bash run_ubuntu.sh backtest
 bash run_ubuntu.sh backup
 bash run_ubuntu.sh backup-drill
 bash run_ubuntu.sh backup-status
+bash run_ubuntu.sh trading-status
+bash run_ubuntu.sh reconcile
+bash run_ubuntu.sh unlock
+bash run_ubuntu.sh stop-buy --reason "人工停止原因"
+bash run_ubuntu.sh kill-switch-on --reason "人工熔断原因"
 bash run_ubuntu.sh test
 ```
+
+`unlock` 是交互式向导，不是强制解锁：它会执行一次完整对账，要求最近两个全量一致结果来自不同新鲜快照，先确认关闭 `KILL_SWITCH`，再二次确认恢复买入。`kill-switch-off` 不会自动把 `buy_enabled` 改回 1。schema 6、上述命令和新菜单当前仅本地 `implemented`；服务器部署、真实运行和解锁演练仍需单独授权与证据。
 
 前台调试：
 
@@ -325,7 +332,9 @@ head output/backtest_trades.csv
 
 第一版回测默认读取 `cache/ml/signal_samples.jsonl`，如果没有该文件则读取 `cache/joinquant/signals.json`。它是信号级轻量回测：基于已生成的 JoinQuant/ML 信号模拟买卖、手续费、印花税、T+1、止盈止损和仓位限制，输出总收益、最大回撤、交易次数、胜率、未平仓数量和交易明细。
 
-支持天数取决于输入文件里已经积累的信号天数：如果只有今天的 `signals.json`，就只能回测今天这一批；如果 `signal_samples.jsonl` 积累了 30/180 个交易日，就能覆盖对应区间。它目前不会自动下载历史行情，也不会按过去 6 个月逐日重跑全市场策略；完整历史回测会在后续阶段补充。
+支持天数取决于输入文件里已经积累的信号天数：如果只有今天的 `signals.json`，就只能回测今天这一批；如果 `signal_samples.jsonl` 积累了 30/180 个交易日，就能覆盖对应区间。该信号级入口不自动下载历史行情，也不会按过去 6 个月逐日重跑全市场策略。
+
+独立完整历史回测框架使用 `historical_backtest.py` 和 `cache/backtest/history.db`，通过 `bash run_ubuntu.sh historical-backtest-validate ...` 校验、`bash run_ubuntu.sh historical-backtest ...` 运行；两个入口均为手动命令，没有 systemd timer。框架当前仅本地 `implemented`，服务器 `not deployed`，真实 6 个月/1 年 strict 数据 `not observed / not validated`。`price_core` 输出始终是代理证据，不能满足 Batch G。
 
 盘后信号追踪：
 ```bash

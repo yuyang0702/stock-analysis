@@ -5,9 +5,74 @@ import unittest.mock
 from pathlib import Path
 
 import joinquant_signal_server
+from trading_store import TradingStore
 
 
 class JoinQuantSignalServerTest(unittest.TestCase):
+    @staticmethod
+    def _snapshot() -> dict:
+        return {
+            "schema_version": 1, "trade_date": "2026-07-14",
+            "generated_at": "2026-07-14 10:00:00", "cash": 100000,
+            "available_cash": 100000, "total_value": 100000,
+            "positions": [], "orders": [], "trades": [],
+        }
+
+    def test_ledger_commits_before_compatible_json_is_published(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, account_file, store=store
+            )
+
+            original = joinquant_signal_server._write_json
+            def assert_ledger_first(path, payload):
+                with store.connect() as conn:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0], 1)
+                original(path, payload)
+
+            with unittest.mock.patch("joinquant_signal_server._write_json", side_effect=assert_ledger_first):
+                response = app.test_client().post(
+                    "/joinquant/account_snapshot?token=secret", json=self._snapshot()
+                )
+            self.assertEqual(response.status_code, 200)
+
+    def test_ledger_failure_returns_503_and_preserves_old_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            account_file.write_text(json.dumps({"old": True}), encoding="utf-8")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            with unittest.mock.patch(
+                "joinquant_signal_server.ingest_snapshot_payload", side_effect=RuntimeError("database is locked")
+            ):
+                response = app.test_client().post(
+                    "/joinquant/account_snapshot?token=secret", json=self._snapshot()
+                )
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(json.loads(account_file.read_text(encoding="utf-8")), {"old": True})
+
+    def test_snapshot_replay_is_idempotent_in_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file, store=store)
+            client = app.test_client()
+            self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=self._snapshot()).status_code, 200)
+            self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=self._snapshot()).status_code, 200)
+            with store.connect() as conn:
+                self.assertEqual(conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT count(*) FROM reconciliation_runs").fetchone()[0], 1)
+
     def test_rejects_bad_token_and_serves_signals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             signal_file = Path(tmp) / "signals.json"

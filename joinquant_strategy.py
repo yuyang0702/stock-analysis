@@ -22,7 +22,7 @@ STARTUP_SELF_TEST = True
 MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-13.3-risk-controls"
+STRATEGY_TEMPLATE_VERSION = "2026-07-14.1-ledger-v6"
 
 
 def initialize(context):
@@ -315,7 +315,7 @@ def post_account_snapshot(context):
         "pending_buy_risk_pct": metrics["pending_buy_risk_pct"],
         "positions": positions,
         "orders": order_events,
-        "trades": [],
+        "trades": _platform_trade_events(),
     }
     try:
         _post_json(SNAPSHOT_URL, payload)
@@ -357,6 +357,39 @@ def _platform_order_events():
             "amount": amount,
             "filled": filled,
             "price": _order_attr(order, "price", 0),
+        })
+    return events
+
+
+def _platform_trade_events():
+    try:
+        trades = get_trades().values()
+    except Exception:
+        return []
+    try:
+        orders = {str(_order_attr(order, "order_id", "") or ""): order for order in get_orders().values()}
+    except Exception:
+        orders = {}
+    events = []
+    for trade in trades:
+        order_id = str(_order_attr(trade, "order_id", "") or "")
+        order = orders.get(order_id)
+        security = str(_order_attr(trade, "security", _order_attr(order, "security", "")) or "")
+        is_buy = bool(_order_attr(trade, "is_buy", _order_attr(order, "is_buy", False)))
+        trade_id = str(_order_attr(trade, "trade_id", _order_attr(trade, "id", "")) or "")
+        events.append({
+            "trade_id": trade_id,
+            "order_id": order_id,
+            "signal_id": getattr(g, "order_signal_ids", {}).get(order_id),
+            "datetime": str(_order_attr(trade, "time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
+            "action": "buy" if is_buy else "sell",
+            "code": security[:6],
+            "jq_code": security,
+            "amount": abs(float(_order_attr(trade, "amount", 0) or 0)),
+            "price": float(_order_attr(trade, "price", 0) or 0),
+            "commission": float(_order_attr(trade, "commission", 0) or 0),
+            "stamp_tax": float(_order_attr(trade, "tax", _order_attr(trade, "stamp_tax", 0)) or 0),
+            "other_fee": float(_order_attr(trade, "other_fee", 0) or 0),
         })
     return events
 

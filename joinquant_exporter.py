@@ -303,6 +303,8 @@ def export_signals(
         "ledger_signal_count": 0,
         "ledger_error": "",
         "buy_publication_blocked": False,
+        "buy_enabled": "1",
+        "kill_switch": "0",
     }
 
     store = store or TradingStore(app_config.TRADING_DB_FILE)
@@ -323,6 +325,10 @@ def export_signals(
         store.initialize()
         inserted_signal_count = 0
         with store.transaction() as conn:
+            buy_row = conn.execute("SELECT value FROM system_state WHERE key='buy_enabled'").fetchone()
+            kill_row = conn.execute("SELECT value FROM system_state WHERE key='kill_switch'").fetchone()
+            buy_enabled = str(buy_row[0]) if buy_row else "1"
+            kill_switch = str(kill_row[0]) if kill_row else "0"
             store.record_strategy_run(conn, StrategyRunRecord(
                 run_id=ledger_run_id,
                 trade_date=payload["trade_date"],
@@ -364,6 +370,17 @@ def export_signals(
                 )
         payload["diagnostics"]["ledger_ok"] = True
         payload["diagnostics"]["ledger_signal_count"] = inserted_signal_count
+        payload["diagnostics"]["buy_enabled"] = buy_enabled
+        payload["diagnostics"]["kill_switch"] = kill_switch
+        if kill_switch == "1":
+            payload["diagnostics"]["buy_publication_blocked"] = any(
+                signal["action"] == "buy" for signal in payload["signals"]
+            )
+            payload["signals"] = []
+        elif buy_enabled == "0":
+            had_buys = any(signal["action"] == "buy" for signal in payload["signals"])
+            payload["signals"] = [signal for signal in payload["signals"] if signal["action"] == "sell"]
+            payload["diagnostics"]["buy_publication_blocked"] = had_buys
     except (sqlite3.Error, OSError, SignalConflictError) as exc:
         had_buys = any(signal["action"] == "buy" for signal in payload["signals"])
         payload["signals"] = [signal for signal in payload["signals"] if signal["action"] == "sell"]

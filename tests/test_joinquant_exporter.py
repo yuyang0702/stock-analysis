@@ -166,6 +166,37 @@ class JoinQuantExporterTest(unittest.TestCase):
             self.assertEqual(payload["signals"], [])
             self.assertTrue(payload["diagnostics"]["buy_publication_blocked"])
 
+    def test_trading_controls_block_buys_or_all_automatic_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            rows = pd.DataFrame([
+                {"code": "600000", "price": 10, "entry_price": 10, "take_profit": 11,
+                 "position_pct": 12, "final_score": 90, "signal_action": "continue"},
+                {"code": "000001", "price": 12, "final_score": 80,
+                 "signal_action": "sell", "has_holding": True},
+            ])
+            with store.transaction() as conn:
+                store.set_system_state(conn, "buy_enabled", "0", "reconciliation")
+            first = joinquant_exporter.export_signals(
+                rows, run_id="controls-1", trade_date="2026-07-14",
+                output_path=base / "first.json", store=store,
+            )
+            payload = json.loads(first.read_text(encoding="utf-8"))
+            self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
+            self.assertEqual(payload["diagnostics"]["buy_enabled"], "0")
+
+            with store.transaction() as conn:
+                store.set_system_state(conn, "kill_switch", "1", "critical")
+            second = joinquant_exporter.export_signals(
+                rows, run_id="controls-2", trade_date="2026-07-14",
+                output_path=base / "second.json", store=store,
+            )
+            payload = json.loads(second.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(payload["diagnostics"]["kill_switch"], "1")
+
     def test_exports_buy_and_sell_signals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "signals.json"

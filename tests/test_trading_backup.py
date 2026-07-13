@@ -58,6 +58,10 @@ class TradingBackupTest(unittest.TestCase):
             saved = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(saved["sha256"], result["sha256"])
             self.assertEqual(saved["table_counts"]["system_state"], 1)
+            self.assertTrue({
+                "orders", "fills", "account_snapshots", "position_snapshots",
+                "daily_equity", "reconciliation_runs", "reconciliation_items", "control_events",
+            }.issubset(saved["table_counts"]))
 
     def test_rejects_backup_root_inside_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

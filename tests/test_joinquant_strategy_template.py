@@ -27,7 +27,7 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
     def test_template_posts_version_with_snapshot(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
 
-        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-13.3-risk-controls"', text)
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-14.1-ledger-v6"', text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
 
     def test_template_retries_pending_order_event_callback(self) -> None:
@@ -84,6 +84,14 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         self.assertIn("get_orders()", text)
         self.assertIn('"status": status', text)
         self.assertIn("g.order_signal_ids", text)
+
+    def test_snapshot_reports_platform_trade_events(self) -> None:
+        text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
+        self.assertIn("def _platform_trade_events", text)
+        self.assertIn("get_trades()", text)
+        self.assertIn('"trade_id":', text)
+        self.assertIn('"commission":', text)
+        self.assertIn('"trades": _platform_trade_events()', text)
 
 
 if __name__ == "__main__":

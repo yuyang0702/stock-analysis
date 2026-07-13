@@ -31,7 +31,8 @@ def build_report(
     snapshot_file = snapshot_file or app_config.JOINQUANT_ACCOUNT_FILE
     report_file = report_file or app_config.OUTPUT_DIR / f"joinquant_readiness_{datetime.now().strftime('%Y%m%d')}.md"
     db_file = db_file or app_config.TRADING_DB_FILE
-    ledger_health = TradingStore(db_file).health()
+    store = TradingStore(db_file)
+    ledger_health = store.health()
     signals_payload, signal_error = _load(signal_file)
     snapshot_payload, snapshot_error = _load(snapshot_file)
 
@@ -42,6 +43,24 @@ def build_report(
         ledger_signal_count, ledger_json_parity = 0, False
         ledger_health = type(ledger_health)(False, ledger_health.schema_version, str(exc))
     positions = snapshot_payload.get("positions", []) if not snapshot_error else []
+    buy_enabled = "1"
+    kill_switch = "0"
+    latest_full_matched = False
+    unresolved_critical = 0
+    if ledger_health.ok:
+        with store.connect() as conn:
+            buy = conn.execute("SELECT value FROM system_state WHERE key='buy_enabled'").fetchone()
+            kill = conn.execute("SELECT value FROM system_state WHERE key='kill_switch'").fetchone()
+            buy_enabled = str(buy[0]) if buy else "1"
+            kill_switch = str(kill[0]) if kill else "0"
+            latest_full = conn.execute(
+                "SELECT result FROM reconciliation_runs WHERE mode='full' ORDER BY finished_at DESC LIMIT 1"
+            ).fetchone()
+            latest_full_matched = latest_full is not None and str(latest_full[0]) == "matched"
+            unresolved_critical = int(conn.execute(
+                """SELECT count(*) FROM reconciliation_runs r WHERE r.severity='CRITICAL'
+                   AND r.finished_at=(SELECT max(finished_at) FROM reconciliation_runs)"""
+            ).fetchone()[0])
     duplicate_ids = len(signals) - len({item.get("id") for item in signals if isinstance(item, dict)})
     over_position = [
         item for item in signals
@@ -62,8 +81,15 @@ def build_report(
         "ledger_signal_count": ledger_signal_count,
         "ledger_json_parity": ledger_json_parity,
         "ledger_error": " ".join(ledger_health.error.replace("\r", " ").replace("\n", " ").split())[:240],
+        "buy_enabled": buy_enabled,
+        "kill_switch": kill_switch,
+        "latest_full_reconciliation_matched": latest_full_matched,
+        "unresolved_critical_count": unresolved_critical,
     }
-    if result["signal_ok"] and result["snapshot_ok"] and result["ledger_ok"] and ledger_json_parity and duplicate_ids == 0 and not over_position:
+    if (result["signal_ok"] and result["snapshot_ok"] and result["ledger_ok"]
+            and ledger_health.schema_version == 6 and ledger_json_parity and duplicate_ids == 0
+            and not over_position and buy_enabled == "1" and kill_switch == "0"
+            and latest_full_matched and unresolved_critical == 0):
         conclusion = "can_small_position_trial"
     else:
         conclusion = "keep_dry_run"

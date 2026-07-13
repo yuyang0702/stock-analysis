@@ -1,8 +1,19 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import sqlite3
 import unittest
 
-from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore
+from trading_store import (
+    SCHEMA_V1,
+    SCHEMA_V2,
+    SCHEMA_V3,
+    SCHEMA_V4,
+    SCHEMA_V5,
+    SignalConflictError,
+    SignalRecord,
+    StrategyRunRecord,
+    TradingStore,
+)
 
 
 class TradingStoreTest(unittest.TestCase):
@@ -66,7 +77,7 @@ class TradingStoreTest(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(reason, "ledger unavailable")
 
-    def test_initialize_creates_version_five_schema_and_pragmas(self) -> None:
+    def test_initialize_creates_version_six_schema_and_pragmas(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
@@ -75,8 +86,13 @@ class TradingStoreTest(unittest.TestCase):
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
                 busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-            self.assertEqual(version, 5)
-            self.assertTrue({"strategy_runs", "signals", "risk_decisions", "system_state", "position_cycles", "order_events", "exit_intents", "trade_cooldowns"}.issubset(tables))
+            self.assertEqual(version, 6)
+            self.assertTrue({
+                "strategy_runs", "signals", "risk_decisions", "system_state",
+                "position_cycles", "order_events", "exit_intents", "trade_cooldowns",
+                "orders", "fills", "account_snapshots", "position_snapshots",
+                "daily_equity", "reconciliation_runs", "reconciliation_items", "control_events",
+            }.issubset(tables))
             self.assertEqual(foreign_keys, 1)
             self.assertEqual(busy_timeout, 5000)
 
@@ -102,7 +118,64 @@ class TradingStoreTest(unittest.TestCase):
             store.initialize()
             with store.connect() as conn:
                 count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-            self.assertEqual(count, 5)
+            self.assertEqual(count, 6)
+
+    def test_initialize_migrates_version_five_without_losing_rows(self) -> None:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = Path(tmp) / "trading.db"
+            with sqlite3.connect(path) as conn:
+                for version, schema in enumerate((SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5), 1):
+                    conn.executescript(schema)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
+                        (version,),
+                    )
+                conn.execute(
+                    "INSERT INTO system_state(key, value, updated_at, reason) VALUES ('legacy', 'keep', datetime('now'), 'test')"
+                )
+
+            store = TradingStore(path)
+            store.initialize()
+
+            self.assertEqual(store.health().schema_version, 6)
+            self.assertEqual(store.get_system_state("legacy"), "keep")
+
+    def test_prune_execution_history_keeps_mismatch_evidence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                for snapshot_id, trade_date in (("old", "2025-01-01"), ("recent", "2026-07-14")):
+                    conn.execute(
+                        """INSERT INTO account_snapshots(
+                           snapshot_id, trade_date, generated_at, received_at, cash, available_cash,
+                           total_value, position_market_value, daily_turnover_pct, daily_pnl_pct,
+                           account_drawdown_pct, template_version, state_hash, retained_details, raw_json
+                           ) VALUES (?, ?, ?, ?, 1, 1, 1, 0, 0, 0, 0, '', ?, 0, NULL)""",
+                        (snapshot_id, trade_date, trade_date + " 15:00:00", trade_date + " 15:00:01", snapshot_id),
+                    )
+                conn.execute(
+                    """INSERT INTO reconciliation_runs VALUES
+                       ('matched-old', 'incremental', 'old', '2025-01-01 15:00:01', '2025-01-01 15:00:02', 'matched', 'INFO', 0, '', '{}')"""
+                )
+                conn.execute(
+                    """INSERT INTO reconciliation_runs VALUES
+                       ('error-old', 'full', 'old', '2025-01-01 15:00:01', '2025-01-01 15:00:02', 'mismatch', 'ERROR', 1, 'stop_buy', '{}')"""
+                )
+                conn.execute(
+                    """INSERT INTO reconciliation_items(
+                       reconciliation_id, category, object_id, reason_code, local_value,
+                       platform_value, tolerance, severity, details_json
+                       ) VALUES ('error-old', 'position', '600000', 'POSITION_QTY_MISMATCH', '100', '200', 0, 'ERROR', '{}')"""
+                )
+
+                deleted = store.prune_execution_history(conn, "2025-07-14", "2026-07-14 16:00:00")
+
+                self.assertEqual(deleted["account_snapshots"], 0)
+                self.assertEqual(deleted["reconciliation_runs"], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM reconciliation_runs WHERE result <> 'matched'"
+                ).fetchone()[0], 1)
 
     def test_position_cycle_freezes_initial_risk_and_tracks_high_watermark(self) -> None:
         with TemporaryDirectory() as tmp:

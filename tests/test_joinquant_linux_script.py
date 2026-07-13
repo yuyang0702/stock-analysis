@@ -90,6 +90,9 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn("ml-report)", text)
         self.assertIn("sector-context)", text)
         self.assertIn("backtest)", text)
+        self.assertIn("historical-backtest)", text)
+        self.assertIn("historical-backtest-validate)", text)
+        self.assertNotIn("stock-historical-backtest.timer", text)
         self.assertIn("运行本地信号回测", text)
         self.assertIn("install)", text)
         self.assertIn("DRY_RUN      = False", text)
@@ -98,6 +101,14 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn("A股策略服务器菜单", text)
         self.assertIn("请输入序号", text)
         self.assertIn("[[ $# -eq 0 && -t 0 ]]", text)
+        for command in (
+            "trading-status", "reconcile", "unlock", "stop-buy", "resume-buy",
+            "kill-switch-on", "kill-switch-off",
+        ):
+            self.assertIn(f"{command})", text)
+        self.assertIn("交易控制与自动对账", text)
+        self.assertIn("执行完整对账", text)
+        self.assertIn("交易解锁向导", text)
 
     def test_old_linux_entrypoints_are_removed(self) -> None:
         self.assertFalse(Path("install_ubuntu.sh").exists())

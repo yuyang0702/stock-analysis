@@ -8,6 +8,26 @@ from trading_store import TradingStore
 
 
 class JoinQuantReadinessReportTest(unittest.TestCase):
+    def test_active_controls_and_missing_full_reconciliation_are_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            snapshot_file.write_text(json.dumps({"schema_version": 1, "positions": []}), encoding="utf-8")
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.set_system_state(conn, "buy_enabled", "0", "reconciliation error")
+
+            result = joinquant_readiness_report.build_report(
+                signal_file, snapshot_file, base / "report.md", db_file=base / "trading.db"
+            )
+
+            self.assertEqual(result["buy_enabled"], "0")
+            self.assertEqual(result["kill_switch"], "0")
+            self.assertFalse(result["latest_full_reconciliation_matched"])
+            self.assertEqual(result["conclusion"], "keep_dry_run")
     def test_missing_ledger_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

@@ -1,6 +1,6 @@
 ﻿# SQLite Automatic Backup and Recovery Implementation Plan
 
-> **状态：** Tasks 1–5 本地 `implemented`，尚未提交、推送、部署、观察或验证。Linux systemd 模板只有静态检查证据，仍需服务器执行测试与 timer 安装确认。
+> **状态：** Tasks 1–5 本地 `implemented`，核心计数已兼容 schema 6 完整账本；尚未提交、推送、部署、观察或验证。Linux systemd 模板只有静态检查证据，仍需服务器执行测试与 timer 安装确认。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 

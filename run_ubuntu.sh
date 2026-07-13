@@ -46,7 +46,8 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|backup|backup-drill|backup-status|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|historical-backtest|historical-backtest-validate|backup|backup-drill|backup-status|test|show-env
+  bash run_ubuntu.sh trading-status|reconcile|unlock|stop-buy|resume-buy|kill-switch-on|kill-switch-off [options]
 
 First deploy:
   bash run_ubuntu.sh install --webhook 'YOUR_WECOM_WEBHOOK' --token 'YOUR_LONG_RANDOM_TOKEN'
@@ -82,10 +83,43 @@ show_menu() {
  21) 立即执行SQLite备份
  22) 执行SQLite恢复演练
  23) 查看SQLite备份状态
+ 24) 交易控制与自动对账
   h) 帮助
   q) 退出
 
 EOF
+}
+
+trading_menu() {
+  local choice reason
+  while true; do
+    cat <<'EOF'
+
+========== 交易控制与自动对账 ==========
+  1) 查看交易控制状态
+  2) 执行完整对账
+  3) 交易解锁向导
+  4) 手动停止新买入
+  5) 手动开启 KILL_SWITCH
+  0) 返回
+EOF
+    read -r -p "请输入序号： " choice
+    case "${choice}" in
+      1) handle_command trading-status ;;
+      2) handle_command reconcile ;;
+      3) handle_command unlock ;;
+      4)
+        read -r -p "停止新买入原因： " reason
+        handle_command stop-buy --reason "${reason}"
+        ;;
+      5)
+        read -r -p "开启 KILL_SWITCH 原因： " reason
+        handle_command kill-switch-on --reason "${reason}"
+        ;;
+      0|"") break ;;
+      *) warn "未知选项：${choice}" ;;
+    esac
+  done
 }
 
 menu_install() {
@@ -148,6 +182,7 @@ menu_loop() {
       21) handle_command backup ;;
       22) handle_command backup-drill ;;
       23) handle_command backup-status ;;
+      24) trading_menu ;;
       h|H) usage ;;
       q|Q|"") break ;;
       *) warn "未知选项：${choice}" ;;
@@ -213,7 +248,7 @@ env_value() {
 require_project_files() {
   for file in \
     a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
-    joinquant_health.py notify_retry.py backtest_engine.py trading_backup.py \
+    joinquant_health.py notify_retry.py backtest_engine.py historical_backtest.py trading_backup.py trading_control.py \
     joinquant_readiness_report.py ml_dataset.py global_market_context.py strategy_compare_report.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
   done
@@ -814,9 +849,18 @@ handle_command() {
     strategy-compare) run_foreground strategy_compare_report.py ;;
     strategy-compare-weekly) run_foreground strategy_compare_report.py --notify --weekly ;;
     backtest) run_foreground backtest_engine.py ;;
+    historical-backtest) shift; run_foreground historical_backtest.py run "$@" ;;
+    historical-backtest-validate) shift; run_foreground historical_backtest.py validate "$@" ;;
     backup) run_foreground trading_backup.py backup ;;
     backup-drill) run_foreground trading_backup.py drill ;;
     backup-status) run_foreground trading_backup.py status ;;
+    trading-status) run_foreground trading_control.py status ;;
+    reconcile) run_foreground trading_control.py reconcile ;;
+    unlock) run_foreground trading_control.py unlock ;;
+    stop-buy) shift; run_foreground trading_control.py stop-buy "$@" ;;
+    resume-buy) shift; run_foreground trading_control.py resume-buy "$@" ;;
+    kill-switch-on) shift; run_foreground trading_control.py kill-switch-on "$@" ;;
+    kill-switch-off) shift; run_foreground trading_control.py kill-switch-off "$@" ;;
     test) cd "${APP_DIR}"; "$(python_bin)" -m unittest discover -s tests -v ;;
     show-env) show_env_summary ;;
     help|-h|--help) usage ;;

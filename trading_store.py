@@ -9,11 +9,15 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class SignalConflictError(RuntimeError):
     """Raised when an immutable signal ID is reused for different content."""
+
+
+class FillConflictError(RuntimeError):
+    """Raised when an immutable fill ID is reused for different content."""
 
 
 def canonical_json(value: str | dict) -> str:
@@ -164,6 +168,129 @@ CREATE TABLE IF NOT EXISTS trade_cooldowns (
 );
 """
 
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS orders (
+    client_order_id TEXT PRIMARY KEY,
+    signal_id TEXT REFERENCES signals(signal_id),
+    order_id TEXT UNIQUE,
+    stock_code TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_qty INTEGER,
+    requested_qty INTEGER NOT NULL DEFAULT 0,
+    filled_qty INTEGER NOT NULL DEFAULT 0,
+    average_fill_price REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    submit_count INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    first_submitted_at TEXT,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    raw_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fills (
+    fill_id TEXT PRIMARY KEY,
+    client_order_id TEXT REFERENCES orders(client_order_id) ON DELETE SET NULL,
+    order_id TEXT,
+    signal_id TEXT REFERENCES signals(signal_id),
+    stock_code TEXT NOT NULL,
+    action TEXT NOT NULL,
+    qty INTEGER NOT NULL,
+    price REAL NOT NULL,
+    commission REAL NOT NULL DEFAULT 0,
+    stamp_tax REAL NOT NULL DEFAULT 0,
+    other_fee REAL NOT NULL DEFAULT 0,
+    filled_at TEXT NOT NULL,
+    raw_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    trade_date TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    cash REAL NOT NULL DEFAULT 0,
+    available_cash REAL NOT NULL DEFAULT 0,
+    total_value REAL NOT NULL DEFAULT 0,
+    position_market_value REAL NOT NULL DEFAULT 0,
+    daily_turnover_pct REAL NOT NULL DEFAULT 0,
+    daily_pnl_pct REAL NOT NULL DEFAULT 0,
+    account_drawdown_pct REAL NOT NULL DEFAULT 0,
+    template_version TEXT NOT NULL DEFAULT '',
+    state_hash TEXT NOT NULL,
+    retained_details INTEGER NOT NULL DEFAULT 0,
+    raw_json TEXT
+);
+CREATE TABLE IF NOT EXISTS position_snapshots (
+    snapshot_id TEXT NOT NULL REFERENCES account_snapshots(snapshot_id) ON DELETE CASCADE,
+    stock_code TEXT NOT NULL,
+    qty INTEGER NOT NULL DEFAULT 0,
+    closeable_qty INTEGER NOT NULL DEFAULT 0,
+    locked_qty INTEGER NOT NULL DEFAULT 0,
+    today_qty INTEGER NOT NULL DEFAULT 0,
+    avg_cost REAL NOT NULL DEFAULT 0,
+    price REAL NOT NULL DEFAULT 0,
+    market_value REAL NOT NULL DEFAULT 0,
+    pnl REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY(snapshot_id, stock_code)
+);
+CREATE TABLE IF NOT EXISTS daily_equity (
+    trade_date TEXT PRIMARY KEY,
+    opening_equity REAL NOT NULL DEFAULT 0,
+    closing_equity REAL NOT NULL DEFAULT 0,
+    cash REAL NOT NULL DEFAULT 0,
+    position_market_value REAL NOT NULL DEFAULT 0,
+    realized_pnl REAL NOT NULL DEFAULT 0,
+    unrealized_pnl REAL NOT NULL DEFAULT 0,
+    fees REAL NOT NULL DEFAULT 0,
+    net_deposit REAL NOT NULL DEFAULT 0,
+    max_drawdown_pct REAL NOT NULL DEFAULT 0,
+    first_snapshot_at TEXT NOT NULL,
+    last_snapshot_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    reconciliation_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    snapshot_id TEXT REFERENCES account_snapshots(snapshot_id) ON DELETE SET NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    result TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    difference_count INTEGER NOT NULL DEFAULT 0,
+    control_action TEXT NOT NULL DEFAULT '',
+    summary_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reconciliation_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_id TEXT NOT NULL REFERENCES reconciliation_runs(reconciliation_id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    object_id TEXT NOT NULL DEFAULT '',
+    reason_code TEXT NOT NULL,
+    local_value TEXT NOT NULL DEFAULT '',
+    platform_value TEXT NOT NULL DEFAULT '',
+    tolerance REAL NOT NULL DEFAULT 0,
+    severity TEXT NOT NULL,
+    details_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS control_events (
+    event_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    old_value TEXT NOT NULL,
+    new_value TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    reconciliation_id TEXT REFERENCES reconciliation_runs(reconciliation_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orders_signal ON orders(signal_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id);
+CREATE INDEX IF NOT EXISTS idx_fills_signal ON fills(signal_id);
+CREATE INDEX IF NOT EXISTS idx_fills_time ON fills(filled_at);
+CREATE INDEX IF NOT EXISTS idx_account_snapshots_trade_date ON account_snapshots(trade_date, generated_at);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_time ON reconciliation_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_result ON reconciliation_runs(result, severity);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_items_reason ON reconciliation_items(reason_code, severity);
+"""
+
 
 @dataclass(frozen=True)
 class StoreHealth:
@@ -229,6 +356,8 @@ class TradingStore:
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'))")
             conn.executescript(SCHEMA_V5)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'))")
+            conn.executescript(SCHEMA_V6)
+            conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, datetime('now'))")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -455,6 +584,87 @@ class TradingStore:
                 values,
             )
 
+    def upsert_order(self, conn: sqlite3.Connection, order: dict) -> bool:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE client_order_id=? OR (order_id IS NOT NULL AND order_id=?) LIMIT 1",
+            (order["client_order_id"], order.get("order_id")),
+        ).fetchone()
+        signal_id = order.get("signal_id")
+        if signal_id and conn.execute("SELECT 1 FROM signals WHERE signal_id=?", (signal_id,)).fetchone() is None:
+            signal_id = None
+        terminal = {"filled", "cancelled", "rejected", "risk_rejected"}
+        if row is None:
+            conn.execute(
+                """INSERT INTO orders(
+                   client_order_id, signal_id, order_id, stock_code, action, target_qty,
+                   requested_qty, filled_qty, average_fill_price, status, submit_count,
+                   reason, first_submitted_at, updated_at, completed_at, raw_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    order["client_order_id"], signal_id, order.get("order_id"), order["stock_code"],
+                    order["action"], order.get("target_qty"), order["requested_qty"], order["filled_qty"],
+                    order["average_fill_price"], order["status"], order["submit_count"], order["reason"],
+                    order.get("first_submitted_at"), order["updated_at"], order.get("completed_at"),
+                    order["raw_json"],
+                ),
+            )
+            client_id = str(order["client_order_id"])
+            inserted = True
+        else:
+            client_id = str(row["client_order_id"])
+            status = str(row["status"]) if str(row["status"]) in terminal else str(order["status"])
+            filled_qty = max(int(row["filled_qty"]), int(order["filled_qty"]))
+            conn.execute(
+                """UPDATE orders SET signal_id=COALESCE(signal_id, ?), order_id=COALESCE(order_id, ?),
+                   target_qty=COALESCE(?, target_qty), requested_qty=max(requested_qty, ?),
+                   filled_qty=?, average_fill_price=CASE WHEN ?>0 THEN ? ELSE average_fill_price END,
+                   status=?, submit_count=max(submit_count, ?), reason=?, updated_at=max(updated_at, ?),
+                   completed_at=COALESCE(completed_at, ?), raw_json=? WHERE client_order_id=?""",
+                (
+                    signal_id, order.get("order_id"), order.get("target_qty"), order["requested_qty"],
+                    filled_qty, order["average_fill_price"], order["average_fill_price"], status,
+                    order["submit_count"], order["reason"], order["updated_at"], order.get("completed_at"),
+                    order["raw_json"], client_id,
+                ),
+            )
+            inserted = False
+        if order.get("order_id"):
+            conn.execute(
+                "UPDATE fills SET client_order_id=?, signal_id=COALESCE(signal_id, ?) WHERE order_id=?",
+                (client_id, signal_id, order["order_id"]),
+            )
+        return inserted
+
+    def insert_fill(self, conn: sqlite3.Connection, fill: dict) -> bool:
+        existing = conn.execute("SELECT * FROM fills WHERE fill_id=?", (fill["fill_id"],)).fetchone()
+        keys = (
+            "order_id", "stock_code", "action", "qty", "price", "commission",
+            "stamp_tax", "other_fee", "filled_at", "raw_json",
+        )
+        expected = tuple(fill.get(key) for key in keys[:-1]) + (canonical_json(fill["raw_json"]),)
+        if existing is not None:
+            actual = tuple(existing[key] for key in keys[:-1]) + (canonical_json(existing["raw_json"]),)
+            if actual != expected:
+                raise FillConflictError(f"immutable fill conflict: {fill['fill_id']}")
+            return False
+        client_id = fill.get("client_order_id")
+        if client_id and conn.execute("SELECT 1 FROM orders WHERE client_order_id=?", (client_id,)).fetchone() is None:
+            client_id = None
+        signal_id = fill.get("signal_id")
+        if signal_id and conn.execute("SELECT 1 FROM signals WHERE signal_id=?", (signal_id,)).fetchone() is None:
+            signal_id = None
+        conn.execute(
+            """INSERT INTO fills(fill_id, client_order_id, order_id, signal_id, stock_code,
+               action, qty, price, commission, stamp_tax, other_fee, filled_at, raw_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                fill["fill_id"], client_id, fill.get("order_id"), signal_id, fill["stock_code"],
+                fill["action"], fill["qty"], fill["price"], fill["commission"], fill["stamp_tax"],
+                fill["other_fee"], fill["filled_at"], fill["raw_json"],
+            ),
+        )
+        return True
+
     def upsert_exit_intent(self, conn: sqlite3.Connection, signal_id: str, code: str,
                            target_qty: int, reason: str, created_at: str) -> None:
         conn.execute(
@@ -527,3 +737,29 @@ class TradingStore:
                 (trade_date[:10],),
             ).fetchone()[0]
         return int(buys), int(orders)
+
+    def prune_execution_history(
+        self, conn: sqlite3.Connection, cutoff_date: str, now: str
+    ) -> dict[str, int]:
+        del now
+        runs = conn.execute(
+            """DELETE FROM reconciliation_runs
+               WHERE substr(started_at, 1, 10) < ? AND result='matched'
+               AND NOT EXISTS (
+                   SELECT 1 FROM reconciliation_items
+                   WHERE reconciliation_items.reconciliation_id=reconciliation_runs.reconciliation_id
+               )""",
+            (cutoff_date[:10],),
+        ).rowcount
+        snapshots = conn.execute(
+            """DELETE FROM account_snapshots
+               WHERE trade_date < ? AND snapshot_id NOT IN (
+                   SELECT snapshot_id FROM reconciliation_runs
+                   WHERE result<>'matched' AND snapshot_id IS NOT NULL
+               )""",
+            (cutoff_date[:10],),
+        ).rowcount
+        return {
+            "account_snapshots": max(0, int(snapshots)),
+            "reconciliation_runs": max(0, int(runs)),
+        }

@@ -65,6 +65,42 @@ def _ledger_status(db_file: Path, signals: list[dict[str, Any]]) -> tuple[bool, 
         return False, health.schema_version, 0, False, _sanitize_ledger_error(str(exc))
 
 
+def _execution_ledger_metrics(db_file: Path) -> dict[str, Any]:
+    metrics = {
+        "buy_enabled": "1", "kill_switch": "0", "latest_reconciliation_result": "",
+        "latest_reconciliation_severity": "", "reconciliation_mismatch_count": 0,
+        "account_snapshot_count": 0, "order_count": 0, "fill_count": 0,
+        "recovery_ready": False,
+    }
+    try:
+        with TradingStore(db_file).connect() as conn:
+            for key, fallback in (("buy_enabled", "1"), ("kill_switch", "0")):
+                row = conn.execute("SELECT value FROM system_state WHERE key=?", (key,)).fetchone()
+                metrics[key] = str(row[0]) if row else fallback
+            latest = conn.execute(
+                "SELECT result, severity FROM reconciliation_runs ORDER BY finished_at DESC LIMIT 1"
+            ).fetchone()
+            if latest:
+                metrics["latest_reconciliation_result"] = str(latest[0])
+                metrics["latest_reconciliation_severity"] = str(latest[1])
+            metrics["reconciliation_mismatch_count"] = int(conn.execute(
+                "SELECT count(*) FROM reconciliation_runs WHERE result<>'matched'"
+            ).fetchone()[0])
+            metrics["account_snapshot_count"] = int(conn.execute(
+                "SELECT count(*) FROM account_snapshots"
+            ).fetchone()[0])
+            metrics["order_count"] = int(conn.execute("SELECT count(*) FROM orders").fetchone()[0])
+            metrics["fill_count"] = int(conn.execute("SELECT count(*) FROM fills").fetchone()[0])
+            matched = conn.execute(
+                """SELECT snapshot_id FROM reconciliation_runs WHERE mode='full' AND result='matched'
+                   ORDER BY finished_at DESC LIMIT 2"""
+            ).fetchall()
+            metrics["recovery_ready"] = len({str(row[0]) for row in matched if row[0]}) >= 2
+    except Exception:
+        pass
+    return metrics
+
+
 def _exit_intent_mismatches(db_file: Path, snapshot: dict[str, Any]) -> list[str]:
     try:
         intents = TradingStore(db_file).get_open_exit_intents()
@@ -290,6 +326,7 @@ def build_health_report(
     signals = signal_payload.get("signals", []) if isinstance(signal_payload.get("signals"), list) else []
     signal_ids = {str(item.get("id")) for item in signals if isinstance(item, dict) and item.get("id")}
     ledger_ok, ledger_schema_version, ledger_signal_count, ledger_json_parity, ledger_error = _ledger_status(db_file, signals)
+    execution_metrics = _execution_ledger_metrics(db_file)
     positions = snapshot_payload.get("positions", []) if isinstance(snapshot_payload.get("positions"), list) else []
     expected_template_version = app_config.JOINQUANT_TEMPLATE_VERSION
     strategy_template_version = str(snapshot_payload.get("strategy_template_version") or "").strip()
@@ -307,6 +344,16 @@ def build_health_report(
     elif not ledger_json_parity:
         issue_codes.append("ledger_json_signal_mismatch")
         issues.append("SQLite 与 JSON 信号 ID 不一致")
+
+    if execution_metrics["buy_enabled"] == "0":
+        issue_codes.append("buy_disabled_by_control")
+        issues.append("自动对账已停止新买入")
+    if execution_metrics["kill_switch"] == "1":
+        issue_codes.append("kill_switch_active")
+        issues.append("自动交易 KILL_SWITCH 已开启")
+    if execution_metrics["latest_reconciliation_result"] == "mismatch":
+        issue_codes.append("reconciliation_mismatch")
+        issues.append("最近一次自动对账存在差异")
 
     if signal_error:
         issue_codes.append("signal_file_error")
@@ -399,6 +446,7 @@ def build_health_report(
         "stable_gate_pass": status == "ok" and stability_score >= 80,
         "latest_total_value": _num(snapshot_payload.get("total_value")),
         "latest_cash": _num(snapshot_payload.get("cash")),
+        **execution_metrics,
     }
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text(build_report_markdown(result), encoding="utf-8")

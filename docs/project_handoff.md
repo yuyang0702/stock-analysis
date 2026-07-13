@@ -1,12 +1,14 @@
 # 项目接管与新环境恢复说明
 
-> 2026-07-13 增量状态：本地未提交工作区已实现分层退出、执行安全、组合风控、SQLite schema version 5和 JoinQuant `target_qty` 模板；尚未提交、推送、部署、观察或验证。服务器最近确认仍为 `aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1。接管时不得把本地实现状态当成服务器事实，详细边界以主文档 `docs/project_roadmap.md` 为准。
+> 2026-07-14 增量状态：隔离工作树已实现分层退出、执行安全、组合风控、SQLite schema version 6完整账本、自动对账、停买/熔断控制和人工解锁入口；尚未提交、推送、部署、观察或验证。服务器最近确认仍为 `aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1。接管时不得把本地实现状态当成服务器事实，详细边界以主文档 `docs/project_roadmap.md` 为准。
 
 > 同日计划调整：用户要求一次补齐的买入、卖出和执行闭环现已在本地 `implemented`，仍未提交、推送、部署、观察或验证。
 
 > 2026-07-14 计划补充：Batch G 已明确为半自动参数复核，即自动生成证据、人工按候选 ID/哈希批准、另行授权发布和版本化回滚。相关设计与实施计划已写入文档，但候选登记、评价准入、批准、激活和回滚代码均为 `planned`，不能从现有 ML 报表或 `parameter_version` 字段推断为已经实现。
 
 > 2026-07-14 备份增量：`trading_backup.py`、项目外每日在线备份、SHA-256/完整性/schema/核心计数校验、7/4/12 轮转、隔离季度恢复演练、报告、告警复用和 systemd 模板已在本地 `implemented`。尚未提交、推送或安装到服务器，故仍为 `not deployed / not observed / not validated`；服务器最近确认状态不因本地代码变化而改变。
+
+> 2026-07-14 历史回测增量：独立历史库、strict/price_core 双轨数据门、时点候选、A股逐日撮合、复权、绩效/walk-forward、运行持久化、CLI、原子报告和无 timer 的 Linux 手动入口已在本地 `implemented`。尚未提交、推送或部署，也没有真实 6 个月/1 年严格数据运行，因此仍为 `not deployed / not observed / not validated`；price_core 不能满足 Batch G。
 
 > ML 状态边界：当前 `shadow_score.py` 是规则型影子评分，不是训练模型。ML-7 训练型模型和 ML-8/Batch G 参数复核是两条独立的 `planned` 路线；二者未来都必须自动分析止于候选、人工批准、显式发布和版本化回滚。
 
@@ -96,9 +98,9 @@ git ls-remote origin refs/heads/main
 | 订单回报与持仓同步 | deployed | 快照回传、实际成交和持仓一致性。 |
 | 健康检查和微信异常报警 | deployed | timer、报告、告警和失败重试。 |
 | SQLite Batch 1 | deployed | 服务器已运行 schema version 1；待部署后首个有效交易日确认双写和交易日一致性。 |
-| SQLite schema 5执行账本扩展 | implemented（仅本地） | 已含持仓周期、委托事件、退出意图和冷却；服务器仍为schema 1。 |
-| SQLite完整成交/账户/权益曲线账本 | planned | 当前扩展不等于完整逐笔成交与权益账本。 |
-| 完整历史回测 | planned | 当前仅有已生成信号的信号级回测。 |
+| SQLite schema 6完整执行账本 | implemented（仅本地） | 含持仓周期、订单、逐笔成交、账户/持仓检查点、日权益、对账、控制审计和冷却；服务器仍为schema 1。 |
+| 自动对账与人工解锁 | implemented（仅本地） | ERROR停买、CRITICAL熔断、两次不同全量一致快照和二次确认；未部署、观察或验证。 |
+| 完整历史回测 | implemented（仅本地框架） | 与信号级回测并存；真实 6 个月/1 年 strict 数据尚未导入、观察或人工验证，服务器未部署。 |
 | 模拟盘买卖强制风控 | implemented（仅本地） | 尚未部署、观察或验证；真实资金级风控仍为planned。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
@@ -129,7 +131,7 @@ Batch 1当前主要保存：
 - 权益曲线。
 - 手续费和滑点账本。
 - 信号到订单、成交和收益的完整关联。
-- 参数候选、评价、人工决定、激活和回滚记录；这些表属于 2026-07-14 Batch G 计划，不属于服务器 schema 1 或本地 schema 5 的当前实际范围。
+- 参数候选、评价、人工决定、激活和回滚记录；这些表属于 2026-07-14 Batch G 计划，不属于服务器 schema 1 或本地 schema 6 的当前实际范围。
 
 ## 6. 关键文档读取顺序
 

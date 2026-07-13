@@ -10,6 +10,30 @@ from trading_store import TradingStore
 
 
 class JoinQuantHealthTest(unittest.TestCase):
+    def test_reports_bounded_execution_ledger_metrics_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db_file = base / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            with store.transaction() as conn:
+                store.set_system_state(conn, "buy_enabled", "0", "reconciliation error")
+                store.set_system_state(conn, "kill_switch", "1", "critical")
+            signal_file = base / "signals.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+
+            result = joinquant_health.build_health_report(
+                signal_file, base / "missing-account.json", report_file=base / "report.md",
+                now=datetime(2026, 7, 9, 10, 0), db_file=db_file,
+                health_history_file=base / "health.jsonl",
+            )
+
+            self.assertEqual(result["buy_enabled"], "0")
+            self.assertEqual(result["kill_switch"], "1")
+            self.assertEqual(result["account_snapshot_count"], 0)
+            self.assertEqual(result["order_count"], 0)
+            self.assertEqual(result["fill_count"], 0)
+            self.assertIn("kill_switch_active", result["issue_codes"])
     def _ledger_with_signal_ids(self, path: Path, signal_ids: list[str]) -> None:
         store = TradingStore(path)
         store.initialize()

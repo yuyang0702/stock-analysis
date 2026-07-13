@@ -10,7 +10,13 @@ from typing import Any
 from flask import Flask, abort, g, jsonify, request
 
 import config as app_config
+from joinquant_sync import ingest_snapshot_payload
 from notifier import WeComNotifier
+from reconciliation import (
+    ReconciliationDifference, ReconciliationResult, notify_reconciliation,
+)
+from trading_control import apply_reconciliation_control
+from trading_store import TradingStore
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -143,17 +149,30 @@ def _notify_execution(payload: dict[str, Any]) -> None:
     notifier.send_markdown("JoinQuant 模拟盘执行回报", md, dedupe_key=f"joinquant-exec:{digest}")
 
 
+def _reconciliation_notifier() -> WeComNotifier:
+    return WeComNotifier(
+        webhook_url=app_config.WECOM_WEBHOOK_URL,
+        state_file=app_config.CACHE_DIR / "wecom_notify_state.json",
+        cooldown_sec=app_config.NOTIFY_COOLDOWN_SEC_DEFAULT,
+        timeout_sec=app_config.WECOM_TIMEOUT_SEC,
+    )
+
+
 def create_app(
     token: str | None = None,
     signal_file: Path | None = None,
     account_file: Path | None = None,
     api_event_file: Path | None = None,
+    store: TradingStore | None = None,
 ) -> Flask:
     app = Flask(__name__)
     expected_token = token if token is not None else app_config.JOINQUANT_SYNC_TOKEN
     signal_path = signal_file or app_config.JOINQUANT_SIGNAL_FILE
     account_path = account_file or app_config.JOINQUANT_ACCOUNT_FILE
     event_path = api_event_file or account_path.parent / "api_events.jsonl"
+    ledger_store = store or TradingStore(
+        app_config.TRADING_DB_FILE if account_file is None else account_path.parent / "trading.db"
+    )
 
     @app.after_request
     def log_api_error(response):
@@ -191,6 +210,61 @@ def create_app(
     def account_snapshot():
         _check_token(expected_token)
         payload = _validate_snapshot(request.get_json(silent=True))
+        try:
+            ledger_result = ingest_snapshot_payload(
+                payload, ledger_store, str(payload.get("received_at")), mode="incremental"
+            )
+        except Exception as exc:
+            _append_api_event(
+                event_path, "account_snapshot", 503,
+                error_type=type(exc).__name__, error=str(exc)[:160],
+            )
+            failure = ReconciliationResult(
+                hashlib.sha256(f"ledger:{type(exc).__name__}".encode("utf-8")).hexdigest()[:32],
+                "mismatch", "CRITICAL", [ReconciliationDifference(
+                    "ledger", "sqlite", "LEDGER_INTEGRITY_FAILURE", "unavailable", "callback", 0,
+                    "CRITICAL", {},
+                )], "", None,
+            )
+            try:
+                ledger_store.initialize()
+                with ledger_store.transaction() as conn:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO reconciliation_runs(
+                           reconciliation_id, mode, snapshot_id, started_at, finished_at, result,
+                           severity, difference_count, control_action, summary_json
+                           ) VALUES (?, 'incremental', NULL, datetime('now'), datetime('now'),
+                           'mismatch', 'CRITICAL', 1, '', '{}')""",
+                        (failure.reconciliation_id,),
+                    )
+                    if conn.execute(
+                        "SELECT 1 FROM reconciliation_items WHERE reconciliation_id=? LIMIT 1",
+                        (failure.reconciliation_id,),
+                    ).fetchone() is None:
+                        conn.execute(
+                            """INSERT INTO reconciliation_items(
+                               reconciliation_id, category, object_id, reason_code, local_value,
+                               platform_value, tolerance, severity, details_json
+                               ) VALUES (?, 'ledger', 'sqlite', 'LEDGER_INTEGRITY_FAILURE',
+                               'unavailable', 'callback', 0, 'CRITICAL', '{}')""",
+                            (failure.reconciliation_id,),
+                        )
+                    apply_reconciliation_control(ledger_store, conn, failure)
+            except Exception:
+                pass
+            try:
+                failure_controls = {
+                    "buy_enabled": ledger_store.get_system_state("buy_enabled", "0"),
+                    "kill_switch": ledger_store.get_system_state("kill_switch", "0"),
+                }
+            except Exception:
+                failure_controls = {"buy_enabled": "0", "kill_switch": "0"}
+            notify_reconciliation(
+                failure,
+                failure_controls,
+                notifier=_reconciliation_notifier(),
+            )
+            return jsonify({"ok": False, "error": "ledger_unavailable"}), 503
         _write_json(account_path, payload)
         history_path = account_path.parent / "account_snapshot_history.jsonl"
         history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +281,16 @@ def create_app(
             notification_payload = dict(payload)
             notification_payload["orders"] = filled_orders
             _notify_execution(notification_payload)
+        reconciliation = ledger_result.get("reconciliation")
+        if reconciliation is not None and reconciliation.severity in {"ERROR", "CRITICAL"}:
+            notify_reconciliation(
+                reconciliation,
+                {
+                    "buy_enabled": ledger_store.get_system_state("buy_enabled", "1"),
+                    "kill_switch": ledger_store.get_system_state("kill_switch", "0"),
+                },
+                notifier=_reconciliation_notifier(),
+            )
         _append_api_event(
             event_path,
             "account_snapshot",
