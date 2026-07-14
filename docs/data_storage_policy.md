@@ -336,11 +336,11 @@ SQLite WAL持续异常增长：warning
 高频账户摘要保留366天热数据；订单、逐笔成交、日权益、控制事件、异常对账及其引用快照长期保留。清理每日最多运行一次，只删除超过热保留期且没有异常对账引用的账户快照与无差异摘要；未来压缩或扩大清理范围必须另行设计、dry-run并人工授权。
 
 `TradingStore.backup_to`、目标连接显式关闭、项目外路径保护、原子发布、SHA-256、`PRAGMA integrity_check`、schema/核心计数、7份每日/4份每周/12份每月保留、保守清理、隔离季度恢复演练、latest/季度报告、告警复用和 systemd 模板已在 `origin/main` 中 `implemented（已推送）`。服务器 timer 安装和自动证据状态待重新只读核验，因此仍为 `not observed / not validated`；原“运行治理能力部分实现”的结论不变。
-当前状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。schema 6完整账本、366天热保留、自动对账、控制审计以及自动备份/恢复演练均已随提交 `9f4c12d` 进入 `origin/main` 并为 `implemented（已推送）`；用户提供的 20:06 服务器输出确认 `1311182`、schema 6、一次完整备份/校验和三个核心服务 active。`health_history.jsonl`、`api_events.jsonl`、盘中扫描文件、备份 timer 连续证据和恢复演练仍需只读核验。因此服务器代码为 `deployed（用户提供证据）`，运行治理仍为 `not observed / not validated`。
+当前状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。schema 6完整账本、366天热保留、自动对账、控制审计以及自动备份/恢复演练均已随提交 `9f4c12d` 进入 `origin/main`，并包含在服务器当前 `52b3653` 中；本次部署前完整备份/校验成功，部署后 schema 6 健康可写且三个核心服务 active。`health_history.jsonl`、`api_events.jsonl`、盘中扫描文件、备份 timer 连续证据和恢复演练仍需只读核验。因此服务器代码为 `deployed`，运行治理仍为 `not observed / not validated`。
 
-2026-07-14 通知与复盘增量：执行回报复用长期 `fills` 唯一约束，只在当前事务内返回少量新成交，不新增通知表、JSONL 或逐轮报告；失败通知继续沿用成功后移除的队列。`signal_watchlist.json` 调整为原子覆盖、20个自然日热保留和500条硬上限，目标低于1 MB。当前为 `implemented / not deployed / not observed / not validated`。
+2026-07-14 通知与复盘增量：执行回报复用长期 `fills` 唯一约束，只在当前事务内返回少量新成交，不新增通知表、JSONL 或逐轮报告；失败通知继续沿用成功后移除的队列。`signal_watchlist.json` 调整为原子覆盖、20个自然日热保留和500条硬上限，目标低于1 MB。该增量已包含在服务器当前 `52b3653` 中，状态为 `implemented（已推送） / deployed / not observed / not validated`。
 
-2026-07-14 五项执行正确性 P0 增量不改变 SQLite schema version 6，不新增表、数据库、JSONL、逐轮快照或第三方依赖。持仓与挂单分类从现有 `signals.raw_json`、`position_cycles` 和 `orders` 做有界查询；执行计划版本和分类只随既有信号 JSON 保存，退出续执行复用现有 `exit_intents`。因此长期增长、366天热保留、备份和7/4/12轮转策略均不变。当前为 `implemented（未提交/未推送） / not deployed / not observed / not validated`。
+2026-07-14 五项执行正确性 P0 增量不改变 SQLite schema version 6，不新增表、数据库、JSONL、逐轮快照或第三方依赖。持仓与挂单分类从现有 `signals.raw_json`、`position_cycles` 和 `orders` 做有界查询；执行计划版本和分类只随既有信号 JSON 保存，退出续执行复用现有 `exit_intents`。因此长期增长、366天热保留、备份和7/4/12轮转策略均不变。该增量已随 `52b3653` 推送并部署；部署前备份完整性通过，部署后 `ledger-check` 仍为 schema version 6 且健康可写。当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
 2026-07-14 计划增量：半自动参数复核的年度新增 SQLite 聚合数据目标低于约 30 MB；超过 50 MB/年、单次评价明细超过 5 MB、单次候选超过 5 个或出现逐扫描持久化时必须报警并暂停扩展评审。自动 SQLite 备份、轮转和恢复演练是其发布前置；备份能力已在 `origin/main` 中 `implemented（已推送）`，但在确认服务器部署、至少7个自然日观察和季度恢复验收前，参数复核仍不能标为可发布。
 

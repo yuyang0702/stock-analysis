@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3 standard library, pandas, SQLite schema version 6, existing JoinQuant strategy template, `unittest`, Markdown documentation.
 
-**Current Status (2026-07-14):** Tasks 1-6 are implemented in the isolated worktree. The focused P0 suite passes 123/123, all 292 platform-independent tests pass, Python compilation and `git diff --check` pass. Full Windows discovery runs 297 tests with 3 unchanged Linux-only `run_ubuntu.sh ledger-check` errors because Bash is unavailable; there are no additional failures. Nothing is committed, pushed, deployed, restarted, or copied into the JoinQuant website. Status remains `implemented（未提交/未推送） / not deployed / not observed / not validated` until those separate gates are completed.
+**Current Status (2026-07-14):** Tasks 1-6 are complete and were committed and pushed as `52b3653`. The server `/opt/stock-analysis` has fast-forwarded to that commit; the focused P0 suite passes 123/123, Python compilation and `ledger-check` pass, SQLite remains schema version 6, the environment file checksum is unchanged, and all three stock services are active. The JoinQuant “AI” strategy has persisted template version `2026-07-14.2-p0-execution-contract` while retaining its existing URL, token and runtime configuration. Status is `implemented（已推送） / deployed（服务器与 JoinQuant 模板） / not observed / not validated`; no real trading-day evidence exists for this version yet.
 
 ## Global Constraints
 
@@ -575,7 +575,7 @@ Run `git diff --check`; do not commit.
 - Modify: `linux_deploy.md`
 
 **Interfaces:**
-- Marks the five fixes `implemented（未提交/未推送） / not deployed / not observed / not validated` only after tests pass.
+- Initially marks the five fixes `implemented / not deployed / not observed / not validated` after tests pass; deployment status is promoted only from separate server and JoinQuant evidence. The 2026-07-14 deployment evidence now supports `implemented（已推送） / deployed / not observed / not validated`.
 - Adds the new spec and plan to the main document's active subdocument index.
 
 - [ ] **Step 1: Run focused Python compilation**

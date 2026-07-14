@@ -79,7 +79,7 @@
 
 目标：回答“过去 6 个月或 1 年按当前策略逐日运行，收益、回撤和胜率如何”。
 
-当前状态：第一版信号级回测继续保留；独立逐日历史回测框架已在 `origin/main` 中 `implemented（已推送）`。服务器部署状态待外部核验；没有真实 6 个月/1 年严格数据运行，因此仍为 `not observed / not validated`。
+当前状态：第一版信号级回测继续保留；独立逐日历史回测框架已在 `origin/main` 中 `implemented（已推送）`，并包含在服务器当前 `52b3653` 中。没有真实 6 个月/1 年严格数据导入和运行，因此仍为 `not observed / not validated`。
 
 本地框架已补充：
 
@@ -300,17 +300,17 @@ JoinQuant 实盘服务（如果确认可用）
 - `implemented`：全持仓硬止损不再依赖候选池；持仓周期冻结初始止损与 R；支持 +2R 目标半仓、移动止盈、交易日时间止损；弱市减仓、风险释放禁止新买；卖出始终优先于买入。
 - `implemented`：SQLite schema version 6，覆盖持仓周期、正式订单、不可变逐笔成交、账户/持仓检查点、日权益、自动对账、控制审计、退出意图和再买冷却；包含重复/乱序回放、部分成交、压缩快照、自动停买/熔断和人工恢复门槛测试。
 - `implemented（已推送基线）`：信号 schema version 1 的兼容扩展 `target_qty`，基线 JoinQuant 模板版本 `2026-07-14.1-ledger-v6`，同证券未完成委托、可卖数量和T+1保护，并回传订单、`get_trades()`逐笔成交、真实成交换手、日内盈亏、账户回撤和连续亏损交易日。
-- `implemented（未提交/未推送增量）`：目标模板版本 `2026-07-14.2-p0-execution-contract`；强制版本化买入执行契约、退出意图续执行、5只/80%双层上限、独立买卖开关，以及已有持仓和未完成买单的行业/主题暴露。该增量仍为 `not deployed / not observed / not validated`。
+- `implemented（已推送） / deployed（服务器与 JoinQuant 模板） / not observed / not validated`：提交 `52b3653` 的模板版本 `2026-07-14.2-p0-execution-contract` 已同步；包含强制版本化买入执行契约、退出意图续执行、5只/80%双层上限、独立买卖开关，以及已有持仓和未完成买单的行业/主题暴露。服务器专项测试 123/123、Python 编译和 `ledger-check` 通过，但尚无真实交易日观察与验收证据。
 - `implemented`：执行回报由 SQLite 首次入账的新 fill 驱动；无 trades 旧快照仅在累计成交增加时报告。相同成交的周期快照不再反复推送，部分成交增量仍逐次报告。
 - `implemented`：统一企业微信出口增加实际服务器发送时间；盘后按 D+0/D+1/D+3/D+5/D+10 交易日完整复盘成功推送买点，使用全量行情、最多6只分片并显式保留行情缺失样本。
-- `deployed：待外部核验 / not observed / not validated`：Git 已包含服务器代码、数据库 migration 和 JoinQuant 网站模板，但当前审核未确认外部环境是否同步；不得在只读核验前声称模拟盘已经执行新规则。
-- 部署顺序必须是：备份服务器 SQLite，拉取代码，运行完整测试与 `ledger-check` 确认 schema version 6，更新 JoinQuant 网站模板并确认版本健康检查通过，再重启/恢复相关服务。任何部署和重启仍需用户单独授权。
-- `implemented（已推送） / deployed：待外部核验 / not observed / not validated`：独立 `trading_backup.py` 已实现每日在线备份、SHA-256/完整性/schema/核心计数校验、7/4/12 轮转、隔离季度恢复演练、状态报告、失败告警和 Linux timer 模板。部署或升级前仍须先确认服务器现有主库 schema 并备份；新 timer 只有安装并真实运行后才能升级状态。
+- `deployed（服务器与 JoinQuant 模板） / not observed / not validated`：服务器代码、数据库 migration 和 JoinQuant 网站模板已同步到 `52b3653` / `2026-07-14.2-p0-execution-contract`；尚不能声称模拟盘已在真实交易日执行并验证新规则。
+- 本次部署已按顺序完成：备份服务器 SQLite，拉取代码，运行专项测试、Python 编译与 `ledger-check` 确认 schema version 6，更新 JoinQuant 网站模板，再重启并核验三个核心服务。后续任何新部署和重启仍需用户单独授权。
+- `implemented（已推送） / deployed（服务器代码） / not observed / not validated`：独立 `trading_backup.py` 已实现每日在线备份、SHA-256/完整性/schema/核心计数校验、7/4/12 轮转、隔离季度恢复演练、状态报告、失败告警和 Linux timer 模板；本次人工备份成功。timer 是否安装及其连续运行仍需只读核验。
 
 计划要求的可卖/冻结数量、平台委托状态与部分成交对账、退出意图、旧持仓迁移报告、可用现金与组合风险、未完成买单风险占用、按评分排序分配容量、行业25%/题材20%/无分类单票10%限制、连续亏损交易日冻结、ST/停牌/特殊上市阶段/流动性/追价/陈旧行情过滤、JoinQuant下单前当前价和现金复核、卖出异常价保护、市场状态确认滞后及退出原因冷却现已在 `origin/main` 中 `implemented（已推送）`。组合风险、可交易性、状态确认、退出冷却和分层退出均有独立环境开关。详细接口、门槛与观察分栏以分层退出实施计划的Batch A–G为准。
 卖出要按场景拆分：
 
-当前实现边界：退出规则、可卖数量、成交状态、旧持仓安全迁移、真实组合风险、可交易性过滤、状态滞后与冷却均已在 `origin/main` 实现；部署状态待外部核验，尚未观察或验证。只有通过统一部署门槛并确认模拟盘同步后才能提升状态。
+当前实现边界：退出规则、可卖数量、成交状态、旧持仓安全迁移、真实组合风险、可交易性过滤、状态滞后与冷却均已在 `origin/main` 实现，并已同步服务器与 JoinQuant 模板；当前为 `deployed / not observed / not validated`。只有积累真实交易日证据并完成验收后才能继续提升状态。
 
 ```text
 硬止损：跌破止损价必须卖

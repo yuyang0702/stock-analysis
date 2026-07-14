@@ -4,7 +4,7 @@
 
 > 主文档：`docs/project_roadmap.md`。本文是风险准入、最终买入计划、退出意图续执行、JoinQuant 组合上限和持仓分类暴露的专项设计。
 >
-> 当前状态：`implemented（未提交/未推送） / not deployed / not observed / not validated`。代码和专项测试已完成；服务器与 JoinQuant 网站尚未同步，真实模拟盘交易日尚无本版本证据。
+> 当前状态：`implemented（已推送） / deployed（服务器与 JoinQuant 模板） / not observed / not validated`。代码已随 `52b3653` 推送并部署到服务器 `/opt/stock-analysis`；专项测试 123/123、Python 编译和 `ledger-check` 通过，SQLite 仍为 schema version 6，三个核心服务 active。JoinQuant “AI” 策略已持久化模板版本 `2026-07-14.2-p0-execution-contract`，并保留原 URL、token 和运行配置。真实模拟盘交易日尚无本版本证据。
 
 ## 1. 目标
 
@@ -277,7 +277,7 @@ observed
 validated
 ```
 
-本地代码和测试完成后最多标记 `implemented（未提交/未推送）`。Git 提交、推送、服务器部署、SQLite 备份、服务重启和 JoinQuant 网站模板更新均需要用户后续分别授权。
+本地代码和测试完成后最多标记 `implemented（未提交/未推送）`。Git 提交、推送、服务器部署、SQLite 备份、服务重启和 JoinQuant 网站模板更新均需要用户后续分别授权。2026-07-14 用户已完成这些后续授权，本次部署证据支持提升为 `implemented（已推送） / deployed`，但不支持提升为 `observed / validated`。
 
 ## 13. 实施边界
 

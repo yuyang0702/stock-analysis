@@ -6,19 +6,19 @@
 >
 > 主文档：`docs/project_roadmap.md`。
 
-> 2026-07-14 执行正确性增量以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为准：它复用 schema 6 的 `signals`、`position_cycles`、`orders` 和 `exit_intents`，不改变本账本设计的存储、对账或保留口径。该增量当前仅为 `implemented（未提交/未推送） / not deployed / not observed / not validated`。
+> 2026-07-14 执行正确性增量以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为准：它复用 schema 6 的 `signals`、`position_cycles`、`orders` 和 `exit_intents`，不改变本账本设计的存储、对账或保留口径。该增量已随 `52b3653` 推送并部署到服务器和 JoinQuant 模板，当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
-> 外部部署状态更新：用户提供的 2026-07-14 20:06 服务器输出确认 `1311182`、schema version 6、完整性/可写检查通过和三个核心服务 active，因此该基线服务器代码可标记 `deployed（用户提供证据）`；JoinQuant 网站模板、自动 timer 连续运行和真实交易日行为仍未据此成为 `observed / validated`。
+> 外部部署状态更新：2026-07-14 后续部署确认服务器已到 `52b3653`，schema version 6、完整性/可写检查通过，环境校验未变且三个核心服务 active；JoinQuant 模板也已同步。服务器与模板可标记 `deployed`，自动 timer 连续运行和真实交易日行为仍未成为 `observed / validated`。
 >
 > 执行从文档：`docs/live_trading_execution_plan.md`。
 >
-> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。原 Batch 1 schema 1 已部署事实保持不变；完整账本与自动对账已随提交 `9f4c12d` 进入 `origin/main` 并完成 `implemented（已推送）`。服务器和 JoinQuant 部署状态待外部核验；只有同步及对应线上验收完成后，才能提升到 `deployed / observed / validated`。
+> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。原 Batch 1 schema 1 已部署事实保持不变；完整账本与自动对账已随提交 `9f4c12d` 进入 `origin/main`，并包含在服务器当前 `52b3653` 中。当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
 ## 0. 当前增量状态
 
-原 Batch 1 的服务器已部署事实仍指 schema version 1 的策略运行、信号、观察型风险和系统状态账本。`origin/main` 已包含 schema version 5 基础提交 `8e35d03c90af2592921c81347bddf8b5af41ba94` 和在其上实现 schema version 6 的 `9f4c12d`。服务器最近记录的 `aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1 只是历史检查点；服务器外部状态必须重新核验，不能从 Git 推断为已部署。
+原 Batch 1 的 schema version 1 部署事实是历史基线。`origin/main` 已包含 schema version 5 基础提交 `8e35d03c90af2592921c81347bddf8b5af41ba94` 和在其上实现 schema version 6 的 `9f4c12d`；服务器当前 `52b3653` 已通过 schema version 6 的 `ledger-check`。`aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1 仅保留为历史检查点。
 
-下述“完整账本与自动对账增量”已获用户设计批准并在 `origin/main` 中 `implemented（已推送）`：schema version 6、订单/逐笔成交、账户与持仓检查点、日权益、自动对账、控制审计、企业微信摘要和人工解锁入口均有自动化证据。当前提交为 `9f4c12d`，状态是 `deployed：待外部核验 / not observed / not validated`。
+下述“完整账本与自动对账增量”已获用户设计批准并在 `origin/main` 中 `implemented（已推送）`：schema version 6、订单/逐笔成交、账户与持仓检查点、日权益、自动对账、控制审计、企业微信摘要和人工解锁入口均有自动化证据。该增量始于 `9f4c12d` 并包含在服务器当前 `52b3653` 中，状态是 `deployed / not observed / not validated`。
 
 ### 0.1 完整账本与自动对账增量
 

@@ -1,12 +1,12 @@
 # 项目接管与新环境恢复说明
 
-> 2026-07-14 Git 代码基线：`origin/main` 已包含提交 `9f4c12d`，其中包括分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复，以及独立逐日历史回测框架。上述能力为 `implemented（已推送）`；服务器 `1311182` 代码、schema 6 和核心服务已由用户输出确认，JoinQuant 网站模板及真实交易日行为仍须核验，且尚无足够证据标记为 `observed / validated`。真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
+> 2026-07-14 当前代码与部署基线：`origin/main`、服务器 `/opt/stock-analysis` 均包含 `52b3653`；该提交包含分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复、独立逐日历史回测框架、通知复盘增量和五项执行正确性 P0。服务器测试、编译、账本检查和服务状态均通过，JoinQuant 网站模板也已同步。上述能力为 `implemented（已推送） / deployed`，但真实交易日行为仍为 `not observed / not validated`；真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
 
-> 2026-07-14 `origin/main` 实现基线 `7c31684` 新增：SQLite 新 fill/legacy 累计成交增量驱动的执行回报、统一企业微信服务器时间，以及 D+0/D+1/D+3/D+5/D+10 全量买点复盘。上述增量为 `implemented（已推送、未部署） / not observed / not validated`，不得与服务器现有旧通知行为混淆。
+> 2026-07-14 `7c31684` 通知复盘增量已包含在服务器当前 `52b3653` 中：SQLite 新 fill/legacy 累计成交增量驱动执行回报、统一企业微信服务器时间，以及 D+0/D+1/D+3/D+5/D+10 全量买点复盘。当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
-> 2026-07-14 隔离工作树增量：五项执行正确性 P0 已完成代码和专项测试，包括强制风险准入、版本化唯一买入计划、退出意图续执行及优先级保护、JoinQuant 5只/80%双层边界与买卖开关、已有持仓及未完成买单分类暴露。目标模板版本为 `2026-07-14.2-p0-execution-contract`。当前严格为 `implemented（未提交/未推送） / not deployed / not observed / not validated`，接管者不得把它与 `origin/main` 或服务器现状混淆。
+> 2026-07-14 五项执行正确性 P0 已随 `52b3653` 进入 `origin/main` 并部署到服务器 `/opt/stock-analysis`，包括强制风险准入、版本化唯一买入计划、退出意图续执行及优先级保护、JoinQuant 5只/80%双层边界与买卖开关、已有持仓及未完成买单分类暴露。服务器专项测试 123/123、Python 编译和 `ledger-check` 通过，环境文件校验未变，三个核心服务 active；JoinQuant “AI” 策略已持久化模板版本 `2026-07-14.2-p0-execution-contract` 并保留原运行配置。当前严格为 `implemented（已推送） / deployed（服务器与 JoinQuant 模板） / not observed / not validated`。
 
-> 最近服务器外部检查点（用户提供，Git 无法独立确认）：2026-07-14 20:06，服务器 HEAD 为 `131118213f22bbdaecd5cd8ab89a87db9aaf7f85`，分支与 `origin/main` 一致且干净；SQLite schema 6 完整性/可写检查通过，环境文件哈希未变，三个核心服务均 active。该检查点不包含本隔离工作树增量，JoinQuant 网站模板状态仍需单独核验。
+> 上一服务器外部检查点（用户提供）：2026-07-14 20:06，服务器 HEAD 为 `131118213f22bbdaecd5cd8ab89a87db9aaf7f85`，分支与 `origin/main` 一致且干净；SQLite schema 6 完整性/可写检查通过，环境文件哈希未变，三个核心服务均 active。该历史检查点已被本次 `52b3653` 服务器与 JoinQuant 部署证据取代，但仍可用于追溯部署前基线。
 
 > 仍为 `planned`：ML-7 训练型模型，以及 ML-8/Batch G 的候选登记、评价准入、人工决定、激活和回滚。当前 `shadow_score.py` 只是规则型影子评分；自动分析未来仍必须止于候选，发布需人工批准和当次单独授权。
 
@@ -47,7 +47,7 @@ Git不能恢复：
 - 数据存储、文件增长与保留规范。
 - 根目录 `AGENTS.md`仓库开发约束。
 
-`9f4c12d` 在此基础上增加 schema 6 完整执行账本、自动对账与人工解锁，以及独立逐日历史回测框架；该提交已进入 `origin/main`。Git 只能证明代码已推送，不能证明服务器或 JoinQuant 已部署。
+`9f4c12d` 在此基础上增加 schema 6 完整执行账本、自动对账与人工解锁，以及独立逐日历史回测框架；该提交已进入 `origin/main` 并包含在服务器当前 `52b3653` 中。Git 本身只能证明代码已推送；本次服务器和 JoinQuant 的 `deployed` 结论来自独立部署证据。
 
 接管时不要把本文记录的SHA永久写死为“最新版本”。应执行：
 
@@ -99,11 +99,11 @@ git ls-remote origin refs/heads/main
 | 订单回报与持仓同步 | deployed | 快照回传、实际成交和持仓一致性。 |
 | 健康检查和微信异常报警 | deployed | timer、报告、告警和失败重试。 |
 | SQLite Batch 1 | deployed | 服务器已运行 schema version 1；待部署后首个有效交易日确认双写和交易日一致性。 |
-| SQLite schema 6完整执行账本 | deployed（用户提供证据） | 含持仓周期、订单、逐笔成交、账户/持仓检查点、日权益、对账、控制审计和冷却；服务器 `1311182` schema 6 检查通过，尚未观察或验证。 |
-| 自动对账与人工解锁 | implemented（已推送） | ERROR停买、CRITICAL熔断、两次不同全量一致快照和二次确认；部署状态待核验，尚未观察或验证。 |
-| 成交回报幂等与 D+N 全量复盘 | implemented（已推送、未部署） | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘；未部署、观察或验证。 |
-| 完整历史回测 | implemented（已推送框架） | 与信号级回测并存；服务器部署状态待核验，真实 6 个月/1 年 strict 数据尚未导入、观察或人工验证。 |
-| 模拟盘买卖强制风控 | implemented（已推送） | 部署状态待核验，尚未观察或验证；真实资金级风控仍为planned。 |
+| SQLite schema 6完整执行账本 | deployed | 含持仓周期、订单、逐笔成交、账户/持仓检查点、日权益、对账、控制审计和冷却；服务器 `52b3653` schema 6 检查通过，尚未观察或验证。 |
+| 自动对账与人工解锁 | deployed | ERROR停买、CRITICAL熔断、两次不同全量一致快照和二次确认已部署；尚未观察或验证。 |
+| 成交回报幂等与 D+N 全量复盘 | deployed | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘已随 `52b3653` 部署；尚未观察或验证。 |
+| 完整历史回测 | deployed（框架） | 与信号级回测并存且代码已在服务器；真实 6 个月/1 年 strict 数据尚未导入、运行或人工验证。 |
+| 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。
