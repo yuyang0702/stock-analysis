@@ -8,6 +8,14 @@ import config
 
 
 class ConfigEnvTest(unittest.TestCase):
+    def test_signal_watchlist_retention_default_is_twenty_days(self) -> None:
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                reloaded = importlib.reload(config)
+                self.assertEqual(reloaded.SIGNAL_WATCHLIST_DAYS_DEFAULT, 20)
+        finally:
+            importlib.reload(config)
+
     def test_observation_risk_defaults(self) -> None:
         try:
             with patch.dict(os.environ, {}, clear=True):

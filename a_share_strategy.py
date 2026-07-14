@@ -11,7 +11,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -43,6 +43,8 @@ OUTPUT_DIR = app_config.OUTPUT_DIR
 CACHE_DIR = app_config.CACHE_DIR
 INDUSTRY_CACHE = app_config.INDUSTRY_CACHE
 SIGNAL_WATCHLIST_FILE = CACHE_DIR / "signal_watchlist.json"
+REVIEW_TRADING_DAY_OFFSETS = (0, 1, 3, 5, 10)
+SIGNAL_WATCHLIST_MAX_ITEMS = 500
 SECTOR_MARKET_CONTEXT_FILE = CACHE_DIR / "market" / "sector_context.json"
 
 
@@ -475,7 +477,30 @@ def prune_signal_watchlist_items(items: list[dict[str, Any]], now: datetime | No
         if pushed_at and (now - pushed_at).days > keep_days:
             continue
         kept.append(item)
-    return kept[-80:]
+    kept.sort(key=lambda item: _parse_watchlist_time(item.get("pushed_at")) or datetime.min)
+    return kept[-SIGNAL_WATCHLIST_MAX_ITEMS:]
+
+
+def trading_day_age(pushed_at: datetime, now: datetime) -> int:
+    if pushed_at.date() >= now.date():
+        return 0
+    cursor = pushed_at.date()
+    count = 0
+    while cursor < now.date():
+        cursor += timedelta(days=1)
+        if is_a_share_trading_day(datetime.combine(cursor, datetime_time.min)):
+            count += 1
+    return count
+
+
+def due_review_offset(item: dict[str, Any], now: datetime) -> int | None:
+    if safe_text(item.get("kind")) != "买点":
+        return None
+    pushed_at = _parse_watchlist_time(item.get("pushed_at"))
+    if pushed_at is None:
+        return None
+    age = trading_day_age(pushed_at, now)
+    return age if age in REVIEW_TRADING_DAY_OFFSETS else None
 
 
 def _series_float(row: pd.Series, key: str) -> float | None:

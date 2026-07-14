@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +21,57 @@ class FakeNotifier:
 
 
 class SignalWatchlistTest(unittest.TestCase):
+    def test_review_offsets_use_a_share_trading_days(self) -> None:
+        friday = datetime(2026, 7, 10, 10, 0)
+        monday = datetime(2026, 7, 13, 15, 30)
+        self.assertEqual(strat.trading_day_age(friday, monday), 1)
+        self.assertEqual(
+            strat.due_review_offset({"kind": "买点", "pushed_at": "2026-07-10 10:00:00"}, monday),
+            1,
+        )
+        self.assertIsNone(
+            strat.due_review_offset({"kind": "风险", "pushed_at": "2026-07-10 10:00:00"}, monday)
+        )
+        now = datetime(2026, 7, 14, 15, 30)
+        expected = {
+            "2026-07-14 10:00:00": 0,
+            "2026-07-13 10:00:00": 1,
+            "2026-07-09 10:00:00": 3,
+            "2026-07-07 10:00:00": 5,
+            "2026-06-30 10:00:00": 10,
+        }
+        for pushed_at, offset in expected.items():
+            with self.subTest(offset=offset):
+                self.assertEqual(
+                    strat.due_review_offset({"kind": "买点", "pushed_at": pushed_at}, now),
+                    offset,
+                )
+
+    def test_review_offsets_honor_configured_a_share_holiday(self) -> None:
+        with patch.object(strat.app_config, "A_SHARE_HOLIDAYS_DEFAULT", {"2026-07-13"}):
+            self.assertEqual(
+                strat.trading_day_age(
+                    datetime(2026, 7, 10, 10, 0),
+                    datetime(2026, 7, 14, 15, 30),
+                ),
+                1,
+            )
+
+    def test_watchlist_retention_is_twenty_days_and_capped_at_five_hundred(self) -> None:
+        now = datetime(2026, 7, 31, 15, 30)
+        items = [
+            {
+                "code": f"{index:06d}",
+                "pushed_at": (datetime(2026, 7, 15, 10, 0) + timedelta(seconds=index)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+            for index in range(520)
+        ]
+        kept = strat.prune_signal_watchlist_items(list(reversed(items)), now=now)
+        self.assertEqual(len(kept), 500)
+        self.assertEqual(kept[0]["code"], "000020")
+
     def test_notification_title_includes_runtime_phase(self) -> None:
         self.assertEqual(strat.notification_title("after", "盘后复盘"), "【盘后】盘后复盘")
         self.assertEqual(strat.notification_title("intraday", "买点提醒 600000"), "【盘中】买点提醒 600000")
