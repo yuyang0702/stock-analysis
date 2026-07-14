@@ -12,6 +12,16 @@ import requests
 import config as app_config
 
 
+def _server_time_text() -> str:
+    now = datetime.now().astimezone()
+    zone = getattr(now.tzinfo, "key", None) or now.tzname() or "local"
+    return f"{now.strftime('%Y-%m-%d %H:%M:%S')} {zone}"
+
+
+def _render_timed_content(content: str) -> str:
+    return f"> 服务器时间：{_server_time_text()}\n{content}"
+
+
 @dataclass
 class NotifyState:
     sent: dict[str, float]
@@ -96,7 +106,7 @@ class WeComNotifier:
         payload = {
             "msgtype": "markdown",
             "markdown": {
-                "content": f"### {title}\n{content}",
+                "content": f"### {title}\n{_render_timed_content(content)}",
             },
         }
 
