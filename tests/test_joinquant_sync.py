@@ -49,6 +49,8 @@ class JoinQuantSyncTest(unittest.TestCase):
             second = joinquant_sync.ingest_snapshot_payload(snapshot, store, "2026-07-07 10:05:03")
 
             self.assertEqual(first["snapshot_id"], second["snapshot_id"])
+            self.assertEqual([event["event_id"] for event in first["new_executions"]], ["fill:20"])
+            self.assertEqual(second["new_executions"], [])
             with store.connect() as conn:
                 self.assertEqual(conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT count(*) FROM position_snapshots").fetchone()[0], 1)
@@ -59,6 +61,60 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertEqual(equity["closing_equity"], 100000)
             self.assertAlmostEqual(equity["fees"], 5.2)
             self.assertEqual(equity["unrealized_pnl"], 500)
+
+    def test_new_execution_events_include_each_new_partial_fill_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            first = self._ledger_snapshot("2026-07-07 10:05:00")
+            first["orders"][0]["filled"] = 50
+            first["orders"][0]["amount"] = 100
+            first["trades"][0]["trade_id"] = "fill-50-a"
+            first["trades"][0]["amount"] = 50
+            second = self._ledger_snapshot("2026-07-07 10:06:00")
+            second["orders"][0]["filled"] = 100
+            second["orders"][0]["amount"] = 100
+            second["trades"] = [
+                dict(first["trades"][0]),
+                {
+                    "trade_id": "fill-50-b",
+                    "order_id": "10",
+                    "code": "600000",
+                    "action": "buy",
+                    "amount": 50,
+                    "price": 10.1,
+                    "commission": 1.0,
+                    "stamp_tax": 0.0,
+                    "other_fee": 0.0,
+                    "datetime": "2026-07-07 10:06:00",
+                },
+            ]
+
+            first_result = joinquant_sync.ingest_snapshot_payload(first, store, "2026-07-07 10:05:02")
+            second_result = joinquant_sync.ingest_snapshot_payload(second, store, "2026-07-07 10:06:02")
+            replay_result = joinquant_sync.ingest_snapshot_payload(second, store, "2026-07-07 10:06:03")
+
+            self.assertEqual([row["event_id"] for row in first_result["new_executions"]], ["fill:fill-50-a"])
+            self.assertEqual([row["event_id"] for row in second_result["new_executions"]], ["fill:fill-50-b"])
+            self.assertEqual(replay_result["new_executions"], [])
+
+    def test_legacy_order_progress_notifies_only_when_filled_quantity_increases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            snapshot = self._ledger_snapshot()
+            snapshot["trades"] = []
+            snapshot["orders"][0]["amount"] = 100
+            snapshot["orders"][0]["filled"] = 50
+
+            first = joinquant_sync.ingest_snapshot_payload(snapshot, store, "2026-07-07 10:05:02")
+            replay = joinquant_sync.ingest_snapshot_payload(snapshot, store, "2026-07-07 10:05:03")
+            snapshot["generated_at"] = "2026-07-07 10:06:00"
+            snapshot["orders"][0]["filled"] = 100
+            increased = joinquant_sync.ingest_snapshot_payload(snapshot, store, "2026-07-07 10:06:02")
+
+            self.assertEqual(first["new_executions"][0]["qty"], 50)
+            self.assertEqual(replay["new_executions"], [])
+            self.assertEqual(increased["new_executions"][0]["qty"], 50)
+            self.assertEqual(increased["new_executions"][0]["cumulative_qty"], 100)
 
     def test_detail_retention_keeps_changes_and_hourly_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -201,19 +201,55 @@ def persist_account_snapshot(
             )
 
     strategy_version = str(snapshot.get("template_version") or snapshot.get("strategy_version") or "")
+    trade_events = [event for event in snapshot.get("trades", []) if isinstance(event, dict)]
+    has_trades = bool(trade_events)
+    new_executions: list[dict[str, object]] = []
     orders_by_id: dict[str, dict[str, object]] = {}
     for event in snapshot.get("orders", []):
         if not isinstance(event, dict):
             continue
         order = normalize_order(event, trade_date=trade_date, strategy_version=strategy_version)
+        previous = conn.execute(
+            "SELECT filled_qty FROM orders WHERE client_order_id=?",
+            (order["client_order_id"],),
+        ).fetchone()
+        previous_filled = int(previous[0]) if previous is not None else 0
         store.upsert_order(conn, order)
         if order.get("order_id"):
             orders_by_id[str(order["order_id"])] = order
-    inserted_fills = 0
-    for event in snapshot.get("trades", []):
-        if not isinstance(event, dict):
+        current_filled = int(order.get("filled_qty") or 0)
+        if not has_trades and current_filled > previous_filled:
+            new_executions.append({
+                "event_id": f"legacy:{order['client_order_id']}:{current_filled}",
+                "source": "legacy_order_progress",
+                "order_id": order.get("order_id"),
+                "signal_id": order.get("signal_id"),
+                "stock_code": order.get("stock_code"),
+                "action": order.get("action"),
+                "qty": current_filled - previous_filled,
+                "cumulative_qty": current_filled,
+                "price": order.get("average_fill_price"),
+                "status": order.get("status"),
+                "filled_at": order.get("updated_at") or generated_at,
+            })
+    for event in trade_events:
+        fill = normalize_fill(event, orders=orders_by_id)
+        if not store.insert_fill(conn, fill):
             continue
-        inserted_fills += int(store.insert_fill(conn, normalize_fill(event, orders=orders_by_id)))
+        order = orders_by_id.get(str(fill.get("order_id") or ""), {})
+        new_executions.append({
+            "event_id": f"fill:{fill['fill_id']}",
+            "source": "fill",
+            "order_id": fill.get("order_id"),
+            "signal_id": fill.get("signal_id"),
+            "stock_code": fill.get("stock_code"),
+            "action": fill.get("action"),
+            "qty": fill.get("qty"),
+            "cumulative_qty": order.get("filled_qty"),
+            "price": fill.get("price"),
+            "status": order.get("status") or "filled",
+            "filled_at": fill.get("filled_at"),
+        })
 
     fees = conn.execute(
         "SELECT COALESCE(sum(commission+stamp_tax+other_fee),0) FROM fills WHERE substr(filled_at,1,10)=?",
@@ -242,7 +278,12 @@ def persist_account_snapshot(
             unrealized, fees, drawdown, generated_at, generated_at,
         ),
     )
-    return {"snapshot_id": sid, "retained_details": retain, "inserted_fills": inserted_fills}
+    return {
+        "snapshot_id": sid,
+        "retained_details": retain,
+        "inserted_fills": sum(event["source"] == "fill" for event in new_executions),
+        "new_executions": new_executions,
+    }
 
 
 def ingest_snapshot_payload(
