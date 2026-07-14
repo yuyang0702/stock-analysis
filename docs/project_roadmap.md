@@ -20,7 +20,8 @@
 | `docs/superpowers/specs/2026-07-14-sqlite-backup-recovery-design.md` | SQLite 自动备份、7/4/12 轮转、恢复演练、告警和状态门槛 | 实现、部署或审核交易账本备份恢复时读取；当前本地 `implemented`，服务器未部署。 |
 | `docs/superpowers/plans/2026-07-14-sqlite-backup-recovery.md` | SQLite 自动备份与恢复演练实施任务和验证命令 | 修改或部署备份恢复能力时读取；Tasks 1–5 本地 `implemented`。 |
 | `docs/superpowers/plans/2026-07-14-complete-trading-ledger-reconciliation.md` | schema 6 完整成交账本、自动对账和人工解锁实施证据 | 修改订单、成交、快照、权益、对账或交易控制时读取；当前仅本地 `implemented`。 |
-| `docs/superpowers/specs/2026-07-14-notification-review-idempotency-design.md` | 企业微信执行回报幂等、D+1 全量复盘和统一服务器时间 | 修改成交通知、信号复盘或通知公共出口时读取；当前为 `planned`。 |
+| `docs/superpowers/specs/2026-07-14-notification-review-idempotency-design.md` | 企业微信执行回报幂等、D+1 全量复盘和统一服务器时间 | 修改成交通知、信号复盘或通知公共出口时读取；当前为 `implemented（仅本地）`。 |
+| `docs/superpowers/plans/2026-07-14-notification-review-idempotency.md` | 新成交事件通知、统一时间和 D+N 全量复盘实施证据 | 修改或部署上述能力时读取；当前为 `implemented（仅本地）`。 |
 | `docs/superpowers/specs/2026-07-14-point-in-time-historical-backtest-design.md` | strict/price_core 双轨逐日时点历史回测、反前视和撮合证据边界 | 修改完整历史回测、walk-forward、历史数据质量或 Batch G 回测门槛时读取；当前仅本地 `implemented`。 |
 | `docs/superpowers/plans/2026-07-14-point-in-time-historical-backtest.md` | 独立历史库、候选生成、逐日撮合、指标、CLI和验证任务 | 实现或核验完整历史回测时读取；框架本地已实现，真实严格数据运行尚未观察或验证。 |
 | `docs/superpowers/specs/2026-07-14-semi-automatic-parameter-review-design.md` | 参数候选、准入、人工批准、版本和回滚治理 | 设计参数复核或机器学习与参数边界时读取；当前为 `planned`。 |
@@ -73,17 +74,17 @@ flowchart LR
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
 | A 股数据扫描与策略评分 | 已实现 | 现有策略会生成候选、分数、风险参数和目标仓位。 |
-| 企业微信基础推送 | 已实现 | 支持策略报告、JoinQuant 信号计划、JoinQuant 执行回报。 |
+| 企业微信基础推送 | 已实现 | 支持策略报告、JoinQuant 信号计划、JoinQuant 执行回报；统一通知出口会在实际发送时增加服务器时间，失败重试使用新的实际发送时间。 |
 | JoinQuant 信号导出 | 已实现 | 本地策略会导出 JoinQuant 可读取的买卖信号。 |
 | JoinQuant 信号服务 | 已实现 | 提供信号拉取接口和账户快照回调接口。 |
 | JoinQuant 策略模板 | 已实现 | JoinQuant 平台运行 `joinquant_strategy.py`，默认使用模拟盘真实下单模式，不是 dry-run。 |
-| JoinQuant 执行回报 | 已实现 | 完整订单事件会通过回调进入服务器并落盘；只有 `buy/sell` 且 `filled > 0` 的实际成交会推送微信，零成交、失败和跳过不推送。 |
+| JoinQuant 执行回报 | 已实现 | 执行回报只由 SQLite 首次入账的新 fill 或无 trades 旧快照的累计成交增量触发；周期快照不会重复推送历史成交，零成交、失败和跳过不推送。 |
 | JoinQuant 持仓同步 | 已实现 | 本地持仓展示读取 JoinQuant 回传结果，作为模拟盘主数据来源。 |
 | 全持仓硬止损信号 | 已实现 | 每轮使用全市场实时价检查全部 JoinQuant 同步持仓；持仓即使未进入候选池，跌破既有止损价也会生成卖出信号。本地代码和测试已完成，服务器部署及真实交易日卖出证据仍待确认。 |
 | JoinQuant 健康检查与异常报警 | 已实现 | `joinquant_health.py` 会检查信号文件、账户快照、API 拉取/回传次数、失败原因、持仓一致性、JoinQuant 网站模板版本和稳定性评分，生成 `output/joinquant_health_YYYYMMDD.md`；非交易时段的信号/快照过期只记录报告，不刷微信报警。 |
 | 企业微信失败重试 | 已实现 | 推送失败会进入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 会定时重试。 |
 | 节假日推送静默 | 已实现 | 非 A 股交易日默认不推普通扫描、买点提醒和 JoinQuant 空计划；可用 `NOTIFY_NON_TRADING_DAY=1` 临时打开联调。 |
-| 盘后信号追踪复盘 | 已实现 | 对已推送信号记录推送价、入场/止损/止盈、分数、题材和市场状态；盘后补充 D+N 快照、高低收、入场、止盈止损、最大浮盈、最大回撤和策略质量分组。 |
+| 盘后信号追踪复盘 | 已实现 | 对成功推送的买点按 D+0/D+1/D+3/D+5/D+10 交易日批次完整复盘；使用全量行情、固定分片，掉出候选池或行情缺失都不丢样本，风险提醒不混入买点统计。 |
 | 本地信号级回测 | 已实现第一版 | `backtest_engine.py` 可读取 `cache/ml/signal_samples.jsonl` 或 `cache/joinquant/signals.json`，模拟信号买卖、手续费、印花税、T+1、止盈止损和仓位限制，输出 `output/backtest_report.md` 与 `output/backtest_trades.csv`。 |
 | ML 样本采集与基础复盘 | 部分实现 | 已采集 JoinQuant 信号样本、回填订单执行标签、生成基础复盘报告；多日收益标签和模型训练未启用。 |
 | Linux 一键部署脚本 | 已实现 | 当前统一使用 `run_ubuntu.sh`，旧的拆分脚本已删除。 |
@@ -129,22 +130,22 @@ flowchart LR
 
 ## 盘后信号追踪复盘
 
-当前追踪范围是“微信成功推送过的信号”，数据保存在 `cache/signal_watchlist.json`。每条信号会记录：
+当前买点复盘范围是“微信成功推送过的 `kind=买点` 信号”，数据保存在 `cache/signal_watchlist.json`。风险、卖出和普通扫描摘要不混入买点胜率。每条信号会记录：
 
 - 推送价、建议入场、止损、止盈、仓位。
 - 模式、总分、交易分、市场状态、题材和题材热度。
 - 推送时间、信号 ID、买点状态和推送理由。
 
-盘后复盘会基于最新行情补充：
+盘后复盘使用当日完整行情按股票代码取值，不再与当轮 TopN 候选取交集：
 
-- 当日最高、最低、收盘价。
-- 是否已入场、是否触及止盈、是否触及止损。
-- 单只信号的最大浮盈、最大回撤和收盘收益。
-- 汇总统计：今日跟踪数量、已入场、未入场、止盈、止损、平均最大浮盈、平均最大回撤。
-- D+N 追踪快照：每次盘后复盘会把当日收盘、高、低、收益和结果追加到 `review_history`。
+- D+0 只列当日成功推送买点，不提前评价成败。
+- D+1/D+3/D+5/D+10 按 A 股交易日补充最高、最低、收盘、收益、入场、止盈止损、最大浮盈和最大回撤。
+- 每个到期批次全量处理；单条消息最多 6 只并显示第 N/M 组，超过容量时分片而非截断。
+- 股票掉出候选池仍复盘；完整行情缺少该股票或价格时明确显示“行情缺失”并保留后续资格。
+- 每次阶段复盘把当日收盘、高、低、收益和结果追加到 `review_history`。
 - 策略质量分组：按模式、题材热度、市场状态输出轻量胜率和平均收益，用于判断哪些信号更有效。
 
-后续更严格的 `D+1/D+3/D+5/D+10` 交易日收益标签、最大区间浮盈浮亏和模型训练样本，会继续并入机器学习标签阶段。
+`signal_watchlist.json` 原子覆盖、热保留 20 个自然日、最多 500 条，目标低于 1 MB。当前能力为 `implemented / not deployed / not observed / not validated`；真实 D+N 效果和模型训练标签仍需后续交易日积累。
 
 ## 本地信号级回测
 
@@ -210,7 +211,7 @@ flowchart LR
 - `global_market_context.py` 会通过 AkShare 东方财富主源抓取美股、日本、韩国主要指数并写入 `cache/market/global_context.json`；主源失败时切到 Sina 备用源，备用源也失败时优先复用 24 小时内最近一次成功缓存，仍不可用才按海外风险中性处理，不阻塞扫描。
 - 日常微信扫描汇总、单票提醒和 JoinQuant 下单计划会显示原策略分、影子分、影子调整和原排名到影子排名的变化；影子分不是百分制，允许超过 100，只用于观察，不参与下单。
 - JoinQuant 执行链路已增加可成交性与健康保护：买入信号导出前按账户总资产、目标仓位和入场价检查是否至少够买 100 股，不够一手时记录 `buy_too_small_for_board_lot` 并不下单；订单状态在快照回传前统一转成字符串，避免 `OrderStatus` JSON 序列化失败；普通 `skipped` 仍保留在原因明细中但不计入硬失败阈值；`JOINQUANT_ENFORCE_HEALTH_GATE=1` 时健康准入不通过只禁止新买单，卖出仍允许。
-- JoinQuant 网站模板会在交易时间每次 `handle_data` 执行后回传账户快照，因此成交后的现金、总资产和持仓通常会在下一分钟快照中更新；服务器每 60 秒同步该快照到本地持仓。无订单的周期快照只用于账户同步；只有 `buy/sell` 且 `filled > 0` 的完整或部分成交才发送企业微信执行回报，零成交、失败和跳过不推送。
+- JoinQuant 网站模板会在交易时间每次 `handle_data` 执行后回传账户快照，因此成交后的现金、总资产和持仓通常会在下一分钟快照中更新；服务器每 60 秒同步该快照到本地持仓。执行回报只消费本次 SQLite 事务首次插入的新 fill；无 trades 的兼容快照只报告累计成交增量，周期快照不会再次推送历史成交。
 - JoinQuant 回传订单后，会把订单状态、失败原因、订单号、数量、成交量和价格回填到样本中。
 - `ml_dataset.py` 可生成 `output/ml_signal_review.md`，用于查看样本数、买卖数量、订单状态、原策略分布和影子评分分布。
 - `strategy_compare_report.py` 会补充 D+1/D+3/D+5、最大浮盈、最大回撤、止盈止损触发标签，生成 `output/strategy_compare_report.md`；每日盘后生成本地报告，每周五推送策略对照微信摘要。

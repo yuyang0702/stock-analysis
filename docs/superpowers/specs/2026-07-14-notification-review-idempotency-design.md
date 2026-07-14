@@ -6,7 +6,7 @@
 >
 > 主文档：`docs/project_roadmap.md`。如项目状态、阶段或权限口径冲突，以主文档为准。
 >
-> 当前状态：`planned / not implemented / not deployed / not observed / not validated`。
+> 当前状态：`implemented（仅本地） / not deployed / not observed / not validated`。
 
 ## 1. 背景与已确认问题
 

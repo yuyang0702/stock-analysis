@@ -300,6 +300,8 @@ JoinQuant 实盘服务（如果确认可用）
 - `implemented`：全持仓硬止损不再依赖候选池；持仓周期冻结初始止损与 R；支持 +2R 目标半仓、移动止盈、交易日时间止损；弱市减仓、风险释放禁止新买；卖出始终优先于买入。
 - `implemented`：SQLite schema version 6，覆盖持仓周期、正式订单、不可变逐笔成交、账户/持仓检查点、日权益、自动对账、控制审计、退出意图和再买冷却；包含重复/乱序回放、部分成交、压缩快照、自动停买/熔断和人工恢复门槛测试。
 - `implemented`：信号 schema version 1 的兼容扩展 `target_qty`，JoinQuant 模板版本 `2026-07-14.1-ledger-v6`，同证券未完成委托、可卖数量和T+1保护，并回传订单、`get_trades()`逐笔成交、真实成交换手、日内盈亏、账户回撤和连续亏损交易日。
+- `implemented`：执行回报由 SQLite 首次入账的新 fill 驱动；无 trades 旧快照仅在累计成交增加时报告。相同成交的周期快照不再反复推送，部分成交增量仍逐次报告。
+- `implemented`：统一企业微信出口增加实际服务器发送时间；盘后按 D+0/D+1/D+3/D+5/D+10 交易日完整复盘成功推送买点，使用全量行情、最多6只分片并显式保留行情缺失样本。
 - `not deployed / not observed / not validated`：服务器代码、数据库 migration 和 JoinQuant 网站模板尚未同步；不得在同步前声称模拟盘已经执行新规则。
 - 部署顺序必须是：备份服务器 SQLite，拉取代码，运行完整测试与 `ledger-check` 确认 schema version 6，更新 JoinQuant 网站模板并确认版本健康检查通过，再重启/恢复相关服务。任何部署和重启仍需用户单独授权。
 - `implemented / not deployed / not observed / not validated`：独立 `trading_backup.py` 已实现每日在线备份、SHA-256/完整性/schema/核心计数校验、7/4/12 轮转、隔离季度恢复演练、状态报告、失败告警和 Linux timer 模板。部署前仍须先使用现有方式备份服务器 schema 1 主库；新 timer 只有安装并真实运行后才能升级状态。
@@ -339,7 +341,7 @@ a_share_strategy.py 的板块行情改为独立低频刷新：a_share_strategy.p
 global_market_context.py 会通过 AkShare 东方财富主源抓取美股、日本、韩国主要指数并写入 cache/market/global_context.json；主源失败时切到 Sina 备用源，备用源也失败时优先复用 24 小时内最近一次成功缓存，仍不可用才按海外风险中性处理。
 日常微信扫描汇总、单票提醒和 JoinQuant 下单计划会显示原策略分、影子分、影子调整和原排名到影子排名的变化；影子分标注为仅观察，不参与下单。
 JoinQuant 执行保护已补齐：买入信号导出前检查是否至少够买 100 股，不足一手时记录 buy_too_small_for_board_lot 并过滤；订单状态在账户快照回传前统一转成字符串，避免 OrderStatus 无法 JSON 序列化；普通 skipped 订单仍保留在失败原因明细中，但不再计入硬失败阈值；设置 JOINQUANT_ENFORCE_HEALTH_GATE=1 后，健康准入不通过会停止新买单导出，但已有持仓的卖出、止损和止盈仍允许。
-JoinQuant 网站模板在交易时间每次 handle_data 后都会回传账户快照，成交后的现金、总资产和持仓通常下一分钟即可更新；服务器 stock-joinquant-sync.timer 每 60 秒同步到本地。周期快照和完整订单事件仍会落盘并同步；只有 `buy/sell` 且 `filled > 0` 的完整或部分成交才触发企业微信执行回报，零成交、失败和跳过不推送。
+JoinQuant 网站模板在交易时间每次 handle_data 后都会回传账户快照，成交后的现金、总资产和持仓通常下一分钟即可更新；服务器 stock-joinquant-sync.timer 每 60 秒同步到本地。周期快照和完整订单事件仍会落盘并同步；企业微信执行回报只由 SQLite 新 fill 或 legacy 累计成交增量触发，零成交、失败、跳过和未变化的历史成交不推送。
 strategy_compare_report.py 每天 15:35 生成 output/strategy_compare_report.md，每周五 15:45 推送策略对照微信摘要。
 现阶段不改变 final_score 排序、不改变 JoinQuant 下单、不改变 position_pct。
 ```
@@ -495,7 +497,7 @@ KILL_SWITCH 已实现并验证
 - 持仓一致性：报告会比较 JoinQuant 最新快照和本地同步后的 `cache/portfolio_web/positions.json`，发现数量或代码不一致会标记 critical。
 - 模板版本自检：`joinquant_strategy.py` 回传 `strategy_template_version`，`joinquant_health.py` 对比 `JOINQUANT_TEMPLATE_VERSION`，不一致时标记 `template_version_mismatch` 并提示 JoinQuant 网站模板未更新。
 - 影子评分第一版：`shadow_score.py` 基于原策略分、消息催化、题材热度、板块位置缓存、市场情绪、交易质量和海外风险生成 `enhanced_score`、`shadow_adjust_score`、`original_rank`、`shadow_rank`、`shadow_rank_change` 和 `shadow_reason`；`enhanced_score = final_score + shadow_adjust_score`，不再按 100 封顶；`a_share_strategy.py --sector-context-only` / `bash run_ubuntu.sh sector-context` 低频刷新 `cache/market/sector_context.json`，扫描只读缓存并补充 `sector_pct_chg`、`sector_rank_pct`、`sector_hot_level` 和 `sector_position_reason`，没有缓存时才按板块中性处理并提示原因；`global_market_context.py` 通过 AkShare 东方财富主源抓取美股、日本、韩国主要指数并写入 `cache/market/global_context.json`，主源失败时切到 Sina 备用源，备用源也失败时优先复用 24 小时内最近一次成功缓存，仍不可用才按中性处理；`a_share_strategy.py` 在日常微信和 JoinQuant 下单计划中展示原分、影子分、调整和排名变化；`strategy_compare_report.py` 每天盘后生成原策略 vs 影子评分对照报告、每周五推送周报摘要；JoinQuant 下单仍使用原 `final_score` 和原仓位。
-- 通知兜底：`notifier.py` 会把发送失败的企业微信消息写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 每 5 分钟重试。
+- 通知兜底：`notifier.py` 会给每次实际发送增加服务器时间，并把发送失败的原始业务正文写入 `cache/notify_failed_queue.jsonl`；`notify_retry.py` 和 `stock-notify-retry.timer` 每 5 分钟重试，重试时显示新的实际发送时间。
 - 统一运维入口：`run_ubuntu.sh` 新增 `notify-retry`、`global-context`、`sector-context`、`strategy-compare` 和 `strategy-compare-weekly` 命令；`install` 会统一安装健康检查、持仓同步、微信重试、readiness、ML 复盘、海外上下文、板块行情缓存和策略对照等 timer。
 
 阶段 1 剩余工作不再是代码功能缺口，而是线上观察：至少连续 10 个交易日检查健康报告、执行回报、微信提醒和 JoinQuant 网站委托记录是否一致。阶段 2 框架和部分模拟盘风险能力虽已本地实现，但仍需分别完成部署、真实 strict 数据运行和交易日观察；实盘级风控仍属于后续阶段。
