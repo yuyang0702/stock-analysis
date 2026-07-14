@@ -1,6 +1,6 @@
 # SQLite 自动备份与恢复演练设计
 
-> 状态：已随本地提交 `9f4c12d` 完成 `implemented`，服务器 `not deployed / not observed / not validated`。`trading_backup.py`、7/4/12 轮转、隔离恢复演练、状态报告、告警复用和 systemd 模板已通过本地测试；核心计数现已覆盖 schema 6 完整账本表。服务器安装、自动运行证据和季度演练验收仍需单独授权与真实观察。
+> 状态：已随提交 `9f4c12d` 进入 `origin/main` 并完成 `implemented（已推送）`，服务器 `deployed：待外部核验 / not observed / not validated`。`trading_backup.py`、7/4/12 轮转、隔离恢复演练、状态报告、告警复用和 systemd 模板已通过本地测试；核心计数现已覆盖 schema 6 完整账本表。服务器安装、自动运行证据和季度演练验收仍需单独授权与真实观察。
 
 ## 1. 目标
 

@@ -1,6 +1,6 @@
 ﻿# SQLite Automatic Backup and Recovery Implementation Plan
 
-> **状态：** Tasks 1–5 已随本地提交 `9f4c12d` 完成 `implemented`，核心计数已兼容 schema 6 完整账本；尚未推送、部署、观察或验证。Linux systemd 模板只有静态检查证据，仍需服务器执行测试与 timer 安装确认。
+> **状态：** Tasks 1–5 已随提交 `9f4c12d` 进入 `origin/main` 并完成 `implemented（已推送）`，核心计数已兼容 schema 6 完整账本；部署状态待外部核验，尚未观察或验证。Linux systemd 模板只有静态检查证据，仍需服务器执行测试与 timer 安装确认。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
@@ -393,7 +393,7 @@ Report local status only.
 
 - [x] **Step 1: Update status without overstating deployment**
 
-Set code, tests, CLI, and systemd templates to local `implemented`; keep server installation `not deployed`, timer evidence `not observed`, and quarterly recovery evidence `not validated`. Preserve the existing statement that `TradingStore.backup_to` alone did not constitute automatic backup.
+Set code, tests, CLI, and systemd templates to `implemented`; after Git push, record `implemented（已推送）`. Keep server installation externally unverified, timer evidence `not observed`, and quarterly recovery evidence `not validated`. Preserve the existing statement that `TradingStore.backup_to` alone did not constitute automatic backup.
 
 - [x] **Step 2: Update Codex read-only evidence fields**
 
@@ -423,4 +423,4 @@ Expected: all platform-independent tests pass. If the three Bash execution tests
 
 - [x] **Step 5: Final status report**
 
-Report modified files, exact tests, failures or platform limits, and Git diff/status. Keep all new backup capabilities at local `implemented / not deployed / not observed / not validated`. Do not commit, push, deploy, install timers, or restart services.
+Report modified files, exact tests, failures or platform limits, and Git diff/status. At the original implementation checkpoint, stop before commit, push, deployment, timer installation, or restart; after separately authorized Git publication, update the status to `implemented（已推送） / deployment externally unverified / not observed / not validated` without implying server installation.

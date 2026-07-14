@@ -4,7 +4,7 @@
 
 **Goal:** Build an independent, deterministic A-share daily backtest that supports honest `strict` point-in-time evidence and explicitly labeled `price_core` proxy evidence without changing the existing signal-level backtest.
 
-**Local completion evidence (2026-07-14):** Framework `implemented` and committed locally as `9f4c12d`. Pre-commit verification passed 254 platform-independent tests, 2 Linux static entrypoint tests, module compilation, and `git diff --check`. No push, deployment, server write, real 6/12-month dataset run, observation, or validation occurred.
+**Completion evidence (2026-07-14):** Framework `implemented（已推送）` as `9f4c12d`, which is included in `origin/main`. Pre-commit verification passed 254 platform-independent tests, 2 Linux static entrypoint tests, module compilation, and `git diff --check`. Deployment remains externally unverified; no real 6/12-month dataset run, observation, or validation has been confirmed.
 
 **Architecture:** `historical_data.py` owns a separate SQLite history database, imports and quality gates. `historical_strategy.py` generates deterministic candidates without realtime calls. `historical_backtest.py` owns next-open matching, account state, walk-forward metrics, CLI and atomic outputs. Existing `exit_policy.py` supplies layered exit decisions; the formal trading ledger remains untouched.
 
@@ -371,11 +371,11 @@ Do not commit.
 - Modify: `linux_deploy.md`
 
 **Interfaces:**
-- Produces one consistent status: local framework `implemented`; no imported real 6/12-month dataset means `not observed / not validated`; server remains `not deployed`.
+- Produces one consistent status: framework `implemented（已推送）`; server deployment is externally unverified; no imported real 6/12-month dataset means `not observed / not validated`.
 
 - [x] **Step 1: Update active document relationships and truth labels**
 
-Add the spec/plan to the roadmap index. Replace “complete history backtest planned” only after code verification with “framework implemented locally; strict data run not observed or validated.” Keep the existing signal-level backtest documented separately. State that `price_core` is proxy evidence and cannot satisfy Batch G.
+Add the spec/plan to the roadmap index. Replace “complete history backtest planned” only after code verification with “framework implemented”; after the Git push, record `implemented（已推送）`; keep strict data runs as not observed or validated. Keep the existing signal-level backtest documented separately. State that `price_core` is proxy evidence and cannot satisfy Batch G.
 
 - [x] **Step 2: Update storage and auditor boundaries**
 

@@ -10,7 +10,7 @@
 
 当前已知状态：
 
-- Batch A-E：已随本地提交 `9f4c12d` 完成 `implemented`，尚未推送、部署、观察或验证。
+- Batch A-E：已随提交 `9f4c12d` 进入 `origin/main` 并完成 `implemented（已推送）`；部署状态待外部核验，尚未观察或验证。
 - Batch F：部署与真实模拟盘观察 `planned`，需要用户当次单独授权。
 - Batch G：半自动参数复核 `planned / not implemented / not deployed / not observed / not validated`。
 - 本地 SQLite schema version 6、自动备份 CLI/轮转/恢复演练和 systemd 模板不代表服务器已升级、timer 已安装或自动证据已形成。

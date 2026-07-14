@@ -17,13 +17,13 @@
 | `docs/superpowers/specs/2026-07-11-simulation-stability-ledger-design.md` | SQLite 账本、幂等、对账、安全和 20 日验证 | 涉及账本、订单/成交、对账或稳定性门槛时读取；Batch 1 与后续目标状态必须分开。 |
 | `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` | 当前买入、卖出、持仓周期、组合风险和安全降级规则 | 修改策略、交易、仓位、止盈止损或风险逻辑前必读。 |
 | `docs/superpowers/plans/2026-07-13-layered-exit-risk-management.md` | 当前 Batch A-G 唯一实施、部署和观察顺序 | 执行或部署本地已实现风险能力时读取。 |
-| `docs/superpowers/specs/2026-07-14-sqlite-backup-recovery-design.md` | SQLite 自动备份、7/4/12 轮转、恢复演练、告警和状态门槛 | 实现、部署或审核交易账本备份恢复时读取；当前本地 `implemented`，服务器未部署。 |
-| `docs/superpowers/plans/2026-07-14-sqlite-backup-recovery.md` | SQLite 自动备份与恢复演练实施任务和验证命令 | 修改或部署备份恢复能力时读取；Tasks 1–5 本地 `implemented`。 |
-| `docs/superpowers/plans/2026-07-14-complete-trading-ledger-reconciliation.md` | schema 6 完整成交账本、自动对账和人工解锁实施证据 | 修改订单、成交、快照、权益、对账或交易控制时读取；当前仅本地 `implemented`。 |
+| `docs/superpowers/specs/2026-07-14-sqlite-backup-recovery-design.md` | SQLite 自动备份、7/4/12 轮转、恢复演练、告警和状态门槛 | 实现、部署或审核交易账本备份恢复时读取；当前为 `implemented（已推送）`，服务器部署状态待外部核验。 |
+| `docs/superpowers/plans/2026-07-14-sqlite-backup-recovery.md` | SQLite 自动备份与恢复演练实施任务和验证命令 | 修改或部署备份恢复能力时读取；Tasks 1–5 为 `implemented（已推送）`。 |
+| `docs/superpowers/plans/2026-07-14-complete-trading-ledger-reconciliation.md` | schema 6 完整成交账本、自动对账和人工解锁实施证据 | 修改订单、成交、快照、权益、对账或交易控制时读取；当前为 `implemented（已推送）`。 |
 | `docs/superpowers/specs/2026-07-14-notification-review-idempotency-design.md` | 企业微信执行回报幂等、D+1 全量复盘和统一服务器时间 | 修改成交通知、信号复盘或通知公共出口时读取；当前为 `implemented（已推送、未部署）`。 |
 | `docs/superpowers/plans/2026-07-14-notification-review-idempotency.md` | 新成交事件通知、统一时间和 D+N 全量复盘实施证据 | 修改或部署上述能力时读取；当前为 `implemented（已推送、未部署）`。 |
-| `docs/superpowers/specs/2026-07-14-point-in-time-historical-backtest-design.md` | strict/price_core 双轨逐日时点历史回测、反前视和撮合证据边界 | 修改完整历史回测、walk-forward、历史数据质量或 Batch G 回测门槛时读取；当前仅本地 `implemented`。 |
-| `docs/superpowers/plans/2026-07-14-point-in-time-historical-backtest.md` | 独立历史库、候选生成、逐日撮合、指标、CLI和验证任务 | 实现或核验完整历史回测时读取；框架本地已实现，真实严格数据运行尚未观察或验证。 |
+| `docs/superpowers/specs/2026-07-14-point-in-time-historical-backtest-design.md` | strict/price_core 双轨逐日时点历史回测、反前视和撮合证据边界 | 修改完整历史回测、walk-forward、历史数据质量或 Batch G 回测门槛时读取；当前为 `implemented（已推送）`。 |
+| `docs/superpowers/plans/2026-07-14-point-in-time-historical-backtest.md` | 独立历史库、候选生成、逐日撮合、指标、CLI和验证任务 | 实现或核验完整历史回测时读取；框架已进入 `origin/main`，真实严格数据运行尚未观察或验证。 |
 | `docs/superpowers/specs/2026-07-14-semi-automatic-parameter-review-design.md` | 参数候选、准入、人工批准、版本和回滚治理 | 设计参数复核或机器学习与参数边界时读取；当前为 `planned`。 |
 | `docs/superpowers/plans/2026-07-14-semi-automatic-parameter-review.md` | 半自动参数复核未来实施任务 | 数据与前置门槛满足后执行；当前为 `planned`。 |
 
@@ -31,15 +31,15 @@
 
 稳定性账本 Batch 1 当前状态为“代码已实现并部署服务器、待部署后首个有效交易日双写观察”；2026-07-12 只读核验确认服务器、本地代码当时均为 `54eaaf423f690dda84776304c4ec87846aa8cf66`，SQLite schema version 为 1 且空信号一致。此历史检查点不能替代当前服务器复核。
 
-## 2026-07-14 本地实现基线
+## 2026-07-14 Git 实现基线
 
-本地提交 `9f4c12d` 已包含下列 `implemented` 能力，但尚未推送或部署：全 JoinQuant 持仓硬止损覆盖、板块/ATR 初始止损、账户风险定仓、+2R 按100股单位降至初始半仓、首段止盈后的移动止盈、短线3个/中线10个交易日时间止损，以及 `CAUTION` 减半风险仓位和 `RISK_OFF` 禁止新买入。卖出动作使用稳定持仓周期 ID，且优先覆盖同股买入。
+提交 `9f4c12d` 已进入 `origin/main`，包含下列 `implemented（已推送）` 能力：全 JoinQuant 持仓硬止损覆盖、板块/ATR 初始止损、账户风险定仓、+2R 按100股单位降至初始半仓、首段止盈后的移动止盈、短线3个/中线10个交易日时间止损，以及 `CAUTION` 减半风险仓位和 `RISK_OFF` 禁止新买入。卖出动作使用稳定持仓周期 ID，且优先覆盖同股买入。服务器和 JoinQuant 是否已经同步该提交仍须重新只读核验；不得据 Git 推送推断为 `deployed / observed / validated`。
 
-SQLite 本地 schema 已升至 version 6：除 schema 5 的持仓周期、委托事件、退出意图和冷却外，新增正式订单、不可变逐笔成交、账户摘要、压缩持仓检查点、日权益、对账批次/差异项和控制审计。回调先事务入账和自动对账，成功后才发布兼容 JSON；`ERROR` 停止新买入，`CRITICAL` 追加 `KILL_SWITCH`，只有两个不同新鲜快照的全量一致对账及人工二次确认才允许恢复。在线备份、校验、7/4/12轮转和恢复演练已把 schema 6 核心表纳入。本批已随 `9f4c12d` 本地提交，但尚未推送或安装到服务器，因此是 `not deployed / not observed / not validated`。
+当前 `origin/main` 的 SQLite 代码 schema 已升至 version 6：除 schema 5 的持仓周期、委托事件、退出意图和冷却外，新增正式订单、不可变逐笔成交、账户摘要、压缩持仓检查点、日权益、对账批次/差异项和控制审计。回调先事务入账和自动对账，成功后才发布兼容 JSON；`ERROR` 停止新买入，`CRITICAL` 追加 `KILL_SWITCH`，只有两个不同新鲜快照的全量一致对账及人工二次确认才允许恢复。在线备份、校验、7/4/12轮转和恢复演练已把 schema 6 核心表纳入。本批已随 `9f4c12d` 推送；当前状态为 `implemented（已推送） / deployed：待外部核验 / not observed / not validated`。
 
-JoinQuant 信号 JSON 继续使用兼容的 schema version 1，并增加可选 `target_qty`；本地网站模板期望版本为 `2026-07-14.1-ledger-v6`，并回传 `get_trades()` 逐笔成交。服务器仍以最近只读确认的 `aa9acffaf62239e39c076408d83d113dce22b029`、SQLite schema version 1 和旧网站模板为准；Git、服务器和 JoinQuant 外部状态都必须重新核验。本地测试不构成 `deployed / observed / validated`。
+JoinQuant 信号 JSON 继续使用兼容的 schema version 1，并增加可选 `target_qty`；`origin/main` 网站模板期望版本为 `2026-07-14.1-ledger-v6`，并回传 `get_trades()` 逐笔成交。服务器 `aa9acffaf62239e39c076408d83d113dce22b029`、SQLite schema version 1 和旧网站模板只是最近一次已记录的历史检查点，不代表当前外部状态；服务器和 JoinQuant 必须重新只读核验。本地测试和 Git 推送都不构成 `deployed / observed / validated`。
 
-2026-07-13 用户确认调整实施策略：执行安全、旧持仓迁移、真实组合买入风控、买入可交易性、市场状态滞后和冷却机制一次补齐。上述代码和自动化测试现已在本地 `implemented`，包括行业25%、题材20%、无分类单票10%、连续亏损交易日冻结、真实成交换手/日内盈亏/账户回撤回传、未完成买单风险占用、评分优先分配、JoinQuant下单前复核，以及买卖两侧陈旧行情和异常价保护；各模块有独立环境开关。仍保持 `not deployed / not observed / not validated`。唯一详细计划为 `docs/superpowers/plans/2026-07-13-layered-exit-risk-management.md`。
+2026-07-13 用户确认调整实施策略：执行安全、旧持仓迁移、真实组合买入风控、买入可交易性、市场状态滞后和冷却机制一次补齐。上述代码和自动化测试现已在 `origin/main` 中 `implemented（已推送）`，包括行业25%、题材20%、无分类单票10%、连续亏损交易日冻结、真实成交换手/日内盈亏/账户回撤回传、未完成买单风险占用、评分优先分配、JoinQuant下单前复核，以及买卖两侧陈旧行情和异常价保护；各模块有独立环境开关。当前为 `deployed：待外部核验 / not observed / not validated`。唯一详细计划为 `docs/superpowers/plans/2026-07-13-layered-exit-risk-management.md`。
 阶段门槛分为两层：阶段 1 基础系统稳定性按连续 10 个有效交易日验收；专项设计中的 20 个有效交易日用于完整账本加固与策略验证。达到 10 日门槛不等于完成 20 日专项验证，两者均不得以代码实现或非交易日静态检查替代。
 
 Batch G 参数复核采用“自动分析、人工批准、显式发布、版本化回滚”，专项设计和实施计划分别见 `docs/superpowers/specs/2026-07-14-semi-automatic-parameter-review-design.md` 与 `docs/superpowers/plans/2026-07-14-semi-automatic-parameter-review.md`。当前已有样本、部分标签、策略对照、信号级回测、逐日历史回测框架和 `parameter_version` 基础；候选登记、评价准入、人工决定、激活和回滚均为 `planned / not implemented / not deployed / not observed / not validated`。20 个有效交易日只允许开始数据复核，候选进入可批准列表还需要可用 strict 历史 walk-forward 证据加 20 个有效模拟盘交易日；缺少该证据时替代门槛为至少 60 个有效模拟盘交易日。任何自动任务和 Codex 只读审核员都无权批准或改变活动参数。
@@ -170,9 +170,9 @@ flowchart LR
 - 历史撮合：默认使用 T 日收盘决策、T+1 开盘成交，并遵守 T+1、手续费、印花税、涨跌停和仓位限制。
 - 结果输出：净值曲线、交易明细、收益、最大回撤、胜率、盈亏比、分数分组表现和市场状态分组表现。
 
-本地已实现独立 `cache/backtest/history.db`、JoinQuant/AkShare CSV 映射、幂等冲突检查、`strict`/`price_core` 质量门、T 收盘决策与 T+1 开盘撮合、复权连续性、费用/滑点/涨跌停/停牌、分层退出、绩效分组、三个 walk-forward 窗口、参数比较契约、CLI、原子报告和手动 Linux 入口。现有 `backtest_engine.py` 信号级回测保持独立兼容。
+当前 `origin/main` 已实现独立 `cache/backtest/history.db`、JoinQuant/AkShare CSV 映射、幂等冲突检查、`strict`/`price_core` 质量门、T 收盘决策与 T+1 开盘撮合、复权连续性、费用/滑点/涨跌停/停牌、分层退出、绩效分组、三个 walk-forward 窗口、参数比较契约、CLI、原子报告和手动 Linux 入口。现有 `backtest_engine.py` 信号级回测保持独立兼容。
 
-状态必须保持为：框架已在本地提交 `9f4c12d` 并为 `implemented`，但尚未推送或部署；没有真实 6 个月/1 年数据集通过严格质量门并重复运行，所以是 `not deployed / not observed / not validated`。`price_core` 固定标记 `proxy_only=true`，只能验证价格、撮合和退出机制，不能满足 Batch G 的完整历史回测准入。
+状态必须保持为：框架已随提交 `9f4c12d` 进入 `origin/main`，为 `implemented（已推送）`；服务器部署状态待外部核验。没有真实 6 个月/1 年数据集通过严格质量门并重复运行，所以仍是 `not observed / not validated`。`price_core` 固定标记 `proxy_only=true`，只能验证价格、撮合和退出机制，不能满足 Batch G 的完整历史回测准入。
 
 ## 当前部署原则
 
@@ -230,7 +230,7 @@ flowchart LR
 | ML-2 成交与收益标注 | 部分实现 | 订单执行标签已回填；`strategy_compare_report.py` 会补 D+1/D+3/D+5、最大浮盈、最大回撤、止盈止损触发；D+10 和组合级标签待补齐。 |
 | ML-3 复盘报表 | 已实现 | 可生成 `output/ml_signal_review.md` 和 `output/strategy_compare_report.md`，统计样本、订单状态、原策略分布、影子评分分布和策略对照结果；不训练模型、不参与下单。 |
 | ML-4 信号回测 | 已实现第一版 | 基于已生成信号输出收益、回撤、胜率和交易明细，为后续模型训练提供对照基线；与 ML-5 的逐日历史框架保持独立。 |
-| ML-5 完整历史回测 | implemented（仅本地框架） | 独立历史库、strict/price_core 双轨、逐日撮合、walk-forward、指标、CLI和报告已实现；真实 6 个月/1 年严格数据尚未导入，故未部署、观察或验证。 |
+| ML-5 完整历史回测 | implemented（已推送框架） | 独立历史库、strict/price_core 双轨、逐日撮合、walk-forward、指标、CLI和报告已进入 `origin/main`；服务器部署状态待核验，真实 6 个月/1 年严格数据尚未导入，故尚未观察或验证。 |
 | ML-6 影子模型 | 已实现第一版 | 当前不是训练模型，而是规则型影子评分；已纳入消息催化、题材热度、板块位置缓存、市场情绪、交易质量和海外风险；`enhanced_score = final_score + shadow_adjust_score`，不再按 100 封顶，并输出原排名、影子排名和排名变化；板块位置由独立 timer 低频刷新，扫描只读最近成功缓存；不影响真实下单，用来和原策略做对照。 |
 | ML-7 训练模型与策略辅助 | 待实现 | 训练模型先只输出版本化 `ml_score` 并进入影子观察；通过门槛和人工批准后，才可在独立授权任务中逐步用于排序、过滤或小幅仓位调整。止损、卖出安全、单票/行业/题材/总仓位和开放风险硬上限仍由规则控制。 |
 | ML-8 半自动参数复核 | 待实现 | 这是与训练模型分离的参数治理能力。自动任务只生成有界候选、时间切分评价和准入报告；候选必须绑定版本与哈希，由用户明确批准并在独立授权任务中发布到 JoinQuant 模拟盘。禁止自动批准、自动改参、自动部署或进入真实资金；详细门槛见 2026-07-14 专项设计。 |
@@ -302,4 +302,4 @@ JoinQuant 回传后补充以下标签：
 
 阶段 1 的实盘前观察标准：连续 10 个交易日稳定运行，`joinquant_health` 报告无 critical，信号拉取和快照回传稳定，失败订单原因可解释，微信异常通知可以收到或被重试补发。本地模拟盘仍为废弃功能，不作为当前模拟交易依据。
 
-非交易日生成的 readiness 结论只表示静态文件、schema 和配置检查结果，不构成有效观察日、阶段放行或实盘准入证据。当前运行数据治理仍为部分实现：SQLite 自动备份与恢复演练代码已本地实现但未部署、观察或验证；健康/API 单文件 JSONL 月度轮转、盘中扫描文件保留和统一归档仍待实施。
+非交易日生成的 readiness 结论只表示静态文件、schema 和配置检查结果，不构成有效观察日、阶段放行或实盘准入证据。当前运行数据治理仍为部分实现：SQLite 自动备份与恢复演练代码已在 `origin/main` 中 `implemented（已推送）`，部署状态待外部核验且尚未观察或验证；健康/API 单文件 JSONL 月度轮转、盘中扫描文件保留和统一归档仍待实施。

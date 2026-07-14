@@ -1,6 +1,6 @@
 # Complete Trading Ledger and Reconciliation Implementation Plan
 
-> **Status (2026-07-14):** Tasks 1–8 are locally `implemented` and committed as `9f4c12d`. Pre-commit platform-independent verification passed; the Bash execution tests remain reserved for Linux because Bash was unavailable on this Windows host. The commit is not pushed, deployed, observed, or validated.
+> **Status (2026-07-14):** Tasks 1–8 are `implemented（已推送）` as commit `9f4c12d`, which is included in `origin/main`. Platform-independent verification passed; the Bash execution tests remain reserved for Linux because Bash was unavailable on this Windows host. Deployment remains externally unverified, and the capability is not observed or validated.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
@@ -507,12 +507,12 @@ Run `git diff --check`; do not commit.
 - Modify: `linux_deploy.md`
 
 **Interfaces:**
-- Produces one consistent `implemented / not deployed / not observed / not validated` status for the new code.
+- Produces one consistent `implemented（已推送） / deployment externally unverified / not observed / not validated` status for the new code.
 - Keeps server and JoinQuant state explicitly unverified until separately inspected and deployed.
 
 - [x] **Step 1: Update documentation status and active index**
 
-Mark complete ledger and automatic reconciliation as local `implemented` only after code tests pass. Correct the now-stale statements that schema-5 work is uncommitted/unpushed, while preserving that the server was last confirmed on the older SHA/schema and needs fresh verification.
+Mark complete ledger and automatic reconciliation as `implemented` only after code tests pass, and as `implemented（已推送）` only after the Git push is confirmed. Correct stale Git statements while preserving that the server and JoinQuant need fresh external verification.
 
 - [x] **Step 2: Update storage and backup contracts**
 
@@ -545,4 +545,4 @@ Confirm schema migration, immutable fills, callback ordering, reconciliation cat
 
 - [x] **Step 7: Stop before Git or deployment operations**
 
-Report modified files, exact verification output, remaining Linux/server/JoinQuant checks, and current Git status. This checkpoint was followed by separate authorization for the local commit `9f4c12d`; push, server migration, JoinQuant website update, service restart, and live observation remain unauthorized and undone.
+Report modified files, exact verification output, remaining Linux/server/JoinQuant checks, and current Git status. This implementation checkpoint was followed by separate authorization for commit `9f4c12d` and its Git push, which are complete. Server migration, JoinQuant website state, service state, and live observation remain externally unverified and require separate evidence or authorization.

@@ -2,7 +2,7 @@
 
 > 日期：2026-07-14
 >
-> 状态：设计已确认，框架已在本地提交 `9f4c12d` 并为 `implemented`；尚未推送或部署，未导入真实 6 个月/1 年严格数据，因此为 `not deployed / not observed / not validated`。
+> 状态：设计已确认，框架已随提交 `9f4c12d` 进入 `origin/main` 并为 `implemented（已推送）`；服务器部署状态待外部核验，且未导入真实 6 个月/1 年严格数据，因此为 `not observed / not validated`。
 >
 > 主文档：`docs/project_roadmap.md`。本设计从属于主文档和 `docs/live_trading_execution_plan.md`；如状态冲突，以主文档为准。
 

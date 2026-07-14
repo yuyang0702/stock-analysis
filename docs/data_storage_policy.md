@@ -331,16 +331,16 @@ SQLite WAL持续异常增长：warning
 
 ### 14.1 2026-07-13 持仓周期账本增量
 
-本地 SQLite schema version 6新增 `orders`、`fills`、`account_snapshots`、`position_snapshots`、`daily_equity`、`reconciliation_runs`、`reconciliation_items`和`control_events`，并保留 schema 5 的持仓周期、委托事件、退出意图和冷却。账户摘要约6万行/年；持仓明细只在状态变化、整点和每日首次收盘检查点保存；年度新增连索引目标低于200MB，超过300MB/年或2MB/日必须告警并暂停新增高频明细。
+当前 `origin/main` 的 SQLite schema version 6代码新增 `orders`、`fills`、`account_snapshots`、`position_snapshots`、`daily_equity`、`reconciliation_runs`、`reconciliation_items`和`control_events`，并保留 schema 5 的持仓周期、委托事件、退出意图和冷却。账户摘要约6万行/年；持仓明细只在状态变化、整点和每日首次收盘检查点保存；年度新增连索引目标低于200MB，超过300MB/年或2MB/日必须告警并暂停新增高频明细。
 
 高频账户摘要保留366天热数据；订单、逐笔成交、日权益、控制事件、异常对账及其引用快照长期保留。清理每日最多运行一次，只删除超过热保留期且没有异常对账引用的账户快照与无差异摘要；未来压缩或扩大清理范围必须另行设计、dry-run并人工授权。
 
-`TradingStore.backup_to`、目标连接显式关闭、项目外路径保护、原子发布、SHA-256、`PRAGMA integrity_check`、schema/核心计数、7份每日/4份每周/12份每月保留、保守清理、隔离季度恢复演练、latest/季度报告、告警复用和 systemd 模板已在本地 `implemented`。服务器尚未安装 timer 或产生自动证据，因此保持 `not deployed / not observed / not validated`；原“运行治理能力部分实现”的结论不变。
-当前状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。schema 6完整账本、366天热保留、自动对账、控制审计以及自动备份/恢复演练均已在本地提交 `9f4c12d` 并为 `implemented`；服务器上的 `health_history.jsonl` 和 `api_events.jsonl` 仍是单文件，盘中扫描仍持续生成独立 CSV/Markdown。上述能力尚未推送、部署、观察或验证，不得因本地测试通过标记为 deployed 或 validated。
+`TradingStore.backup_to`、目标连接显式关闭、项目外路径保护、原子发布、SHA-256、`PRAGMA integrity_check`、schema/核心计数、7份每日/4份每周/12份每月保留、保守清理、隔离季度恢复演练、latest/季度报告、告警复用和 systemd 模板已在 `origin/main` 中 `implemented（已推送）`。服务器 timer 安装和自动证据状态待重新只读核验，因此仍为 `not observed / not validated`；原“运行治理能力部分实现”的结论不变。
+当前状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。schema 6完整账本、366天热保留、自动对账、控制审计以及自动备份/恢复演练均已随提交 `9f4c12d` 进入 `origin/main` 并为 `implemented（已推送）`；服务器上的 `health_history.jsonl`、`api_events.jsonl`、盘中扫描文件以及部署版本都需重新只读核验。上述能力为 `deployed：待外部核验 / not observed / not validated`，不得因本地测试或 Git 推送标记为 deployed 或 validated。
 
 2026-07-14 通知与复盘增量：执行回报复用长期 `fills` 唯一约束，只在当前事务内返回少量新成交，不新增通知表、JSONL 或逐轮报告；失败通知继续沿用成功后移除的队列。`signal_watchlist.json` 调整为原子覆盖、20个自然日热保留和500条硬上限，目标低于1 MB。当前为 `implemented / not deployed / not observed / not validated`。
 
-2026-07-14 计划增量：半自动参数复核的年度新增 SQLite 聚合数据目标低于约 30 MB；超过 50 MB/年、单次评价明细超过 5 MB、单次候选超过 5 个或出现逐扫描持久化时必须报警并暂停扩展评审。自动 SQLite 备份、轮转和恢复演练是其发布前置；当前仅本地 `implemented`，在完成服务器部署、至少7个自然日观察和季度恢复验收前，参数复核仍不能标为可发布。
+2026-07-14 计划增量：半自动参数复核的年度新增 SQLite 聚合数据目标低于约 30 MB；超过 50 MB/年、单次评价明细超过 5 MB、单次候选超过 5 个或出现逐扫描持久化时必须报警并暂停扩展评审。自动 SQLite 备份、轮转和恢复演练是其发布前置；备份能力已在 `origin/main` 中 `implemented（已推送）`，但在确认服务器部署、至少7个自然日观察和季度恢复验收前，参数复核仍不能标为可发布。
 
 ### Batch A：低风险性能优化
 

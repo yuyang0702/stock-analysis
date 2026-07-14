@@ -11,7 +11,7 @@
 - `ml_dataset.py` 已采集信号、订单状态和部分收益标签。
 - `strategy_compare_report.py` 已输出原策略与规则型影子评分对照。
 - `backtest_engine.py` 已支持对既有信号样本做第一版信号级回测。
-- 独立逐日历史回测框架已在本地 `implemented`，但尚无真实 strict 数据运行和验证证据。
+- 独立逐日历史回测框架已在 `origin/main` 中 `implemented（已推送）`，但尚无真实 strict 数据运行和验证证据。
 - SQLite 策略运行记录已有 `parameter_version` 字段。
 
 当前尚不存在：

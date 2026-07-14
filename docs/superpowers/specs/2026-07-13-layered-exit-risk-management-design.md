@@ -6,7 +6,7 @@
 
 ## 1. 状态边界
 
-本地提交 `9f4c12d` 已 `implemented`：分层退出、全持仓硬止损、持仓周期、执行安全、真实组合买入风控、可交易性过滤、市场状态滞后和退出冷却。它尚未推送、部署、观察或验证；服务器最近确认仍为 SQLite schema version 1，不能把本地 schema version 6 或网站模板 `2026-07-14.1-ledger-v6` 写成服务器事实。
+提交 `9f4c12d` 已进入 `origin/main` 并 `implemented（已推送）`：分层退出、全持仓硬止损、持仓周期、执行安全、真实组合买入风控、可交易性过滤、市场状态滞后和退出冷却。服务器和 JoinQuant 部署状态待外部核验，尚未观察或验证；不能把 Git 中的 schema version 6 或网站模板 `2026-07-14.1-ledger-v6` 直接写成服务器事实。
 
 状态含义固定为：
 
@@ -142,6 +142,6 @@ SQLite 本地 schema version 6 保留以下 schema 5 持仓与执行状态表，
 
 ## 10. 存储与验证
 
-持仓周期、委托事件、退出意图和冷却属于长期审计数据，不按日志清理。自动在线备份、7日/4周/12月轮转、隔离恢复演练、报告和 systemd 模板已在本地 `implemented`；服务器 timer 安装、自动运行观察和季度恢复验收仍为 `not deployed / not observed / not validated`。
+持仓周期、委托事件、退出意图和冷却属于长期审计数据，不按日志清理。自动在线备份、7日/4周/12月轮转、隔离恢复演练、报告和 systemd 模板已在 `origin/main` 中 `implemented（已推送）`；服务器 timer 安装状态待外部核验，自动运行观察和季度恢复验收仍为 `not observed / not validated`。
 
 部署与验证必须分层：本地测试完成只代表 `implemented`；服务器与 JoinQuant 模板同步后是 `deployed`；首个有效交易日逐笔一致才是 `observed`；连续 3 日执行安全和至少 20 日策略观察达到门槛后，相关能力才能人工标为 `validated`。
