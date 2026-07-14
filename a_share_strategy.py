@@ -637,151 +637,224 @@ def record_signal_watchlist(
     save_signal_watchlist(path, {"items": prune_signal_watchlist_items(items)})
 
 
-def build_watchlist_review_markdown(
-    result: pd.DataFrame,
-    path: Path = SIGNAL_WATCHLIST_FILE,
-    max_rows: int = 6,
-    now: datetime | None = None,
-) -> str:
-    now = now or datetime.now()
-    payload = load_signal_watchlist(path)
-    items = prune_signal_watchlist_items(payload["items"])
-    if result.empty or not items:
-        return ""
-    rows_by_code = {clean_code(row.get("code")): row for _, row in result.iterrows()}
-    updated: list[dict[str, Any]] = []
-    lines = ["#### 推送跟踪复盘"]
-    matched = 0
-    entered_count = 0
-    take_hits = 0
-    stop_hits = 0
-    max_gain_values: list[float] = []
-    drawdown_values: list[float] = []
-    detail_lines: list[str] = []
-    reviewed_rows: list[dict[str, Any]] = []
-
-    for item in items:
-        code = clean_code(item.get("code"))
-        row = rows_by_code.get(code)
-        if row is None:
-            updated.append(item)
-            continue
-
-        price = _series_float(row, "price")
-        high = _series_float(row, "high") or price
-        low = _series_float(row, "low") or price
-        pct_chg = _series_float(row, "pct_chg")
-        entry = float(item.get("entry_price") or 0)
-        stop = float(item.get("stop_loss") or 0)
-        take = float(item.get("take_profit") or 0)
-        signal_action = safe_text(row.get("signal_action"))
-        pushed_at = _parse_watchlist_time(item.get("pushed_at"))
-        age_days = max(0, (now.date() - pushed_at.date()).days) if pushed_at else 0
-        review_day = f"D+{age_days}"
-        active = True
-        status = "继续观察"
-        distance_text = ""
-        entered = bool(entry and high and high >= entry)
-
-        if entered:
-            entered_count += 1
-            if high and entry:
-                max_gain_values.append((high - entry) / entry * 100.0)
-            if low and entry:
-                drawdown_values.append((low - entry) / entry * 100.0)
-
-        if entered and high and take and high >= take:
-            status = "触及止盈"
-            active = False
-            take_hits += 1
-        elif entered and low and stop and low <= stop:
-            status = "触及止损"
-            active = False
-            stop_hits += 1
-        elif signal_action in {"time_stop", "stop_loss", "take_profit"}:
-            status = safe_text(row.get("signal_state")) or signal_action
-            active = False
-        elif entry and not entered:
-            status = "未入场"
-            distance_text = f"距入场{(entry - price) / price * 100:.2f}%"
-        elif price and take:
-            distance_text = f"距止盈{max(0.0, (take - price) / price * 100):.2f}%"
-
-        price_text = f"入{entry:.2f} | 高{high:.2f} | 低{low:.2f} | 收{price:.2f}" if price and high and low and entry else f"现价{price:.2f}" if price else "现价-"
-        pct_text = f"{pct_chg:+.2f}%" if pct_chg is not None else "-"
-        tail = f" | {distance_text}" if distance_text else ""
-        detail_lines.append(
-            f"{matched + 1}. {code} {safe_text(row.get('name') or item.get('name'))} | "
-            f"{safe_text(item.get('kind'))} | {review_day} | {price_text} {pct_text} | {status}{tail}"
-        )
-        note = compact_text(row.get("risk_reason") or row.get("buy_reason") or row.get("signal_note") or item.get("risk_reason"), 28)
-        if note:
-            detail_lines.append(f"> {note}")
-        review_return = (price - entry) / entry * 100.0 if price and entry and entered else None
-        review_result = "take_profit" if status == "触及止盈" else "stop_loss" if status == "触及止损" else "entered" if entered else "not_entered"
-        history = [entry for entry in item.get("review_history", []) if isinstance(entry, dict)]
-        history = [entry for entry in history if safe_text(entry.get("date")) != now.date().isoformat()]
-        history.append(
-            {
-                "date": now.date().isoformat(),
-                "day": review_day,
-                "close": round(price, 2) if price else None,
-                "high": round(high, 2) if high else None,
-                "low": round(low, 2) if low else None,
-                "return_pct": round(review_return, 2) if review_return is not None else None,
-                "result": review_result,
-            }
-        )
+def review_watchlist_item(
+    item: dict[str, Any],
+    row: pd.Series | None,
+    now: datetime,
+    offset: int,
+) -> tuple[dict[str, Any], list[str]]:
+    code = clean_code(item.get("code"))
+    name = safe_text(row.get("name")) if row is not None else ""
+    name = name or safe_text(item.get("name"))
+    history = [entry for entry in item.get("review_history", []) if isinstance(entry, dict)]
+    history = [entry for entry in history if safe_text(entry.get("date")) != now.date().isoformat()]
+    if offset == 0:
+        history.append({
+            "date": now.date().isoformat(), "day": "D+0",
+            "close": None, "high": None, "low": None,
+            "return_pct": None, "result": "listed",
+        })
         reviewed = {
             **item,
             "last_reviewed_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "active": active,
-            "review_day": review_day,
-            "review_result": review_result,
-            "review_return_pct": round(review_return, 2) if review_return is not None else None,
-            "review_high": high,
-            "review_low": low,
-            "review_close": price,
+            "review_day": "D+0",
+            "review_result": "listed",
             "review_history": history[-12:],
         }
-        reviewed_rows.append(reviewed)
-        updated.append(
-            {
-                **reviewed,
-            }
-        )
-        matched += 1
-        if matched >= max_rows:
-            break
+        return reviewed, [
+            f"- {code} {name} | D+0 | 入{_float_value(item.get('entry_price')):.2f} "
+            f"止损{_float_value(item.get('stop_loss')):.2f} "
+            f"止盈{_float_value(item.get('take_profit')):.2f} | 待后续复盘"
+        ]
 
-    if matched == 0:
-        return ""
-    avg_gain = sum(max_gain_values) / len(max_gain_values) if max_gain_values else 0.0
-    avg_drawdown = sum(drawdown_values) / len(drawdown_values) if drawdown_values else 0.0
-    lines.append(
-        f"> 今日跟踪{matched}只 | 已入场{entered_count} | 未入场{matched - entered_count} | "
-        f"止盈{take_hits} | 止损{stop_hits}"
+    price = _series_float(row, "price") if row is not None else None
+    if row is None or price is None:
+        history.append({
+            "date": now.date().isoformat(), "day": f"D+{offset}",
+            "close": None, "high": None, "low": None,
+            "return_pct": None, "result": "missing_quote",
+        })
+        reviewed = {
+            **item,
+            "last_reviewed_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "review_day": f"D+{offset}",
+            "review_result": "missing_quote",
+            "review_history": history[-12:],
+        }
+        return reviewed, [f"- {code} {name} | D+{offset} | 行情缺失"]
+
+    high = _series_float(row, "high") or price
+    low = _series_float(row, "low") or price
+    pct_chg = _float_value(row.get("pct_chg"))
+    entry = _float_value(item.get("entry_price"))
+    stop = _float_value(item.get("stop_loss"))
+    take = _float_value(item.get("take_profit"))
+    previous_results = [safe_text(entry_item.get("result")) for entry_item in history]
+    terminal_result = next(
+        (result for result in reversed(previous_results) if result in {"take_profit", "stop_loss"}),
+        "",
     )
-    lines.append(f"> 平均最大浮盈{avg_gain:+.2f}% | 平均最大回撤{avg_drawdown:+.2f}%")
+    entered = any(result in {"entered", "take_profit", "stop_loss"} for result in previous_results)
+    entered = entered or bool(entry and high >= entry)
+    active = bool(item.get("active", True))
+    status = "继续观察"
+    if terminal_result:
+        status = "触及止盈" if terminal_result == "take_profit" else "触及止损"
+        active = False
+    elif entered and take and high >= take:
+        status = "触及止盈"
+        terminal_result = "take_profit"
+        active = False
+    elif entered and stop and low <= stop:
+        status = "触及止损"
+        terminal_result = "stop_loss"
+        active = False
+    elif safe_text(row.get("signal_action")) in {"time_stop", "stop_loss", "take_profit"}:
+        status = safe_text(row.get("signal_state")) or safe_text(row.get("signal_action"))
+        active = False
+    elif not entered:
+        status = "未入场"
+    review_return = (price - entry) / entry * 100.0 if entry and entered else None
+    review_result = terminal_result or ("entered" if entered else "not_entered")
+    history.append({
+        "date": now.date().isoformat(), "day": f"D+{offset}",
+        "close": round(price, 2), "high": round(high, 2), "low": round(low, 2),
+        "return_pct": round(review_return, 2) if review_return is not None else None,
+        "result": review_result,
+    })
+    reviewed = {
+        **item,
+        "last_reviewed_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "active": active,
+        "review_day": f"D+{offset}",
+        "review_result": review_result,
+        "review_return_pct": round(review_return, 2) if review_return is not None else None,
+        "review_high": high,
+        "review_low": low,
+        "review_close": price,
+        "review_history": history[-12:],
+    }
+    return reviewed, [
+        f"- {code} {name} | D+{offset} | 入{entry:.2f} 高{high:.2f} 低{low:.2f} 收{price:.2f} "
+        f"{pct_chg:+.2f}% | {status}"
+    ]
+
+
+def build_review_cohort_summary(
+    reviewed: list[tuple[dict[str, Any], list[str]]],
+) -> list[str]:
+    rows = [item for item, _ in reviewed]
+    entered = [
+        row for row in rows
+        if row.get("review_result") in {"entered", "take_profit", "stop_loss"}
+    ]
+    missing = sum(row.get("review_result") == "missing_quote" for row in rows)
+    take_hits = sum(row.get("review_result") == "take_profit" for row in rows)
+    stop_hits = sum(row.get("review_result") == "stop_loss" for row in rows)
+    max_gains = [
+        (_float_value(row.get("review_high")) - _float_value(row.get("entry_price")))
+        / _float_value(row.get("entry_price")) * 100.0
+        for row in entered
+        if _float_value(row.get("entry_price")) and row.get("review_high") is not None
+    ]
+    drawdowns = [
+        (_float_value(row.get("review_low")) - _float_value(row.get("entry_price")))
+        / _float_value(row.get("entry_price")) * 100.0
+        for row in entered
+        if _float_value(row.get("entry_price")) and row.get("review_low") is not None
+    ]
+    lines = [
+        f"> 已入场{len(entered)} | 未入场{len(rows) - len(entered) - missing} | "
+        f"行情缺失{missing} | 止盈{take_hits} | 止损{stop_hits}",
+        f"> 平均最大浮盈{(sum(max_gains) / len(max_gains) if max_gains else 0.0):+.2f}% | "
+        f"平均最大回撤{(sum(drawdowns) / len(drawdowns) if drawdowns else 0.0):+.2f}%",
+    ]
     quality_parts: list[str] = []
+    scored_rows = [row for row in rows if row.get("review_return_pct") is not None]
     for label, key in (("模式", "mode"), ("题材", "theme_heat_level"), ("市场", "market_state")):
         groups: dict[str, list[dict[str, Any]]] = {}
-        for row in reviewed_rows:
-            group_key = safe_text(row.get(key)) or "未标记"
-            groups.setdefault(group_key, []).append(row)
-        if groups:
-            best_key, rows = max(groups.items(), key=lambda item: len(item[1]))
-            wins = sum(1 for row in rows if row.get("review_result") in {"take_profit", "entered"} and _float_value(row.get("review_return_pct")) >= 0)
-            avg_ret_values = [_float_value(row.get("review_return_pct")) for row in rows if row.get("review_return_pct") is not None]
-            avg_ret = sum(avg_ret_values) / len(avg_ret_values) if avg_ret_values else 0.0
-            quality_parts.append(f"{label}{best_key} 胜率{wins / len(rows):.0%} 均值{avg_ret:+.2f}%")
+        for row in scored_rows:
+            groups.setdefault(safe_text(row.get(key)) or "未标记", []).append(row)
+        if not groups:
+            continue
+        best_key, group_rows = max(groups.items(), key=lambda pair: len(pair[1]))
+        wins = sum(
+            row.get("review_result") in {"take_profit", "entered"}
+            and _float_value(row.get("review_return_pct")) >= 0
+            for row in group_rows
+        )
+        avg_return = sum(_float_value(row.get("review_return_pct")) for row in group_rows) / len(group_rows)
+        quality_parts.append(
+            f"{label}{best_key} 胜率{wins / len(group_rows):.0%} 均值{avg_return:+.2f}%"
+        )
     if quality_parts:
         lines.append(f"> 策略质量：{'；'.join(quality_parts[:3])}")
-    lines.extend(detail_lines)
-    seen = {clean_code(item.get("code")) for item in updated}
-    updated.extend(item for item in items if clean_code(item.get("code")) not in seen)
-    save_signal_watchlist(path, {"items": prune_signal_watchlist_items(updated)})
-    return "\n".join(lines)
+    return lines
+
+
+def build_watchlist_review_messages(
+    quotes: pd.DataFrame,
+    path: Path = SIGNAL_WATCHLIST_FILE,
+    chunk_size: int = 6,
+    now: datetime | None = None,
+) -> list[tuple[str, str]]:
+    now = now or datetime.now()
+    items = prune_signal_watchlist_items(load_signal_watchlist(path)["items"], now=now)
+    rows_by_code = {
+        clean_code(row.get("code")): row
+        for _, row in quotes.iterrows()
+        if clean_code(row.get("code"))
+    }
+    due: dict[int, list[dict[str, Any]]] = {}
+    for item in items:
+        offset = due_review_offset(item, now)
+        if offset is not None:
+            due.setdefault(offset, []).append(item)
+
+    def identity(item: dict[str, Any]) -> tuple[str, str]:
+        return (
+            clean_code(item.get("code")),
+            safe_text(item.get("signal_id")) or safe_text(item.get("pushed_at")),
+        )
+
+    updated_by_identity = {identity(item): item for item in items}
+    messages: list[tuple[str, str]] = []
+    safe_chunk_size = max(1, chunk_size)
+    for offset in REVIEW_TRADING_DAY_OFFSETS:
+        cohort = due.get(offset, [])
+        if not cohort:
+            continue
+        reviewed = [
+            review_watchlist_item(
+                item,
+                rows_by_code.get(clean_code(item.get("code"))),
+                now,
+                offset,
+            )
+            for item in cohort
+        ]
+        for reviewed_item, _ in reviewed:
+            updated_by_identity[identity(reviewed_item)] = reviewed_item
+        chunks = [
+            reviewed[index:index + safe_chunk_size]
+            for index in range(0, len(reviewed), safe_chunk_size)
+        ]
+        for index, chunk in enumerate(chunks, start=1):
+            header = [
+                f"#### 推送跟踪复盘 D+{offset} 第 {index}/{len(chunks)} 组",
+                f"> 批次样本：{len(cohort)} | 本组：{len(chunk)}",
+            ]
+            if offset > 0:
+                header.extend(build_review_cohort_summary(reviewed))
+            body = [line for _, lines in chunk for line in lines]
+            suffix = f"{now.date().isoformat()}:d{offset}:{index}:{len(chunks)}"
+            messages.append((suffix, "\n".join(header + body)))
+
+    save_signal_watchlist(
+        path,
+        {"items": prune_signal_watchlist_items(list(updated_by_identity.values()), now=now)},
+    )
+    return messages
 
 
 class IndustryMapper:
@@ -3475,6 +3548,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
             market_info,
             market_news_state,
             watch_result=watch_result,
+            review_quotes=spot,
             ai_overview=ai_overview,
         )
 
@@ -3508,6 +3582,7 @@ def dispatch_notifications(
     market_info: dict[str, Any],
     market_news_state: str,
     watch_result: pd.DataFrame | None = None,
+    review_quotes: pd.DataFrame | None = None,
     ai_overview: str = "",
 ) -> None:
     """通知和策略彻底解耦：通知失败不影响主流程。"""
@@ -3561,11 +3636,17 @@ def dispatch_notifications(
     title = "盘后复盘" if cfg.mode == "after" else "扫描汇总"
     notifier.send_markdown(notification_title(cfg.mode, title), summary_md, dedupe_key=summary_key)
 
-    if cfg.mode == "after":
-        review_md = build_watchlist_review_markdown(result, SIGNAL_WATCHLIST_FILE, max_rows=min(max(cfg.notify_top, 1), 6))
-        if review_md:
-            review_key = hashlib.sha256(review_md.encode("utf-8")).hexdigest()
-            notifier.send_markdown(notification_title(cfg.mode, "推送跟踪复盘"), review_md, dedupe_key=f"watch-review:{review_key}")
+    if cfg.mode == "after" and review_quotes is not None:
+        for suffix, review_md in build_watchlist_review_messages(
+            review_quotes,
+            SIGNAL_WATCHLIST_FILE,
+            chunk_size=min(max(cfg.notify_top, 1), 6),
+        ):
+            notifier.send_markdown(
+                notification_title(cfg.mode, "推送跟踪复盘"),
+                review_md,
+                dedupe_key=f"watch-review:{suffix}",
+            )
 
     # 盘中或盘后都只再补一条重点卡片，避免消息过杂
     highlight_row = None

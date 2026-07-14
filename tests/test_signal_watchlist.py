@@ -118,7 +118,7 @@ class SignalWatchlistTest(unittest.TestCase):
             self.assertEqual(item["market_state"], "强势进攻")
             self.assertEqual(item["signal_id"], "600000:short:2026-07-06")
 
-    def test_after_review_message_tracks_previous_pushed_stock(self) -> None:
+    def test_d1_review_keeps_existing_performance_and_quality_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "signal_watchlist.json"
             strat.save_signal_watchlist(
@@ -128,16 +128,16 @@ class SignalWatchlistTest(unittest.TestCase):
                         {
                             "code": "600000",
                             "name": "示例股",
-                            "kind": "强势",
+                            "kind": "买点",
                             "mode": "intraday",
-                            "pushed_at": "2026-07-06 10:30:00",
+                            "pushed_at": "2026-07-13 10:30:00",
                             "entry_price": 10.0,
                             "stop_loss": 9.5,
                         "take_profit": 11.0,
                         "position_pct": 8.0,
                         "final_score": 86,
                         "theme_heat_level": "高",
-                        "signal_id": "600000:short:2026-07-06",
+                            "signal_id": "600000:short:2026-07-13",
                     }
                 ]
                 },
@@ -160,24 +160,143 @@ class SignalWatchlistTest(unittest.TestCase):
                 ]
             )
 
-            message = strat.build_watchlist_review_markdown(result, path, max_rows=3, now=datetime(2026, 7, 8, 15, 30))
+            messages = strat.build_watchlist_review_messages(
+                result,
+                path,
+                chunk_size=3,
+                now=datetime(2026, 7, 14, 15, 30),
+            )
+            self.assertEqual(len(messages), 1)
+            message = messages[0][1]
 
             self.assertIn("推送跟踪复盘", message)
-            self.assertIn("今日跟踪1只", message)
+            self.assertIn("批次样本：1", message)
             self.assertIn("已入场1", message)
             self.assertIn("止盈1", message)
             self.assertIn("最大浮盈+12.00%", message)
             self.assertIn("600000 示例股", message)
-            self.assertIn("D+2", message)
-            self.assertIn("入10.00 | 高11.20 | 低9.90 | 收10.80", message)
+            self.assertIn("D+1", message)
+            self.assertIn("入10.00 高11.20 低9.90 收10.80", message)
             self.assertIn("触及止盈", message)
             self.assertIn("策略质量", message)
-            self.assertIn("强势", message)
+            self.assertIn("intraday", message)
 
             data = strat.load_signal_watchlist(path)
             item = data["items"][0]
-            self.assertEqual(item["review_day"], "D+2")
+            self.assertEqual(item["review_day"], "D+1")
             self.assertEqual(item["review_history"][0]["return_pct"], 8.0)
+
+    def test_review_messages_cover_complete_cohorts_and_chunk_without_candidate_bias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "signal_watchlist.json"
+            prior_buys = [
+                {
+                    "code": f"60000{index}", "name": f"昨日买点{index}", "kind": "买点",
+                    "mode": "intraday", "pushed_at": f"2026-07-13 10:0{index}:00",
+                    "entry_price": 10.0, "stop_loss": 9.5, "take_profit": 11.0,
+                    "signal_id": f"60000{index}:mid:2026-07-13", "active": True,
+                }
+                for index in range(7)
+            ]
+            same_day = {
+                "code": "000001", "name": "今日买点", "kind": "买点", "mode": "intraday",
+                "pushed_at": "2026-07-14 10:00:00", "entry_price": 10.0,
+                "stop_loss": 9.5, "take_profit": 11.0,
+                "signal_id": "000001:mid:2026-07-14", "active": True,
+            }
+            risk = {
+                "code": "300001", "name": "风险样本", "kind": "风险", "mode": "after",
+                "pushed_at": "2026-07-13 15:00:00", "entry_price": 10.0,
+                "signal_id": "300001:mid:2026-07-13", "active": True,
+            }
+            strat.save_signal_watchlist(path, {"items": prior_buys + [same_day, risk]})
+            quotes = pd.DataFrame([
+                {
+                    "code": f"60000{index}", "name": f"昨日买点{index}", "price": 10.5,
+                    "high": 10.8, "low": 9.9, "pct_chg": 2.0,
+                    "signal_action": "continue", "signal_state": "fresh",
+                }
+                for index in range(6)
+            ] + [{
+                "code": "000001", "name": "今日买点", "price": 10.2,
+                "high": 10.3, "low": 9.9, "pct_chg": 1.0,
+                "signal_action": "continue", "signal_state": "fresh",
+            }])
+
+            messages = strat.build_watchlist_review_messages(
+                quotes, path, chunk_size=3, now=datetime(2026, 7, 14, 15, 30)
+            )
+            combined = "\n".join(markdown for _, markdown in messages)
+            self.assertEqual(len(messages), 4)
+            self.assertIn("D+1", combined)
+            self.assertIn("D+0", combined)
+            for code in ("600000", "600001", "600002", "600003", "600004", "600005", "600006"):
+                self.assertIn(code, combined)
+            self.assertIn("行情缺失", combined)
+            self.assertNotIn("风险样本", combined)
+            d0_markdown = "\n".join(markdown for suffix, markdown in messages if ":d0:" in suffix)
+            self.assertIn("待后续复盘", d0_markdown)
+            self.assertNotIn("触及止盈", d0_markdown)
+
+    def test_review_keeps_prior_buy_when_full_quote_frame_has_no_matching_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "signal_watchlist.json"
+            strat.save_signal_watchlist(path, {"items": [{
+                "code": "600000", "name": "昨日买点", "kind": "买点",
+                "pushed_at": "2026-07-13 10:00:00", "entry_price": 10.0,
+                "stop_loss": 9.5, "take_profit": 11.0,
+                "signal_id": "600000:mid:2026-07-13", "active": True,
+            }]})
+
+            messages = strat.build_watchlist_review_messages(
+                pd.DataFrame(columns=["code", "price", "high", "low"]),
+                path,
+                now=datetime(2026, 7, 14, 15, 30),
+            )
+
+            self.assertEqual(len(messages), 1)
+            self.assertIn("600000", messages[0][1])
+            self.assertIn("行情缺失", messages[0][1])
+
+    def test_review_treats_present_row_without_price_as_missing_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "signal_watchlist.json"
+            strat.save_signal_watchlist(path, {"items": [{
+                "code": "600000", "name": "昨日买点", "kind": "买点",
+                "pushed_at": "2026-07-13 10:00:00", "entry_price": 10.0,
+                "signal_id": "600000:mid:2026-07-13", "active": True,
+            }]})
+
+            messages = strat.build_watchlist_review_messages(
+                pd.DataFrame([{"code": "600000", "name": "昨日买点", "price": None}]),
+                path,
+                now=datetime(2026, 7, 14, 15, 30),
+            )
+
+            self.assertEqual(len(messages), 1)
+            self.assertIn("行情缺失", messages[0][1])
+
+    def test_dispatch_after_sends_every_review_chunk_from_full_quotes(self) -> None:
+        notifier = FakeNotifier()
+        result = pd.DataFrame(columns=["code", "final_score"])
+        quotes = pd.DataFrame([{"code": "600000", "price": 10.0}])
+        chunks = [("d1:1", "第一组"), ("d1:2", "第二组")]
+
+        with patch("a_share_strategy.is_a_share_trading_day", return_value=True):
+            with patch("a_share_strategy.select_signal_rows", return_value=(result, result)):
+                with patch("a_share_strategy.build_watchlist_review_messages", return_value=chunks) as build:
+                    strat.dispatch_notifications(
+                        strat.Config(mode="after", notify_top=6),
+                        notifier,
+                        result,
+                        {"state": "震荡"},
+                        "中性",
+                        review_quotes=quotes,
+                    )
+
+        self.assertIs(build.call_args.args[0], quotes)
+        review_keys = [key for _, _, key in notifier.sent if key and key.startswith("watch-review:")]
+        self.assertEqual(review_keys, ["watch-review:d1:1", "watch-review:d1:2"])
 
     def test_dispatch_after_titles_and_records_highlight(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
