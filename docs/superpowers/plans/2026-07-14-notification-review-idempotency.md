@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Execution status (2026-07-14):** Tasks 1–6 are `implemented（仅本地） / not deployed / not observed / not validated`. Focused regression: 55/55 passed. Full Windows run: 272 tests, 269 passed and only 3 Linux-script launch errors caused by missing Bash; the Windows-capable suite excluding that Linux-only file passed 267/267.
+> **Execution status (2026-07-14):** Tasks 1–6 are `implemented（已推送、未部署） / not observed / not validated`. Implementation baseline `7c31684` is in `origin/main`. Focused regression: 55/55 passed. Full Windows run: 272 tests, 269 passed and only 3 Linux-script launch errors caused by missing Bash; the Windows-capable suite excluding that Linux-only file passed 267/267.
 
 **Goal:** Make JoinQuant execution reports originate only from newly persisted fills, review every successfully pushed buy signal at D+0/D+1/D+3/D+5/D+10, and add the server send time to every WeCom message.
 
@@ -1020,7 +1020,7 @@ git commit -m "feat: review complete buy-signal cohorts"
 
 - [ ] **Step 1: Update active documentation**
 
-Update the roadmap row for the专项 spec from `planned` to `implemented（仅本地）` only after all focused tests pass. Add these facts to the current notification/review sections:
+Update the roadmap row for the专项 spec from `planned` to `implemented` only after all focused tests pass; after Git push, record it as pushed but still not deployed. Add these facts to the current notification/review sections:
 
 ```text
 - 执行回报只由 SQLite 首次入账的新 fill 或 legacy 累计成交增量触发；周期快照不再重复推送历史成交。

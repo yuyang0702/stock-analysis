@@ -2,7 +2,7 @@
 
 > 2026-07-14 本地代码基线：提交 `9f4c12d` 已包含分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复，以及独立逐日历史回测框架。该提交仅存在于本地分支，尚未推送、部署、观察或验证；真实 6 个月/1 年 strict 数据也尚未导入和重复运行。服务器最近确认仍为 `aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1，JoinQuant 网站模板和所有外部状态接管后必须重新只读核验。
 
-> 2026-07-14 当前隔离分支新增：SQLite 新 fill/legacy 累计成交增量驱动的执行回报、统一企业微信服务器时间，以及 D+0/D+1/D+3/D+5/D+10 全量买点复盘。上述增量为 `implemented（仅本地） / not deployed / not observed / not validated`，不得与服务器现有旧通知行为混淆。
+> 2026-07-14 `origin/main` 实现基线 `7c31684` 新增：SQLite 新 fill/legacy 累计成交增量驱动的执行回报、统一企业微信服务器时间，以及 D+0/D+1/D+3/D+5/D+10 全量买点复盘。上述增量为 `implemented（已推送、未部署） / not observed / not validated`，不得与服务器现有旧通知行为混淆。
 
 > 仍为 `planned`：ML-7 训练型模型，以及 ML-8/Batch G 的候选登记、评价准入、人工决定、激活和回滚。当前 `shadow_score.py` 只是规则型影子评分；自动分析未来仍必须止于候选，发布需人工批准和当次单独授权。
 
@@ -97,7 +97,7 @@ git ls-remote origin refs/heads/main
 | SQLite Batch 1 | deployed | 服务器已运行 schema version 1；待部署后首个有效交易日确认双写和交易日一致性。 |
 | SQLite schema 6完整执行账本 | implemented（仅本地） | 含持仓周期、订单、逐笔成交、账户/持仓检查点、日权益、对账、控制审计和冷却；服务器仍为schema 1。 |
 | 自动对账与人工解锁 | implemented（仅本地） | ERROR停买、CRITICAL熔断、两次不同全量一致快照和二次确认；未部署、观察或验证。 |
-| 成交回报幂等与 D+N 全量复盘 | implemented（仅本地） | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘；未部署、观察或验证。 |
+| 成交回报幂等与 D+N 全量复盘 | implemented（已推送、未部署） | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘；未部署、观察或验证。 |
 | 完整历史回测 | implemented（仅本地框架） | 与信号级回测并存；真实 6 个月/1 年 strict 数据尚未导入、观察或人工验证，服务器未部署。 |
 | 模拟盘买卖强制风控 | implemented（仅本地） | 尚未部署、观察或验证；真实资金级风控仍为planned。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
