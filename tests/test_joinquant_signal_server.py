@@ -154,41 +154,27 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             self.assertEqual(rows[0]["endpoint"], "signals")
             self.assertEqual(rows[0]["status_code"], 403)
 
-    def test_builds_mobile_execution_markdown_from_orders(self) -> None:
+    def test_builds_mobile_execution_markdown_from_new_executions(self) -> None:
         payload = {
             "generated_at": "2026-07-07 15:05:00",
             "cash": 1000,
             "total_value": 2000,
             "positions": [{"code": "600000"}],
-            "orders": [
-                {
-                    "action": "buy",
-                    "jq_code": "600000.XSHG",
-                    "name": "PF Bank",
-                    "status": "held",
-                    "filled": 100,
-                    "amount": 100,
-                    "target_pct": 12.5,
-                },
-                {
-                    "action": "buy",
-                    "jq_code": "000001.XSHE",
-                    "name": "PA Bank",
-                    "status": "failed",
-                    "reason": "limit_up_or_suspended",
-                },
-            ],
         }
+        executions = [{
+            "event_id": "fill:20", "action": "buy", "stock_code": "600000",
+            "qty": 100, "cumulative_qty": 100, "price": 10.0,
+            "status": "filled", "filled_at": "2026-07-07 15:04:58", "order_id": "10",
+        }]
 
-        md = joinquant_signal_server.build_execution_markdown(payload)
+        md = joinquant_signal_server.build_execution_markdown(payload, executions)
 
         self.assertIn("JoinQuant 模拟盘", md)
         self.assertIn("执行回报", md)
-        self.assertIn("委托 2", md)
-        self.assertIn("成功 1", md)
-        self.assertIn("失败 1", md)
-        self.assertIn("600000.XSHG", md)
-        self.assertIn("limit_up_or_suspended", md)
+        self.assertIn("本次新增成交：1", md)
+        self.assertIn("买入 600000", md)
+        self.assertIn("本次 100股 @ 10.00", md)
+        self.assertIn("成交时间：2026-07-07 15:04:58", md)
 
 
     def test_empty_periodic_snapshot_does_not_notify_execution(self) -> None:
@@ -209,7 +195,7 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             notify.assert_not_called()
 
-    def test_snapshot_with_orders_notifies_execution_once(self) -> None:
+    def test_repeated_filled_snapshot_notifies_execution_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             signal_file = base / "signals.json"
@@ -220,20 +206,72 @@ class JoinQuantSignalServerTest(unittest.TestCase):
 
             payload = {
                 "schema_version": 1,
-                "positions": [{"code": "600000", "qty": 100}],
-                "trades": [],
-                "orders": [{"action": "buy", "code": "600000", "status": "held", "filled": 100}],
+                "trade_date": "2026-07-14",
+                "generated_at": "2026-07-14 13:39:10",
+                "positions": [],
+                "orders": [{
+                    "order_id": "1783991771", "action": "sell", "code": "000021",
+                    "amount": 100, "filled": 100, "avg_price": 52.43,
+                    "status": "filled", "datetime": "2026-07-14 09:52:10",
+                }],
+                "trades": [{
+                    "trade_id": "trade-1783991771", "order_id": "1783991771",
+                    "action": "sell", "code": "000021", "amount": 100,
+                    "price": 52.43, "datetime": "2026-07-14 09:52:10",
+                }],
             }
             with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
-                response = client.post("/joinquant/account_snapshot?token=secret", json=payload)
+                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
+                payload["generated_at"] = "2026-07-14 13:40:10"
+                payload["total_value"] = 99482.757
+                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
 
-            self.assertEqual(response.status_code, 200)
             notify.assert_called_once()
-            notified = notify.call_args.args[0]
-            self.assertEqual(notified["orders"], payload["orders"])
-            self.assertEqual(notified["positions"], payload["positions"])
-            self.assertEqual(notified["source"], "joinquant")
-            self.assertTrue(notified["received_at"])
+            self.assertEqual(notify.call_args.args[1][0]["event_id"], "fill:trade-1783991771")
+
+    def test_second_partial_fill_notifies_only_the_new_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            account_file = base / "account.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            client = app.test_client()
+            first_trade = {
+                "trade_id": "trade-1", "order_id": "order-1", "action": "buy",
+                "code": "600000", "amount": 50, "price": 10.0,
+                "datetime": "2026-07-14 10:00:00",
+            }
+            payload = {
+                "schema_version": 1,
+                "trade_date": "2026-07-14",
+                "generated_at": "2026-07-14 10:00:10",
+                "positions": [],
+                "orders": [{
+                    "order_id": "order-1", "action": "buy", "code": "600000",
+                    "amount": 100, "filled": 50, "avg_price": 10.0,
+                    "status": "partial", "datetime": "2026-07-14 10:00:00",
+                }],
+                "trades": [first_trade],
+            }
+            with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
+                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
+                payload["generated_at"] = "2026-07-14 10:01:10"
+                payload["orders"][0]["filled"] = 100
+                payload["orders"][0]["status"] = "filled"
+                payload["trades"] = [
+                    first_trade,
+                    {
+                        "trade_id": "trade-2", "order_id": "order-1", "action": "buy",
+                        "code": "600000", "amount": 50, "price": 10.1,
+                        "datetime": "2026-07-14 10:01:00",
+                    },
+                ]
+                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
+
+            self.assertEqual(notify.call_count, 2)
+            self.assertEqual([row["event_id"] for row in notify.call_args_list[0].args[1]], ["fill:trade-1"])
+            self.assertEqual([row["event_id"] for row in notify.call_args_list[1].args[1]], ["fill:trade-2"])
 
     def test_zero_filled_orders_do_not_notify_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,7 +298,7 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             notify.assert_not_called()
 
-    def test_mixed_orders_notify_only_positive_filled_buy_and_sell(self) -> None:
+    def test_legacy_mixed_orders_notify_only_positive_filled_buy_and_sell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             signal_file = base / "signals.json"
@@ -288,8 +326,8 @@ class JoinQuantSignalServerTest(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             notify.assert_called_once()
-            notified = notify.call_args.args[0]
-            self.assertEqual(notified["orders"], [filled_buy, filled_sell])
+            executions = notify.call_args.args[1]
+            self.assertEqual([event["action"] for event in executions], ["buy", "sell"])
             saved = json.loads(account_file.read_text(encoding="utf-8"))
             self.assertEqual(saved["orders"], payload["orders"])
 

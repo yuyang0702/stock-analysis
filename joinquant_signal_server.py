@@ -87,59 +87,36 @@ def _short(value: Any, limit: int = 36) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _filled_trade_orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        item
-        for item in payload.get("orders", [])
-        if isinstance(item, dict)
-        and str(item.get("action") or "").strip().lower() in {"buy", "sell"}
-        and _num(item.get("filled")) > 0
-    ]
-
-
-def build_execution_markdown(payload: dict[str, Any]) -> str:
-    orders = [item for item in payload.get("orders", []) if isinstance(item, dict)]
+def build_execution_markdown(
+    payload: dict[str, Any], executions: list[dict[str, Any]]
+) -> str:
     positions = payload.get("positions", []) if isinstance(payload.get("positions"), list) else []
-    success_status = {"held", "filled", "submitted", "open", "done"}
-    failed_status = {"failed", "rejected", "cancelled", "skipped"}
-    success_count = sum(1 for item in orders if str(item.get("status", "")).lower() in success_status)
-    failed_count = sum(1 for item in orders if str(item.get("status", "")).lower() in failed_status)
-    pending_count = max(0, len(orders) - success_count - failed_count)
-
     lines = [
         "#### 【JoinQuant 模拟盘】执行回报",
-        f"> 时间：{payload.get('generated_at') or payload.get('received_at') or '-'}",
+        f"> 账户快照：{payload.get('generated_at') or payload.get('received_at') or '-'}",
         f"> 总资产：{_num(payload.get('total_value')):.2f} | 现金：{_num(payload.get('cash')):.2f} | 持仓：{len(positions)}",
-        f"> 委托 {len(orders)} | 成功 {success_count} | 失败 {failed_count} | 待确认 {pending_count}",
+        f"> 本次新增成交：{len(executions)}",
     ]
-    if not orders:
-        lines.append("> 本次快照没有委托记录；请在 JoinQuant 模拟盘页面核对成交。")
-        return "\n".join(lines)
-
-    for item in orders[:8]:
+    for item in executions:
         action = "买入" if item.get("action") == "buy" else "卖出"
-        code = item.get("jq_code") or item.get("code") or "-"
-        name = _short(item.get("name"), 10)
-        status = item.get("status") or "-"
-        filled = item.get("filled")
-        amount = item.get("amount")
-        qty_text = ""
-        if filled is not None or amount is not None:
-            qty_text = f" | 成交 {int(_num(filled))}/{int(_num(amount))}"
-        target = f" | 目标 {item.get('target_pct')}%" if item.get("target_pct") not in (None, "") else ""
-        lines.append(f"- {action} {code} {name} | {status}{qty_text}{target}")
-        if item.get("reason"):
-            lines.append(f"  > {_short(item.get('reason'), 48)}")
-    if len(orders) > 8:
-        lines.append(f"> 还有 {len(orders) - 8} 条未展开，请看 JoinQuant 模拟盘委托列表。")
+        lines.append(
+            f"- {action} {item.get('stock_code') or '-'} | 本次 {int(_num(item.get('qty')))}股 "
+            f"@ {_num(item.get('price')):.2f} | 累计 {int(_num(item.get('cumulative_qty')))}股 | "
+            f"{item.get('status') or '-'}"
+        )
+        lines.append(
+            f"  > 成交时间：{item.get('filled_at') or '-'} | "
+            f"订单：{_short(item.get('order_id')) or '-'}"
+        )
     return "\n".join(lines)
 
 
-def _notify_execution(payload: dict[str, Any]) -> None:
-    if not app_config.WECOM_WEBHOOK_URL:
+def _notify_execution(payload: dict[str, Any], executions: list[dict[str, Any]]) -> None:
+    if not app_config.WECOM_WEBHOOK_URL or not executions:
         return
-    md = build_execution_markdown(payload)
-    digest = hashlib.sha256(md.encode("utf-8")).hexdigest()
+    md = build_execution_markdown(payload, executions)
+    identity = "|".join(sorted(str(item["event_id"]) for item in executions))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     notifier = WeComNotifier(
         webhook_url=app_config.WECOM_WEBHOOK_URL,
         state_file=app_config.CACHE_DIR / "wecom_notify_state.json",
@@ -276,11 +253,9 @@ def create_app(
             update_order_labels(app_config.ML_SIGNAL_SAMPLE_FILE, payload)
         except Exception as exc:
             print(f"ML order label update skipped: {exc}", flush=True)
-        filled_orders = _filled_trade_orders(payload)
-        if filled_orders:
-            notification_payload = dict(payload)
-            notification_payload["orders"] = filled_orders
-            _notify_execution(notification_payload)
+        new_executions = list(ledger_result.get("new_executions") or [])
+        if new_executions:
+            _notify_execution(payload, new_executions)
         reconciliation = ledger_result.get("reconciliation")
         if reconciliation is not None and reconciliation.severity in {"ERROR", "CRITICAL"}:
             notify_reconciliation(

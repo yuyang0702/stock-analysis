@@ -218,7 +218,11 @@ def persist_account_snapshot(
         if order.get("order_id"):
             orders_by_id[str(order["order_id"])] = order
         current_filled = int(order.get("filled_qty") or 0)
-        if not has_trades and current_filled > previous_filled:
+        if (
+            not has_trades
+            and order.get("action") in {"buy", "sell"}
+            and current_filled > previous_filled
+        ):
             new_executions.append({
                 "event_id": f"legacy:{order['client_order_id']}:{current_filled}",
                 "source": "legacy_order_progress",
