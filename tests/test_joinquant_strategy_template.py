@@ -28,9 +28,17 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
         config_text = Path("config.py").read_text(encoding="utf-8")
 
-        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-14.1-ledger-v6"', text)
-        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-14.1-ledger-v6"', config_text)
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-14.2-p0-execution-contract"', text)
+        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-14.2-p0-execution-contract"', config_text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
+
+    def test_template_rechecks_five_positions_and_eighty_percent_total(self) -> None:
+        text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
+
+        self.assertIn("MAX_POSITIONS = 5", text)
+        self.assertIn("MAX_TOTAL_POSITION_PCT = 80.0", text)
+        self.assertIn('return False, "max_positions"', text)
+        self.assertIn('return False, "total_position_limit"', text)
 
     def test_template_retries_pending_order_event_callback(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")

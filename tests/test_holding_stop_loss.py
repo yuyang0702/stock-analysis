@@ -156,6 +156,68 @@ class HoldingStopLossTest(unittest.TestCase):
             pd.DataFrame(), abnormal, portfolio,
         ).empty)
 
+    def test_open_hard_stop_intent_republishes_after_price_recovers(self) -> None:
+        portfolio = {"600000": {
+            "code": "600000", "name": "浦发银行", "qty": 1000,
+            "status": "holding", "current_price": 10.2, "stop_price": 9.0,
+        }}
+        intents = {"600000": {
+            "signal_id": "cycle-hard_stop-0", "stock_code": "600000",
+            "target_qty": 0, "reason": "hard_stop", "status": "active",
+        }}
+
+        result = a_share_strategy.merge_holding_stop_loss_rows(
+            pd.DataFrame(), pd.DataFrame(), portfolio, exit_intents=intents,
+        )
+
+        self.assertEqual(result.iloc[0]["exit_signal_id"], "cycle-hard_stop-0")
+        self.assertEqual(result.iloc[0]["target_qty"], 0)
+
+    def test_open_partial_exit_republishes_only_until_target_is_reached(self) -> None:
+        intent = {"600000": {
+            "signal_id": "cycle-take_profit_1-0", "stock_code": "600000",
+            "target_qty": 500, "reason": "take_profit_1", "status": "active",
+        }}
+        pending = {"600000": {
+            "code": "600000", "qty": 800, "status": "partial_sell",
+            "current_price": 11.0, "stop_price": 9.0,
+        }}
+        completed = {"600000": {**pending["600000"], "qty": 500}}
+
+        pending_result = a_share_strategy.merge_holding_stop_loss_rows(
+            pd.DataFrame(), pd.DataFrame(), pending, exit_intents=intent,
+        )
+        completed_result = a_share_strategy.merge_holding_stop_loss_rows(
+            pd.DataFrame(), pd.DataFrame(), completed, exit_intents=intent,
+        )
+
+        self.assertEqual(pending_result.iloc[0]["target_qty"], 500)
+        self.assertTrue(completed_result.empty)
+
+    def test_fresh_hard_stop_overrides_open_take_profit_intent(self) -> None:
+        portfolio = {"600000": {
+            "code": "600000", "qty": 1000, "status": "holding",
+            "current_price": 8.9, "stop_price": 9.0,
+        }}
+        cycles = {"600000": {
+            "position_cycle_id": "cycle-1", "mode": "short",
+            "initial_qty": 1000, "current_qty": 1000, "entry_price": 10.0,
+            "initial_stop_price": 9.0, "highest_price": 12.0, "atr14": 0.4,
+            "take_profit_stage": 0, "opened_at": "2026-07-10 09:31:00",
+        }}
+        intents = {"600000": {
+            "signal_id": "cycle-1-take_profit_1-0", "stock_code": "600000",
+            "target_qty": 500, "reason": "take_profit_1", "status": "active",
+        }}
+
+        result = a_share_strategy.merge_holding_stop_loss_rows(
+            pd.DataFrame(), pd.DataFrame(), portfolio, cycles=cycles,
+            exit_intents=intents, current_day=date(2026, 7, 14),
+        )
+
+        self.assertEqual(result.iloc[0]["signal_action"], "hard_stop")
+        self.assertEqual(result.iloc[0]["target_qty"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

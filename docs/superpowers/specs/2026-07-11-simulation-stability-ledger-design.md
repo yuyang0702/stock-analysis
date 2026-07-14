@@ -5,6 +5,10 @@
 > 文档层级：本文件是模拟盘稳定性专项设计从文档。
 >
 > 主文档：`docs/project_roadmap.md`。
+
+> 2026-07-14 执行正确性增量以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为准：它复用 schema 6 的 `signals`、`position_cycles`、`orders` 和 `exit_intents`，不改变本账本设计的存储、对账或保留口径。该增量当前仅为 `implemented（未提交/未推送） / not deployed / not observed / not validated`。
+
+> 外部部署状态更新：用户提供的 2026-07-14 20:06 服务器输出确认 `1311182`、schema version 6、完整性/可写检查通过和三个核心服务 active，因此该基线服务器代码可标记 `deployed（用户提供证据）`；JoinQuant 网站模板、自动 timer 连续运行和真实交易日行为仍未据此成为 `observed / validated`。
 >
 > 执行从文档：`docs/live_trading_execution_plan.md`。
 >

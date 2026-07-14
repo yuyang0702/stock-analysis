@@ -1,8 +1,12 @@
 # 项目接管与新环境恢复说明
 
-> 2026-07-14 Git 代码基线：`origin/main` 已包含提交 `9f4c12d`，其中包括分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复，以及独立逐日历史回测框架。上述能力为 `implemented（已推送）`；服务器和 JoinQuant 部署状态仍须重新只读核验，且尚无足够证据标记为 `observed / validated`。真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
+> 2026-07-14 Git 代码基线：`origin/main` 已包含提交 `9f4c12d`，其中包括分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复，以及独立逐日历史回测框架。上述能力为 `implemented（已推送）`；服务器 `1311182` 代码、schema 6 和核心服务已由用户输出确认，JoinQuant 网站模板及真实交易日行为仍须核验，且尚无足够证据标记为 `observed / validated`。真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
 
 > 2026-07-14 `origin/main` 实现基线 `7c31684` 新增：SQLite 新 fill/legacy 累计成交增量驱动的执行回报、统一企业微信服务器时间，以及 D+0/D+1/D+3/D+5/D+10 全量买点复盘。上述增量为 `implemented（已推送、未部署） / not observed / not validated`，不得与服务器现有旧通知行为混淆。
+
+> 2026-07-14 隔离工作树增量：五项执行正确性 P0 已完成代码和专项测试，包括强制风险准入、版本化唯一买入计划、退出意图续执行及优先级保护、JoinQuant 5只/80%双层边界与买卖开关、已有持仓及未完成买单分类暴露。目标模板版本为 `2026-07-14.2-p0-execution-contract`。当前严格为 `implemented（未提交/未推送） / not deployed / not observed / not validated`，接管者不得把它与 `origin/main` 或服务器现状混淆。
+
+> 最近服务器外部检查点（用户提供，Git 无法独立确认）：2026-07-14 20:06，服务器 HEAD 为 `131118213f22bbdaecd5cd8ab89a87db9aaf7f85`，分支与 `origin/main` 一致且干净；SQLite schema 6 完整性/可写检查通过，环境文件哈希未变，三个核心服务均 active。该检查点不包含本隔离工作树增量，JoinQuant 网站模板状态仍需单独核验。
 
 > 仍为 `planned`：ML-7 训练型模型，以及 ML-8/Batch G 的候选登记、评价准入、人工决定、激活和回滚。当前 `shadow_score.py` 只是规则型影子评分；自动分析未来仍必须止于候选，发布需人工批准和当次单独授权。
 
@@ -95,7 +99,7 @@ git ls-remote origin refs/heads/main
 | 订单回报与持仓同步 | deployed | 快照回传、实际成交和持仓一致性。 |
 | 健康检查和微信异常报警 | deployed | timer、报告、告警和失败重试。 |
 | SQLite Batch 1 | deployed | 服务器已运行 schema version 1；待部署后首个有效交易日确认双写和交易日一致性。 |
-| SQLite schema 6完整执行账本 | implemented（已推送） | 含持仓周期、订单、逐笔成交、账户/持仓检查点、日权益、对账、控制审计和冷却；服务器 schema 需重新只读核验，尚未观察或验证。 |
+| SQLite schema 6完整执行账本 | deployed（用户提供证据） | 含持仓周期、订单、逐笔成交、账户/持仓检查点、日权益、对账、控制审计和冷却；服务器 `1311182` schema 6 检查通过，尚未观察或验证。 |
 | 自动对账与人工解锁 | implemented（已推送） | ERROR停买、CRITICAL熔断、两次不同全量一致快照和二次确认；部署状态待核验，尚未观察或验证。 |
 | 成交回报幂等与 D+N 全量复盘 | implemented（已推送、未部署） | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘；未部署、观察或验证。 |
 | 完整历史回测 | implemented（已推送框架） | 与信号级回测并存；服务器部署状态待核验，真实 6 个月/1 年 strict 数据尚未导入、观察或人工验证。 |

@@ -1,5 +1,9 @@
 import unittest
 
+import pandas as pd
+
+import a_share_strategy
+import exit_policy
 from risk_engine import build_risk_decision, classify_trade_mode
 from strategy_profile import build_strategy_profile
 
@@ -97,6 +101,30 @@ class RiskEngineTest(unittest.TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertLess(decision.risk_reward, profile.min_risk_reward)
+
+    def test_risk_bundle_exposes_current_execution_rejection(self) -> None:
+        row = pd.Series({
+            "code": "600000",
+            "price": 10.0,
+            "amount": 100_000_000,
+            "support_level": 9.6,
+            "atr14": 0.2,
+            "trend_state": "明显破坏",
+            "market_state": "NORMAL",
+            "has_holding": False,
+        })
+
+        bundle = a_share_strategy.build_risk_bundle(
+            row,
+            {"state": "NORMAL"},
+            "",
+        )
+
+        self.assertFalse(bundle["execution_allowed"])
+        self.assertEqual(
+            bundle["execution_plan_version"],
+            exit_policy.EXECUTION_PLAN_VERSION,
+        )
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import pandas as pd
 
+import a_share_strategy
+import exit_policy
 import joinquant_exporter
 from trading_store import TradingStore
 
@@ -23,6 +25,52 @@ class JoinQuantExporterTest(unittest.TestCase):
         )
         self._db_patch.start()
         self.addCleanup(self._db_patch.stop)
+
+    def test_buy_signal_persists_normalized_classification(self) -> None:
+        row = pd.Series({
+            "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+            "take_profit": 11, "position_pct": 5, "final_score": 90,
+            "industry": "银行", "theme_label": "中特估",
+        })
+
+        signal = joinquant_exporter._buy_signal(row, "run", 0)
+
+        self.assertEqual(signal["industry"], "银行")
+        self.assertEqual(signal["theme"], "中特估")
+
+    def test_uncategorized_positions_share_one_aggregate_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+                "take_profit": 11, "position_pct": 4, "final_score": 90,
+            }])
+            path = joinquant_exporter.export_signals(
+                rows, output_path=Path(tmp) / "signals.json",
+                account_total_value=100000, available_cash=100000,
+                sector_exposure_pct={"__UNCATEGORIZED__": 8},
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(payload["diagnostics"]["reject_reasons"], {"buy_uncategorized_limit": 1})
+
+    def test_hard_position_boundaries_cannot_be_disabled_with_observation_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter.app_config, "JOINQUANT_PORTFOLIO_RISK_ENABLE_DEFAULT", False
+        ):
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+                "take_profit": 11, "position_pct": 2, "final_score": 90,
+            }])
+            path = joinquant_exporter.export_signals(
+                rows, output_path=Path(tmp) / "signals.json",
+                account_total_value=100000, available_cash=100000,
+                current_position_count=5, current_position_pct=79,
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(payload["diagnostics"]["reject_reasons"], {"buy_max_positions": 1})
 
     def test_conflicting_signal_id_blocks_buy_and_preserves_sell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -602,6 +650,138 @@ class JoinQuantExporterTest(unittest.TestCase):
             payload = json.loads(result.read_text(encoding="utf-8"))
             self.assertEqual(payload["signals"], [])
 
+    def test_high_score_risk_disallowed_row_cannot_buy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            rows = pd.DataFrame([{
+                "code": "600000",
+                "price": 10.0,
+                "entry_price": 10.0,
+                "stop_loss": 9.5,
+                "take_profit": 11.0,
+                "risk_per_share": 0.5,
+                "risk_reward": 2.0,
+                "position_pct": 10.0,
+                "final_score": 99,
+                "signal_action": "continue",
+                "execution_plan_version": exit_policy.EXECUTION_PLAN_VERSION,
+                "execution_allowed": False,
+                "execution_reject_reason": "趋势走弱",
+            }])
+
+            result = joinquant_exporter.export_signals(
+                rows,
+                run_id="risk-disallowed",
+                trade_date="2026-07-14",
+                output_path=output_path,
+            )
+
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"]["buy_risk_disallowed"],
+                1,
+            )
+
+    def test_strict_export_rejects_missing_execution_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            rows = pd.DataFrame([{
+                "code": "600000",
+                "price": 10.0,
+                "entry_price": 10.0,
+                "position_pct": 10.0,
+                "final_score": 99,
+                "signal_action": "continue",
+            }])
+
+            result = joinquant_exporter.export_signals(
+                rows,
+                run_id="missing-contract",
+                output_path=output_path,
+                enforce_execution_contract=True,
+            )
+
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"]["buy_execution_plan_missing"],
+                1,
+            )
+
+    def test_strict_export_rejects_invalid_current_execution_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "signals.json"
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10.0, "entry_price": 10.0,
+                "stop_loss": 10.1, "take_profit": 10.2, "position_pct": 10.0,
+                "final_score": 99, "signal_action": "continue",
+                "execution_plan_version": exit_policy.EXECUTION_PLAN_VERSION,
+                "execution_allowed": True,
+            }])
+
+            result = joinquant_exporter.export_signals(
+                rows, output_path=output_path, enforce_execution_contract=True,
+            )
+
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"]["buy_execution_plan_invalid"], 1,
+            )
+
+    def test_final_plan_matches_scan_json_and_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            row = pd.Series({
+                "code": "600000",
+                "name": "PF Bank",
+                "price": 10.0,
+                "amount": 100_000_000,
+                "pct_chg": 1.0,
+                "support_level": 9.6,
+                "pressure_level": 12.0,
+                "atr14": 0.2,
+                "trend_state": "趋势修复",
+                "market_state": "NORMAL",
+                "industry": "银行",
+                "theme_label": "中特估",
+                "final_score": 95,
+                "signal_action": "continue",
+                "signal_state": "fresh",
+                "signal_first_seen": "2026-07-14",
+                "has_holding": False,
+            })
+            bundle = a_share_strategy.build_risk_bundle(row, {"state": "NORMAL"}, "")
+            for key, value in bundle.items():
+                row[key] = value
+            anchor = a_share_strategy.build_signal_anchor_bundle(
+                row,
+                a_share_strategy.DiskCache(base / "anchor.json"),
+            )
+            for key, value in anchor.items():
+                row[key] = value
+            store = TradingStore(base / "trading.db")
+
+            output = joinquant_exporter.export_signals(
+                pd.DataFrame([row]),
+                run_id="contract-equality",
+                trade_date="2026-07-14",
+                output_path=base / "signals.json",
+                enforce_execution_contract=True,
+                store=store,
+            )
+
+            signal = json.loads(output.read_text(encoding="utf-8"))["signals"][0]
+            with store.connect() as conn:
+                ledger = json.loads(conn.execute(
+                    "SELECT raw_json FROM signals WHERE signal_id=?",
+                    (signal["id"],),
+                ).fetchone()[0])
+            for field in ("entry_price", "stop_loss", "take_profit", "position_pct"):
+                self.assertEqual(float(row[field]), float(signal[field]))
+                self.assertEqual(float(signal[field]), float(ledger[field]))
+
     def test_board_lot_check_uses_risk_adjusted_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "signals.json"
@@ -634,6 +814,64 @@ class JoinQuantExporterTest(unittest.TestCase):
             payload = json.loads(result.read_text(encoding="utf-8"))
             self.assertEqual(payload["signals"], [])
             self.assertEqual(payload["diagnostics"]["reject_reasons"]["buy_total_position_limit"], 1)
+
+    def test_buy_rejects_sixth_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10,
+                "stop_loss": 9.5, "take_profit": 11.0,
+                "position_pct": 2, "final_score": 95,
+                "signal_action": "continue",
+                "execution_plan_version": exit_policy.EXECUTION_PLAN_VERSION,
+                "execution_allowed": True,
+            }])
+            path = joinquant_exporter.export_signals(
+                rows,
+                run_id="max-positions",
+                output_path=Path(tmp) / "signals.json",
+                current_position_count=5,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(payload["diagnostics"]["reject_reasons"]["buy_max_positions"], 1)
+
+    def test_buy_uses_joinquant_eighty_percent_total_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10,
+                "stop_loss": 9.5, "take_profit": 11.0,
+                "position_pct": 2, "final_score": 95,
+                "signal_action": "continue",
+                "execution_plan_version": exit_policy.EXECUTION_PLAN_VERSION,
+                "execution_allowed": True,
+                "industry": "银行",
+            }])
+            path = joinquant_exporter.export_signals(
+                rows,
+                run_id="total-eighty",
+                output_path=Path(tmp) / "signals.json",
+                account_total_value=100000,
+                current_position_pct=79,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(payload["diagnostics"]["reject_reasons"]["buy_total_position_limit"], 1)
+
+    def test_allow_sell_false_records_explicit_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = pd.DataFrame([{
+                "code": "600000", "price": 10, "signal_action": "hard_stop",
+                "has_holding": True, "target_qty": 0,
+            }])
+            path = joinquant_exporter.export_signals(
+                rows,
+                run_id="sell-disabled",
+                output_path=Path(tmp) / "signals.json",
+                allow_sell=False,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(payload["diagnostics"]["reject_reasons"]["sell_disabled"], 1)
 
     def test_buy_enforces_open_risk_and_sector_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

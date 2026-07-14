@@ -13,13 +13,21 @@ import warnings
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import akshare as ak
 import pandas as pd
 
 import config as app_config
-from exit_policy import PositionExitState, evaluate_exit, market_regime
+from exit_policy import (
+    EXECUTION_PLAN_VERSION,
+    PositionExitState,
+    build_buy_execution_plan,
+    evaluate_exit,
+    exit_priority,
+    market_regime,
+    normalize_exit_action,
+)
 from global_market_context import load_global_context
 from paper_trading import apply_paper_trades, build_paper_trade_markdown, load_account, save_account
 from risk_engine import RiskDecision, build_risk_decision, build_signal_lifecycle, classify_trade_mode
@@ -255,6 +263,40 @@ def load_portfolio_account_metrics() -> dict[str, float]:
         return {}
 
 
+def load_pending_buy_codes(path: Path | None = None) -> set[str]:
+    path = path or app_config.JOINQUANT_ACCOUNT_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    active_statuses = {"submitting", "submitted", "held", "open", "partial"}
+    result: set[str] = set()
+    for order in raw.get("orders", []) if isinstance(raw, dict) else []:
+        if not isinstance(order, dict) or safe_text(order.get("action")).lower() != "buy":
+            continue
+        if safe_text(order.get("status")).lower() not in active_statuses:
+            continue
+        code = clean_code(order.get("code") or order.get("jq_code"))
+        if code:
+            result.add(code)
+    return result
+
+
+def load_cached_industry_map(path: Path | None = None) -> dict[str, str]:
+    path = path or INDUSTRY_CACHE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        clean_code(code): safe_text(industry)
+        for code, industry in raw.items()
+        if clean_code(code) and safe_text(industry)
+    }
+
+
 def joinquant_health_gate_pass() -> bool:
     path = app_config.OUTPUT_DIR / f"joinquant_health_{datetime.now().strftime('%Y%m%d')}.md"
     if not path.exists():
@@ -296,11 +338,13 @@ def merge_holding_stop_loss_rows(
     spot: pd.DataFrame,
     portfolio: dict[str, dict[str, Any]],
     cycles: dict[str, dict[str, Any]] | None = None,
+    exit_intents: dict[str, dict[str, Any]] | None = None,
     market_state: str = "NORMAL",
     current_day: date | None = None,
 ) -> pd.DataFrame:
     """把全持仓退出动作合并到 JoinQuant 导出源。"""
     cycles = cycles or {}
+    exit_intents = exit_intents or {}
     current_day = current_day or datetime.now().date()
     quotes = {
         clean_code(row.get("code")): row
@@ -375,6 +419,16 @@ def merge_holding_stop_loss_rows(
         elif stop_price > 0 and price <= stop_price:
             action = "stop_loss"
             note = f"现价{price:.2f}已触及持仓止损价{stop_price:.2f}"
+        intent = exit_intents.get(code) or {}
+        intent_target = int(_float_value(intent.get("target_qty")))
+        if safe_text(intent.get("status")) == "active" and int(qty) > intent_target:
+            intent_source = f"{safe_text(intent.get('signal_id'))} {safe_text(intent.get('reason'))}"
+            intent_action = normalize_exit_action(intent_source)
+            if not action or exit_priority(intent_action) >= exit_priority(action):
+                action = intent_action
+                target_qty = intent_target
+                exit_signal_id = safe_text(intent.get("signal_id"))
+                note = safe_text(intent.get("reason")) or "继续执行未完成退出意图"
         if action:
             stops.append({
                 "code": code,
@@ -1988,37 +2042,39 @@ def build_signal_anchor_bundle(row: pd.Series, cache: DiskCache) -> pd.Series:
     risk_confidence = float(row.get("risk_confidence", 0) or 0)
     buy_state = safe_text(row.get("buy_state"))
     buy_reason = safe_text(row.get("buy_reason"))
+    execution_plan_version = safe_text(row.get("execution_plan_version"))
+    execution_allowed = bool(row.get("execution_allowed"))
+    execution_reject_reason = safe_text(row.get("execution_reject_reason"))
     theme_label = safe_text(row.get("theme_label")) or "题材待确认"
     theme_heat_level = safe_text(row.get("theme_heat_level")) or "待确认"
     theme_heat_reason = safe_text(row.get("theme_heat_reason")) or "题材证据不足"
 
-    use_cache = active and cached_active and cached_first_seen == first_seen
+    use_cache = (
+        active
+        and cached_active
+        and cached_first_seen == first_seen
+        and execution_plan_version == EXECUTION_PLAN_VERSION
+        and safe_text(cached.get("execution_plan_version")) == EXECUTION_PLAN_VERSION
+    )
     if use_cache:
         entry_price = float(cached.get("entry_price", entry_price) or entry_price)
         stop_loss = float(cached.get("stop_loss", stop_loss) or stop_loss)
         take_profit = float(cached.get("take_profit", take_profit) or take_profit)
         risk_reward = float(cached.get("risk_reward", risk_reward) or risk_reward)
         position_pct = float(cached.get("position_pct", position_pct) or position_pct)
-        risk_reason = safe_text(cached.get("risk_reason")) or risk_reason
-        risk_confidence = float(cached.get("risk_confidence", risk_confidence) or risk_confidence)
         theme_label = safe_text(cached.get("theme_label")) or theme_label
         theme_heat_level = safe_text(cached.get("theme_heat_level")) or theme_heat_level
         theme_heat_reason = safe_text(cached.get("theme_heat_reason")) or theme_heat_reason
-        buy_state = safe_text(cached.get("buy_state")) or buy_state
-        buy_reason = safe_text(cached.get("buy_reason")) or buy_reason
     elif active:
         payload = {
             "first_seen": first_seen,
             "active": True,
+            "execution_plan_version": execution_plan_version,
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "risk_reward": risk_reward,
             "position_pct": position_pct,
-            "risk_reason": risk_reason,
-            "risk_confidence": risk_confidence,
-            "buy_state": buy_state,
-            "buy_reason": buy_reason,
             "theme_label": theme_label,
             "theme_heat_level": theme_heat_level,
             "theme_heat_reason": theme_heat_reason,
@@ -2040,7 +2096,7 @@ def build_signal_anchor_bundle(row: pd.Series, cache: DiskCache) -> pd.Series:
             },
         )
 
-    if active:
+    if active and execution_allowed:
         buy_state, buy_reason = _rebalance_buy_state(price, entry_price, bool(row.get("has_holding")), buy_state, buy_reason or signal_note)
         if entry_price > 0 and price > 0:
             entry_gap_pct = round((entry_price - price) / price * 100.0, 2)
@@ -2053,6 +2109,7 @@ def build_signal_anchor_bundle(row: pd.Series, cache: DiskCache) -> pd.Series:
         {
             "signal_anchor_id": signal_anchor_id,
             "signal_anchor_locked": active,
+            "signal_anchor_plan_version": execution_plan_version,
             "signal_anchor_first_seen": first_seen,
             "signal_anchor_entry": round(entry_price, 2) if entry_price > 0 else entry_price,
             "signal_anchor_stop_loss": round(stop_loss, 2) if stop_loss > 0 else stop_loss,
@@ -2066,6 +2123,9 @@ def build_signal_anchor_bundle(row: pd.Series, cache: DiskCache) -> pd.Series:
             "signal_anchor_theme_label": theme_label,
             "signal_anchor_theme_heat_level": theme_heat_level,
             "signal_anchor_theme_heat_reason": theme_heat_reason,
+            "execution_plan_version": execution_plan_version,
+            "execution_allowed": execution_allowed,
+            "execution_reject_reason": execution_reject_reason,
             "entry_price": round(entry_price, 2) if entry_price > 0 else entry_price,
             "stop_loss": round(stop_loss, 2) if stop_loss > 0 else stop_loss,
             "take_profit": round(take_profit, 2) if take_profit > 0 else take_profit,
@@ -2995,6 +3055,18 @@ def format_buy_state_text(decision: RiskDecision, has_holding: bool, row: pd.Ser
     return "不建议介入", decision.reason
 
 
+def format_execution_plan_text(row: Mapping[str, Any], holding: bool = False) -> str:
+    prefix = "持仓风控" if holding else "交易建议"
+    return (
+        f"{prefix}｜{safe_text(row.get('mode')) or 'mid'}｜"
+        f"入场{_float_value(row.get('entry_price')):.2f}｜"
+        f"止损{_float_value(row.get('stop_loss')):.2f}｜"
+        f"止盈{_float_value(row.get('take_profit')):.2f}｜"
+        f"仓位{_float_value(row.get('position_pct')):.1f}%｜"
+        f"R/R {_float_value(row.get('risk_reward')):.2f}"
+    )
+
+
 def build_risk_bundle(row: pd.Series, market_info: dict[str, Any], market_news_state: str) -> pd.Series:
     """把风控引擎输出整理成一组可直接写回 DataFrame 的字段。"""
 
@@ -3006,22 +3078,57 @@ def build_risk_bundle(row: pd.Series, market_info: dict[str, Any], market_news_s
         market_news_state=market_news_state,
         holding=holding_row,
     )
+    plan = build_buy_execution_plan(
+        code=clean_code(row.get("code")),
+        entry_price=decision.entry_price,
+        support_price=_float_value(row.get("support_level")),
+        atr14=_float_value(row.get("atr14")),
+        position_cap_pct=decision.position_pct,
+        market_state=safe_text(row.get("market_state") or market_info.get("state")),
+    )
+    if not safe_text(row.get("industry")) and not safe_text(row.get("theme_label")):
+        plan = replace(
+            plan,
+            position_pct=min(
+                plan.position_pct,
+                app_config.MAX_UNCATEGORIZED_POSITION_PCT,
+            ),
+        )
+    execution_allowed = bool(decision.allowed and plan.position_pct > 0)
+    execution_reject_reason = "" if execution_allowed else (
+        decision.reason or "最终执行计划无有效仓位"
+    )
     buy_state, buy_reason = format_buy_state_text(decision, bool(row.get("has_holding")), row)
     return pd.Series(
         {
             "mode": decision.mode,
-            "entry_price": decision.entry_price,
-            "stop_loss": decision.stop_loss,
-            "take_profit": decision.take_profit,
-            "risk_per_share": decision.risk_per_share,
-            "risk_reward": decision.risk_reward,
-            "position_pct": decision.position_pct,
+            "execution_plan_version": EXECUTION_PLAN_VERSION,
+            "execution_allowed": execution_allowed,
+            "execution_reject_reason": execution_reject_reason,
+            "entry_price": plan.entry_price,
+            "stop_loss": plan.stop_loss,
+            "take_profit": plan.take_profit,
+            "risk_per_share": plan.risk_per_share,
+            "risk_reward": plan.risk_reward,
+            "position_pct": plan.position_pct,
+            "board_type": plan.board_type,
+            "market_regime": plan.market_regime,
             "risk_reason": decision.reason,
             "risk_confidence": decision.confidence,
             "take_profit_2": decision.take_profit_2,
             "stop_loss_pct": decision.stop_loss_pct,
             "entry_gap_pct": decision.entry_gap_pct,
-            "risk_plan": format_risk_plan_text(decision, bool(row.get("has_holding"))),
+            "risk_plan": format_execution_plan_text(
+                {
+                    "mode": decision.mode,
+                    "entry_price": plan.entry_price,
+                    "stop_loss": plan.stop_loss,
+                    "take_profit": plan.take_profit,
+                    "position_pct": plan.position_pct,
+                    "risk_reward": plan.risk_reward,
+                },
+                bool(row.get("has_holding")),
+            ),
             "buy_state": buy_state,
             "buy_reason": buy_reason,
         }
@@ -3201,12 +3308,15 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
     from joinquant_exporter import export_signals
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    allow_buy = is_a_share_trading_time()
+    allow_buy = app_config.JOINQUANT_ALLOW_BUY_DEFAULT and is_a_share_trading_time()
+    allow_sell = app_config.JOINQUANT_ALLOW_SELL_DEFAULT
     if app_config.JOINQUANT_ENFORCE_HEALTH_GATE_DEFAULT and allow_buy:
         allow_buy = joinquant_health_gate_pass()
     account_total_value = load_portfolio_account_total_value(cfg.paper_trade_cash)
     available_cash = load_portfolio_available_cash(account_total_value)
     positions = load_portfolio_positions()
+    pending_buy_codes = load_pending_buy_codes()
+    current_position_count = len(positions) + len(pending_buy_codes - set(positions))
     current_position_pct = (
         sum(_float_value(item.get("market_value")) for item in positions.values())
         / account_total_value * 100 if account_total_value > 0 else 0
@@ -3215,10 +3325,14 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
     try:
         store.initialize()
         cycles = store.get_active_position_cycles()
+        position_classifications = store.get_active_position_classifications()
+        pending_classification_exposures = store.get_pending_buy_classification_exposures()
         cooldown_codes = store.active_cooldown_codes(datetime.now().strftime("%Y-%m-%d")) if app_config.JOINQUANT_EXIT_COOLDOWN_ENABLE_DEFAULT else set()
         new_positions_today, orders_today = store.daily_activity(datetime.now().strftime("%Y-%m-%d"))
     except (OSError, sqlite3.Error):
         cycles = {}
+        position_classifications = {}
+        pending_classification_exposures = []
         cooldown_codes = set()
         new_positions_today, orders_today = 0, 0
     account_metrics = load_portfolio_account_metrics()
@@ -3232,13 +3346,34 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
     current_open_risk_pct += account_metrics.get("pending_buy_risk_pct", 0)
     sector_exposure_pct: dict[str, float] = {}
     theme_exposure_pct: dict[str, float] = {}
-    for item in positions.values():
-        sector = safe_text(item.get("industry") or item.get("sector"))
+    industry_cache = load_cached_industry_map()
+    for code, item in positions.items():
+        classification = position_classifications.get(code, {})
+        sector = safe_text(
+            item.get("industry") or item.get("sector") or classification.get("industry")
+            or industry_cache.get(code)
+        )
+        theme = safe_text(
+            item.get("theme") or item.get("theme_label") or item.get("concept")
+            or classification.get("theme") or sector
+        )
+        exposure = _float_value(item.get("market_value")) / account_total_value * 100 if account_total_value > 0 else 0
         if sector and account_total_value > 0:
-            sector_exposure_pct[sector] = sector_exposure_pct.get(sector, 0) + _float_value(item.get("market_value")) / account_total_value * 100
-        theme = safe_text(item.get("theme") or item.get("concept"))
+            sector_exposure_pct[sector] = sector_exposure_pct.get(sector, 0) + exposure
         if theme and account_total_value > 0:
-            theme_exposure_pct[theme] = theme_exposure_pct.get(theme, 0) + _float_value(item.get("market_value")) / account_total_value * 100
+            theme_exposure_pct[theme] = theme_exposure_pct.get(theme, 0) + exposure
+        if not sector and not theme:
+            sector_exposure_pct["__UNCATEGORIZED__"] = sector_exposure_pct.get("__UNCATEGORIZED__", 0) + exposure
+    for item in pending_classification_exposures:
+        exposure = _float_value(item.get("position_pct"))
+        sector = safe_text(item.get("industry"))
+        theme = safe_text(item.get("theme") or sector)
+        if sector:
+            sector_exposure_pct[sector] = sector_exposure_pct.get(sector, 0) + exposure
+        if theme:
+            theme_exposure_pct[theme] = theme_exposure_pct.get(theme, 0) + exposure
+        if not sector and not theme:
+            sector_exposure_pct["__UNCATEGORIZED__"] = sector_exposure_pct.get("__UNCATEGORIZED__", 0) + exposure
     path = export_signals(
         result,
         run_id=run_id,
@@ -3246,8 +3381,10 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
         dry_run=cfg.joinquant_dry_run,
         min_score=cfg.joinquant_min_score,
         allow_buy=allow_buy,
+        allow_sell=allow_sell,
         account_total_value=account_total_value,
         current_position_pct=current_position_pct,
+        current_position_count=current_position_count,
         current_open_risk_pct=current_open_risk_pct,
         sector_exposure_pct=sector_exposure_pct,
         theme_exposure_pct=theme_exposure_pct,
@@ -3259,6 +3396,7 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
         daily_pnl_pct=account_metrics.get("daily_pnl_pct", 0),
         account_drawdown_pct=account_metrics.get("account_drawdown_pct", 0),
         consecutive_losses=int(account_metrics.get("consecutive_losses", 0)),
+        enforce_execution_contract=True,
     )
     print(f"JoinQuant signals exported: {path}", flush=True)
     if notifier and notifier.enabled and (cfg.notify_non_trading_day or is_a_share_trading_day()):
@@ -3423,6 +3561,10 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     anchor_frame = result.apply(lambda row: build_signal_anchor_bundle(row, cache), axis=1, result_type="expand")
     for col in anchor_frame.columns:
         result[col] = anchor_frame[col]
+    result["risk_plan"] = result.apply(
+        lambda row: format_execution_plan_text(row, bool(row.get("has_holding"))),
+        axis=1,
+    )
     result = apply_shadow_scores(result, global_risk_score=float(market_info.get("global_risk_score", 0) or 0))
     pending_theme_mask = result["theme_label"].isin(["未识别题材", "题材待确认"])
     industry.note_pending(result[pending_theme_mask][["code", "name", "theme_label"]].copy())
@@ -3504,6 +3646,10 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
             watch_anchor_frame = watch_result.apply(lambda row: build_signal_anchor_bundle(row, cache), axis=1, result_type="expand")
             for col in watch_anchor_frame.columns:
                 watch_result[col] = watch_anchor_frame[col]
+            watch_result["risk_plan"] = watch_result.apply(
+                lambda row: format_execution_plan_text(row, bool(row.get("has_holding"))),
+                axis=1,
+            )
             watch_result = apply_shadow_scores(
                 watch_result,
                 global_risk_score=float(market_info.get("global_risk_score", 0) or 0),
@@ -3518,11 +3664,13 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
     if cfg.joinquant:
         export_source = watch_result if cfg.mode == "intraday" and not watch_result.empty else result
         position_cycles: dict[str, dict[str, Any]] = {}
+        open_exit_intents: dict[str, dict[str, Any]] = {}
         confirmed_regime = market_regime(str(market_info.get("state") or ""))
         try:
             trading_store = TradingStore(app_config.TRADING_DB_FILE)
             trading_store.initialize()
             position_cycles = trading_store.get_active_position_cycles() if app_config.JOINQUANT_LAYERED_EXIT_ENABLE_DEFAULT else {}
+            open_exit_intents = trading_store.get_open_exit_intents()
             if app_config.JOINQUANT_REGIME_CONFIRM_ENABLE_DEFAULT:
                 confirmed_regime = trading_store.confirm_market_regime(confirmed_regime)
         except (OSError, ValueError, sqlite3.Error) as exc:
@@ -3532,6 +3680,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
             spot,
             portfolio_positions,
             cycles=position_cycles,
+            exit_intents=open_exit_intents,
             market_state=confirmed_regime,
             current_day=date.today(),
         )

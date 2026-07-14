@@ -21,8 +21,9 @@ DRY_RUN = False
 STARTUP_SELF_TEST = True
 MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
+MAX_POSITIONS = 5
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-14.1-ledger-v6"
+STRATEGY_TEMPLATE_VERSION = "2026-07-14.2-p0-execution-contract"
 
 
 def initialize(context):
@@ -117,6 +118,16 @@ def _can_execute(context, signal):
         return False, "bad_position"
     if float(signal.get("position_pct") or 0) > MAX_TOTAL_POSITION_PCT:
         return False, "position_limit"
+    if signal.get("action") == "buy":
+        if len(context.portfolio.positions) >= MAX_POSITIONS:
+            return False, "max_positions"
+        total_value = float(context.portfolio.total_value or 0)
+        current_position_pct = (
+            sum(float(_position_attr(position, "value", 0) or 0) for position in context.portfolio.positions.values())
+            / total_value * 100 if total_value > 0 else 0
+        )
+        if current_position_pct + float(signal.get("position_pct") or 0) > MAX_TOTAL_POSITION_PCT:
+            return False, "total_position_limit"
     jq_code = signal.get("jq_code")
     if not jq_code:
         return False, "missing_code"

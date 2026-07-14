@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 import a_share_strategy as strat
+from exit_policy import EXECUTION_PLAN_VERSION
 
 
 class DummyCache:
@@ -140,6 +141,9 @@ class ThemeAndAnchorTests(unittest.TestCase):
                 "take_profit": 13.0,
                 "risk_reward": 3.0,
                 "position_pct": 5.0,
+                "execution_plan_version": EXECUTION_PLAN_VERSION,
+                "execution_allowed": True,
+                "execution_reject_reason": "",
                 "risk_reason": "回踩型",
                 "risk_confidence": 0.8,
                 "buy_state": "已到买点",
@@ -165,6 +169,95 @@ class ThemeAndAnchorTests(unittest.TestCase):
         self.assertEqual(float(anchored_first["entry_price"]), 10.0)
         self.assertEqual(float(anchored_second["entry_price"]), 10.0)
         self.assertTrue(bool(anchored_second["signal_anchor_locked"]))
+
+    def test_signal_anchor_rebuilds_old_execution_plan_version(self):
+        cache = DummyCache()
+        cache.db["signal_anchor:600000:mid"] = {
+            "active": True,
+            "first_seen": "2026-07-06",
+            "execution_plan_version": "legacy-plan",
+            "entry_price": 8.0,
+            "stop_loss": 7.0,
+            "take_profit": 10.0,
+            "position_pct": 20.0,
+        }
+        row = pd.Series({
+            "code": "600000",
+            "mode": "mid",
+            "price": 10.0,
+            "entry_price": 10.0,
+            "stop_loss": 9.2,
+            "take_profit": 11.6,
+            "risk_reward": 2.0,
+            "position_pct": 8.0,
+            "risk_reason": "当前计划",
+            "risk_confidence": 0.7,
+            "buy_state": "已到买点",
+            "buy_reason": "当前轮允许",
+            "signal_first_seen": "2026-07-06",
+            "signal_state": "fresh",
+            "signal_action": "continue",
+            "execution_plan_version": EXECUTION_PLAN_VERSION,
+            "execution_allowed": True,
+            "execution_reject_reason": "",
+            "has_holding": False,
+        })
+
+        result = strat.build_signal_anchor_bundle(row, cache)
+
+        self.assertEqual(result["signal_anchor_plan_version"], EXECUTION_PLAN_VERSION)
+        self.assertEqual(float(result["stop_loss"]), 9.2)
+
+    def test_signal_anchor_never_restores_stale_allowed_state(self):
+        cache = DummyCache()
+        base = pd.Series({
+            "code": "600000",
+            "mode": "mid",
+            "price": 10.0,
+            "entry_price": 10.0,
+            "stop_loss": 9.2,
+            "take_profit": 11.6,
+            "risk_reward": 2.0,
+            "position_pct": 8.0,
+            "risk_reason": "当前计划",
+            "risk_confidence": 0.7,
+            "buy_state": "已到买点",
+            "buy_reason": "当前轮允许",
+            "signal_first_seen": "2026-07-06",
+            "signal_state": "fresh",
+            "signal_action": "continue",
+            "execution_plan_version": EXECUTION_PLAN_VERSION,
+            "execution_allowed": True,
+            "execution_reject_reason": "",
+            "has_holding": False,
+        })
+        strat.build_signal_anchor_bundle(base, cache)
+        blocked = base.copy()
+        blocked["execution_allowed"] = False
+        blocked["execution_reject_reason"] = "趋势走弱"
+        blocked["buy_state"] = "不建议介入"
+        blocked["buy_reason"] = "趋势走弱"
+
+        result = strat.build_signal_anchor_bundle(blocked, cache)
+
+        self.assertFalse(bool(result["execution_allowed"]))
+        self.assertEqual(result["buy_state"], "不建议介入")
+        self.assertEqual(result["buy_reason"], "趋势走弱")
+
+    def test_execution_plan_text_uses_final_row_fields(self):
+        text = strat.format_execution_plan_text(pd.Series({
+            "mode": "mid",
+            "entry_price": 10.0,
+            "stop_loss": 9.2,
+            "take_profit": 11.6,
+            "position_pct": 8.0,
+            "risk_reward": 2.0,
+        }))
+
+        self.assertIn("入场10.00", text)
+        self.assertIn("止损9.20", text)
+        self.assertIn("止盈11.60", text)
+        self.assertIn("仓位8.0%", text)
 
 
 if __name__ == "__main__":

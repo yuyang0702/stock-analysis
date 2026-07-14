@@ -95,6 +95,24 @@ class ExitPolicyTest(unittest.TestCase):
         self.assertEqual(caution, 5.0)
         self.assertEqual(risk_off, 0.0)
 
+    def test_build_buy_execution_plan_is_single_two_r_contract(self) -> None:
+        plan = exit_policy.build_buy_execution_plan(
+            code="600000",
+            entry_price=10.0,
+            support_price=9.6,
+            atr14=0.2,
+            position_cap_pct=20.0,
+            market_state="NORMAL",
+        )
+
+        self.assertEqual(plan.version, exit_policy.EXECUTION_PLAN_VERSION)
+        self.assertEqual(
+            plan.take_profit,
+            round(plan.entry_price + 2 * plan.risk_per_share, 2),
+        )
+        self.assertEqual(plan.risk_reward, 2.0)
+        self.assertGreater(plan.position_pct, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+EXECUTION_PLAN_VERSION = "2026-07-14.2-p0-execution-contract"
+
+
 @dataclass(frozen=True)
 class PositionExitState:
     code: str
@@ -27,12 +30,50 @@ class ExitDecision:
     reason: str
 
 
+@dataclass(frozen=True)
+class BuyExecutionPlan:
+    version: str
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    risk_per_share: float
+    risk_reward: float
+    position_pct: float
+    board_type: str
+    market_regime: str
+
+
 _BOARD_LIMITS = {
     "main_low": (1.8, 0.06),
     "main_active": (2.0, 0.07),
     "growth": (2.5, 0.09),
 }
 _BOARD_RISK_BUDGET = {"main_low": 0.65, "main_active": 0.5, "growth": 0.4}
+
+
+def normalize_exit_action(value: str) -> str:
+    text = str(value or "").strip().lower()
+    aliases = (
+        ("hard_stop", ("hard_stop", "stop_loss", "硬止损", "止损")),
+        ("market_risk_exit", ("market_risk", "市场风险")),
+        ("trailing_stop", ("trailing_stop", "移动止盈")),
+        ("take_profit_1", ("take_profit_1", "达到2r", "+2r", "首段止盈")),
+        ("time_stop", ("time_stop", "时间止损", "持仓交易日达到上限")),
+    )
+    for action, tokens in aliases:
+        if any(token in text for token in tokens):
+            return action
+    return text or "sell"
+
+
+def exit_priority(reason_or_action: str) -> int:
+    return {
+        "hard_stop": 5,
+        "market_risk_exit": 4,
+        "trailing_stop": 3,
+        "take_profit_1": 2,
+        "time_stop": 1,
+    }.get(normalize_exit_action(reason_or_action), 0)
 
 
 def market_regime(value: str) -> str:
@@ -86,6 +127,40 @@ def risk_position_pct(
     if market_state == "CAUTION":
         position_pct *= 0.5
     return round(max(position_pct, 0.0), 2)
+
+
+def build_buy_execution_plan(
+    *,
+    code: str,
+    entry_price: float,
+    support_price: float,
+    atr14: float,
+    position_cap_pct: float,
+    market_state: str,
+) -> BuyExecutionPlan:
+    regime = market_regime(market_state)
+    board = board_type(code, entry_price, atr14)
+    stop = initial_stop_price(entry_price, support_price, atr14, board)
+    risk = round(max(entry_price - stop, 0.0), 2)
+    take = round(entry_price + 2 * risk, 2) if risk > 0 else 0.0
+    position = risk_position_pct(
+        entry_price,
+        stop,
+        board,
+        position_cap_pct,
+        regime,
+    )
+    return BuyExecutionPlan(
+        version=EXECUTION_PLAN_VERSION,
+        entry_price=round(entry_price, 2),
+        stop_loss=stop,
+        take_profit=take,
+        risk_per_share=risk,
+        risk_reward=2.0 if risk > 0 else 0.0,
+        position_pct=position,
+        board_type=board,
+        market_regime=regime,
+    )
 
 
 def evaluate_exit(

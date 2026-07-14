@@ -549,6 +549,50 @@ class TradingStore:
             ).fetchall()
         return {str(row["stock_code"]): dict(row) for row in rows}
 
+    @staticmethod
+    def _signal_classification(raw_json: str) -> dict[str, str]:
+        try:
+            raw = json.loads(raw_json)
+        except (TypeError, ValueError):
+            raw = {}
+        industry = str(raw.get("industry") or raw.get("sector") or "").strip()
+        theme = str(raw.get("theme") or raw.get("theme_label") or raw.get("concept") or industry).strip()
+        return {"industry": industry, "theme": theme}
+
+    def get_active_position_classifications(self) -> dict[str, dict[str, str]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT p.stock_code, s.raw_json
+                   FROM position_cycles p
+                   LEFT JOIN signals s ON s.signal_id=p.entry_signal_id
+                   WHERE p.status='active' ORDER BY p.stock_code"""
+            ).fetchall()
+        return {
+            str(row["stock_code"]): self._signal_classification(row["raw_json"] or "{}")
+            for row in rows
+        }
+
+    def get_pending_buy_classification_exposures(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT o.stock_code, s.raw_json
+                   FROM orders o JOIN signals s ON s.signal_id=o.signal_id
+                   WHERE o.action='buy' AND o.status IN ('submitting','submitted','held','open','partial')
+                   ORDER BY o.stock_code, o.client_order_id"""
+            ).fetchall()
+        result: list[dict] = []
+        for row in rows:
+            try:
+                raw = json.loads(row["raw_json"] or "{}")
+            except (TypeError, ValueError):
+                raw = {}
+            result.append({
+                "code": str(row["stock_code"]),
+                **self._signal_classification(row["raw_json"] or "{}"),
+                "position_pct": float(raw.get("position_pct") or 0),
+            })
+        return result
+
     def backup_to(self, destination: Path) -> None:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -666,7 +710,23 @@ class TradingStore:
         return True
 
     def upsert_exit_intent(self, conn: sqlite3.Connection, signal_id: str, code: str,
-                           target_qty: int, reason: str, created_at: str) -> None:
+                           target_qty: int, reason: str, created_at: str) -> bool:
+        from exit_policy import exit_priority
+
+        active = conn.execute(
+            "SELECT signal_id, target_qty, reason FROM exit_intents WHERE stock_code=? AND status='active' LIMIT 1",
+            (code,),
+        ).fetchone()
+        if active is not None and str(active["signal_id"]) != signal_id:
+            old_priority = exit_priority(
+                f"{active['signal_id']} {active['reason'] or ''}"
+            )
+            new_priority = exit_priority(f"{signal_id} {reason}")
+            if new_priority < old_priority or (
+                new_priority == old_priority
+                and int(target_qty) >= int(active["target_qty"])
+            ):
+                return False
         conn.execute(
             "UPDATE exit_intents SET status='superseded', updated_at=? WHERE stock_code=? AND status='active' AND signal_id<>?",
             (created_at, code, signal_id),
@@ -678,6 +738,7 @@ class TradingStore:
                reason=excluded.reason, updated_at=excluded.updated_at""",
             (signal_id, code, int(target_qty), reason, created_at, created_at),
         )
+        return True
 
     def reconcile_exit_intents(self, conn: sqlite3.Connection, positions: list[dict], snapshot_at: str) -> None:
         quantities = {str(item.get("code") or ""): int(float(item.get("qty") or 0)) for item in positions}

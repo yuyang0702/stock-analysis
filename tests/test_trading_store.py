@@ -266,6 +266,49 @@ class TradingStoreTest(unittest.TestCase):
             self.assertEqual(cycle["mode"], "short")
             self.assertEqual(cycle["atr14"], 0.4)
 
+    def test_active_position_classification_is_recovered_from_entry_signal(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            run = StrategyRunRecord("run-1", "2026-07-13", "2026-07-13 09:30:00", "v1", "p1")
+            signal = SignalRecord(
+                "buy-1", "run-1", "2026-07-13", "600000", "600000.XSHG", "buy", 10,
+                "2026-07-13 09:31:00", "",
+                '{"id":"buy-1","industry":"银行","theme_label":"中特估"}',
+            )
+            with store.transaction() as conn:
+                store.record_strategy_run(conn, run)
+                store.record_signal(conn, signal)
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 1000, "cost_price": 10, "current_price": 10.2,
+                }], "2026-07-13 09:32:00")
+
+            self.assertEqual(store.get_active_position_classifications(), {
+                "600000": {"industry": "银行", "theme": "中特估"},
+            })
+
+    def test_pending_buy_exposure_is_recovered_from_signal_and_order(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            run = StrategyRunRecord("run-1", "2026-07-13", "2026-07-13 09:30:00", "v1", "p1")
+            signal = SignalRecord(
+                "buy-1", "run-1", "2026-07-13", "000001", "000001.XSHE", "buy", 8,
+                "2026-07-13 09:31:00", "",
+                '{"id":"buy-1","industry":"银行","theme":"高股息","position_pct":8}',
+            )
+            with store.transaction() as conn:
+                store.record_strategy_run(conn, run)
+                store.record_signal(conn, signal)
+                conn.execute(
+                    """INSERT INTO orders(client_order_id,signal_id,stock_code,action,status,updated_at,raw_json)
+                       VALUES ('order-1','buy-1','000001','buy','submitted','2026-07-13 09:32:00','{}')"""
+                )
+
+            self.assertEqual(store.get_pending_buy_classification_exposures(), [{
+                "code": "000001", "industry": "银行", "theme": "高股息", "position_pct": 8.0,
+            }])
+
     def test_online_backup_restores_schema_and_position_cycles(self) -> None:
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
@@ -334,6 +377,25 @@ class TradingStoreTest(unittest.TestCase):
                 store.upsert_exit_intent(conn, "take-1", "600000", 500, "take_profit_1", "2026-07-13 10:00:00")
                 store.upsert_exit_intent(conn, "stop-1", "600000", 0, "hard_stop", "2026-07-13 10:01:00")
             self.assertEqual(store.get_open_exit_intents()["600000"]["signal_id"], "stop-1")
+
+    def test_lower_priority_exit_cannot_downgrade_active_hard_stop(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                self.assertTrue(store.upsert_exit_intent(
+                    conn, "stop-1", "600000", 0, "hard_stop", "2026-07-13 10:00:00",
+                ))
+                self.assertFalse(store.upsert_exit_intent(
+                    conn, "time-1", "600000", 0, "time_stop", "2026-07-13 10:01:00",
+                ))
+                self.assertFalse(store.upsert_exit_intent(
+                    conn, "take-1", "600000", 500, "take_profit_1", "2026-07-13 10:02:00",
+                ))
+
+            active = store.get_open_exit_intents()["600000"]
+            self.assertEqual(active["signal_id"], "stop-1")
+            self.assertEqual(active["target_qty"], 0)
 
     def test_market_regime_confirmation_persists_across_calls(self) -> None:
         with TemporaryDirectory() as tmp:

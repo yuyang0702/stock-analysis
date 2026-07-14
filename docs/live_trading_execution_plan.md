@@ -2,7 +2,7 @@
 
 > 主文档：`docs/project_roadmap.md`。本文是实盘化与策略升级的可执行细化方案；如果状态、已实现能力或部署口径与主文档冲突，以主文档为准。
 
-> 文档边界：本文负责阶段路线和真实资金前门槛；当前买入、卖出和风险规则以 `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` 为准，具体 Batch A-G 以对应实施计划为准。已归档的早期 JoinQuant、硬止损和实施计划不再定义当前流程。
+> 文档边界：本文负责阶段路线和真实资金前门槛；当前买入、卖出和风险规则以 `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` 为基础，五项执行正确性 P0 以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为最新增量，具体实施以对应计划为准。已归档的早期 JoinQuant、硬止损和实施计划不再定义当前流程。
 
 ## 目标
 
@@ -299,7 +299,8 @@ JoinQuant 实盘服务（如果确认可用）
 
 - `implemented`：全持仓硬止损不再依赖候选池；持仓周期冻结初始止损与 R；支持 +2R 目标半仓、移动止盈、交易日时间止损；弱市减仓、风险释放禁止新买；卖出始终优先于买入。
 - `implemented`：SQLite schema version 6，覆盖持仓周期、正式订单、不可变逐笔成交、账户/持仓检查点、日权益、自动对账、控制审计、退出意图和再买冷却；包含重复/乱序回放、部分成交、压缩快照、自动停买/熔断和人工恢复门槛测试。
-- `implemented`：信号 schema version 1 的兼容扩展 `target_qty`，JoinQuant 模板版本 `2026-07-14.1-ledger-v6`，同证券未完成委托、可卖数量和T+1保护，并回传订单、`get_trades()`逐笔成交、真实成交换手、日内盈亏、账户回撤和连续亏损交易日。
+- `implemented（已推送基线）`：信号 schema version 1 的兼容扩展 `target_qty`，基线 JoinQuant 模板版本 `2026-07-14.1-ledger-v6`，同证券未完成委托、可卖数量和T+1保护，并回传订单、`get_trades()`逐笔成交、真实成交换手、日内盈亏、账户回撤和连续亏损交易日。
+- `implemented（未提交/未推送增量）`：目标模板版本 `2026-07-14.2-p0-execution-contract`；强制版本化买入执行契约、退出意图续执行、5只/80%双层上限、独立买卖开关，以及已有持仓和未完成买单的行业/主题暴露。该增量仍为 `not deployed / not observed / not validated`。
 - `implemented`：执行回报由 SQLite 首次入账的新 fill 驱动；无 trades 旧快照仅在累计成交增加时报告。相同成交的周期快照不再反复推送，部分成交增量仍逐次报告。
 - `implemented`：统一企业微信出口增加实际服务器发送时间；盘后按 D+0/D+1/D+3/D+5/D+10 交易日完整复盘成功推送买点，使用全量行情、最多6只分片并显式保留行情缺失样本。
 - `deployed：待外部核验 / not observed / not validated`：Git 已包含服务器代码、数据库 migration 和 JoinQuant 网站模板，但当前审核未确认外部环境是否同步；不得在只读核验前声称模拟盘已经执行新规则。

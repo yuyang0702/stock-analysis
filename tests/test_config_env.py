@@ -23,6 +23,10 @@ class ConfigEnvTest(unittest.TestCase):
                 self.assertEqual(reloaded.RISK_MODE, "observe")
                 self.assertEqual(reloaded.MAX_SINGLE_POSITION_PCT, 30)
                 self.assertEqual(reloaded.MAX_TOTAL_POSITION_PCT, 95)
+                self.assertEqual(reloaded.JOINQUANT_MAX_POSITIONS_DEFAULT, 5)
+                self.assertEqual(reloaded.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT, 80)
+                self.assertTrue(reloaded.JOINQUANT_ALLOW_BUY_DEFAULT)
+                self.assertTrue(reloaded.JOINQUANT_ALLOW_SELL_DEFAULT)
         finally:
             importlib.reload(config)
 
