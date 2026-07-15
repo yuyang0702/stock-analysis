@@ -23,7 +23,30 @@ MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_POSITIONS = 5
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-14.2-p0-execution-contract"
+STRATEGY_TEMPLATE_VERSION = "2026-07-15.1-execution-state-recovery"
+
+
+def _ensure_runtime_state(context):
+    if not isinstance(getattr(g, "signals", None), list):
+        g.signals = []
+    if not isinstance(getattr(g, "executed_signal_ids", None), set):
+        g.executed_signal_ids = set()
+    if not isinstance(getattr(g, "order_events", None), list):
+        g.order_events = []
+    if not isinstance(getattr(g, "order_signal_ids", None), dict):
+        g.order_signal_ids = {}
+    total = float(context.portfolio.total_value or 0)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not getattr(g, "metrics_trade_date", None):
+        g.metrics_trade_date = today
+    if not hasattr(g, "day_start_value"):
+        g.day_start_value = total
+    if not hasattr(g, "peak_value"):
+        g.peak_value = total
+    if not hasattr(g, "last_total_value"):
+        g.last_total_value = total
+    if not hasattr(g, "consecutive_losses"):
+        g.consecutive_losses = 0
 
 
 def initialize(context):
@@ -42,11 +65,13 @@ def initialize(context):
 
 
 def handle_data(context, data):
+    _ensure_runtime_state(context)
     fetch_and_execute(context)
     post_account_snapshot(context)
 
 
 def fetch_and_execute(context):
+    _ensure_runtime_state(context)
     fetch_signals(context)
     return execute_signals(context)
 
@@ -79,6 +104,7 @@ def _post_json(url, payload):
 
 
 def fetch_signals(context):
+    _ensure_runtime_state(context)
     try:
         payload = _get_json(SIGNAL_URL)
     except Exception as exc:
@@ -96,12 +122,16 @@ def fetch_signals(context):
 
 
 def _signal_is_fresh(signal):
-    text = getattr(g, "signal_generated_at", "") or ""
+    text = (
+        signal.get("validated_at") or signal.get("created_at")
+        or getattr(g, "signal_generated_at", "") or ""
+    )
     try:
         generated_at = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
     except Exception:
         return False
-    return datetime.now() - generated_at <= timedelta(
+    age = datetime.now() - generated_at
+    return timedelta(0) <= age <= timedelta(
         minutes=int(signal.get("max_age_min") or MAX_SIGNAL_AGE_MIN)
     )
 
@@ -205,6 +235,10 @@ def _order_status_text(value):
     return {"held": "submitted", "canceled": "cancelled"}.get(status, status)
 
 def _record_order(signal, status, reason="", order=None):
+    if not isinstance(getattr(g, "order_events", None), list):
+        g.order_events = []
+    if not isinstance(getattr(g, "order_signal_ids", None), dict):
+        g.order_signal_ids = {}
     event = {
         "id": signal.get("id"),
         "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

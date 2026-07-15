@@ -62,6 +62,22 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertAlmostEqual(equity["fees"], 5.2)
             self.assertEqual(equity["unrealized_pnl"], 500)
 
+    def test_snapshot_persists_strategy_template_version_for_recovery_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            payload = self._ledger_snapshot()
+            payload.pop("template_version", None)
+            payload["strategy_template_version"] = "2026-07-15.1-execution-state-recovery"
+            result = joinquant_sync.ingest_snapshot_payload(
+                payload, store, "2026-07-07 10:05:02"
+            )
+            with store.connect() as conn:
+                version = conn.execute(
+                    "SELECT template_version FROM account_snapshots WHERE snapshot_id=?",
+                    (result["snapshot_id"],),
+                ).fetchone()[0]
+            self.assertEqual(version, "2026-07-15.1-execution-state-recovery")
+
     def test_new_execution_events_include_each_new_partial_fill_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")

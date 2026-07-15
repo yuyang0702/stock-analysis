@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
+import config as app_config
+from execution_state import classify_exit_execution
 from order_ledger import fill_id
 from trading_store import TradingStore, canonical_json
 
@@ -28,13 +31,15 @@ class ReconciliationResult:
     differences: list[ReconciliationDifference]
     control_action: str
     snapshot_id: str | None
+    transitions: list[dict[str, Any]] = field(default_factory=list)
 
 
 _SEVERITY = {"INFO": 0, "WARNING": 1, "ERROR": 2, "CRITICAL": 3}
+_STICKY_ISSUES = {"LEDGER_INTEGRITY_FAILURE", "IMMUTABLE_FILL_CONFLICT"}
 
 
 def _text(value: Any) -> str:
-    return str(value or "").strip()
+    return "" if value is None else str(value).strip()
 
 
 def _number(value: Any) -> float:
@@ -130,6 +135,8 @@ def reconcile_snapshot(
     local_orders = {
         str(row["order_id"]): row for row in conn.execute("SELECT * FROM orders WHERE order_id IS NOT NULL")
     }
+    execution_orders = [dict(row) for row in conn.execute("SELECT * FROM orders")]
+    execution_orders.extend(dict(row) for row in conn.execute("SELECT * FROM order_events"))
     platform_orders = {
         _text(item.get("order_id")): item for item in payload.get("orders", [])
         if isinstance(item, dict) and _text(item.get("order_id"))
@@ -199,10 +206,18 @@ def reconcile_snapshot(
     quantities = {code: _qty(item.get("qty")) for code, item in platform_positions.items()}
     for intent in conn.execute("SELECT * FROM exit_intents WHERE status='active'"):
         code = str(intent["stock_code"])
-        if quantities.get(code, 0) > int(intent["target_qty"]):
+        execution = classify_exit_execution(
+            dict(intent), execution_orders, quantities.get(code, 0),
+            now, set(app_config.A_SHARE_HOLIDAYS_DEFAULT),
+        )
+        if not execution["complete"]:
             differences.append(_difference(
-                "exit_intent", str(intent["signal_id"]), "EXIT_INTENT_MISMATCH",
-                intent["target_qty"], quantities.get(code, 0), 0, "ERROR", stock_code=code,
+                "exit_intent", str(intent["signal_id"]), str(execution["state"]),
+                intent["target_qty"], quantities.get(code, 0), 0,
+                str(execution["severity"]), stock_code=code,
+                stage_started_at=execution["stage_started_at"],
+                age_minutes=execution["age_minutes"],
+                filled_qty=execution.get("filled_qty", 0),
             ))
 
     severity = max((item.severity for item in differences), key=lambda item: _SEVERITY[item], default="INFO")
@@ -238,6 +253,71 @@ def reconcile_snapshot(
     return result
 
 
+def persist_issue_transitions(
+    store: TradingStore, conn: Any, result: ReconciliationResult, now: str
+) -> list[dict[str, Any]]:
+    transitions: list[dict[str, Any]] = []
+    active_keys: set[str] = set()
+    by_key: dict[str, ReconciliationDifference] = {}
+    for item in result.differences:
+        key = f"{item.category}:{item.object_id}"
+        current = by_key.get(key)
+        if current is None or (
+            _SEVERITY.get(item.severity, 0), item.reason_code
+        ) > (
+            _SEVERITY.get(current.severity, 0), current.reason_code
+        ):
+            by_key[key] = item
+    for key in sorted(by_key):
+        item = by_key[key]
+        active_keys.add(key)
+        previous = conn.execute(
+            """SELECT state, recovered_at FROM execution_issue_state
+               WHERE issue_key=?""", (key,)
+        ).fetchone()
+        if (
+            previous is not None and previous["recovered_at"] is None
+            and str(previous["state"]) in _STICKY_ISSUES
+            and item.reason_code not in _STICKY_ISSUES
+        ):
+            continue
+        changed = store.upsert_execution_issue(conn, {
+            "issue_key": key, "object_type": item.category, "object_id": item.object_id,
+            "state": item.reason_code, "severity": item.severity,
+            "stage_started_at": str(item.details.get("stage_started_at") or now),
+            "seen_at": now,
+            "signal_id": item.object_id if item.category == "exit_intent" else "",
+            "order_id": item.object_id if item.category == "order" else "",
+            "reconciliation_id": result.reconciliation_id,
+            "details": item.details,
+        })
+        if changed["transitioned"]:
+            changed["transition"] = "OPENED" if not changed["previous_state"] else "CHANGED"
+            transitions.append(changed)
+        elif item.severity == "ERROR":
+            notified = str(changed.get("last_notified_at") or "")
+            reminder_base = notified or str(changed.get("last_transition_at") or "")
+            if reminder_base and (
+                datetime.fromisoformat(now) - datetime.fromisoformat(reminder_base)
+            ).total_seconds() >= 1800:
+                changed["transition"] = "REMINDER"
+                transitions.append(changed)
+    rows = conn.execute(
+        """SELECT issue_key, state FROM execution_issue_state
+           WHERE recovered_at IS NULL"""
+    ).fetchall()
+    for row in rows:
+        key, state = str(row[0]), str(row[1])
+        if key in active_keys or state in _STICKY_ISSUES:
+            continue
+        recovered = store.recover_execution_issue(conn, key, now)
+        if recovered:
+            recovered["transition"] = "RECOVERED"
+            transitions.append(recovered)
+    result.transitions = transitions
+    return transitions
+
+
 def build_reconciliation_markdown(
     result: ReconciliationResult, controls: dict[str, str]
 ) -> str:
@@ -249,6 +329,9 @@ def build_reconciliation_markdown(
     ]
     for item in result.differences[:8]:
         lines.append(f"- {item.reason_code} | {item.category}:{item.object_id}")
+    for transition in result.transitions[:8]:
+        if transition.get("state") == "RECOVERED":
+            lines.append(f"- RECOVERED | {transition.get('issue_key')}")
     if len(result.differences) > 8:
         lines.append(f"> 另有 {len(result.differences) - 8} 项差异未展开")
     lines.extend((
@@ -262,10 +345,36 @@ def build_reconciliation_markdown(
 
 
 def notify_reconciliation(
-    result: ReconciliationResult, controls: dict[str, str], *, notifier: Any
+    result: ReconciliationResult, controls: dict[str, str], *, notifier: Any,
+    store: TradingStore | None = None, now: str | None = None,
 ) -> bool:
-    if not result.differences:
+    if not result.differences and not result.transitions:
         return False
+    if result.transitions:
+        visible = [
+            item for item in result.transitions
+            if item.get("state") == "RECOVERED"
+            or item.get("severity") in {"WARNING", "ERROR", "CRITICAL"}
+        ]
+        if not visible:
+            return False
+        transition = visible[0]
+        sent = bool(notifier.send_markdown(
+            "JoinQuant 自动对账状态变化",
+            build_reconciliation_markdown(result, controls),
+            dedupe_key=(
+                f"reconciliation-transition:{transition.get('issue_key')}:"
+                f"{transition.get('state')}:{transition.get('severity')}:"
+                f"{transition.get('transition')}"
+            ),
+        ))
+        if sent and store is not None:
+            notified_at = now or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with store.transaction() as conn:
+                store.mark_execution_issues_notified(
+                    conn, [str(item.get("issue_key") or "") for item in visible], notified_at
+                )
+        return sent
     primary = max(
         result.differences, key=lambda item: _SEVERITY.get(item.severity, 0)
     )

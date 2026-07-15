@@ -395,6 +395,10 @@ def export_signals(
             else:
                 reject_reasons[buy_reject_reason] += 1
         payload["signals"] = signals
+        for signal in payload["signals"]:
+            signal["created_at"] = payload["generated_at"]
+            signal["validated_at"] = payload["generated_at"]
+            signal["published_at"] = payload["generated_at"]
     payload["diagnostics"] = {
         "candidate_count": int(len(df)) if df is not None else 0,
         "allow_buy": bool(allow_buy),
@@ -442,13 +446,23 @@ def export_signals(
                 parameter_version="risk-observe-v1",
             ))
             for signal, decision in decisions:
+                existing = conn.execute(
+                    "SELECT generated_at, raw_json FROM signals WHERE signal_id=?",
+                    (signal["id"],),
+                ).fetchone()
+                if existing is not None:
+                    previous = json.loads(existing["raw_json"])
+                    signal["created_at"] = str(
+                        previous.get("created_at") or existing["generated_at"]
+                    )
                 inserted_signal_count += int(store.record_signal(conn, SignalRecord(
                     signal_id=signal["id"], run_id=ledger_run_id,
                     trade_date=payload["trade_date"], code=signal["code"],
                     jq_code=signal["jq_code"], action=signal["action"],
                     position_pct=float(signal.get("position_pct") or 0),
                     generated_at=payload["generated_at"], expires_at="",
-                    raw_json=canonical_json(signal),
+                    raw_json=canonical_json(signal), validated_at=signal["validated_at"],
+                    published_at=signal["published_at"],
                 )))
                 if signal["action"] == "sell":
                     store.upsert_exit_intent(

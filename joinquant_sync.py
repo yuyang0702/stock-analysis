@@ -9,8 +9,8 @@ from typing import Any
 
 import config as app_config
 from order_ledger import normalize_fill, normalize_order
-from reconciliation import reconcile_snapshot
-from trading_control import apply_reconciliation_control
+from reconciliation import persist_issue_transitions, reconcile_snapshot
+from trading_control import apply_automatic_buy_recovery, apply_reconciliation_control
 from trading_store import TradingStore, canonical_json
 
 
@@ -177,7 +177,9 @@ def persist_account_snapshot(
             _num(snapshot.get("available_cash"), _num(snapshot.get("cash"), 0)),
             _num(snapshot.get("total_value"), 0), market_value,
             _num(snapshot.get("daily_turnover_pct"), 0), _num(snapshot.get("daily_pnl_pct"), 0),
-            _num(snapshot.get("account_drawdown_pct"), 0), str(snapshot.get("template_version") or ""),
+            _num(snapshot.get("account_drawdown_pct"), 0), str(
+                snapshot.get("strategy_template_version") or snapshot.get("template_version") or ""
+            ),
             state_hash, int(retain), canonical_json(snapshot) if retain else None,
         ),
     )
@@ -200,7 +202,10 @@ def persist_account_snapshot(
                 ),
             )
 
-    strategy_version = str(snapshot.get("template_version") or snapshot.get("strategy_version") or "")
+    strategy_version = str(
+        snapshot.get("strategy_template_version") or snapshot.get("template_version")
+        or snapshot.get("strategy_version") or ""
+    )
     trade_events = [event for event in snapshot.get("trades", []) if isinstance(event, dict)]
     has_trades = bool(trade_events)
     new_executions: list[dict[str, object]] = []
@@ -307,9 +312,25 @@ def ingest_snapshot_payload(
         reconciliation = reconcile_snapshot(
             store, conn, snapshot, snapshot_id=result["snapshot_id"], mode=mode, now=received_at,
         )
+        persist_issue_transitions(store, conn, reconciliation, received_at)
         actions = apply_reconciliation_control(store, conn, reconciliation)
+        automatic_recovery = None
+        if reconciliation.result == "matched":
+            automatic_recovery = apply_automatic_buy_recovery(
+                store, conn, reconciliation, now=received_at,
+                required_template=app_config.JOINQUANT_TEMPLATE_VERSION,
+            )
+            if automatic_recovery:
+                actions.append("auto_resume_buy")
+                reconciliation.control_action = ",".join(actions)
+                reconciliation.transitions.append({
+                    "issue_key": "control:buy_enabled", "previous_state": "0",
+                    "state": "RECOVERED", "severity": "INFO",
+                    "transitioned": True, "transition": "RECOVERED",
+                })
         result["reconciliation"] = reconciliation
         result["control_actions"] = actions
+        result["automatic_recovery"] = automatic_recovery
         today = received_at[:10]
         last_pruned = conn.execute(
             "SELECT value FROM system_state WHERE key='execution_history_last_pruned'"

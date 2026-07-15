@@ -10,6 +10,8 @@
 
 **Current Status (2026-07-14):** Tasks 1-6 are complete and were committed and pushed as `52b3653`. The server `/opt/stock-analysis` has fast-forwarded to that commit; the focused P0 suite passes 123/123, Python compilation and `ledger-check` pass, SQLite remains schema version 6, the environment file checksum is unchanged, and all three stock services are active. The JoinQuant “AI” strategy has persisted template version `2026-07-14.2-p0-execution-contract` while retaining its existing URL, token and runtime configuration. Status is `implemented（已推送） / deployed（服务器与 JoinQuant 模板） / not observed / not validated`; no real trading-day evidence exists for this version yet.
 
+**2026-07-15 follow-up:** Execution timing, signal lifecycle, reconciliation state, and guarded auto recovery are implemented only in the local workspace under `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md`; the deployed P0 baseline above is unchanged.
+
 ## Global Constraints
 
 - Authoritative business design: `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md`.

@@ -14,6 +14,7 @@ from joinquant_sync import ingest_snapshot_payload
 from notifier import WeComNotifier
 from reconciliation import (
     ReconciliationDifference, ReconciliationResult, notify_reconciliation,
+    persist_issue_transitions,
 )
 from trading_control import apply_reconciliation_control
 from trading_store import TradingStore
@@ -226,6 +227,10 @@ def create_app(
                                'unavailable', 'callback', 0, 'CRITICAL', '{}')""",
                             (failure.reconciliation_id,),
                         )
+                    persist_issue_transitions(
+                        ledger_store, conn, failure,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
                     apply_reconciliation_control(ledger_store, conn, failure)
             except Exception:
                 pass
@@ -240,6 +245,8 @@ def create_app(
                 failure,
                 failure_controls,
                 notifier=_reconciliation_notifier(),
+                store=ledger_store,
+                now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
             return jsonify({"ok": False, "error": "ledger_unavailable"}), 503
         _write_json(account_path, payload)
@@ -257,7 +264,7 @@ def create_app(
         if new_executions:
             _notify_execution(payload, new_executions)
         reconciliation = ledger_result.get("reconciliation")
-        if reconciliation is not None and reconciliation.severity in {"ERROR", "CRITICAL"}:
+        if reconciliation is not None and reconciliation.transitions:
             notify_reconciliation(
                 reconciliation,
                 {
@@ -265,6 +272,8 @@ def create_app(
                     "kill_switch": ledger_store.get_system_state("kill_switch", "0"),
                 },
                 notifier=_reconciliation_notifier(),
+                store=ledger_store,
+                now=str(payload.get("received_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
         _append_api_event(
             event_path,

@@ -70,7 +70,8 @@ def _execution_ledger_metrics(db_file: Path) -> dict[str, Any]:
         "buy_enabled": "1", "kill_switch": "0", "latest_reconciliation_result": "",
         "latest_reconciliation_severity": "", "reconciliation_mismatch_count": 0,
         "account_snapshot_count": 0, "order_count": 0, "fill_count": 0,
-        "recovery_ready": False,
+        "recovery_ready": False, "active_execution_issue_count": 0,
+        "active_execution_error_count": 0, "auto_resume_owned": False,
     }
     try:
         with TradingStore(db_file).connect() as conn:
@@ -91,6 +92,17 @@ def _execution_ledger_metrics(db_file: Path) -> dict[str, Any]:
             ).fetchone()[0])
             metrics["order_count"] = int(conn.execute("SELECT count(*) FROM orders").fetchone()[0])
             metrics["fill_count"] = int(conn.execute("SELECT count(*) FROM fills").fetchone()[0])
+            metrics["active_execution_issue_count"] = int(conn.execute(
+                "SELECT count(*) FROM execution_issue_state WHERE recovered_at IS NULL"
+            ).fetchone()[0])
+            metrics["active_execution_error_count"] = int(conn.execute(
+                """SELECT count(*) FROM execution_issue_state WHERE recovered_at IS NULL
+                   AND severity IN ('ERROR','CRITICAL')"""
+            ).fetchone()[0])
+            owner = conn.execute(
+                "SELECT value FROM system_state WHERE key='reconciliation_auto_resume_owner'"
+            ).fetchone()
+            metrics["auto_resume_owned"] = bool(owner and str(owner[0]))
             matched = conn.execute(
                 """SELECT snapshot_id FROM reconciliation_runs WHERE mode='full' AND result='matched'
                    ORDER BY finished_at DESC LIMIT 2"""

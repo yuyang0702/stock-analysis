@@ -2894,14 +2894,49 @@ def is_a_share_trading_time(now: datetime | None = None) -> bool:
 def resolve_runtime_phase(now: datetime | None = None) -> str:
     """把当前时间映射成脚本运行阶段。"""
     now = now or datetime.now()
-    hhmm = now.strftime("%H:%M")
-    if ("09:30" <= hhmm <= "11:30") or ("13:00" <= hhmm <= "15:00"):
-        return "intraday"
-    if "11:30" < hhmm < "13:00":
-        return "lunch"
-    if hhmm < "09:30":
+    if not is_a_share_trading_day(now):
+        return "closed"
+    hhmmss = now.strftime("%H:%M:%S")
+    if hhmmss < "09:15:00":
+        return "closed"
+    if hhmmss < "09:30:00":
         return "pre"
+    if ("09:30:00" <= hhmmss <= "11:30:00") or ("13:00:00" <= hhmmss <= "15:00:00"):
+        return "intraday"
+    if "11:30:00" < hhmmss < "13:00:00":
+        return "lunch"
     return "after"
+
+
+def _next_trading_morning(now: datetime, include_today: bool) -> datetime:
+    day = now.date() if include_today else now.date() + timedelta(days=1)
+    while True:
+        candidate = datetime.combine(day, datetime_time(9, 15))
+        if is_a_share_trading_day(candidate):
+            return candidate
+        day += timedelta(days=1)
+
+
+def next_runtime_wake(
+    now: datetime, phase: str, interval: int, jitter: int = 0
+) -> datetime:
+    if phase == "closed":
+        return _next_trading_morning(now, include_today=True)
+    if phase == "pre":
+        return datetime.combine(now.date(), datetime_time(9, 30))
+    if phase == "lunch":
+        return datetime.combine(now.date(), datetime_time(13, 0))
+    if phase == "after":
+        return _next_trading_morning(now, include_today=False)
+    boundary = datetime.combine(
+        now.date(), datetime_time(11, 30) if now.time() <= datetime_time(11, 30) else datetime_time(15, 0)
+    )
+    delay = max(5, int(interval) + random.randint(0, max(0, int(jitter))))
+    return min(now + timedelta(seconds=delay), boundary)
+
+
+def sleep_until(wake_at: datetime) -> None:
+    time.sleep(max(0.0, (wake_at - datetime.now()).total_seconds()))
 
 
 def sleep_with_jitter(base_sec: int, jitter_sec: int) -> None:
@@ -4155,9 +4190,9 @@ def main() -> None:
             now = datetime.now()
             runtime_phase = resolve_runtime_phase(now) if auto_daemon else cfg.mode
 
-            if runtime_phase == "lunch":
-                print("午休时段，稍后再检查。", flush=True)
-                sleep_with_jitter(max(cfg.interval * 2, 900), cfg.jitter)
+            if runtime_phase in {"closed", "lunch"}:
+                print("闭市或午休时段，等待下一运行阶段。", flush=True)
+                sleep_until(next_runtime_wake(now, runtime_phase, cfg.interval, cfg.jitter))
                 continue
 
             if cfg.market_only and runtime_phase == "intraday" and not is_market_time(now):
@@ -4167,7 +4202,7 @@ def main() -> None:
 
             stage_key = f"{now.strftime('%Y%m%d')}:{runtime_phase}"
             if auto_daemon and runtime_phase in {"pre", "after"} and stage_key == last_stage_key:
-                sleep_with_jitter(max(cfg.interval * 2, 900), cfg.jitter)
+                sleep_until(next_runtime_wake(now, runtime_phase, cfg.interval, cfg.jitter))
                 continue
 
             runtime_cfg = replace(cfg, mode=runtime_phase)
@@ -4176,7 +4211,7 @@ def main() -> None:
         except Exception as exc:
             print(f"本轮执行失败：{exc}", flush=True)
 
-        sleep_with_jitter(cfg.interval if runtime_phase == "intraday" else max(cfg.interval * 2, 900), cfg.jitter)
+        sleep_until(next_runtime_wake(datetime.now(), runtime_phase, cfg.interval, cfg.jitter))
 
 
 if __name__ == "__main__":

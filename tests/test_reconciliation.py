@@ -1,11 +1,13 @@
 import tempfile
 import unittest
+from unittest.mock import Mock
 from pathlib import Path
 
 from joinquant_sync import ingest_snapshot_payload
 from reconciliation import (
     ReconciliationDifference, ReconciliationResult, build_reconciliation_markdown,
     notify_reconciliation, reconcile_snapshot,
+    persist_issue_transitions,
 )
 from trading_store import TradingStore
 
@@ -98,7 +100,7 @@ class ReconciliationTest(unittest.TestCase):
         }]
         result = self.reconcile(changed)
         codes = {item.reason_code for item in result.differences}
-        self.assertIn("EXIT_INTENT_MISMATCH", codes)
+        self.assertIn("SIGNAL_DELIVERY_PENDING", codes)
         self.assertIn("IMMUTABLE_FILL_CONFLICT", codes)
         self.assertEqual(result.severity, "CRITICAL")
 
@@ -117,11 +119,216 @@ class ReconciliationTest(unittest.TestCase):
         self.assertIn("run_ubuntu.sh unlock", markdown)
         self.assertNotIn("must-not-leak", markdown)
 
-        notifier = unittest.mock.Mock()
+        notifier = Mock()
         notifier.send_markdown.return_value = True
         self.assertTrue(notify_reconciliation(result, controls, notifier=notifier))
         key = notifier.send_markdown.call_args.kwargs["dedupe_key"]
         self.assertEqual(key, "reconciliation:IMMUTABLE_FILL_CONFLICT:t-1:0/1")
+
+    def test_issue_transitions_are_emitted_once_and_recover_once(self) -> None:
+        difference = ReconciliationDifference(
+            "exit_intent", "s-1", "SIGNAL_STALE", "0", "600", 0,
+            "ERROR", {"stage_started_at": "2026-07-15 09:30:00"},
+        )
+        result = ReconciliationResult("r-1", "mismatch", "ERROR", [difference], "", "snap-1")
+        with self.store.transaction() as conn:
+            first = persist_issue_transitions(self.store, conn, result, "2026-07-15 09:33:00")
+            replay = persist_issue_transitions(self.store, conn, result, "2026-07-15 09:34:00")
+            recovered = persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult("r-2", "matched", "INFO", [], "", "snap-2"),
+                "2026-07-15 09:35:00",
+            )
+            repeated = persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult("r-3", "matched", "INFO", [], "", "snap-3"),
+                "2026-07-15 09:36:00",
+            )
+        self.assertEqual(first[0]["transition"], "OPENED")
+        self.assertEqual(replay, [])
+        self.assertEqual(recovered[0]["state"], "RECOVERED")
+        self.assertEqual(repeated, [])
+
+    def test_pending_info_transition_does_not_send_wecom_message(self) -> None:
+        transition = {
+            "issue_key": "exit_intent:s-1", "state": "SIGNAL_DELIVERY_PENDING",
+            "severity": "INFO", "transition": "OPENED",
+        }
+        result = ReconciliationResult(
+            "r-info", "mismatch", "INFO", [], "", "snap", [transition]
+        )
+        notifier = Mock()
+        self.assertFalse(notify_reconciliation(
+            result, {"buy_enabled": "1", "kill_switch": "0"}, notifier=notifier
+        ))
+        notifier.send_markdown.assert_not_called()
+
+    def test_idless_platform_block_event_is_used_for_exit_classification(self) -> None:
+        with self.store.transaction() as conn:
+            self.store.upsert_exit_intent(
+                conn, "exit-blocked", "600000", 0, "hard_stop", "2026-07-14 09:59:00"
+            )
+            self.store.reconcile_order_events(conn, [{
+                "id": "exit-blocked", "code": "600000", "action": "sell",
+                "status": "t_plus_one", "reason": "t_plus_one",
+                "datetime": "2026-07-14 10:00:00",
+            }], "2026-07-14 10:00:00")
+        result = self.reconcile(self.payload)
+        states = {item.reason_code for item in result.differences}
+        self.assertIn("MARKET_BLOCKED_T1", states)
+        self.assertNotIn("SIGNAL_DELIVERY_PENDING", states)
+
+    def test_issue_state_keeps_highest_severity_for_one_object(self) -> None:
+        result = ReconciliationResult("r-severity", "mismatch", "ERROR", [
+            ReconciliationDifference(
+                "position", "600000", "POSITION_QTY_MISMATCH", "100", "90", 0,
+                "ERROR", {},
+            ),
+            ReconciliationDifference(
+                "position", "600000", "POSITION_SELLABLE_MISMATCH", "80", "70", 0,
+                "WARNING", {},
+            ),
+        ], "", "snap")
+        with self.store.transaction() as conn:
+            persist_issue_transitions(self.store, conn, result, "2026-07-15 09:30:00")
+            row = conn.execute(
+                "SELECT state, severity FROM execution_issue_state WHERE issue_key='position:600000'"
+            ).fetchone()
+        self.assertEqual((row["state"], row["severity"]), ("POSITION_QTY_MISMATCH", "ERROR"))
+
+    def test_resolved_noncritical_issue_recovers_while_other_mismatch_remains(self) -> None:
+        with self.store.transaction() as conn:
+            for key, object_id in (("account:cash", "cash"), ("position:600000", "600000")):
+                self.store.upsert_execution_issue(conn, {
+                    "issue_key": key, "object_type": key.split(":", 1)[0],
+                    "object_id": object_id, "state": "OLD_ERROR", "severity": "ERROR",
+                    "stage_started_at": "2026-07-15 09:30:00",
+                    "seen_at": "2026-07-15 09:30:00", "details": {},
+                })
+            result = ReconciliationResult("r-partial-recovery", "mismatch", "ERROR", [
+                ReconciliationDifference(
+                    "position", "600000", "POSITION_QTY_MISMATCH", "100", "90", 0,
+                    "ERROR", {},
+                )
+            ], "", "snap")
+            transitions = persist_issue_transitions(
+                self.store, conn, result, "2026-07-15 09:31:00"
+            )
+            cash = conn.execute(
+                "SELECT state, recovered_at FROM execution_issue_state WHERE issue_key='account:cash'"
+            ).fetchone()
+        self.assertEqual(cash["state"], "RECOVERED")
+        self.assertTrue(cash["recovered_at"])
+        self.assertIn("account:cash", [item["issue_key"] for item in transitions])
+
+    def test_matched_snapshot_does_not_auto_recover_sticky_critical(self) -> None:
+        with self.store.transaction() as conn:
+            self.store.upsert_execution_issue(conn, {
+                "issue_key": "ledger:sqlite", "object_type": "ledger", "object_id": "sqlite",
+                "state": "LEDGER_INTEGRITY_FAILURE", "severity": "CRITICAL",
+                "stage_started_at": "2026-07-15 09:30:00",
+                "seen_at": "2026-07-15 09:30:00", "details": {},
+            })
+            persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult("r-clean", "matched", "INFO", [], "", "snap-clean"),
+                "2026-07-15 09:31:00",
+            )
+            row = conn.execute(
+                "SELECT recovered_at FROM execution_issue_state WHERE issue_key='ledger:sqlite'"
+            ).fetchone()
+        self.assertIsNone(row["recovered_at"])
+
+    def test_sticky_critical_is_not_downgraded_by_later_warning(self) -> None:
+        with self.store.transaction() as conn:
+            self.store.upsert_execution_issue(conn, {
+                "issue_key": "fill:t-1", "object_type": "fill", "object_id": "t-1",
+                "state": "IMMUTABLE_FILL_CONFLICT", "severity": "CRITICAL",
+                "stage_started_at": "2026-07-15 09:00:00",
+                "seen_at": "2026-07-15 09:00:00", "details": {},
+            })
+            result = ReconciliationResult("r-warning", "mismatch", "WARNING", [
+                ReconciliationDifference(
+                    "fill", "t-1", "MANUAL_TRADE", "no_signal", "platform_trade", 0,
+                    "WARNING", {},
+                )
+            ], "", "snap")
+            persist_issue_transitions(self.store, conn, result, "2026-07-15 09:01:00")
+            row = conn.execute(
+                "SELECT state, severity FROM execution_issue_state WHERE issue_key='fill:t-1'"
+            ).fetchone()
+        self.assertEqual((row["state"], row["severity"]), ("IMMUTABLE_FILL_CONFLICT", "CRITICAL"))
+
+    def test_transition_dedupe_key_includes_severity(self) -> None:
+        result = ReconciliationResult("r-alert", "mismatch", "ERROR", [], "", "snap", [{
+            "issue_key": "exit_intent:s-1", "state": "SIGNAL_STALE",
+            "severity": "ERROR", "transition": "CHANGED",
+        }])
+        notifier = Mock()
+        notifier.send_markdown.return_value = True
+        self.assertTrue(notify_reconciliation(
+            result, {"buy_enabled": "0", "kill_switch": "0"}, notifier=notifier
+        ))
+        self.assertIn(":ERROR:", notifier.send_markdown.call_args.kwargs["dedupe_key"])
+
+    def test_unchanged_error_reminds_only_after_thirty_minutes(self) -> None:
+        difference = ReconciliationDifference(
+            "exit_intent", "s-1", "SIGNAL_STALE", "0", "600", 0,
+            "ERROR", {"stage_started_at": "2026-07-15 09:00:00"},
+        )
+        with self.store.transaction() as conn:
+            opened = ReconciliationResult("r-open", "mismatch", "ERROR", [difference], "", "snap-1")
+            persist_issue_transitions(self.store, conn, opened, "2026-07-15 09:00:00")
+            self.store.mark_execution_issues_notified(
+                conn, ["exit_intent:s-1"], "2026-07-15 09:00:00"
+            )
+            early = ReconciliationResult("r-early", "mismatch", "ERROR", [difference], "", "snap-2")
+            due = ReconciliationResult("r-due", "mismatch", "ERROR", [difference], "", "snap-3")
+            self.assertEqual(
+                persist_issue_transitions(self.store, conn, early, "2026-07-15 09:29:59"), []
+            )
+            reminders = persist_issue_transitions(
+                self.store, conn, due, "2026-07-15 09:30:00"
+            )
+        self.assertEqual(reminders[0]["transition"], "REMINDER")
+
+    def test_never_notified_error_waits_thirty_minutes_before_reminder(self) -> None:
+        difference = ReconciliationDifference(
+            "exit_intent", "s-2", "SIGNAL_STALE", "0", "600", 0,
+            "ERROR", {"stage_started_at": "2026-07-15 09:00:00"},
+        )
+        with self.store.transaction() as conn:
+            opened = ReconciliationResult("r-open-2", "mismatch", "ERROR", [difference], "", "snap-1")
+            persist_issue_transitions(self.store, conn, opened, "2026-07-15 09:00:00")
+            early = ReconciliationResult("r-early-2", "mismatch", "ERROR", [difference], "", "snap-2")
+            due = ReconciliationResult("r-due-2", "mismatch", "ERROR", [difference], "", "snap-3")
+            self.assertEqual(
+                persist_issue_transitions(self.store, conn, early, "2026-07-15 09:29:59"), []
+            )
+            reminders = persist_issue_transitions(
+                self.store, conn, due, "2026-07-15 09:30:00"
+            )
+        self.assertEqual(reminders[0]["transition"], "REMINDER")
+
+    def test_successful_transition_notification_marks_issue_notified(self) -> None:
+        difference = ReconciliationDifference(
+            "exit_intent", "s-1", "SIGNAL_STALE", "0", "600", 0,
+            "ERROR", {"stage_started_at": "2026-07-15 09:00:00"},
+        )
+        with self.store.transaction() as conn:
+            result = ReconciliationResult("r-notify", "mismatch", "ERROR", [difference], "", "snap")
+            persist_issue_transitions(self.store, conn, result, "2026-07-15 09:00:00")
+        notifier = Mock()
+        notifier.send_markdown.return_value = True
+        self.assertTrue(notify_reconciliation(
+            result, {"buy_enabled": "0", "kill_switch": "0"}, notifier=notifier,
+            store=self.store, now="2026-07-15 09:00:01",
+        ))
+        with self.store.connect() as conn:
+            notified = conn.execute(
+                "SELECT last_notified_at FROM execution_issue_state WHERE issue_key='exit_intent:s-1'"
+            ).fetchone()[0]
+        self.assertEqual(notified, "2026-07-15 09:00:01")
 
 
 if __name__ == "__main__":

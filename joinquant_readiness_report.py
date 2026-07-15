@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import config as app_config
-from trading_store import TradingStore
+from trading_store import SCHEMA_VERSION, TradingStore
 
 
 def _load(path: Path) -> tuple[dict[str, Any], str]:
@@ -87,7 +87,7 @@ def build_report(
         "unresolved_critical_count": unresolved_critical,
     }
     if (result["signal_ok"] and result["snapshot_ok"] and result["ledger_ok"]
-            and ledger_health.schema_version == 6 and ledger_json_parity and duplicate_ids == 0
+            and ledger_health.schema_version == SCHEMA_VERSION and ledger_json_parity and duplicate_ids == 0
             and not over_position and buy_enabled == "1" and kill_switch == "0"
             and latest_full_matched and unresolved_critical == 0):
         conclusion = "can_small_position_trial"

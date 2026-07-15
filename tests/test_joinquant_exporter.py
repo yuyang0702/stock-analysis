@@ -295,6 +295,10 @@ class JoinQuantExporterTest(unittest.TestCase):
             self.assertEqual(payload["signals"][0]["jq_code"], "600000.XSHG")
             self.assertEqual(payload["signals"][0]["enhanced_score"], 94)
             self.assertEqual(payload["signals"][1]["jq_code"], "000001.XSHE")
+            for signal in payload["signals"]:
+                self.assertTrue(signal["created_at"])
+                self.assertEqual(signal["validated_at"], payload["generated_at"])
+                self.assertEqual(signal["published_at"], payload["generated_at"])
 
     def test_empty_export_keeps_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

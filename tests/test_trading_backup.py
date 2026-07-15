@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import requests
+import trading_backup
 
 from trading_backup import (
     create_backup,
@@ -24,6 +25,9 @@ from trading_store import SCHEMA_VERSION, TradingStore
 
 
 class TradingBackupTest(unittest.TestCase):
+    def test_schema_v7_backup_counts_current_execution_issue_state(self) -> None:
+        self.assertIn("execution_issue_state", trading_backup.CORE_TABLES)
+
     def make_store(self, path: Path) -> TradingStore:
         store = TradingStore(path)
         store.initialize()

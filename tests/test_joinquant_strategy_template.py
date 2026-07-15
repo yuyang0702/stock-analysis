@@ -28,8 +28,8 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
         config_text = Path("config.py").read_text(encoding="utf-8")
 
-        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-14.2-p0-execution-contract"', text)
-        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-14.2-p0-execution-contract"', config_text)
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-15.1-execution-state-recovery"', text)
+        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-15.1-execution-state-recovery"', config_text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
 
     def test_template_rechecks_five_positions_and_eighty_percent_total(self) -> None:
@@ -46,6 +46,14 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         self.assertIn("fetch_and_execute(context)\n    post_account_snapshot(context)", text)
         self.assertIn("return execute_signals(context)", text)
         self.assertIn('signal.get("max_age_min") or MAX_SIGNAL_AGE_MIN', text)
+        self.assertIn('signal.get("validated_at")', text)
+        self.assertIn('signal.get("created_at")', text)
+
+    def test_template_self_heals_runtime_globals_after_online_update(self) -> None:
+        text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
+        self.assertIn("def _ensure_runtime_state(context):", text)
+        self.assertIn("_ensure_runtime_state(context)\n    fetch_and_execute(context)", text)
+        self.assertIn('if not isinstance(getattr(g, "order_signal_ids", None), dict):', text)
 
     def test_template_posts_startup_self_test_without_orders(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")

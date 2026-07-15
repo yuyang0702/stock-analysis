@@ -6,7 +6,7 @@
 >
 > 主文档：`docs/project_roadmap.md`。如项目状态、阶段或权限口径冲突，以主文档为准。
 >
-> 当前状态：`implemented（已推送、未部署） / not observed / not validated`。
+> 当前状态：`implemented（已推送） / deployed / not observed / not validated`。该能力已包含在服务器 `52b3653`；2026-07-15 本地后续增量把对账告警改为问题状态转换/恢复触发，见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`，后续增量尚未部署。
 
 ## 1. 背景与已确认问题
 

@@ -33,6 +33,7 @@ CORE_TABLES = (
     "reconciliation_runs",
     "reconciliation_items",
     "control_events",
+    "execution_issue_state",
 )
 
 

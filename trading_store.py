@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class SignalConflictError(RuntimeError):
@@ -291,6 +291,28 @@ CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_result ON reconciliation_runs
 CREATE INDEX IF NOT EXISTS idx_reconciliation_items_reason ON reconciliation_items(reason_code, severity);
 """
 
+SCHEMA_V7 = """
+CREATE TABLE IF NOT EXISTS execution_issue_state (
+    issue_key TEXT PRIMARY KEY,
+    object_type TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    stage_started_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_transition_at TEXT NOT NULL,
+    last_notified_at TEXT,
+    recovered_at TEXT,
+    signal_id TEXT,
+    order_id TEXT,
+    reconciliation_id TEXT,
+    details_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_issue_state_active
+ON execution_issue_state(recovered_at, severity, last_seen_at);
+"""
+
 
 @dataclass(frozen=True)
 class StoreHealth:
@@ -320,6 +342,8 @@ class SignalRecord:
     generated_at: str
     expires_at: str
     raw_json: str
+    validated_at: str = ""
+    published_at: str = ""
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -358,6 +382,24 @@ class TradingStore:
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'))")
             conn.executescript(SCHEMA_V6)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, datetime('now'))")
+            signal_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(signals)")}
+            if "validated_at" not in signal_columns:
+                conn.execute("ALTER TABLE signals ADD COLUMN validated_at TEXT")
+            if "published_at" not in signal_columns:
+                conn.execute("ALTER TABLE signals ADD COLUMN published_at TEXT")
+            intent_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(exit_intents)")}
+            if "validated_at" not in intent_columns:
+                conn.execute("ALTER TABLE exit_intents ADD COLUMN validated_at TEXT")
+            if "published_at" not in intent_columns:
+                conn.execute("ALTER TABLE exit_intents ADD COLUMN published_at TEXT")
+            conn.execute(
+                "UPDATE signals SET validated_at=COALESCE(validated_at, generated_at), published_at=COALESCE(published_at, generated_at)"
+            )
+            conn.execute(
+                "UPDATE exit_intents SET validated_at=COALESCE(validated_at, created_at), published_at=COALESCE(published_at, created_at)"
+            )
+            conn.executescript(SCHEMA_V7)
+            conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, datetime('now'))")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -397,13 +439,16 @@ class TradingStore:
             """
             INSERT OR IGNORE INTO signals(
                 signal_id, run_id, trade_date, stock_code, jq_code, action,
-                target_position, generated_at, expires_at, raw_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                target_position, generated_at, expires_at, raw_json, created_at,
+                validated_at, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
             """,
             (
                 signal.signal_id, signal.run_id, signal.trade_date, signal.code,
                 signal.jq_code, signal.action, signal.position_pct, signal.generated_at,
                 signal.expires_at, signal.raw_json,
+                signal.validated_at or signal.generated_at,
+                signal.published_at or signal.generated_at,
             ),
         )
         if cursor.rowcount == 1:
@@ -413,18 +458,34 @@ class TradingStore:
                       generated_at, expires_at, raw_json FROM signals WHERE signal_id = ?""",
             (signal.signal_id,),
         ).fetchone()
-        expected = (
-            signal.run_id, signal.trade_date, signal.code, signal.jq_code, signal.action,
-            signal.position_pct, signal.generated_at, signal.expires_at, canonical_json(signal.raw_json),
-        )
-        actual = tuple(row[:8]) + (canonical_json(row[8]),) if row is not None else ()
-        if actual != expected:
+        old_raw = json.loads(row[8]) if row is not None else {}
+        new_raw = json.loads(signal.raw_json)
+        mutable = {"validated_at", "published_at"}
+        if str(new_raw.get("action") or signal.action) == "sell":
+            mutable.update({"price", "name"})
+        old_identity = {key: value for key, value in old_raw.items() if key not in mutable}
+        new_identity = {key: value for key, value in new_raw.items() if key not in mutable}
+        if row is None or old_identity != new_identity:
             raise SignalConflictError(f"immutable signal conflict: {signal.signal_id}")
+        conn.execute(
+            "UPDATE signals SET validated_at=?, published_at=? WHERE signal_id=?",
+            (
+                signal.validated_at or signal.generated_at,
+                signal.published_at or signal.generated_at,
+                signal.signal_id,
+            ),
+        )
         return False
 
     def current_signal_parity(self, signals: list[dict]) -> tuple[int, bool]:
         """Compare only current JSON signals with ledger rows; never scan history."""
-        expected = {str(item.get("id")): canonical_json(item) for item in signals if item.get("id")}
+        def identity(item: dict) -> str:
+            mutable = {"validated_at", "published_at"}
+            if str(item.get("action") or "") == "sell":
+                mutable.update({"price", "name"})
+            return canonical_json({key: value for key, value in item.items() if key not in mutable})
+
+        expected = {str(item.get("id")): identity(item) for item in signals if item.get("id")}
         if not expected:
             return 0, True
         found: dict[str, str] = {}
@@ -436,7 +497,7 @@ class TradingStore:
                 rows = conn.execute(
                     f"SELECT signal_id, raw_json FROM signals WHERE signal_id IN ({placeholders})", chunk
                 ).fetchall()
-                found.update((str(row[0]), canonical_json(row[1])) for row in rows)
+                found.update((str(row[0]), identity(json.loads(row[1]))) for row in rows)
         return len(found), found == expected
 
     def set_system_state(
@@ -458,6 +519,97 @@ class TradingStore:
         with self.connect() as conn:
             row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
         return default if row is None else str(row[0])
+
+    def upsert_execution_issue(
+        self, conn: sqlite3.Connection, issue: dict[str, object]
+    ) -> dict[str, object]:
+        key = str(issue["issue_key"])
+        previous = conn.execute(
+            "SELECT * FROM execution_issue_state WHERE issue_key=?", (key,)
+        ).fetchone()
+        state = str(issue["state"])
+        severity = str(issue["severity"])
+        seen_at = str(issue["seen_at"])
+        transitioned = previous is None or (
+            str(previous["state"]) != state or str(previous["severity"]) != severity
+            or previous["recovered_at"] is not None
+        )
+        first_seen = str(previous["first_seen_at"]) if previous else seen_at
+        transition_at = seen_at if transitioned else str(previous["last_transition_at"])
+        last_notified = str(previous["last_notified_at"] or "") if previous else ""
+        stage_started = str(issue["stage_started_at"])
+        if previous is not None and not transitioned:
+            previous_details = json.loads(str(previous["details_json"] or "{}"))
+            current_details = issue.get("details") or {}
+            material_progress = (
+                state == "PARTIAL_FILL_PENDING"
+                and int(current_details.get("filled_qty") or 0)
+                > int(previous_details.get("filled_qty") or 0)
+            )
+            if not material_progress:
+                stage_started = str(previous["stage_started_at"])
+        conn.execute(
+            """INSERT INTO execution_issue_state(
+               issue_key, object_type, object_id, state, severity, first_seen_at,
+               stage_started_at, last_seen_at, last_transition_at, last_notified_at,
+               recovered_at, signal_id, order_id, reconciliation_id, details_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+               ON CONFLICT(issue_key) DO UPDATE SET
+               object_type=excluded.object_type, object_id=excluded.object_id,
+               state=excluded.state, severity=excluded.severity,
+               stage_started_at=excluded.stage_started_at, last_seen_at=excluded.last_seen_at,
+               last_transition_at=excluded.last_transition_at, recovered_at=NULL,
+               signal_id=excluded.signal_id, order_id=excluded.order_id,
+               reconciliation_id=excluded.reconciliation_id, details_json=excluded.details_json""",
+            (
+                key, str(issue["object_type"]), str(issue["object_id"]), state, severity,
+                first_seen, stage_started, seen_at, transition_at,
+                last_notified or None, str(issue.get("signal_id") or "") or None,
+                str(issue.get("order_id") or "") or None,
+                str(issue.get("reconciliation_id") or "") or None,
+                canonical_json(issue.get("details") or {}),
+            ),
+        )
+        return {
+            "issue_key": key,
+            "previous_state": str(previous["state"]) if previous else "",
+            "state": state,
+            "severity": severity,
+            "transitioned": transitioned,
+            "reopened": bool(previous and previous["recovered_at"] is not None),
+            "last_notified_at": last_notified,
+            "last_transition_at": transition_at,
+        }
+
+    def mark_execution_issues_notified(
+        self, conn: sqlite3.Connection, issue_keys: list[str], now: str
+    ) -> None:
+        keys = sorted({str(key) for key in issue_keys if str(key)})
+        if not keys:
+            return
+        conn.executemany(
+            "UPDATE execution_issue_state SET last_notified_at=? WHERE issue_key=?",
+            ((now, key) for key in keys),
+        )
+
+    def recover_execution_issue(
+        self, conn: sqlite3.Connection, issue_key: str, now: str
+    ) -> dict[str, object] | None:
+        row = conn.execute(
+            "SELECT * FROM execution_issue_state WHERE issue_key=?", (issue_key,)
+        ).fetchone()
+        if row is None or row["recovered_at"] is not None:
+            return None
+        conn.execute(
+            """UPDATE execution_issue_state SET state='RECOVERED', severity='INFO',
+               last_seen_at=?, last_transition_at=?, recovered_at=? WHERE issue_key=?""",
+            (now, now, now, issue_key),
+        )
+        return {
+            "issue_key": issue_key, "previous_state": str(row["state"]),
+            "state": "RECOVERED", "severity": "INFO", "transitioned": True,
+            "reopened": False, "last_notified_at": str(row["last_notified_at"] or ""),
+        }
 
     def reconcile_position_cycles(
         self,
@@ -733,10 +885,12 @@ class TradingStore:
         )
         conn.execute(
             """INSERT INTO exit_intents(signal_id, stock_code, target_qty, reason, status,
-               remaining_qty, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
+               remaining_qty, created_at, updated_at, validated_at, published_at)
+               VALUES (?, ?, ?, ?, 'active', 0, ?, ?, ?, ?)
                ON CONFLICT(signal_id) DO UPDATE SET target_qty=excluded.target_qty,
-               reason=excluded.reason, updated_at=excluded.updated_at""",
-            (signal_id, code, int(target_qty), reason, created_at, created_at),
+               reason=excluded.reason, updated_at=excluded.updated_at,
+               validated_at=excluded.validated_at, published_at=excluded.published_at""",
+            (signal_id, code, int(target_qty), reason, created_at, created_at, created_at, created_at),
         )
         return True
 

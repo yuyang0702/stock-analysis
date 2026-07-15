@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Execution status (2026-07-14):** Tasks 1–6 are `implemented（已推送、未部署） / not observed / not validated`. Implementation baseline `7c31684` is in `origin/main`. Focused regression: 55/55 passed. Full Windows run: 272 tests, 269 passed and only 3 Linux-script launch errors caused by missing Bash; the Windows-capable suite excluding that Linux-only file passed 267/267.
+> **Execution status (2026-07-14):** Tasks 1–6 are `implemented（已推送） / deployed / not observed / not validated`. Implementation baseline `7c31684` is in `origin/main` and included in server `52b3653`. Focused regression: 55/55 passed. Full Windows run: 272 tests, 269 passed and only 3 Linux-script launch errors caused by missing Bash; the Windows-capable suite excluding that Linux-only file passed 267/267. The 2026-07-15 local transition-based reconciliation-alert follow-up is documented separately and is not deployed.
 
 **Goal:** Make JoinQuant execution reports originate only from newly persisted fills, review every successfully pushed buy signal at D+0/D+1/D+3/D+5/D+10, and add the server send time to every WeCom message.
 

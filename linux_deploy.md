@@ -2,6 +2,8 @@
 
 > 当前项目规划以 `docs/project_roadmap.md` 为准。本文只保留服务器执行步骤。
 
+> 2026-07-15 本地 schema 7/模板 `2026-07-15.1-execution-state-recovery` 增量尚未提交、推送或部署。下列命令不得被理解为已执行；未来部署必须先备份 SQLite、保留并校验 `stock-analysis.env`，再迁移/`ledger-check`，更新 JoinQuant 模板时保留原 URL、`SYNC_TOKEN` 和运行配置，最后仅在单独授权后重启指定服务。
+
 项目上传到服务器后只用一个入口脚本：
 
 ```bash

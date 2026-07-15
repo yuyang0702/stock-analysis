@@ -17,6 +17,36 @@ from trading_store import (
 
 
 class TradingStoreTest(unittest.TestCase):
+    def test_schema_v7_tracks_signal_lifecycle_and_execution_issue_transitions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            self.assertEqual(store.health().schema_version, 7)
+            with store.transaction() as conn:
+                signal_columns = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
+                intent_columns = {row[1] for row in conn.execute("PRAGMA table_info(exit_intents)")}
+                self.assertTrue({"validated_at", "published_at"} <= signal_columns)
+                self.assertTrue({"validated_at", "published_at"} <= intent_columns)
+                issue = {
+                    "issue_key": "exit:s-1", "object_type": "exit_intent",
+                    "object_id": "s-1", "state": "SIGNAL_DELIVERY_PENDING",
+                    "severity": "INFO", "stage_started_at": "2026-07-15 09:30:00",
+                    "seen_at": "2026-07-15 09:31:00", "signal_id": "s-1",
+                    "order_id": "", "reconciliation_id": "r-1",
+                    "details": {"target_qty": 0},
+                }
+                first = store.upsert_execution_issue(conn, issue)
+                replay = store.upsert_execution_issue(
+                    conn, {**issue, "seen_at": "2026-07-15 09:31:30"}
+                )
+                self.assertTrue(first["transitioned"])
+                self.assertFalse(replay["transitioned"])
+                recovered = store.recover_execution_issue(conn, "exit:s-1", "2026-07-15 09:32:00")
+                self.assertEqual(recovered["state"], "RECOVERED")
+                self.assertIsNone(store.recover_execution_issue(
+                    conn, "exit:s-1", "2026-07-15 09:33:00"
+                ))
+
     def test_signal_insert_is_immutable_and_idempotent(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
@@ -77,7 +107,7 @@ class TradingStoreTest(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(reason, "ledger unavailable")
 
-    def test_initialize_creates_version_six_schema_and_pragmas(self) -> None:
+    def test_initialize_creates_version_seven_schema_and_pragmas(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
@@ -86,7 +116,7 @@ class TradingStoreTest(unittest.TestCase):
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
                 busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-            self.assertEqual(version, 6)
+                self.assertEqual(version, 7)
             self.assertTrue({
                 "strategy_runs", "signals", "risk_decisions", "system_state",
                 "position_cycles", "order_events", "exit_intents", "trade_cooldowns",
@@ -118,7 +148,29 @@ class TradingStoreTest(unittest.TestCase):
             store.initialize()
             with store.connect() as conn:
                 count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-            self.assertEqual(count, 6)
+                self.assertEqual(count, 7)
+
+    def test_execution_issue_preserves_stage_start_until_state_changes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            issue = {
+                "issue_key": "exit_intent:s-1", "object_type": "exit_intent",
+                "object_id": "s-1", "state": "FILL_PENDING", "severity": "WARNING",
+                "stage_started_at": "2026-07-15 09:31:00",
+                "seen_at": "2026-07-15 09:32:00", "details": {},
+            }
+            with store.transaction() as conn:
+                store.upsert_execution_issue(conn, issue)
+                store.upsert_execution_issue(conn, {
+                    **issue, "stage_started_at": "2026-07-15 09:32:00",
+                    "seen_at": "2026-07-15 09:33:00",
+                })
+                row = conn.execute(
+                    "SELECT stage_started_at FROM execution_issue_state WHERE issue_key=?",
+                    (issue["issue_key"],),
+                ).fetchone()
+            self.assertEqual(row["stage_started_at"], "2026-07-15 09:31:00")
 
     def test_initialize_migrates_version_five_without_losing_rows(self) -> None:
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -137,7 +189,7 @@ class TradingStoreTest(unittest.TestCase):
             store = TradingStore(path)
             store.initialize()
 
-            self.assertEqual(store.health().schema_version, 6)
+            self.assertEqual(store.health().schema_version, 7)
             self.assertEqual(store.get_system_state("legacy"), "keep")
 
     def test_prune_execution_history_keeps_mismatch_evidence(self) -> None:

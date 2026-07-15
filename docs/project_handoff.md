@@ -1,6 +1,8 @@
 # 项目接管与新环境恢复说明
 
-> 2026-07-14 当前代码与部署基线：`origin/main`、服务器 `/opt/stock-analysis` 均包含 `52b3653`；该提交包含分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复、独立逐日历史回测框架、通知复盘增量和五项执行正确性 P0。服务器测试、编译、账本检查和服务状态均通过，JoinQuant 网站模板也已同步。上述能力为 `implemented（已推送） / deployed`，但真实交易日行为仍为 `not observed / not validated`；真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
+> 2026-07-15 本地未提交增量：当前工作树已实现 schema 7、边界对齐调度、单信号生命周期时间、JoinQuant 运行状态自愈、退出执行状态/有效交易分钟、转换式告警，以及仅限“ERROR 对账系统自己实际停买”的双新快照安全自动恢复。CRITICAL 不建立或保留自动恢复所有权，必须人工恢复；任何人工买入或 kill-switch 操作都取消所有权。状态为 `implemented（本地工作树） / not deployed / not observed / not validated`。服务器和 JoinQuant 仍保持下述 `52b3653` / schema 6 / 模板 `2026-07-14.2-p0-execution-contract` 部署基线；接管时不得混淆。
+
+> 2026-07-14 当前代码与部署基线：本地及 `origin/main` 当前为 `aabe1e6`，其中交易代码基线仍是已部署的 `52b3653`，后续仅同步部署状态文档；最后确认的服务器 `/opt/stock-analysis` 为 `52b3653`。该交易代码包含分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复、独立逐日历史回测框架、通知复盘增量和五项执行正确性 P0。服务器测试、编译、账本检查和服务状态均通过，JoinQuant 网站模板也已同步。上述能力为 `implemented（已推送） / deployed`，但真实交易日行为仍为 `not observed / not validated`；真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
 
 > 2026-07-14 `7c31684` 通知复盘增量已包含在服务器当前 `52b3653` 中：SQLite 新 fill/legacy 累计成交增量驱动执行回报、统一企业微信服务器时间，以及 D+0/D+1/D+3/D+5/D+10 全量买点复盘。当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
