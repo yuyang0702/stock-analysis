@@ -15,7 +15,7 @@ from trading_store import TradingStore
 def snapshot(generated_at: str = "2026-07-14 10:00:00") -> dict:
     return {
         "schema_version": 1,
-        "trade_date": "2026-07-14",
+        "trade_date": generated_at[:10],
         "generated_at": generated_at,
         "template_version": "ledger-v6",
         "cash": 99000,
@@ -83,6 +83,44 @@ class ReconciliationTest(unittest.TestCase):
         self.assertIn("FILL_MISSING_LOCAL", codes)
         self.assertIn("ORDER_FILL_QTY_MISMATCH", codes)
         self.assertIn("MANUAL_TRADE", codes)
+
+    def test_full_reconciliation_ignores_prior_day_local_fills(self) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """INSERT INTO fills(fill_id, order_id, stock_code, action, qty, price, filled_at, raw_json)
+                   VALUES ('prior-day-fill','prior-order','000021','sell',100,10,
+                           '2026-07-14 09:46:00','{}')"""
+            )
+        current = snapshot("2026-07-15 10:00:00")
+        current_id = ingest_snapshot_payload(
+            current, self.store, "2026-07-15 10:00:02"
+        )["snapshot_id"]
+        with self.store.transaction() as conn:
+            result = reconcile_snapshot(
+                self.store, conn, current, snapshot_id=current_id,
+                mode="full", now="2026-07-15 10:00:03",
+            )
+        self.assertEqual(result.result, "matched")
+        self.assertNotIn(
+            "FILL_MISSING_PLATFORM",
+            {item.reason_code for item in result.differences},
+        )
+
+    def test_full_reconciliation_warns_for_missing_same_day_local_fill(self) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """INSERT INTO fills(fill_id, order_id, stock_code, action, qty, price, filled_at, raw_json)
+                   VALUES ('same-day-fill','same-order','601600','buy',800,10,
+                           '2026-07-14 14:22:00','{}')"""
+            )
+        result = self.reconcile(self.payload)
+        missing = [
+            item for item in result.differences
+            if item.reason_code == "FILL_MISSING_PLATFORM"
+        ]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0].object_id, "same-day-fill")
+        self.assertEqual(missing[0].severity, "WARNING")
 
     def test_exit_intent_and_conflicting_fill_are_detected(self) -> None:
         with self.store.transaction() as conn:

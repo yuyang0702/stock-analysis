@@ -6,6 +6,8 @@
 
 > 2026-07-15 执行链增量以 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` 为准：schema 7、开盘边界调度、逐信号时效、退出阶段对账、转换告警和受限自动恢复买入已随 `e2ce5b5` 推送并部署服务器。服务器备份、Linux 324/324 测试、schema 7 `ledger-check`、配置哈希和三个服务状态已核验；用户报告 JoinQuant 网站模板已手动更新，但新模板快照尚待交易日回传。当前为 `implemented（已推送） / deployed / not observed / not validated`。自动恢复仍只适用于 ERROR 对账自己实际造成的停买；CRITICAL 与任何人工控制均要求人工恢复。
 
+> 2026-07-15 成交对账修复当前为 `implemented（本地工作区） / not deployed / not observed / not validated`：完整模式只对当前快照交易日做成交存在性比较，不改变 SQLite 历史账本、交易策略、控制严重度或自动恢复门槛。服务器 Linux 全量测试和部署验收仍待执行。
+
 ## 目标
 
 把当前项目从“能扫描、能模拟下单”升级为“可长期稳定运行、具备风控、回测、审计和实盘接入能力的股票量化工具”。

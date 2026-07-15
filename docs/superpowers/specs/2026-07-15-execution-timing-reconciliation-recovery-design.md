@@ -2,6 +2,8 @@
 
 > **Status (2026-07-15):** `implemented (pushed) / deployed (server; JoinQuant website update user-confirmed) / not observed / not validated`. Implementation commit `e2ce5b5` is on `origin/main`; Linux verification passes 324/324, the server ledger is schema 7, configuration hash is unchanged, and all three core services are active. The website update still requires a fresh trading-session snapshot before it is observed.
 >
+> **Approved post-deployment correction:** The trade-date scope correction in Section 16 is `implemented (local workspace) / not deployed / not observed / not validated`. Focused reconciliation tests pass 18/18 and Python compilation passes. The Windows suite passed 323/326; the remaining three tests require Bash and must pass on the Linux server before deployment is accepted.
+>
 > This document records the user-approved design. It does not authorize Git operations, server deployment, service restart, JoinQuant website changes, or secret/configuration changes.
 
 ## 1. Purpose
@@ -328,3 +330,45 @@ The historical local implementation checkpoint was:
 The later authorized Git and server operations completed for `e2ce5b5`; the user separately confirmed the JoinQuant website update. Observation still requires fresh runtime logs, database facts, and platform evidence from a trading session; validation requires repeated representative trading sessions.
 
 The later deployment sequence, if separately authorized, must preserve server configuration and secrets, back up SQLite, migrate and check the ledger, update the JoinQuant template while preserving its URL/token/runtime configuration, restart only named services, and verify exact versions and post-deployment logs.
+
+## 16. Trade-Date-Scoped Fill Reconciliation Correction
+
+### 16.1 Root cause and evidence
+
+JoinQuant documents `get_trades()` as returning all fills for the current trading day, not the simulation account's complete fill history. The current template correctly serializes the direct result of `get_trades()` into each account snapshot. SQLite correctly retains immutable fills across trading days. The defect is in full reconciliation: it selects every row from `fills` and reports every historical row absent from the current-day snapshot as `FILL_MISSING_PLATFORM`.
+
+This produced two false warnings on 2026-07-15 for valid 2026-07-14 fills. The fills remained intact in SQLite; no platform transaction or ledger row was lost. Reference: [JoinQuant API documentation](https://cdn.joinquant.com/help/img/JoinQuantAPI.pdf), `get_trades - 获取成交信息`.
+
+### 16.2 Required comparison scope
+
+For every reconciliation snapshot, use the normalized `trade_date` already persisted in `account_snapshots` for the current `snapshot_id`. Reconciliation must not parse a second date independently or invent a new fallback.
+
+Full fill reconciliation must:
+
+1. load local fills whose `filled_at` date equals `snapshot_trade_date`;
+2. compare those scoped local fills with every trade returned in the snapshot;
+3. retain `FILL_MISSING_PLATFORM / WARNING` when a same-day local fill is absent from the snapshot;
+4. retain `FILL_MISSING_LOCAL / ERROR` when the snapshot contains a platform fill absent from the same-day local ledger;
+5. retain `IMMUTABLE_FILL_CONFLICT / CRITICAL` for quantity, price, or order-ID conflicts;
+6. ignore prior-day local fills for current-snapshot presence comparison without deleting, rewriting, or recovering them.
+
+Incremental and full modes use the same trade-date-scoped local fill set. Full mode remains the only mode that emits `FILL_MISSING_PLATFORM`; incremental mode continues to ingest and validate platform-provided trades without requiring a complete same-day set.
+
+### 16.3 Non-goals and invariants
+
+- Do not cache cross-day trade history in JoinQuant `g` state.
+- Do not add a database column, table, file, JSONL stream, dependency, retention rule, or configuration switch.
+- Do not weaken platform-fill-to-local-ledger validation.
+- Do not change orders, positions, exit timing, control severity, unlock eligibility, buy/sell logic, risk thresholds, or notification policy.
+- Historical fill integrity remains protected by the immutable `fills` primary key, SQLite integrity checks, online backup, manifests, and restore drills.
+
+### 16.4 Acceptance tests
+
+The correction is complete only when automated tests prove all of the following:
+
+1. a full 2026-07-15 snapshot with no trades matches even when SQLite contains valid 2026-07-14 fills;
+2. a full 2026-07-15 snapshot missing a SQLite fill dated 2026-07-15 still reports `FILL_MISSING_PLATFORM / WARNING`;
+3. a platform trade absent from the same-day SQLite ledger still reports `FILL_MISSING_LOCAL / ERROR`;
+4. existing immutable-conflict, order, position, exit-state, control, backup, and schema-7 tests remain green.
+
+Passing local tests establishes only `implemented`. Server deployment, a fresh JoinQuant trading-day snapshot, two distinct matched full reconciliations, and successful audited buy recovery are separate `deployed / observed / validated` evidence.

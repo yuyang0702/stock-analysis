@@ -73,7 +73,7 @@ def reconcile_snapshot(
     del store
     differences: list[ReconciliationDifference] = []
     account = conn.execute(
-        "SELECT cash, available_cash, total_value FROM account_snapshots WHERE snapshot_id=?",
+        "SELECT trade_date, cash, available_cash, total_value FROM account_snapshots WHERE snapshot_id=?",
         (snapshot_id,),
     ).fetchone()
     if account is None:
@@ -167,7 +167,12 @@ def reconcile_snapshot(
                     "order", order_id, "ORDER_FILL_QTY_MISMATCH", reported, summed, 0, "ERROR",
                 ))
 
-    local_fills = {str(row["fill_id"]): row for row in conn.execute("SELECT * FROM fills")}
+    local_fills = {
+        str(row["fill_id"]): row for row in conn.execute(
+            "SELECT * FROM fills WHERE substr(filled_at, 1, 10)=?",
+            (str(account["trade_date"]),),
+        )
+    } if account is not None else {}
     platform_fill_ids: set[str] = set()
     for trade in payload.get("trades", []):
         if not isinstance(trade, dict):

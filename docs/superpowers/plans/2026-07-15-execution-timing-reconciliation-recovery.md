@@ -2,6 +2,8 @@
 
 > **Execution status (2026-07-15):** Tasks 1–10 plus the post-review corrections are `implemented (pushed) / deployed (server; JoinQuant website update user-confirmed) / not observed / not validated`. Implementation commit `e2ce5b5` passed Python compilation and the isolated Linux full suite 324/324. The server was backed up, migrated to schema 7, checked healthy/writable, and restarted with unchanged environment hash and all three core services active. A fresh trading-session snapshot is still required to observe the manually updated website template.
 
+> **Task 11 status:** `implemented (local workspace) / not deployed / not observed / not validated`. The cross-day regression was reproduced before the minimal query correction; focused tests now pass 18/18. Windows passed 323/326 tests, with only the three Bash-only script tests pending Linux verification.
+
 > **Post-review corrections:** Exit classification now consumes idless JoinQuant block/skip events; stage timing preserves first submission and material partial-fill progress; one object retains its highest-severity current issue; ordinary resolved issues recover independently while immutable ledger criticals remain sticky; transition dedupe includes severity and persisted successful-notification time supports a 30-minute ERROR reminder. Automatic ownership is ERROR-only, includes the originating control-event ID, is cancelled by every manual buy/kill-switch action, and is never created or retained for CRITICAL.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
@@ -793,3 +795,41 @@ Map every design section to a passing test or an explicit external pending item.
 - [x] **Step 6: Stop before Git or external operations**
 
 Report changed files, exact test totals, local-only status, and required future Linux/server/JoinQuant verification. Do not commit, push, deploy, restart, migrate the server, or modify the JoinQuant website.
+
+---
+
+### Task 11: Trade-Date-Scoped Fill Reconciliation Correction
+
+**Files:**
+- Modify: `reconciliation.py`
+- Modify: `tests/test_reconciliation.py`
+- Modify: active project status documents only where the correction changes current facts
+
+**Interfaces:**
+- Uses `account_snapshots.trade_date` for the current `snapshot_id` as the sole reconciliation date.
+- Limits the local fill set to `substr(filled_at, 1, 10)=trade_date`.
+- Preserves same-day `FILL_MISSING_PLATFORM / WARNING` and platform-only `FILL_MISSING_LOCAL / ERROR` behavior.
+
+- [x] **Step 1: Write failing fill-scope regression tests**
+
+Add tests proving a prior-day local fill is ignored by a current-day full snapshot, a same-day local fill missing from a full snapshot still warns, and a platform fill missing locally still errors.
+
+- [x] **Step 2: Run the focused tests and verify RED**
+
+```powershell
+python -m unittest tests.test_reconciliation -v
+```
+
+Expected: the prior-day test fails with `FILL_MISSING_PLATFORM` before the production correction.
+
+- [x] **Step 3: Apply the minimal query correction**
+
+Read `trade_date` from the already-persisted account snapshot and select local fills for that date only. If the account row is missing, preserve the existing ledger-integrity failure and use an empty local fill set rather than inventing a fallback date.
+
+- [ ] **Step 4: Run focused and complete verification**
+
+Run the reconciliation test module, Python compilation, the complete local suite, `git diff --check`, and repository status review.
+
+- [ ] **Step 5: Synchronize status documents**
+
+Record the correction as implemented only after local verification, pushed only after the remote push succeeds, deployed only after server verification, and leave observed/validated pending until a fresh trading-day snapshot proves the behavior.

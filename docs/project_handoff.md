@@ -1,5 +1,7 @@
 # 项目接管与新环境恢复说明
 
+> 2026-07-15 待部署增量：成交全量对账已在本地改为仅比较快照交易日的 SQLite 成交与 JoinQuant 当日 `get_trades()`；跨日历史成交不再产生假 `FILL_MISSING_PLATFORM`，同日缺失与平台侧未落账的严重度保持不变。当前为 `implemented（本地工作区） / not deployed / not observed / not validated`；专项测试18/18通过，Windows全量323/326通过，3项 Bash-only 测试待服务器 Linux 验证。
+
 > 2026-07-15 当前部署检查点：schema 7 执行链增量已随实现提交 `e2ce5b50590edc28cb748bee1fa985f43c9a0366` 进入 `origin/main` 并部署到服务器 `/opt/stock-analysis`。部署前 schema 6 备份完整性为 `ok`；Python 编译、Linux 隔离测试账本全量测试 324/324、正式账本 `ledger-check` 和 schema 7 迁移通过；`stock-analysis.env` 哈希未变化，三个核心服务 active，重启后五分钟 ERROR 日志为0，服务器工作树干净并与 `origin/main` 一致。状态为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
 > 用户报告已在 JoinQuant 网站手动更新模板 `2026-07-15.1-execution-state-recovery`；更新后尚无新快照证据，故网站侧记录为 `deployed（用户确认） / not observed / not validated`。服务器 `buy_enabled=0`、`kill_switch=0`；盘后立即恢复因 `ACCOUNT_SNAPSHOT_STALE` 被拒绝。一次性 timer 已排程在 2026-07-16 09:32、09:35 完整对账并于09:37在全部安全门满足时 CAS 恢复买入，成功前不得写成已经解除。
