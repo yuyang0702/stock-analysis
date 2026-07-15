@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pandas as pd
+
+from candidate_core import score_candidate_frame
 from exit_policy import board_type, initial_stop_price, market_regime, risk_position_pct
 from historical_data import HistoricalDataValidationError, HistoricalStore, STRICT_FEATURES
 
@@ -70,18 +73,28 @@ def _strict_candidates(
         for row in rows
         if STRICT_FEATURES.issubset(all_features.get(str(row["code"]), {}))
     ]
-    pct_values = [_float(features["pct_chg"]) for _, features in prepared]
-    turnover_values = [_float(features["turnover"]) for _, features in prepared]
-    result = []
-    for row, features in prepared:
-        pct_rank = _percentile(_float(features["pct_chg"]), pct_values)
-        turnover_rank = _percentile(_float(features["turnover"]), turnover_values)
-        score = (
-            _float(features["score"])
-            + _float(features["news_score"]) * 1.2
-            + pct_rank * 5
-            + turnover_rank * 2
+    if not prepared:
+        return []
+    scored = score_candidate_frame(
+        pd.DataFrame(
+            [
+                {
+                    "score": features["score"],
+                    "news_score": features["news_score"],
+                    "pct_chg": features["pct_chg"],
+                    "turnover": features["turnover"],
+                }
+                for _, features in prepared
+            ]
         )
+    )
+    pct_ranks = pd.to_numeric(scored["pct_chg"], errors="coerce").rank(pct=True).fillna(0)
+    turnover_ranks = pd.to_numeric(scored["turnover"], errors="coerce").rank(pct=True).fillna(0)
+    result = []
+    for index, (row, features) in enumerate(prepared):
+        pct_rank = float(pct_ranks.iloc[index])
+        turnover_rank = float(turnover_ranks.iloc[index])
+        score = float(scored["final_score"].iloc[index])
         entry = _float(features["entry_price"]) or float(row["close"])
         atr = _float(features["atr14"])
         state = market_regime(features["market_regime"])

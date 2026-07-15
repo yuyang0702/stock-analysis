@@ -3,6 +3,9 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
+
+from candidate_core import score_candidate_frame
 from historical_data import HistoricalStore, STRICT_FEATURES
 from historical_strategy import generate_daily_candidates
 
@@ -81,9 +84,14 @@ class HistoricalStrategyTest(unittest.TestCase):
             candidates = generate_daily_candidates(
                 store, "d1", day, mode="strict", parameter_version="v1", min_score=0
             )
+            expected = score_candidate_frame(
+                pd.DataFrame(
+                    [{"score": 70, "news_score": 2, "pct_chg": 3, "turnover": 4}]
+                )
+            ).iloc[0]["final_score"]
 
             self.assertEqual(len(candidates), 1)
-            self.assertAlmostEqual(candidates[0].score, 70 + 2 * 1.2 + 5 + 2)
+            self.assertAlmostEqual(candidates[0].score, expected)
             self.assertEqual(candidates[0].entry_price, 10)
             self.assertFalse(candidates[0].evidence["proxy_only"])
 
@@ -113,6 +121,18 @@ class HistoricalStrategyTest(unittest.TestCase):
             self.assertEqual([candidate.code for candidate in first], ["600000"])
             self.assertTrue(first[0].evidence["proxy_only"])
             self.assertGreater(first[0].atr14, 0)
+
+    def test_strict_returns_no_candidates_when_features_are_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            day = "2025-01-02"
+            self._insert_market_day(store, day, "600000", 10.0)
+
+            candidates = generate_daily_candidates(
+                store, "d1", day, mode="strict", parameter_version="v1", min_score=0
+            )
+
+            self.assertEqual(candidates, [])
 
 
 if __name__ == "__main__":

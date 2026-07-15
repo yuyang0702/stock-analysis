@@ -19,6 +19,7 @@ import akshare as ak
 import pandas as pd
 
 import config as app_config
+from candidate_core import CandidatePoolConfig, build_candidate_pool, score_candidate_frame
 from exit_policy import (
     EXECUTION_PLAN_VERSION,
     PositionExitState,
@@ -1736,24 +1737,16 @@ def lhb_status(code: str, cache: DiskCache | None = None) -> tuple[str, str]:
 
 
 def build_pool(df: pd.DataFrame, cfg: Config, limit: int | None = None) -> pd.DataFrame:
-    active = df.copy()
-    active = active[~active["name"].str.contains("ST|退", regex=True, na=False)]
-    active = active[(active["price"] >= cfg.min_price) & (active["amount"] >= cfg.min_amount)]
-
-    if cfg.mode == "pre":
-        active = active[(active["gap"] >= 1.5) & (active["gap"] <= 8.5)]
-        active["score"] = active["gap"].rank(pct=True) * 50 + active["amount"].rank(pct=True) * 50
-    elif cfg.mode == "after":
-        active = active[active["pct_chg"] >= 3]
-        active["score"] = active["pct_chg"].rank(pct=True) * 55 + active["amount"].rank(pct=True) * 35
-        if "turnover" in active.columns:
-            active["score"] += active["turnover"].rank(pct=True).fillna(0) * 10
-    else:
-        active = active[active["pct_chg"] >= 4]
-        active["score"] = active["pct_chg"].rank(pct=True) * 60 + active["amount"].rank(pct=True) * 40
-
-    limit = cfg.top if limit is None else max(1, int(limit))
-    return active.sort_values("score", ascending=False).head(limit).copy()
+    resolved_limit = cfg.top if limit is None else max(1, int(limit))
+    return build_candidate_pool(
+        df,
+        CandidatePoolConfig(
+            cfg.mode,
+            cfg.min_price,
+            cfg.min_amount,
+            resolved_limit,
+        ),
+    )
 
 
 def get_ai_client() -> tuple[OpenAI | None, str | None]:
@@ -3554,11 +3547,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
         return None
 
     result["amount_rank_pct"] = result["amount"].rank(pct=True).fillna(0)
-    result["final_score"] = result["score"].fillna(0)
-    result["final_score"] += result["news_score"].fillna(0) * 1.2
-    result["final_score"] += result["pct_chg"].rank(pct=True).fillna(0) * 5
-    if "turnover" in result.columns:
-        result["final_score"] += result["turnover"].rank(pct=True).fillna(0) * 2
+    result = score_candidate_frame(result)
 
     result["entry_reason"] = result.apply(lambda row: build_entry_reason(row, market_info), axis=1)
     result["news_brief"] = result.apply(build_news_brief, axis=1)
@@ -3641,10 +3630,7 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
         watch_result = pd.DataFrame(watch_rows)
         if not watch_result.empty:
             watch_result["amount_rank_pct"] = watch_result["amount"].rank(pct=True).fillna(0)
-            watch_result["final_score"] = watch_result["score"].fillna(0)
-            watch_result["final_score"] += watch_result["pct_chg"].rank(pct=True).fillna(0) * 5
-            if "turnover" in watch_result.columns:
-                watch_result["final_score"] += watch_result["turnover"].rank(pct=True).fillna(0) * 2
+            watch_result = score_candidate_frame(watch_result)
             watch_result["entry_reason"] = watch_result.apply(lambda row: build_entry_reason(row, market_info), axis=1)
             watch_result["news_brief"] = watch_result.apply(build_news_brief, axis=1)
             watch_result["next_day_opportunity"] = watch_result.apply(lambda row: build_next_day_opportunity(row, market_info), axis=1)
