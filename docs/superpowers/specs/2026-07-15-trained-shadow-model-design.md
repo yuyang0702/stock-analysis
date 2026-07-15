@@ -139,7 +139,7 @@ source + dataset_id + trade_date + decision_at + code
 
 ## 6. 模型结构与确定性输出
 
-首版只新增 `scikit-learn` 一个训练依赖，不引入 LightGBM、XGBoost、神经网络、模型服务或特征平台。部署前根据服务器 Python 版本锁定一个训练与推理完全一致的 scikit-learn 版本，并把 Python、NumPy、pandas、scikit-learn 和模型序列化版本写入模型清单。
+首版只新增 `scikit-learn==1.9.0` 一个训练依赖，不引入 LightGBM、XGBoost、神经网络、模型服务或特征平台。该版本要求 Python 3.11+；2026-07-16 已只读确认服务器系统 Python、项目 `.venv` 和三个服务实际解释器均为 Python 3.12.3。训练与推理必须使用完全一致的依赖版本，并把 Python、NumPy、pandas、scikit-learn 和模型序列化版本写入模型清单。
 
 模型由多个独立小模型组成：
 

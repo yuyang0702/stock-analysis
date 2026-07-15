@@ -6,14 +6,14 @@
 
 **Architecture:** Reuse the live candidate frame, historical SQLite, trading ledger, and existing report/backup patterns. Store live ML facts in a separate `cache/ml/ml.db`, store strict historical candidate cohorts in `cache/backtest/history.db`, train small scikit-learn pipelines into immutable model bundles, and route every runtime output through a deterministic permission policy. L0 is the only initially enabled level; higher levels exist behind hash-bound manual approval and remain disabled until their observation gates are met.
 
-**Tech Stack:** Python 3.10+, pandas, SQLite, scikit-learn 1.9.0, joblib, hashlib/json/pathlib, existing unittest suite and `run_ubuntu.sh`.
+**Tech Stack:** Python 3.11+, pandas, SQLite, scikit-learn 1.9.0, joblib, hashlib/json/pathlib, existing unittest suite and `run_ubuntu.sh`.
 
 ## Global Constraints
 
 - Follow `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` exactly.
 - Preserve `final_score`, current signal selection, buy/sell decisions, target positions, exits and hard risk rules while L0 is active.
 - Keep `shadow_score.py` as a deterministic comparator; do not use `enhanced_score`, `shadow_rank` or `shadow_adjust_score` as first-version model inputs.
-- Use one new training dependency only: `scikit-learn==1.9.0`; verify Python is at least 3.10 before changing `requirements.txt`.
+- Use one new training dependency only: `scikit-learn==1.9.0`; verify Python is at least 3.11 before changing `requirements.txt`.
 - Never write high-frequency ML rows to `cache/trading/trading.db`.
 - `price_core` remains proxy-only and cannot train or approve the final model.
 - Exact strict rule: every feature must satisfy `available_at <= decision_at`; date-only comparison is insufficient.
@@ -551,7 +551,7 @@ Expected: clean. Suggested authorized commit: `feat: build leakage safe ml datas
 
 - [ ] **Step 1: Verify dependency compatibility before editing requirements**
 
-Run: `python -c "import sys; print(sys.version); assert sys.version_info >= (3, 10)"`
+Run: `python -c "import sys; print(sys.version); assert sys.version_info >= (3, 11)"`
 
 Expected: exit 0. If it fails, stop and amend the approved spec with a compatible pinned scikit-learn version; do not select a version silently.
 
