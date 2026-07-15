@@ -1,8 +1,10 @@
 # 项目接管与新环境恢复说明
 
-> 2026-07-15 本地未提交增量：当前工作树已实现 schema 7、边界对齐调度、单信号生命周期时间、JoinQuant 运行状态自愈、退出执行状态/有效交易分钟、转换式告警，以及仅限“ERROR 对账系统自己实际停买”的双新快照安全自动恢复。CRITICAL 不建立或保留自动恢复所有权，必须人工恢复；任何人工买入或 kill-switch 操作都取消所有权。状态为 `implemented（本地工作树） / not deployed / not observed / not validated`。服务器和 JoinQuant 仍保持下述 `52b3653` / schema 6 / 模板 `2026-07-14.2-p0-execution-contract` 部署基线；接管时不得混淆。
+> 2026-07-15 当前部署检查点：schema 7 执行链增量已随实现提交 `e2ce5b50590edc28cb748bee1fa985f43c9a0366` 进入 `origin/main` 并部署到服务器 `/opt/stock-analysis`。部署前 schema 6 备份完整性为 `ok`；Python 编译、Linux 隔离测试账本全量测试 324/324、正式账本 `ledger-check` 和 schema 7 迁移通过；`stock-analysis.env` 哈希未变化，三个核心服务 active，重启后五分钟 ERROR 日志为0，服务器工作树干净并与 `origin/main` 一致。状态为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
-> 2026-07-14 当前代码与部署基线：本地及 `origin/main` 当前为 `aabe1e6`，其中交易代码基线仍是已部署的 `52b3653`，后续仅同步部署状态文档；最后确认的服务器 `/opt/stock-analysis` 为 `52b3653`。该交易代码包含分层退出与组合风控、SQLite schema 6 完整执行账本、自动对账与人工解锁、自动备份恢复、独立逐日历史回测框架、通知复盘增量和五项执行正确性 P0。服务器测试、编译、账本检查和服务状态均通过，JoinQuant 网站模板也已同步。上述能力为 `implemented（已推送） / deployed`，但真实交易日行为仍为 `not observed / not validated`；真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
+> 用户报告已在 JoinQuant 网站手动更新模板 `2026-07-15.1-execution-state-recovery`；更新后尚无新快照证据，故网站侧记录为 `deployed（用户确认） / not observed / not validated`。服务器 `buy_enabled=0`、`kill_switch=0`；盘后立即恢复因 `ACCOUNT_SNAPSHOT_STALE` 被拒绝。一次性 timer 已排程在 2026-07-16 09:32、09:35 完整对账并于09:37在全部安全门满足时 CAS 恢复买入，成功前不得写成已经解除。
+
+> 2026-07-14 的 `aabe1e6` / `52b3653` / schema 6 / 模板 `2026-07-14.2-p0-execution-contract` 是上一部署基线，已被上述 `e2ce5b5` / schema 7 检查点取代；其中分层退出、完整账本、备份恢复、历史回测框架、通知复盘和五项 P0 仍包含在当前版本中。真实交易日行为仍为 `not observed / not validated`，真实 6 个月/1 年 strict 数据也尚未导入和重复运行。
 
 > 2026-07-14 `7c31684` 通知复盘增量已包含在服务器当前 `52b3653` 中：SQLite 新 fill/legacy 累计成交增量驱动执行回报、统一企业微信服务器时间，以及 D+0/D+1/D+3/D+5/D+10 全量买点复盘。当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
@@ -101,8 +103,8 @@ git ls-remote origin refs/heads/main
 | 订单回报与持仓同步 | deployed | 快照回传、实际成交和持仓一致性。 |
 | 健康检查和微信异常报警 | deployed | timer、报告、告警和失败重试。 |
 | SQLite Batch 1 | deployed | 服务器已运行 schema version 1；待部署后首个有效交易日确认双写和交易日一致性。 |
-| SQLite schema 6完整执行账本 | deployed | 含持仓周期、订单、逐笔成交、账户/持仓检查点、日权益、对账、控制审计和冷却；服务器 `52b3653` schema 6 检查通过，尚未观察或验证。 |
-| 自动对账与人工解锁 | deployed | ERROR停买、CRITICAL熔断、两次不同全量一致快照和二次确认已部署；尚未观察或验证。 |
+| SQLite schema 7完整执行账本 | deployed | schema 6完整账本由 `e2ce5b5` 幂等迁移到7，新增生命周期和当前执行问题状态；服务器健康/可写检查通过，尚未观察或验证。 |
+| 自动对账、人工解锁与受限自动恢复 | deployed | ERROR停买、CRITICAL熔断、两次不同新鲜快照、CAS 与所有权边界已部署；尚未观察或验证。 |
 | 成交回报幂等与 D+N 全量复盘 | deployed | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘已随 `52b3653` 部署；尚未观察或验证。 |
 | 完整历史回测 | deployed（框架） | 与信号级回测并存且代码已在服务器；真实 6 个月/1 年 strict 数据尚未导入、运行或人工验证。 |
 | 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |

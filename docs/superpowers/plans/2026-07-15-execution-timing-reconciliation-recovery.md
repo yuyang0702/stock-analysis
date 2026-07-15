@@ -1,6 +1,6 @@
 ﻿# Execution Timing, Reconciliation State, and Safe Recovery Implementation Plan
 
-> **Execution status (2026-07-15):** Tasks 1–10 plus the post-review corrections are implemented in the local workspace. Python compilation passes, the focused execution-chain suite passes 169/169, and all Windows-capable tests pass 321/321. Three `run_ubuntu.sh ledger-check` execution tests require Bash and remain pending for Linux. Status is `implemented (local workspace) / not deployed / not observed / not validated`; no commit, push, deployment, restart, server migration, or JoinQuant website update has occurred.
+> **Execution status (2026-07-15):** Tasks 1–10 plus the post-review corrections are `implemented (pushed) / deployed (server; JoinQuant website update user-confirmed) / not observed / not validated`. Implementation commit `e2ce5b5` passed Python compilation and the isolated Linux full suite 324/324. The server was backed up, migrated to schema 7, checked healthy/writable, and restarted with unchanged environment hash and all three core services active. A fresh trading-session snapshot is still required to observe the manually updated website template.
 
 > **Post-review corrections:** Exit classification now consumes idless JoinQuant block/skip events; stage timing preserves first submission and material partial-fill progress; one object retains its highest-severity current issue; ordinary resolved issues recover independently while immutable ledger criticals remain sticky; transition dedupe includes severity and persisted successful-notification time supports a 30-minute ERROR reminder. Automatic ownership is ERROR-only, includes the originating control-event ID, is cancelled by every manual buy/kill-switch action, and is never created or retained for CRITICAL.
 
@@ -22,7 +22,7 @@
 - Do not add third-party dependencies, a message broker, a database server, or an unbounded duplicate event stream.
 - Do not modify or output `stock-analysis.env`, `SYNC_TOKEN`, webhook URLs, SSH keys, or other secrets.
 - Do not commit, push, deploy, restart services, migrate the server, or edit the JoinQuant website without separate authorization.
-- Local completion status is `implemented (local workspace) / not deployed / not observed / not validated`.
+- Historical local completion status was `implemented (local workspace) / not deployed / not observed / not validated`; the current deployment status is recorded above without changing the remaining observation and validation gates.
 
 ---
 

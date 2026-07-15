@@ -1,6 +1,6 @@
 # Execution Timing, Reconciliation State, and Safe Recovery Design
 
-> **Status (2026-07-15):** `implemented (local workspace) / not deployed / not observed / not validated`. Platform-independent verification passes locally; three Bash execution checks remain reserved for Linux. No Git or external operation has been performed.
+> **Status (2026-07-15):** `implemented (pushed) / deployed (server; JoinQuant website update user-confirmed) / not observed / not validated`. Implementation commit `e2ce5b5` is on `origin/main`; Linux verification passes 324/324, the server ledger is schema 7, configuration hash is unchanged, and all three core services are active. The website update still requires a fresh trading-session snapshot before it is observed.
 >
 > This document records the user-approved design. It does not authorize Git operations, server deployment, service restart, JoinQuant website changes, or secret/configuration changes.
 
@@ -321,10 +321,10 @@ Implementation must be test-driven and cover at least:
 
 ## 15. Documentation and Rollout Status
 
-After local implementation and verification, active documents must say exactly:
+The historical local implementation checkpoint was:
 
 `implemented (local workspace) / not deployed / not observed / not validated`
 
-Only a separately authorized Git operation may change that to a commit-based implementation statement. Only separately authorized server and JoinQuant operations may establish deployment. Observation requires runtime logs, database facts, and platform evidence; validation requires repeated representative trading sessions.
+The later authorized Git and server operations completed for `e2ce5b5`; the user separately confirmed the JoinQuant website update. Observation still requires fresh runtime logs, database facts, and platform evidence from a trading session; validation requires repeated representative trading sessions.
 
 The later deployment sequence, if separately authorized, must preserve server configuration and secrets, back up SQLite, migrate and check the ledger, update the JoinQuant template while preserving its URL/token/runtime configuration, restart only named services, and verify exact versions and post-deployment logs.

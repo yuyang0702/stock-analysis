@@ -6,7 +6,7 @@
 >
 > 主文档：`docs/project_roadmap.md`。
 
-> 2026-07-15 后续增量见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`：本地 schema 7 将退出等待从即时 `EXIT_INTENT_MISMATCH/ERROR` 改为送达、提交、成交和市场阻塞状态，并仅允许对账所有权下的受限自动恢复买入。该增量为 `implemented（本地工作树） / not deployed / not observed / not validated`；本文件下述 schema 6 内容仍描述服务器已部署基线。
+> 2026-07-15 后续增量见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`：schema 7 将退出等待从即时 `EXIT_INTENT_MISMATCH/ERROR` 改为送达、提交、成交和市场阻塞状态，并仅允许对账所有权下的受限自动恢复买入。该增量已随 `e2ce5b5` 推送并部署服务器，用户报告 JoinQuant 网站模板已手动更新；当前为 `implemented（已推送） / deployed / not observed / not validated`。本文件下述 schema 6 内容保留为上一服务器基线。
 
 > 2026-07-14 执行正确性增量以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为准：它复用 schema 6 的 `signals`、`position_cycles`、`orders` 和 `exit_intents`，不改变本账本设计的存储、对账或保留口径。该增量已随 `52b3653` 推送并部署到服务器和 JoinQuant 模板，当前为 `implemented（已推送） / deployed / not observed / not validated`。
 

@@ -2,7 +2,7 @@
 
 > 主文档：`docs/project_roadmap.md`。本文是项目所有运行数据、日志、缓存、快照、报告和数据库的长期开发约束；如业务状态与主文档冲突，以主文档为准。
 
-> 2026-07-15 本地 schema 7 增量：`signals` 与 `exit_intents` 增加生命周期时间列，`execution_issue_state` 按问题对象保存一行最高严重度的当前/恢复状态及最近成功通知时间，`system_state` 保存一个有界的 ERROR 对账自动恢复所有权标记。它不逐分钟追加重复问题事件；CRITICAL 不持有自动恢复所有权，粘性 CRITICAL 只能由有审计原因的人工恢复确认处理。订单、成交、对账差异和控制事件继续作为长期证据，高频账户/持仓仍执行366天热保留。schema 6 备份可恢复后幂等迁移到7。当前为 `implemented（本地工作树） / not deployed / not observed / not validated`。
+> 2026-07-15 schema 7 增量：`signals` 与 `exit_intents` 增加生命周期时间列，`execution_issue_state` 按问题对象保存一行最高严重度的当前/恢复状态及最近成功通知时间，`system_state` 保存一个有界的 ERROR 对账自动恢复所有权标记。它不逐分钟追加重复问题事件；CRITICAL 不持有自动恢复所有权，粘性 CRITICAL 只能由有审计原因的人工恢复确认处理。订单、成交、对账差异和控制事件继续作为长期证据，高频账户/持仓仍执行366天热保留。服务器已在完整 schema 6 备份后幂等迁移到7并通过健康/可写检查。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
 ## 1. 目标
 

@@ -28,18 +28,22 @@
 | `docs/superpowers/plans/2026-07-14-point-in-time-historical-backtest.md` | 独立历史库、候选生成、逐日撮合、指标、CLI和验证任务 | 实现或核验完整历史回测时读取；框架已进入 `origin/main`，真实严格数据运行尚未观察或验证。 |
 | `docs/superpowers/specs/2026-07-14-semi-automatic-parameter-review-design.md` | 参数候选、准入、人工批准、版本和回滚治理 | 设计参数复核或机器学习与参数边界时读取；当前为 `planned`。 |
 | `docs/superpowers/plans/2026-07-14-semi-automatic-parameter-review.md` | 半自动参数复核未来实施任务 | 数据与前置门槛满足后执行；当前为 `planned`。 |
-| `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` | 调度边界、信号生命周期、退出执行状态、告警转换和安全自动恢复 | 修改扫描调度、信号时效、自动对账或买入恢复时必读；当前为 `implemented（本地工作树） / not deployed / not observed / not validated`。 |
-| `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施证据 | 本地实现与验证使用；尚未提交、推送或部署。 |
+| `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` | 调度边界、信号生命周期、退出执行状态、告警转换和安全自动恢复 | 修改扫描调度、信号时效、自动对账或买入恢复时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已手动更新） / not observed / not validated`。 |
+| `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
-## 2026-07-15 本地未部署增量
+## 2026-07-15 schema 7 部署检查点
 
-当前工作树已实现 schema version 7、00:00–09:14 `closed` 阶段、09:15 单次盘前运行和阶段边界对齐休眠；信号增加 `created_at`、`validated_at`、`published_at`，JoinQuant 模板期望版本升级为 `2026-07-15.1-execution-state-recovery` 并可自愈旧进程缺失的运行全局变量。退出对账按有效交易分钟区分送达、陈旧、提交、部分成交、T+1/停牌/跌停和目标完成；执行问题按对象保存当前状态，企业微信按状态变化、恢复和受限 ERROR 提醒发送。只有 `ERROR` 对账自己实际关闭的 `buy_enabled` 才能在两个不同新鲜快照连续一致、无未决 ERROR/CRITICAL、无 `submit_unknown`、模板健康且 `kill_switch=0` 时通过 CAS 自动恢复；`CRITICAL` 不建立或保留自动恢复所有权，必须人工检查并恢复。任何人工买入或 kill-switch 操作、账户风控和 `RISK_OFF` 都优先且永不由该机制自动解除。
+当前已部署版本实现 schema version 7、00:00–09:14 `closed` 阶段、09:15 单次盘前运行和阶段边界对齐休眠；信号增加 `created_at`、`validated_at`、`published_at`，JoinQuant 模板期望版本升级为 `2026-07-15.1-execution-state-recovery` 并可自愈旧进程缺失的运行全局变量。退出对账按有效交易分钟区分送达、陈旧、提交、部分成交、T+1/停牌/跌停和目标完成；执行问题按对象保存当前状态，企业微信按状态变化、恢复和受限 ERROR 提醒发送。只有 `ERROR` 对账自己实际关闭的 `buy_enabled` 才能在两个不同新鲜快照连续一致、无未决 ERROR/CRITICAL、无 `submit_unknown`、模板健康且 `kill_switch=0` 时通过 CAS 自动恢复；`CRITICAL` 不建立或保留自动恢复所有权，必须人工检查并恢复。任何人工买入或 kill-switch 操作、账户风控和 `RISK_OFF` 都优先且永不由该机制自动解除。
 
 2026-07-15 复审修正已补齐：无 `order_id` 的 T+1/停牌/跌停/陈旧证据进入退出分类；提交和部分成交阶段计时不被重复快照重置；同对象按最高严重度保存；普通已解决问题可独立恢复而不可变成交/账本 CRITICAL 保持粘性；告警去重包含严重度，成功通知时间写回 SQLite，并支持每30分钟一次的持续 ERROR 提醒。人工 `resume-buy` 在既有资格检查和非空原因下可确认粘性 CRITICAL 已人工处理，但不会同时关闭 `kill_switch`。
 
-该增量当前严格为 `implemented（本地工作树） / not deployed / not observed / not validated`。本地及 `origin/main` 当前提交为 `aabe1e6`，它只在 `52b3653` 之后同步了部署状态文档；最后确认的服务器 `/opt/stock-analysis` 与 JoinQuant 网站仍是 `52b3653` / schema 6 / `2026-07-14.2-p0-execution-contract` 已部署基线。不能把本地未提交代码或 Git 文档提交推断为外部已更新。
+实现提交 `e2ce5b50590edc28cb748bee1fa985f43c9a0366` 已进入 `origin/main` 并部署到服务器 `/opt/stock-analysis`。部署前 schema 6 SQLite 备份完整性为 `ok`；服务器因无法连接 GitHub 443，使用经 `git bundle verify` 验证的增量 bundle 快进到目标提交。Python 编译、隔离测试账本下 Linux 全量测试 324/324 和正式账本 `ledger-check` 均通过，正式 SQLite 已幂等迁移到 schema 7，`stock-analysis.env` 部署前后哈希一致，三个核心服务均为 active，重启后五分钟 ERROR 日志计数为0，服务器工作树与 `origin/main` 一致且干净。
+
+该增量当前严格为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。用户报告已在 JoinQuant 网站手动更新模板 `2026-07-15.1-execution-state-recovery`，但更新后尚无新账户快照回传，因此网站侧只记录为 `deployed（用户确认） / not observed / not validated`，仍需下一个有效交易日核对模板版本回传和真实执行。
+
+部署后 `buy_enabled` 仍为 `0`、`kill_switch=0`。2026-07-15 盘后人工 `resume-buy` 因 `ACCOUNT_SNAPSHOT_STALE` 被安全门拒绝，未绕过门槛改库。已创建一次性 timer：2026-07-16 09:32、09:35 两次完整对账，09:37 仅在两份不同新鲜快照均一致、无未知提交且 CAS 状态未变化时恢复买入；在成功证据出现前仍必须报告“买入受限、恢复已排程”。
 
 稳定性账本 Batch 1 当前状态为“代码已实现并部署服务器、待部署后首个有效交易日双写观察”；2026-07-12 只读核验确认服务器、本地代码当时均为 `54eaaf423f690dda84776304c4ec87846aa8cf66`，SQLite schema version 为 1 且空信号一致。此历史检查点不能替代当前服务器复核。
 
@@ -47,9 +51,9 @@
 
 提交 `9f4c12d` 已进入 `origin/main`，包含下列 `implemented（已推送）` 能力：全 JoinQuant 持仓硬止损覆盖、板块/ATR 初始止损、账户风险定仓、+2R 按100股单位降至初始半仓、首段止盈后的移动止盈、短线3个/中线10个交易日时间止损，以及 `CAUTION` 减半风险仓位和 `RISK_OFF` 禁止新买入。卖出动作使用稳定持仓周期 ID，且优先覆盖同股买入。该提交已包含在服务器当前 `52b3653` 和已同步的 JoinQuant 模板中，状态为 `deployed / not observed / not validated`。
 
-当前 `origin/main` 的 SQLite 代码 schema 已升至 version 6：除 schema 5 的持仓周期、委托事件、退出意图和冷却外，新增正式订单、不可变逐笔成交、账户摘要、压缩持仓检查点、日权益、对账批次/差异项和控制审计。回调先事务入账和自动对账，成功后才发布兼容 JSON；`ERROR` 停止新买入，`CRITICAL` 追加 `KILL_SWITCH`，只有两个不同新鲜快照的全量一致对账及人工二次确认才允许恢复。在线备份、校验、7/4/12轮转和恢复演练已把 schema 6 核心表纳入。本批始于 `9f4c12d` 并已包含在服务器当前 `52b3653` 中；schema 6、完整性和可写检查通过，状态为 `implemented（已推送） / deployed / not observed / not validated`。
+SQLite schema 6 是完整账本基线：除 schema 5 的持仓周期、委托事件、退出意图和冷却外，新增正式订单、不可变逐笔成交、账户摘要、压缩持仓检查点、日权益、对账批次/差异项和控制审计。回调先事务入账和自动对账，成功后才发布兼容 JSON；`ERROR` 停止新买入，`CRITICAL` 追加 `KILL_SWITCH`。该基线始于 `9f4c12d`，已包含在当前服务器 `e2ce5b5` 中，并由上节 schema 7 增量继续扩展；当前服务器完整性、健康和可写检查通过，状态为 `implemented（已推送） / deployed / not observed / not validated`。
 
-JoinQuant 信号 JSON 继续使用兼容的 schema version 1，并增加可选 `target_qty`、回传 `get_trades()` 逐笔成交；当前网站模板版本为 `2026-07-14.2-p0-execution-contract`，服务器为 `52b3653`。旧服务器 `aa9acffaf62239e39c076408d83d113dce22b029`、SQLite schema version 1 和模板 `2026-07-14.1-ledger-v6` 仅是历史检查点。当前外部状态为 `deployed / not observed / not validated`。
+JoinQuant 信号 JSON 继续使用兼容的 schema version 1，并增加可选 `target_qty`、回传 `get_trades()` 逐笔成交。`52b3653` / schema 6 / 模板 `2026-07-14.2-p0-execution-contract` 是上一部署检查点；当前服务器为 `e2ce5b5` / schema 7，用户报告网站模板已手动更新为 `2026-07-15.1-execution-state-recovery`，但新快照尚待验证。旧服务器 `aa9acffaf62239e39c076408d83d113dce22b029`、SQLite schema version 1 和模板 `2026-07-14.1-ledger-v6` 仅是更早历史检查点。当前外部状态为 `deployed / not observed / not validated`。
 
 历史外部检查点（来自用户粘贴的服务器命令输出）：2026-07-14 20:06，服务器 `/opt/stock-analysis` 为 `131118213f22bbdaecd5cd8ab89a87db9aaf7f85`，`main...origin/main` 且工作区干净；备份 `PRAGMA integrity_check=ok`、SQLite schema version 6、`ledger-check` 健康且可写，`stock-analysis.env` 哈希校验未变化，扫描、持仓 Web、JoinQuant 信号三个服务均为 `active`。该检查点已被后续 `52b3653` 部署证据取代，仅用于追溯部署前基线。
 

@@ -4,7 +4,7 @@
 
 > 文档边界：本文负责阶段路线和真实资金前门槛；当前买入、卖出和风险规则以 `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` 为基础，五项执行正确性 P0 以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为最新增量，具体实施以对应计划为准。已归档的早期 JoinQuant、硬止损和实施计划不再定义当前流程。
 
-> 2026-07-15 执行链增量以 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` 为准：本地已实现 schema 7、开盘边界调度、逐信号时效、退出阶段对账、转换告警和受限自动恢复买入。自动恢复仅适用于 ERROR 对账自己实际造成的停买；CRITICAL 与任何人工控制均要求人工恢复。当前为 `implemented（本地工作树） / not deployed / not observed / not validated`。服务器与 JoinQuant 仍运行 2026-07-14 已部署基线。
+> 2026-07-15 执行链增量以 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` 为准：schema 7、开盘边界调度、逐信号时效、退出阶段对账、转换告警和受限自动恢复买入已随 `e2ce5b5` 推送并部署服务器。服务器备份、Linux 324/324 测试、schema 7 `ledger-check`、配置哈希和三个服务状态已核验；用户报告 JoinQuant 网站模板已手动更新，但新模板快照尚待交易日回传。当前为 `implemented（已推送） / deployed / not observed / not validated`。自动恢复仍只适用于 ERROR 对账自己实际造成的停买；CRITICAL 与任何人工控制均要求人工恢复。
 
 ## 目标
 
