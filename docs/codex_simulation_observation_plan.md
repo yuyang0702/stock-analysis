@@ -4,7 +4,7 @@
 
 > 2026-07-15 schema 7 执行问题状态和自动恢复所有权读数已随 `e2ce5b5` 推送并部署服务器；用户报告 JoinQuant 网站模板已手动更新，新快照仍待交易日验证。Codex 定时审核员可只读查看这些字段，但不得运行对账、改变 `buy_enabled`/`kill_switch`、触发自动恢复或部署模板。当前状态为 `implemented（已推送） / deployed / not observed / not validated`。
 
-> 2026-07-15 成交对账日期范围修复当前为 `implemented（本地工作区） / not deployed / not observed / not validated`。部署后只读审核应确认：历史交易日成交不会出现在当前日 `FILL_MISSING_PLATFORM`，同日真实缺失仍保留告警；在新交易日快照出现前不得标记 observed 或 validated。
+> 2026-07-15 成交对账日期范围修复已随代码提交 `cd83f26` 推送并部署服务器，状态为 `implemented（已推送） / deployed / not observed / not validated`。只读审核应确认：历史交易日成交不会出现在当前日 `FILL_MISSING_PLATFORM`，同日真实缺失仍保留告警；在新交易日快照出现前不得标记 observed 或 validated。
 
 ## 1. 目标与边界
 

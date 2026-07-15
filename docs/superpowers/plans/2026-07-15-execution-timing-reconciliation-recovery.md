@@ -2,7 +2,7 @@
 
 > **Execution status (2026-07-15):** Tasks 1–10 plus the post-review corrections are `implemented (pushed) / deployed (server; JoinQuant website update user-confirmed) / not observed / not validated`. Implementation commit `e2ce5b5` passed Python compilation and the isolated Linux full suite 324/324. The server was backed up, migrated to schema 7, checked healthy/writable, and restarted with unchanged environment hash and all three core services active. A fresh trading-session snapshot is still required to observe the manually updated website template.
 
-> **Task 11 status:** `implemented (local workspace) / not deployed / not observed / not validated`. The cross-day regression was reproduced before the minimal query correction; focused tests now pass 18/18. Windows passed 323/326 tests, with only the three Bash-only script tests pending Linux verification.
+> **Task 11 status:** `implemented (pushed) / deployed (server) / not observed / not validated`. The cross-day regression was reproduced before the minimal query correction; focused tests pass 18/18 and the complete isolated Linux suite passes 326/326. Code commit `cd83f26` was deployed after a successful SQLite backup; schema 7 is healthy/writable, configuration is unchanged, all three services are active, and post-restart ERROR logs are empty.
 
 > **Post-review corrections:** Exit classification now consumes idless JoinQuant block/skip events; stage timing preserves first submission and material partial-fill progress; one object retains its highest-severity current issue; ordinary resolved issues recover independently while immutable ledger criticals remain sticky; transition dedupe includes severity and persisted successful-notification time supports a 30-minute ERROR reminder. Automatic ownership is ERROR-only, includes the originating control-event ID, is cancelled by every manual buy/kill-switch action, and is never created or retained for CRITICAL.
 
@@ -826,10 +826,10 @@ Expected: the prior-day test fails with `FILL_MISSING_PLATFORM` before the produ
 
 Read `trade_date` from the already-persisted account snapshot and select local fills for that date only. If the account row is missing, preserve the existing ledger-integrity failure and use an empty local fill set rather than inventing a fallback date.
 
-- [ ] **Step 4: Run focused and complete verification**
+- [x] **Step 4: Run focused and complete verification**
 
 Run the reconciliation test module, Python compilation, the complete local suite, `git diff --check`, and repository status review.
 
-- [ ] **Step 5: Synchronize status documents**
+- [x] **Step 5: Synchronize status documents**
 
 Record the correction as implemented only after local verification, pushed only after the remote push succeeds, deployed only after server verification, and leave observed/validated pending until a fresh trading-day snapshot proves the behavior.

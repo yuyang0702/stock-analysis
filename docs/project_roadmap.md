@@ -35,7 +35,7 @@
 
 ## 2026-07-15 schema 7 部署检查点
 
-2026-07-15 成交对账日期范围修复当前为 `implemented（本地工作区） / not deployed / not observed / not validated`：完整对账只把当前 `account_snapshots.trade_date` 的 SQLite 成交与 JoinQuant 当日 `get_trades()` 比较，历史成交继续保留但不再被误报为平台缺失；同日缺失仍为 `FILL_MISSING_PLATFORM / WARNING`，平台成交未入本地账本仍为 `FILL_MISSING_LOCAL / ERROR`。专项对账测试18/18通过，Windows全量323/326通过，剩余3项仅因本机无 Bash，必须在服务器 Linux 全量测试中通过后才可标记 deployed。
+2026-07-15 成交对账日期范围修复当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`：完整对账只把当前 `account_snapshots.trade_date` 的 SQLite 成交与 JoinQuant 当日 `get_trades()` 比较，历史成交继续保留但不再被误报为平台缺失；同日缺失仍为 `FILL_MISSING_PLATFORM / WARNING`，平台成交未入本地账本仍为 `FILL_MISSING_LOCAL / ERROR`。代码提交 `cd83f26` 已部署；部署前 SQLite 备份完整性为 `ok`，Linux全量326/326、Python编译、schema 7健康/可写、配置未变、三个服务active和重启后ERROR日志为空均已核验。仍需新交易日快照才能标记 observed，连续代表性证据和恢复闭环完成前不得标记 validated。
 
 当前已部署版本实现 schema version 7、00:00–09:14 `closed` 阶段、09:15 单次盘前运行和阶段边界对齐休眠；信号增加 `created_at`、`validated_at`、`published_at`，JoinQuant 模板期望版本升级为 `2026-07-15.1-execution-state-recovery` 并可自愈旧进程缺失的运行全局变量。退出对账按有效交易分钟区分送达、陈旧、提交、部分成交、T+1/停牌/跌停和目标完成；执行问题按对象保存当前状态，企业微信按状态变化、恢复和受限 ERROR 提醒发送。只有 `ERROR` 对账自己实际关闭的 `buy_enabled` 才能在两个不同新鲜快照连续一致、无未决 ERROR/CRITICAL、无 `submit_unknown`、模板健康且 `kill_switch=0` 时通过 CAS 自动恢复；`CRITICAL` 不建立或保留自动恢复所有权，必须人工检查并恢复。任何人工买入或 kill-switch 操作、账户风控和 `RISK_OFF` 都优先且永不由该机制自动解除。
 

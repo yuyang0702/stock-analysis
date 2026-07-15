@@ -2,7 +2,7 @@
 
 > **Status (2026-07-15):** `implemented (pushed) / deployed (server; JoinQuant website update user-confirmed) / not observed / not validated`. Implementation commit `e2ce5b5` is on `origin/main`; Linux verification passes 324/324, the server ledger is schema 7, configuration hash is unchanged, and all three core services are active. The website update still requires a fresh trading-session snapshot before it is observed.
 >
-> **Approved post-deployment correction:** The trade-date scope correction in Section 16 is `implemented (local workspace) / not deployed / not observed / not validated`. Focused reconciliation tests pass 18/18 and Python compilation passes. The Windows suite passed 323/326; the remaining three tests require Bash and must pass on the Linux server before deployment is accepted.
+> **Approved post-deployment correction:** The trade-date scope correction in Section 16 is `implemented (pushed) / deployed (server) / not observed / not validated`. Code commit `cd83f26` passed focused reconciliation tests 18/18, the complete Linux suite 326/326, Python compilation, schema-7 health/writable checks, unchanged configuration verification, and a three-service restart with no subsequent ERROR log entries. A fresh trading-day snapshot is still required for observation and validation.
 >
 > This document records the user-approved design. It does not authorize Git operations, server deployment, service restart, JoinQuant website changes, or secret/configuration changes.
 
