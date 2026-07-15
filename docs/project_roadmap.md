@@ -28,6 +28,8 @@
 | `docs/superpowers/plans/2026-07-14-point-in-time-historical-backtest.md` | 独立历史库、候选生成、逐日撮合、指标、CLI和验证任务 | 实现或核验完整历史回测时读取；框架已进入 `origin/main`，真实严格数据运行尚未观察或验证。 |
 | `docs/superpowers/specs/2026-07-14-semi-automatic-parameter-review-design.md` | 参数候选、准入、人工批准、版本和回滚治理 | 设计参数复核或机器学习与参数边界时读取；当前为 `planned`。 |
 | `docs/superpowers/plans/2026-07-14-semi-automatic-parameter-review.md` | 半自动参数复核未来实施任务 | 数据与前置门槛满足后执行；当前为 `planned`。 |
+| `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` | ML-7 五分钟候选样本、训练型影子模型、walk-forward、模型治理和逐层放权 | 设计或实现训练模型、模型存储、影子观察或模型权限时读取；设计已确认，当前为 `planned / not implemented / not deployed / not observed / not validated`。 |
+| `docs/superpowers/plans/2026-07-15-trained-shadow-model.md` | ML-7 训练型影子模型的测试驱动实施、验证、部署与观察顺序 | 执行训练模型代码或核验实施范围时读取；当前仅计划已完成，业务代码仍为 `not implemented / not deployed / not observed / not validated`。 |
 | `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` | 调度边界、信号生命周期、退出执行状态、告警转换和安全自动恢复 | 修改扫描调度、信号时效、自动对账或买入恢复时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已手动更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
 
@@ -213,6 +215,8 @@ flowchart LR
 
 第一阶段不让机器学习直接自动交易，只做影子评分和复盘报告。未来训练模型即使通过离线评价，也必须先登记模型版本、进入影子观察、经用户人工批准，并在单独授权的任务中发布；不能因为定时训练或报告通过而自动接入仓位、信号过滤或下单。
 
+ML-7 的训练型影子模型设计已经确认，详细契约见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`。该设计采用真实一年 strict 五分钟候选历史作为主训练数据、JoinQuant 模拟盘作为现实校准和影子观察，主目标为 D+5 扣费收益，辅以 D+3/D+10、下行风险和成交概率；采用多个小型表格模型、线性基准和确定性输出层。当前仍只有文档设计，严格状态为 `planned / not implemented / not deployed / not observed / not validated`。
+
 ### 机器学习与参数复核的关系
 
 - ML-1 至 ML-7 是模型数据、训练、影子观察和策略辅助路线；当前只有数据与规则型影子评分，没有训练模型。
@@ -254,7 +258,7 @@ flowchart LR
 | ML-4 信号回测 | 已实现第一版 | 基于已生成信号输出收益、回撤、胜率和交易明细，为后续模型训练提供对照基线；与 ML-5 的逐日历史框架保持独立。 |
 | ML-5 完整历史回测 | deployed（框架） | 独立历史库、strict/price_core 双轨、逐日撮合、walk-forward、指标、CLI和报告已进入 `origin/main` 和服务器 `52b3653`；真实 6 个月/1 年严格数据尚未导入，故尚未观察或验证。 |
 | ML-6 影子模型 | 已实现第一版 | 当前不是训练模型，而是规则型影子评分；已纳入消息催化、题材热度、板块位置缓存、市场情绪、交易质量和海外风险；`enhanced_score = final_score + shadow_adjust_score`，不再按 100 封顶，并输出原排名、影子排名和排名变化；板块位置由独立 timer 低频刷新，扫描只读最近成功缓存；不影响真实下单，用来和原策略做对照。 |
-| ML-7 训练模型与策略辅助 | 待实现 | 训练模型先只输出版本化 `ml_score` 并进入影子观察；通过门槛和人工批准后，才可在独立授权任务中逐步用于排序、过滤或小幅仓位调整。止损、卖出安全、单票/行业/题材/总仓位和开放风险硬上限仍由规则控制。 |
+| ML-7 训练模型与策略辅助 | planned（设计已确认） | 每5分钟保存完整约30只候选批次；以一年 strict 历史主训练、JoinQuant 模拟盘校准，多个小型表格模型输出收益、风险、成交概率和版本化 `ml_score`。先进入 L0 影子；人工批准后按至少20/40/60个有效交易日逐步开放 L1排序、L2过滤、L3 `0.8–1.1` 仓位微调。当前未实现、未部署、未观察、未验证。 |
 | ML-8 半自动参数复核 | 待实现 | 这是与训练模型分离的参数治理能力。自动任务只生成有界候选、时间切分评价和准入报告；候选必须绑定版本与哈希，由用户明确批准并在独立授权任务中发布到 JoinQuant 模拟盘。禁止自动批准、自动改参、自动部署或进入真实资金；详细门槛见 2026-07-14 专项设计。 |
 
 ### 计划采集的特征
@@ -299,7 +303,7 @@ JoinQuant 回传后补充以下标签：
 4. 观察 `output/strategy_compare_report.md` 和每周五策略对照微信摘要，确认原策略 Top5 与影子评分 Top5 的 D+3/D+5、胜率和回撤。
 5. 按信号分数、市场状态、题材热度统计收益质量。
 6. 为完整历史回测导入真实 strict 时点数据，完成 6 个月/1 年、至少 3 个 walk-forward 窗口的重复运行和人工复算。
-7. 再实现训练型影子模型，只输出版本化 `ml_score`，不参与真实模拟下单；当前规则型影子评分继续作为对照基线。
+7. 按 ML-7 专项设计先修复五分钟 strict 决策时点、精确 `available_at`、共享策略核心、完整代码哈希和候选/标签 SQLite 契约，再实现训练型影子模型；第一阶段只运行 L0，不参与模拟盘下单。
 8. 当训练型影子模型连续优于原策略、完成模型登记并经人工批准后，再在独立授权任务中考虑让它参与排序、过滤或仓位微调。
 9. 完整账本、自动备份恢复和数据门槛满足后，再按 Batch G 实施半自动参数复核；先生成只读报告，再实现人工批准和模拟盘版本化发布。
 
