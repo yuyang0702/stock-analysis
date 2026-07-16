@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
@@ -104,6 +105,22 @@ class MlStore:
         self.max_bytes = int(max_bytes)
 
     def connect(self) -> sqlite3.Connection:
+        """Open a public immutable read-only connection."""
+        if not self.path.exists():
+            raise RuntimeError("ML store is not initialized")
+        conn = sqlite3.connect(
+            f"{self.path.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5.0,
+            factory=_ClosingConnection,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA cache_spill=OFF")
+        return conn
+
+    def _connect_writable(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             self.path, timeout=5.0, factory=_ClosingConnection
@@ -115,30 +132,22 @@ class MlStore:
         conn.execute("PRAGMA cache_spill=OFF")
         return conn
 
-    def _readonly_connect(self) -> sqlite3.Connection:
-        if not self.path.exists():
-            raise RuntimeError("ML store is not initialized")
-        conn = sqlite3.connect(
-            f"{self.path.resolve().as_uri()}?mode=ro",
-            uri=True,
-            timeout=5.0,
-            factory=_ClosingConnection,
-        )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA cache_spill=OFF")
-        return conn
-
     def initialize(self) -> None:
-        with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            statements = tuple(_schema_statements(SCHEMA))
-            now = _now()
-            reserved_bytes = (
-                2 * len(SCHEMA.encode("utf-8"))
-                + SCHEMA_BTREE_COUNT * BTREE_RESERVE_BYTES
+        statements = tuple(_schema_statements(SCHEMA))
+        now = _now()
+        reserved_bytes = (
+            2 * len(SCHEMA.encode("utf-8"))
+            + SCHEMA_BTREE_COUNT * BTREE_RESERVE_BYTES
+        )
+        if not self.path.exists() and self.max_bytes < _new_store_minimum_bytes(
+            reserved_bytes
+        ):
+            raise MlCapacityError(
+                f"ML database capacity reached: {self.max_bytes} bytes"
             )
+        with self._connect_writable() as conn:
+            self._ensure_capacity(conn)
+            conn.execute("PRAGMA journal_mode=WAL")
             with self._write_transaction(
                 conn,
                 reserved_bytes=reserved_bytes,
@@ -160,7 +169,7 @@ class MlStore:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Open a SQLite-enforced read-only snapshot transaction."""
-        with self._readonly_connect() as conn:
+        with self.connect() as conn:
             conn.execute("BEGIN")
             try:
                 yield conn
@@ -214,7 +223,7 @@ class MlStore:
         reserved_bytes = _write_reserve_bytes(
             (values for _, values in rows), len(rows), btrees_per_write=3
         )
-        with self.connect() as conn:
+        with self._connect_writable() as conn:
             with self._write_transaction(
                 conn,
                 reserved_bytes=reserved_bytes,
@@ -275,7 +284,7 @@ class MlStore:
             len(rows),
             btrees_per_write=2,
         )
-        with self.connect() as conn:
+        with self._connect_writable() as conn:
             with self._write_transaction(
                 conn,
                 reserved_bytes=reserved_bytes,
@@ -334,7 +343,7 @@ class MlStore:
             len(rows),
             btrees_per_write=2,
         )
-        with self.connect() as conn:
+        with self._connect_writable() as conn:
             with self._write_transaction(
                 conn,
                 reserved_bytes=reserved_bytes,
@@ -368,6 +377,8 @@ class MlStore:
         artifact_path: str,
         status: str = "challenger",
     ) -> bool:
+        _parameter_bytes(status)
+        _parameter_bytes(artifact_path)
         manifest_json = _canonical_json(manifest)
         values = (
             manifest.parent_model_id,
@@ -380,7 +391,7 @@ class MlStore:
         reserved_bytes = _write_reserve_bytes(
             ((manifest.model_id, *values),), 1, btrees_per_write=3
         )
-        with self.connect() as conn, self._write_transaction(
+        with self._connect_writable() as conn, self._write_transaction(
             conn,
             reserved_bytes=reserved_bytes,
             growth_bytes=reserved_bytes,
@@ -422,6 +433,18 @@ class MlStore:
         operator: str,
         created_at: str,
     ) -> bool:
+        for value in (
+            event_id,
+            model_id,
+            action,
+            old_level,
+            new_level,
+            artifact_sha256,
+            reason,
+            operator,
+            created_at,
+        ):
+            _parameter_bytes(value)
         created_at = _aware_iso(created_at, "created_at")
         values = (
             str(model_id),
@@ -436,13 +459,13 @@ class MlStore:
         reserved_bytes = _write_reserve_bytes(
             ((event_id, *values),), 1, btrees_per_write=2
         )
-        with self.connect() as conn, self._write_transaction(
+        with self._connect_writable() as conn, self._write_transaction(
             conn,
             reserved_bytes=reserved_bytes,
             growth_bytes=reserved_bytes,
         ):
             model = conn.execute(
-                "SELECT artifact_sha256 FROM ml_models WHERE model_id=?", (model_id,)
+                "SELECT artifact_sha256 FROM ml_models WHERE model_id=?", (values[0],)
             ).fetchone()
             if model is not None and str(model[0]) != str(artifact_sha256):
                 raise MlDataConflict(f"model event artifact mismatch: {model_id}")
@@ -486,6 +509,14 @@ class MlStore:
         new_permission_level: int,
         updated_at: str,
     ) -> bool:
+        for value in (
+            expected_model_id,
+            expected_permission_level,
+            new_model_id,
+            new_permission_level,
+            updated_at,
+        ):
+            _parameter_bytes(value)
         updated_at = _aware_iso(updated_at, "updated_at")
         if not 0 <= int(new_permission_level) <= 3:
             raise ValueError("permission level must be between 0 and 3")
@@ -500,7 +531,7 @@ class MlStore:
             2 * sum(_parameter_bytes(value) for value in parameters)
             + RUNTIME_RESERVE_BYTES
         )
-        with self.connect() as conn, self._write_transaction(
+        with self._connect_writable() as conn, self._write_transaction(
             conn,
             reserved_bytes=reserved_bytes,
             growth_bytes=0,
@@ -665,6 +696,15 @@ def _aware_iso(value: str, field: str) -> str:
     return parsed.isoformat()
 
 
+def _new_store_minimum_bytes(reserved_bytes: int) -> int:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    reserved_pages = (reserved_bytes + page_size - 1) // page_size
+    wal_bytes = 32 + reserved_pages * (page_size + 24)
+    main_bytes = (reserved_pages + 1) * page_size
+    return main_bytes + wal_bytes + 32_768
+
+
 def _write_reserve_bytes(
     rows: Iterable[tuple[object, ...]],
     writes: int,
@@ -681,13 +721,20 @@ def _write_reserve_bytes(
 
 
 def _parameter_bytes(value: object) -> int:
-    if value is None:
+    value_type = type(value)
+    if value_type is type(None):
         return 1
-    if isinstance(value, str):
+    if value_type is str:
         return len(value.encode("utf-8"))
-    if isinstance(value, bytes):
+    if value_type is bytes:
         return len(value)
-    return 8
+    if value_type is float and not math.isfinite(value):
+        raise ValueError("SQLite float parameters must be finite")
+    if value_type in (bool, int, float):
+        return 8
+    raise TypeError(
+        "SQLite parameters must be None, bool, int, float, str, or bytes"
+    )
 
 
 def _json_value(value: object) -> object:
@@ -696,12 +743,22 @@ def _json_value(value: object) -> object:
             field.name: _json_value(getattr(value, field.name)) for field in fields(value)
         }
     if isinstance(value, Mapping):
-        return {str(key): _json_value(item) for key, item in value.items()}
+        result = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("JSON object keys must be str")
+            result[key] = _json_value(item)
+        return result
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     if isinstance(value, (set, frozenset)):
         return sorted((_json_value(item) for item in value), key=repr)
-    return value
+    value_type = type(value)
+    if value_type is float and not math.isfinite(value):
+        raise ValueError("JSON float values must be finite")
+    if value_type in (type(None), bool, int, float, str):
+        return value
+    raise TypeError("JSON values must contain only standard scalar types")
 
 
 def _canonical_json(value: object) -> str:

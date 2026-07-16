@@ -57,6 +57,14 @@ class MlStoreTest(unittest.TestCase):
         store.initialize()
         return store
 
+    @staticmethod
+    def physical_size(path: Path) -> int:
+        return sum(
+            candidate.stat().st_size
+            for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+            if candidate.exists()
+        )
+
     def manifest(self, model_id: str = "model-1", artifact: str = "artifact-sha") -> ModelManifest:
         return ModelManifest(
             model_id=model_id,
@@ -92,8 +100,9 @@ class MlStoreTest(unittest.TestCase):
             }
             self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
-            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(conn.execute("PRAGMA cache_spill").fetchone()[0], 0)
+        with store._connect_writable() as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
         self.assertTrue(
             {
                 "ml_candidate_samples",
@@ -131,6 +140,53 @@ class MlStoreTest(unittest.TestCase):
             )
         self.assertEqual(features["context"]["value"]["levels"], [1, 2])
 
+    def test_successful_write_is_immediately_visible_to_public_connect(self) -> None:
+        store = self.make_store()
+
+        self.assertEqual(store.record_candidates([self.sample]), 1)
+
+        with store.connect() as conn:
+            row = conn.execute(
+                "SELECT sample_id FROM ml_candidate_samples"
+            ).fetchone()
+        self.assertEqual(row[0], self.sample.sample_id)
+
+    def test_public_connect_is_immutable_and_never_creates_sidecars(self) -> None:
+        store = self.make_store()
+        before = store.runtime_state()
+        max_bytes = store.path.stat().st_size
+        limited = MlStore(store.path, max_bytes=max_bytes)
+        sidecars = (Path(f"{store.path}-wal"), Path(f"{store.path}-shm"))
+        self.assertFalse(any(path.exists() for path in sidecars))
+
+        with limited.connect() as conn:
+            conn.execute("PRAGMA query_only=OFF")
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute(
+                    "UPDATE ml_runtime_state SET updated_at=? WHERE singleton=1",
+                    ("2026-07-15T16:02:00+08:00",),
+                )
+            self.assertFalse(any(path.exists() for path in sidecars))
+
+        self.assertFalse(any(path.exists() for path in sidecars))
+        self.assertEqual(store.runtime_state(), before)
+
+    def test_public_transaction_never_creates_sidecars_at_capacity(self) -> None:
+        store = self.make_store()
+        max_bytes = store.path.stat().st_size
+        limited = MlStore(store.path, max_bytes=max_bytes)
+        sidecars = (Path(f"{store.path}-wal"), Path(f"{store.path}-shm"))
+        self.assertFalse(any(path.exists() for path in sidecars))
+
+        with limited.transaction() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM ml_runtime_state").fetchone()[0],
+                1,
+            )
+            self.assertFalse(any(path.exists() for path in sidecars))
+
+        self.assertFalse(any(path.exists() for path in sidecars))
+
     def test_conflicting_candidate_rolls_back_batch(self) -> None:
         store = self.make_store()
         changed = replace(self.sample, rejection_code="different")
@@ -162,6 +218,47 @@ class MlStoreTest(unittest.TestCase):
         self.assertEqual(
             store.upsert_labels([replace(label, ret_5d_net=0.04)]), 1
         )
+
+    def test_label_rejects_prepare_protocol_before_sql_or_growth(self) -> None:
+        store = self.make_store()
+        store.record_candidates([self.sample])
+
+        class LargeBlob:
+            calls = 0
+
+            def __conform__(self, protocol: object) -> bytes | None:
+                if protocol is sqlite3.PrepareProtocol:
+                    self.calls += 1
+                    return b"x" * 10_000_000
+                return None
+
+        payload = LargeBlob()
+        label = LabelRecord(
+            sample_id=self.sample.sample_id,
+            label_version="label-v1",
+            label_source="historical",
+            cost_version="cost-v1",
+            fill_price=payload,  # type: ignore[arg-type]
+            market_data_sha256="market-sha",
+        )
+        before = self.physical_size(store.path)
+        sql = []
+        original_execute = ml_store._ClosingConnection.execute
+
+        def recording_execute(
+            conn: sqlite3.Connection, statement: str, parameters: tuple = ()
+        ) -> sqlite3.Cursor:
+            sql.append(statement)
+            return original_execute(conn, statement, parameters)
+
+        with patch.object(ml_store._ClosingConnection, "execute", recording_execute):
+            with self.assertRaises(TypeError):
+                store.upsert_labels([label])
+
+        self.assertEqual(payload.calls, 0)
+        self.assertFalse(sql)
+        self.assertEqual(self.physical_size(store.path), before)
+        self.assertEqual(store.counts()["ml_labels"], 0)
 
     def test_pending_label_round_trips_none_matured_at(self) -> None:
         store = self.make_store()
@@ -200,6 +297,70 @@ class MlStoreTest(unittest.TestCase):
         self.assertEqual(store.record_predictions([prediction]), 0)
         with self.assertRaises(MlDataConflict):
             store.record_predictions([replace(prediction, ml_score=74.0)])
+
+    def test_prediction_rejects_prepare_protocol_before_sql_or_growth(self) -> None:
+        store = self.make_store()
+        store.record_candidates([self.sample])
+
+        class LargeBlob:
+            calls = 0
+
+            def __conform__(self, protocol: object) -> bytes | None:
+                if protocol is sqlite3.PrepareProtocol:
+                    self.calls += 1
+                    return b"x" * 10_000_000
+                return None
+
+        payload = LargeBlob()
+        prediction = PredictionRecord(
+            sample_id=self.sample.sample_id,
+            model_id="model-1",
+            created_at="2026-07-15T09:35:01+08:00",
+            expected_ret_5d=payload,  # type: ignore[arg-type]
+        )
+        before = self.physical_size(store.path)
+        sql = []
+        original_execute = ml_store._ClosingConnection.execute
+
+        def recording_execute(
+            conn: sqlite3.Connection, statement: str, parameters: tuple = ()
+        ) -> sqlite3.Cursor:
+            sql.append(statement)
+            return original_execute(conn, statement, parameters)
+
+        with patch.object(ml_store._ClosingConnection, "execute", recording_execute):
+            with self.assertRaises(TypeError):
+                store.record_predictions([prediction])
+
+        self.assertEqual(payload.calls, 0)
+        self.assertFalse(sql)
+        self.assertEqual(self.physical_size(store.path), before)
+        self.assertEqual(store.counts()["ml_predictions"], 0)
+
+    def test_write_rejects_non_finite_float_before_sql(self) -> None:
+        store = self.make_store()
+        store.record_candidates([self.sample])
+        prediction = PredictionRecord(
+            sample_id=self.sample.sample_id,
+            model_id="model-1",
+            created_at="2026-07-15T09:35:01+08:00",
+            expected_ret_5d=float("inf"),
+        )
+        sql = []
+        original_execute = ml_store._ClosingConnection.execute
+
+        def recording_execute(
+            conn: sqlite3.Connection, statement: str, parameters: tuple = ()
+        ) -> sqlite3.Cursor:
+            sql.append(statement)
+            return original_execute(conn, statement, parameters)
+
+        with patch.object(ml_store._ClosingConnection, "execute", recording_execute):
+            with self.assertRaises(ValueError):
+                store.record_predictions([prediction])
+
+        self.assertFalse(sql)
+        self.assertEqual(store.counts()["ml_predictions"], 0)
 
     def test_model_hash_is_immutable_and_events_require_registered_model(self) -> None:
         store = self.make_store()
@@ -376,8 +537,8 @@ class MlStoreTest(unittest.TestCase):
         max_bytes = store.path.stat().st_size + 3_000_000
 
         class TinyCacheMlStore(MlStore):
-            def connect(self) -> sqlite3.Connection:
-                conn = super().connect()
+            def _connect_writable(self) -> sqlite3.Connection:
+                conn = super()._connect_writable()
                 conn.execute("PRAGMA cache_size=1")
                 if conn.execute("PRAGMA cache_spill").fetchone()[0] != 0:
                     conn.execute("PRAGMA cache_spill=1")
@@ -467,7 +628,7 @@ class MlStoreTest(unittest.TestCase):
             },
         )
         store.record_candidates([large])
-        keeper = store.connect()
+        keeper = store._connect_writable()
         try:
             keeper.execute("BEGIN IMMEDIATE")
             keeper.execute(
@@ -503,7 +664,7 @@ class MlStoreTest(unittest.TestCase):
 
     def test_capacity_reserves_main_growth_while_checkpoint_keeps_wal(self) -> None:
         store = self.make_store()
-        keeper = store.connect()
+        keeper = store._connect_writable()
         candidate_inserts = []
         original_execute = ml_store._ClosingConnection.execute
 
@@ -572,15 +733,9 @@ class MlStoreTest(unittest.TestCase):
         with self.assertRaises(MlCapacityError):
             store.initialize()
 
-        if path.exists():
-            with closing(sqlite3.connect(path)) as conn:
-                tables = {
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    )
-                }
-            self.assertFalse(tables)
+        self.assertFalse(path.exists())
+        self.assertFalse(Path(f"{path}-wal").exists())
+        self.assertFalse(Path(f"{path}-shm").exists())
 
     def test_initialize_rolls_back_schema_version_and_runtime_on_ddl_error(self) -> None:
         path = self.root / "broken" / "ml.db"
