@@ -2,11 +2,14 @@ import json
 import sqlite3
 import time
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+import ml_store
 from ml_contracts import (
     CandidateSample,
     LabelRecord,
@@ -159,6 +162,27 @@ class MlStoreTest(unittest.TestCase):
             store.upsert_labels([replace(label, ret_5d_net=0.04)]), 1
         )
 
+    def test_pending_label_round_trips_none_matured_at(self) -> None:
+        store = self.make_store()
+        store.record_candidates([self.sample])
+        label = LabelRecord(
+            sample_id=self.sample.sample_id,
+            label_version="label-v1",
+            label_source="historical",
+            cost_version="cost-v1",
+            market_data_sha256="market-sha",
+            matured_at=None,
+        )
+
+        self.assertEqual(store.upsert_labels([label]), 1)
+        self.assertEqual(store.upsert_labels([label]), 0)
+        with store.transaction() as conn:
+            row = conn.execute(
+                "SELECT matured_at FROM ml_labels WHERE sample_id=?",
+                (self.sample.sample_id,),
+            ).fetchone()
+        self.assertIsNone(row[0])
+
     def test_predictions_are_unique_and_immutable_per_sample_and_model(self) -> None:
         store = self.make_store()
         store.record_candidates([self.sample])
@@ -290,6 +314,113 @@ class MlStoreTest(unittest.TestCase):
             limited.record_candidates([self.sample])
 
         self.assertEqual(store.counts()["ml_candidate_samples"], 0)
+
+    def test_capacity_limit_rolls_back_large_commit_growth(self) -> None:
+        store = self.make_store()
+        store.record_candidates([self.sample])
+        max_bytes = store.path.stat().st_size + 150_000
+        limited = MlStore(store.path, max_bytes=max_bytes)
+        large = replace(
+            self.sample,
+            sample_id="",
+            code="600001",
+            features={
+                "payload": TimedFeature(
+                    "x" * 120_000, "2026-07-15T09:34:59+08:00"
+                )
+            },
+        )
+        self.assertLess(
+            sum(
+                path.stat().st_size
+                for path in (
+                    store.path,
+                    Path(f"{store.path}-wal"),
+                    Path(f"{store.path}-shm"),
+                )
+                if path.exists()
+            ),
+            max_bytes,
+        )
+
+        with self.assertRaises(MlCapacityError):
+            limited.record_candidates([large])
+
+        self.assertEqual(store.counts()["ml_candidate_samples"], 1)
+        with store.connect() as conn:
+            page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+            page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        self.assertLessEqual(page_size * page_count, max_bytes)
+        self.assertLessEqual(
+            sum(
+                path.stat().st_size
+                for path in (
+                    store.path,
+                    Path(f"{store.path}-wal"),
+                    Path(f"{store.path}-shm"),
+                )
+                if path.exists()
+            ),
+            max_bytes,
+        )
+
+    def test_capacity_limit_rejects_runtime_cas_without_changing_state(self) -> None:
+        store = self.make_store()
+        limited = MlStore(store.path, max_bytes=1)
+        before = store.runtime_state()
+
+        with self.assertRaises(MlCapacityError):
+            limited.compare_and_swap_runtime(
+                expected_model_id=None,
+                expected_permission_level=0,
+                new_model_id=None,
+                new_permission_level=1,
+                updated_at="2026-07-15T16:02:00+08:00",
+            )
+
+        self.assertEqual(store.runtime_state(), before)
+
+    def test_capacity_limit_rejects_initialize_without_partial_schema(self) -> None:
+        path = self.root / "limited" / "ml.db"
+        store = MlStore(path, max_bytes=1)
+
+        with self.assertRaises(MlCapacityError):
+            store.initialize()
+
+        if path.exists():
+            with closing(sqlite3.connect(path)) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+            self.assertFalse(tables)
+
+    def test_initialize_rolls_back_schema_version_and_runtime_on_ddl_error(self) -> None:
+        path = self.root / "broken" / "ml.db"
+        store = MlStore(path)
+        broken_schema = """
+        CREATE TABLE schema_migrations(
+          version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+        );
+        CREATE TABLE partial_schema(value TEXT);
+        CREATE TABLE broken_schema(;
+        """
+
+        with patch.object(ml_store, "SCHEMA", broken_schema):
+            with self.assertRaises(sqlite3.OperationalError):
+                store.initialize()
+
+        with closing(sqlite3.connect(path)) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        self.assertNotIn("schema_migrations", tables)
+        self.assertNotIn("partial_schema", tables)
 
     def test_online_backup_restores_integrity_and_counts(self) -> None:
         store = self.make_store()

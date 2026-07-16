@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS ml_labels(
   fill_label INTEGER, fill_delay_sec REAL, fill_price REAL,
   ret_3d_net REAL, ret_5d_net REAL, ret_10d_net REAL,
   mfe_10d REAL, mae_10d REAL, hit_stop INTEGER, hit_take INTEGER,
-  actual_net_pnl REAL, market_data_sha256 TEXT NOT NULL, matured_at TEXT NOT NULL
+  actual_net_pnl REAL, market_data_sha256 TEXT NOT NULL, matured_at TEXT
 );
 CREATE TABLE IF NOT EXISTS ml_predictions(
   sample_id TEXT NOT NULL REFERENCES ml_candidate_samples(sample_id),
@@ -108,35 +108,32 @@ class MlStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
         return conn
 
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(SCHEMA)
-            now = _now()
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, now),
-            )
-            conn.execute(
-                """INSERT OR IGNORE INTO ml_runtime_state(
-                   singleton, active_model_id, permission_level, updated_at
-                   ) VALUES (1, NULL, 0, ?)""",
-                (now,),
-            )
+            with self._transaction(conn):
+                for statement in _schema_statements(SCHEMA):
+                    conn.execute(statement)
+                now = _now()
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, now),
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO ml_runtime_state(
+                       singleton, active_model_id, permission_level, updated_at
+                       ) VALUES (1, NULL, 0, ?)""",
+                    (now,),
+                )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
+            with self._transaction(conn):
                 yield conn
-            except Exception:
-                conn.rollback()
-                raise
-            else:
-                conn.commit()
 
     def schema_version(self) -> int:
         with self.connect() as conn:
@@ -151,7 +148,6 @@ class MlStore:
             }
 
     def record_candidates(self, samples: list[CandidateSample]) -> int:
-        self._ensure_capacity()
         changed = 0
         with self.transaction() as conn:
             for sample in samples:
@@ -193,11 +189,9 @@ class MlStore:
                     raise MlDataConflict(
                         f"immutable candidate conflict: {sample.sample_id}"
                     )
-            self._ensure_capacity()
         return changed
 
     def upsert_labels(self, labels: list[LabelRecord]) -> int:
-        self._ensure_capacity()
         changed = 0
         columns = (
             "label_version",
@@ -219,8 +213,6 @@ class MlStore:
         )
         with self.transaction() as conn:
             for label in labels:
-                if label.matured_at is None:
-                    raise ValueError("matured_at is required")
                 values = tuple(getattr(label, column) for column in columns)
                 row = conn.execute(
                     f"SELECT {','.join(columns)} FROM ml_labels WHERE sample_id=?",
@@ -236,11 +228,9 @@ class MlStore:
                     (label.sample_id, *values),
                 )
                 changed += 1
-            self._ensure_capacity()
         return changed
 
     def record_predictions(self, predictions: list[PredictionRecord]) -> int:
-        self._ensure_capacity()
         changed = 0
         columns = (
             "expected_ret_3d",
@@ -280,7 +270,6 @@ class MlStore:
                         "immutable prediction conflict: "
                         f"{prediction.sample_id}/{prediction.model_id}"
                     )
-            self._ensure_capacity()
         return changed
 
     def register_model(
@@ -290,7 +279,6 @@ class MlStore:
         artifact_path: str,
         status: str = "challenger",
     ) -> bool:
-        self._ensure_capacity()
         manifest_json = _canonical_json(manifest)
         values = (
             manifest.parent_model_id,
@@ -323,7 +311,6 @@ class MlStore:
                 raise MlDataConflict(
                     f"artifact already registered: {manifest.artifact_sha256}"
                 ) from exc
-            self._ensure_capacity()
         return True
 
     def record_model_event(
@@ -339,7 +326,6 @@ class MlStore:
         operator: str,
         created_at: str,
     ) -> bool:
-        self._ensure_capacity()
         created_at = _aware_iso(created_at, "created_at")
         values = (
             str(model_id),
@@ -372,7 +358,6 @@ class MlStore:
                    reason,operator,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
                 (event_id, *values),
             )
-            self._ensure_capacity()
         return True
 
     def runtime_state(self) -> dict[str, object]:
@@ -427,24 +412,114 @@ class MlStore:
             row = conn.execute("PRAGMA integrity_check").fetchone()
         return str(row[0]) if row is not None else "missing"
 
-    def _ensure_capacity(self) -> None:
-        size = sum(
-            candidate.stat().st_size
-            for candidate in (
-                self.path,
-                Path(f"{self.path}-wal"),
-                Path(f"{self.path}-shm"),
-            )
-            if candidate.exists()
+    @contextmanager
+    def _transaction(self, conn: sqlite3.Connection) -> Iterator[None]:
+        self._ensure_capacity(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        start_pages = self._page_count(conn)
+        try:
+            self._set_max_page_count(conn)
+            yield
+            self._ensure_capacity(conn, committing=True, start_pages=start_pages)
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL:
+                raise MlCapacityError(
+                    f"ML database capacity reached: {self.max_bytes} bytes"
+                ) from exc
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        self._checkpoint(conn)
+        self._ensure_capacity(conn)
+
+    def _set_max_page_count(self, conn: sqlite3.Connection) -> None:
+        page_size = self._page_size(conn)
+        max_pages = max(1, self.max_bytes // page_size)
+        actual = int(
+            conn.execute(f"PRAGMA max_page_count={max_pages}").fetchone()[0]
         )
-        if size >= self.max_bytes:
+        if actual * page_size > self.max_bytes:
             raise MlCapacityError(
-                f"ML database capacity reached: {size} >= {self.max_bytes}"
+                "ML logical database exceeds capacity: "
+                f"{actual * page_size} > {self.max_bytes}"
             )
+
+    def _ensure_capacity(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        committing: bool = False,
+        start_pages: int = 0,
+    ) -> None:
+        page_size = self._page_size(conn)
+        page_count = self._page_count(conn)
+        logical_bytes = page_count * page_size
+        main_bytes = self._file_size(self.path)
+        wal_bytes = self._file_size(Path(f"{self.path}-wal"))
+        shm_bytes = self._file_size(Path(f"{self.path}-shm"))
+        physical_bytes = main_bytes + wal_bytes + shm_bytes
+        if logical_bytes > self.max_bytes or physical_bytes >= self.max_bytes:
+            raise MlCapacityError(
+                "ML database capacity reached: "
+                f"logical={logical_bytes}, physical={physical_bytes}, "
+                f"limit={self.max_bytes}"
+            )
+        if not committing:
+            return
+
+        transaction_pages = max(start_pages, page_count)
+        frame_bytes = page_size + 24
+        commit_wal_bytes = 32 + transaction_pages * frame_bytes
+        existing_frames = max(0, wal_bytes - 32) // frame_bytes
+        total_frames = existing_frames + transaction_pages
+        commit_shm_bytes = ((total_frames + 3_999) // 4_000) * 32_768
+        commit_physical_bytes = (
+            max(main_bytes, logical_bytes)
+            + wal_bytes
+            + commit_wal_bytes
+            + max(shm_bytes, commit_shm_bytes)
+        )
+        if commit_physical_bytes > self.max_bytes:
+            raise MlCapacityError(
+                "ML transaction would exceed capacity: "
+                f"logical={logical_bytes}, "
+                f"conservative_physical={commit_physical_bytes}, "
+                f"limit={self.max_bytes}"
+            )
+
+    def _checkpoint(self, conn: sqlite3.Connection) -> None:
+        if Path(f"{self.path}-wal").exists():
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    @staticmethod
+    def _page_size(conn: sqlite3.Connection) -> int:
+        return int(conn.execute("PRAGMA page_size").fetchone()[0])
+
+    @staticmethod
+    def _page_count(conn: sqlite3.Connection) -> int:
+        return int(conn.execute("PRAGMA page_count").fetchone()[0])
+
+    @staticmethod
+    def _file_size(path: Path) -> int:
+        return path.stat().st_size if path.exists() else 0
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _schema_statements(script: str) -> Iterator[str]:
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            yield pending.strip()
+            pending = ""
+    if pending.strip():
+        yield pending.strip()
 
 
 def _aware_iso(value: str, field: str) -> str:
