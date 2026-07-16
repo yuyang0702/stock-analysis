@@ -30,7 +30,7 @@ IMPLEMENTATION_HASH_FILES = (
     "ml_dataset.py",
     "trade_safety.py",
     "exit_policy.py",
-    "execution_contract.py",
+    "trading_store.py",
     "config.py",
 )
 
@@ -610,6 +610,7 @@ def export_signals(
     )
     decisions = [(signal, evaluate_observation(signal, PortfolioState.empty(), limits)) for signal in payload["signals"]]
     ledger_run_id = run_id or f"export-{payload['generated_at'].replace(' ', 'T')}"
+    new_ledger_run = False
     try:
         store.initialize()
         inserted_signal_count = 0
@@ -618,19 +619,13 @@ def export_signals(
             kill_row = conn.execute("SELECT value FROM system_state WHERE key='kill_switch'").fetchone()
             buy_enabled = str(buy_row[0]) if buy_row else "1"
             kill_switch = str(kill_row[0]) if kill_row else "0"
-            store.record_strategy_run(conn, StrategyRunRecord(
+            inserted_ledger_run = store.record_strategy_run(conn, StrategyRunRecord(
                 run_id=ledger_run_id,
                 trade_date=payload["trade_date"],
                 started_at=payload["generated_at"],
                 strategy_version="a_share_strategy",
                 parameter_version="risk-observe-v1",
             ))
-            # A repeated run_id is a replay of the original decision cohort,
-            # so its ML identity keeps the ledger's immutable first start time.
-            candidate_generated_at = str(conn.execute(
-                "SELECT started_at FROM strategy_runs WHERE run_id=?",
-                (ledger_run_id,),
-            ).fetchone()[0])
             for signal, decision in decisions:
                 existing = conn.execute(
                     "SELECT generated_at, raw_json FROM signals WHERE signal_id=?",
@@ -671,8 +666,9 @@ def export_signals(
                      metrics.get("account_drawdown_pct") or 0, metrics.get("daily_turnover_pct") or 0,
                      payload["generated_at"], json.dumps({"hard_blocks": decision.hard_blocks,
                      "soft_warnings": decision.soft_warnings, "metrics": dict(metrics)}, default=str),
-                     payload["generated_at"]),
+                    payload["generated_at"]),
                 )
+        new_ledger_run = inserted_ledger_run
         payload["diagnostics"]["ledger_ok"] = True
         payload["diagnostics"]["ledger_signal_count"] = inserted_signal_count
         payload["diagnostics"]["buy_enabled"] = buy_enabled
@@ -699,9 +695,9 @@ def export_signals(
         allow_sell=allow_sell,
     )
 
-    if ml_store is None and app_config.ML_TRAINED_SHADOW_ENABLE:
+    if new_ledger_run and ml_store is None and app_config.ML_TRAINED_SHADOW_ENABLE:
         ml_store = MlStore(app_config.ML_DB_FILE, app_config.ML_DB_MAX_BYTES)
-    if ml_store is not None:
+    if new_ledger_run and ml_store is not None:
         try:
             if candidate_contract_error is not None:
                 raise candidate_contract_error

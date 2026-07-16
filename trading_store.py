@@ -422,8 +422,8 @@ class TradingStore:
         except Exception as exc:
             return StoreHealth(ok=False, schema_version=0, error=str(exc))
 
-    def record_strategy_run(self, conn: sqlite3.Connection, run: StrategyRunRecord) -> None:
-        conn.execute(
+    def record_strategy_run(self, conn: sqlite3.Connection, run: StrategyRunRecord) -> bool:
+        cursor = conn.execute(
             """
             INSERT INTO strategy_runs(
                 run_id, trade_date, started_at, strategy_version, parameters_version,
@@ -433,6 +433,7 @@ class TradingStore:
             """,
             (run.run_id, run.trade_date, run.started_at, run.strategy_version, run.parameter_version),
         )
+        return cursor.rowcount == 1
 
     def record_signal(self, conn: sqlite3.Connection, signal: SignalRecord) -> bool:
         cursor = conn.execute(

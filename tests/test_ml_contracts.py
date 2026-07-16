@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, replace
 from types import MappingProxyType
 
 from ml_contracts import (
+    CANDIDATE_FINAL_ACTIONS,
     CandidateSample,
     LabelRecord,
     ModelManifest,
@@ -147,6 +148,18 @@ class MlContractsTest(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(ValueError, "CANDIDATE_DECISION_MISMATCH"):
                     self._sample(**overrides)
+
+    def test_candidate_final_action_uses_the_shared_stable_enum(self) -> None:
+        self.assertEqual(CANDIDATE_FINAL_ACTIONS, frozenset({
+            "selected", "score_rejected", "risk_rejected",
+            "tradability_rejected", "execution_rejected",
+            "buy_published", "rule_rejected", "sell_published",
+            "sell_rejected_no_holding", "sell_blocked_disabled",
+            "sell_blocked_kill_switch", "buy_blocked_disabled",
+            "buy_blocked_kill_switch", "buy_blocked_ledger_error",
+        }))
+        with self.assertRaisesRegex(ValueError, "UNKNOWN_FINAL_ACTION"):
+            self._sample(final_action="future_action")
 
     def test_canonical_hash_supports_contracts_and_is_stable_across_processes(self) -> None:
         feature = TimedFeature(

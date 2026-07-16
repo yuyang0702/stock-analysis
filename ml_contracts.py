@@ -10,6 +10,15 @@ from datetime import datetime
 from types import MappingProxyType
 
 
+CANDIDATE_FINAL_ACTIONS = frozenset({
+    "selected", "score_rejected", "risk_rejected", "tradability_rejected",
+    "execution_rejected", "buy_published", "rule_rejected", "sell_published",
+    "sell_rejected_no_holding", "sell_blocked_disabled",
+    "sell_blocked_kill_switch", "buy_blocked_disabled",
+    "buy_blocked_kill_switch", "buy_blocked_ledger_error",
+})
+
+
 @dataclass(frozen=True)
 class TimedFeature:
     value: object
@@ -72,6 +81,8 @@ class CandidateSample:
                 field_name,
                 _required_text(getattr(self, field_name), field_name),
             )
+        if self.final_action not in CANDIDATE_FINAL_ACTIONS:
+            raise ValueError(f"UNKNOWN_FINAL_ACTION: {self.final_action}")
         object.__setattr__(self, "selected", bool(self.selected))
         rejection_stage = self.rejection_stage.strip()
         rejection_code = self.rejection_code.strip()

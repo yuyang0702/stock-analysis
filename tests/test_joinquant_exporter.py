@@ -115,7 +115,7 @@ class JoinQuantExporterTest(unittest.TestCase):
         expected = (
             "a_share_strategy.py", "candidate_core.py", "joinquant_exporter.py",
             "ml_dataset.py", "trade_safety.py", "exit_policy.py",
-            "execution_contract.py", "config.py",
+            "trading_store.py", "config.py",
         )
         self.assertEqual(joinquant_exporter.IMPLEMENTATION_HASH_FILES, expected)
         joinquant_exporter._ml_code_hash.cache_clear()
@@ -178,7 +178,7 @@ class JoinQuantExporterTest(unittest.TestCase):
                     for row in saved
                 ))
 
-    def test_ledger_error_blocks_only_buy_final_action_and_does_not_store_error_text(self) -> None:
+    def test_ledger_error_blocks_buy_and_does_not_create_ml_audit_data(self) -> None:
         class LockedStore:
             def initialize(self):
                 pass
@@ -201,18 +201,31 @@ class JoinQuantExporterTest(unittest.TestCase):
                 store=LockedStore(), ml_store=ml_store, cohort_mode="intraday",
                 cohort_interval_sec=300,
             )
-            with ml_store.transaction() as conn:
-                saved = conn.execute(
-                    "SELECT code, final_action, features_json FROM ml_candidate_samples"
-                ).fetchall()
-        self.assertEqual(
-            {row["code"]: row["final_action"] for row in saved},
-            {"600000": "buy_blocked_ledger_error", "000001": "sell_published"},
-        )
-        self.assertNotIn("secret-ish", json.dumps([
-            {"final_action": row["final_action"], "features": json.loads(row["features_json"])}
-            for row in saved
-        ]))
+            self.assertFalse((base / "ml.db").exists())
+
+    def test_rolled_back_new_run_does_not_write_ml_candidates(self) -> None:
+        class FailingSignalStore(TradingStore):
+            def record_signal(self, conn, signal):
+                raise sqlite3.OperationalError("signal write failed")
+
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10,
+            "stop_loss": 9.5, "take_profit": 11, "position_pct": 5,
+            "final_score": 90,
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            trading_store = FailingSignalStore(base / "trading.db")
+            joinquant_exporter.export_signals(
+                rows, run_id="rolled-back-run", output_path=base / "signals.json",
+                store=trading_store, ml_store=MlStore(base / "ml.db"),
+                cohort_mode="intraday", cohort_interval_sec=300,
+            )
+            self.assertFalse((base / "ml.db").exists())
+            with trading_store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM strategy_runs WHERE run_id='rolled-back-run'"
+                ).fetchone()[0], 0)
 
     def test_sell_disabled_and_no_holding_have_explicit_audit_actions(self) -> None:
         rows = pd.DataFrame([
@@ -264,6 +277,76 @@ class JoinQuantExporterTest(unittest.TestCase):
                     cohort_mode="intraday",
                 )
             self.assertEqual(ml_store.counts()["ml_candidate_samples"], 1)
+
+    def test_replayed_run_never_backfills_ml_from_later_market_data(self) -> None:
+        first_rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10,
+            "stop_loss": 9.5, "take_profit": 11, "position_pct": 5,
+            "final_score": 70,
+        }])
+        later_rows = first_rows.assign(price=12, final_score=72)
+        generated = iter(("2026-07-15 10:05:00", "2026-07-15 10:06:00"))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "_base_payload",
+            side_effect=lambda run_id, trade_date, dry_run: {
+                "schema_version": 1, "trade_date": "2026-07-15",
+                "generated_at": next(generated), "run_id": run_id,
+                "source": "a_share_strategy", "dry_run": dry_run, "signals": [],
+            },
+        ):
+            base = Path(tmp)
+            trading_store = TradingStore(base / "trading.db")
+            joinquant_exporter.export_signals(
+                first_rows, run_id="same-run", trade_date="2026-07-15",
+                output_path=base / "first.json", store=trading_store,
+            )
+            ml_store = MlStore(base / "ml.db")
+            joinquant_exporter.export_signals(
+                later_rows, run_id="same-run", trade_date="2026-07-15",
+                output_path=base / "second.json", store=trading_store,
+                ml_store=ml_store, cohort_mode="intraday", cohort_interval_sec=300,
+            )
+            self.assertFalse((base / "ml.db").exists())
+            with trading_store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM strategy_runs WHERE run_id='same-run'"
+                ).fetchone()[0], 1)
+
+    def test_failed_first_ml_write_is_not_backfilled_by_run_replay(self) -> None:
+        class FailingMlStore:
+            def initialize(self):
+                raise sqlite3.OperationalError("ml locked")
+
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10,
+            "stop_loss": 9.5, "take_profit": 11, "position_pct": 5,
+            "final_score": 70,
+        }])
+        generated = iter(("2026-07-15 10:05:00", "2026-07-15 10:06:00"))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "_base_payload",
+            side_effect=lambda run_id, trade_date, dry_run: {
+                "schema_version": 1, "trade_date": "2026-07-15",
+                "generated_at": next(generated), "run_id": run_id,
+                "source": "a_share_strategy", "dry_run": dry_run, "signals": [],
+            },
+        ):
+            base = Path(tmp)
+            trading_store = TradingStore(base / "trading.db")
+            joinquant_exporter.export_signals(
+                rows, run_id="failed-run", trade_date="2026-07-15",
+                output_path=base / "first.json", store=trading_store,
+                ml_store=FailingMlStore(), cohort_mode="intraday",
+                cohort_interval_sec=300,
+            )
+            ml_store = MlStore(base / "ml.db")
+            joinquant_exporter.export_signals(
+                rows.assign(price=12), run_id="failed-run",
+                trade_date="2026-07-15", output_path=base / "second.json",
+                store=trading_store, ml_store=ml_store,
+                cohort_mode="intraday", cohort_interval_sec=300,
+            )
+            self.assertFalse((base / "ml.db").exists())
 
     def test_ml_write_failure_keeps_export_bytes_equal_to_disabled_path(self) -> None:
         class FailingMlStore:

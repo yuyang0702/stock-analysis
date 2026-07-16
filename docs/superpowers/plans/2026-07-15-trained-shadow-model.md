@@ -317,11 +317,11 @@ candidate_decisions.append({
 
 After the trading-ledger transaction and before JSON publication, call `record_candidate_batch` inside its own `try/except (MlDataConflict, sqlite3.Error, OSError, ValueError)`. The context must use the payload `generated_at` as `decision_at`, include strategy/parameter/feature versions, and mark live-derived feature times as that observed runtime timestamp. Keep the old JSONL call for published signals until the migration observation gate passes.
 
-The live `parameter_version` suffix must hash a non-secret snapshot containing `min_score`, `enforce_execution_contract`, all `_buy_reject_reason` configuration limits and its fixed thresholds; persist the same snapshot as a timed batch feature. It must not contain account identifiers, tokens, URLs, webhooks or environment content. The cached implementation hash must list `a_share_strategy.py`, `candidate_core.py`, `joinquant_exporter.py`, `ml_dataset.py`, `trade_safety.py`, `exit_policy.py`, `execution_contract.py` and `config.py`; a currently absent listed file contributes an explicit missing-file sentinel so its later appearance changes the hash. A repeated `run_id` is a replay and reuses the immutable first ledger `started_at` as the ML decision time.
+The live `parameter_version` suffix must hash a non-secret snapshot containing `min_score`, `enforce_execution_contract`, all `_buy_reject_reason` configuration limits and its fixed thresholds; persist the same snapshot as a timed batch feature. It must not contain account identifiers, tokens, URLs, webhooks or environment content. The cached implementation hash must list `a_share_strategy.py`, `candidate_core.py`, `joinquant_exporter.py`, `ml_dataset.py`, `trade_safety.py`, `exit_policy.py`, `trading_store.py` and `config.py`. Only a newly inserted normal trading-ledger `strategy_runs` row may produce an ML cohort. A repeated `run_id` remains an audit-ledger replay and never backfills ML candidates from later market data.
 
 - [ ] **Step 4: Run focused and export-contract tests**
 
-Run: `python -m unittest tests.test_ml_dataset tests.test_joinquant_exporter tests.test_execution_contract -v`
+Run: `python -m unittest tests.test_ml_dataset tests.test_joinquant_exporter tests.test_execution_ledger_integration tests.test_execution_state -v`
 
 Expected: every candidate is stored once and exported trading signals remain unchanged.
 
@@ -396,7 +396,7 @@ CREATE TABLE candidate_prices(
 );
 ```
 
-Canonical candidate CSV columns are `decision_at,trade_date,code,selected,rejection_stage,rejection_code,strategy_version,parameter_version,feature_schema_version,generator_hash,universe_hash,features_json`. Validate every nested feature timestamp against exact `decision_at`. The historical path reads imported cohorts, never current caches or network calls. Extend `_implementation_hash` to include `candidate_core.py`, `exit_policy.py`, `execution_contract.py`, `historical_data.py`, `historical_strategy.py` and `historical_backtest.py`.
+Canonical candidate CSV columns are `decision_at,trade_date,code,selected,rejection_stage,rejection_code,strategy_version,parameter_version,feature_schema_version,generator_hash,universe_hash,features_json`. Validate every nested feature timestamp against exact `decision_at`. The historical path reads imported cohorts, never current caches or network calls. Extend `_implementation_hash` to include `candidate_core.py`, `exit_policy.py`, `trading_store.py`, `historical_data.py`, `historical_strategy.py` and `historical_backtest.py`.
 
 - [ ] **Step 4: Run historical tests**
 
@@ -746,7 +746,7 @@ Verify resolved artifact paths remain under `ML_MODEL_DIR`, the file SHA matches
 
 - [ ] **Step 4: Run runtime and full execution-contract tests**
 
-Run: `python -m unittest tests.test_ml_runtime tests.test_a_share_strategy tests.test_joinquant_exporter tests.test_execution_contract tests.test_exit_policy -v`
+Run: `python -m unittest tests.test_ml_runtime tests.test_a_share_strategy tests.test_joinquant_exporter tests.test_execution_ledger_integration tests.test_execution_state tests.test_exit_policy -v`
 
 Expected: L0 is byte/column equivalent for existing trading inputs and failures fall back safely.
 
@@ -859,7 +859,7 @@ Expected: compilation and every focused test pass.
 Run:
 
 ```powershell
-python -m unittest tests.test_historical_data tests.test_historical_strategy tests.test_historical_backtest tests.test_historical_backtest_cli tests.test_joinquant_exporter tests.test_execution_contract tests.test_exit_policy tests.test_reconciliation -v
+python -m unittest tests.test_historical_data tests.test_historical_strategy tests.test_historical_backtest tests.test_historical_backtest_cli tests.test_joinquant_exporter tests.test_execution_ledger_integration tests.test_execution_state tests.test_exit_policy tests.test_reconciliation -v
 ```
 
 Expected: all pass; no existing trading contract changes under ML disabled/L0.

@@ -62,7 +62,8 @@ class TradingStoreTest(unittest.TestCase):
                 expires_at="2026-07-11 09:51:00", raw_json='{"id":"sig-1"}',
             )
             with store.transaction() as conn:
-                store.record_strategy_run(conn, run)
+                self.assertTrue(store.record_strategy_run(conn, run))
+                self.assertFalse(store.record_strategy_run(conn, run))
                 self.assertTrue(store.record_signal(conn, signal))
                 self.assertFalse(store.record_signal(conn, signal))
             with store.connect() as conn:
