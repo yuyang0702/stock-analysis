@@ -105,11 +105,21 @@ class MlStore:
         self.max_bytes = int(max_bytes)
 
     def connect(self) -> sqlite3.Connection:
-        """Open a public immutable read-only connection."""
+        """Open a public read-only connection that includes committed WAL data."""
         if not self.path.exists():
             raise RuntimeError("ML store is not initialized")
+        if self._wal_has_content():
+            return self._connect_readonly(immutable=False)
+        conn = self._connect_readonly(immutable=True)
+        if self._wal_has_content():
+            conn.close()
+            return self._connect_readonly(immutable=False)
+        return conn
+
+    def _connect_readonly(self, *, immutable: bool) -> sqlite3.Connection:
+        query = "mode=ro&immutable=1" if immutable else "mode=ro"
         conn = sqlite3.connect(
-            f"{self.path.resolve().as_uri()}?mode=ro&immutable=1",
+            f"{self.path.resolve().as_uri()}?{query}",
             uri=True,
             timeout=5.0,
             factory=_ClosingConnection,
@@ -139,32 +149,23 @@ class MlStore:
             2 * len(SCHEMA.encode("utf-8"))
             + SCHEMA_BTREE_COUNT * BTREE_RESERVE_BYTES
         )
-        if not self.path.exists() and self.max_bytes < _new_store_minimum_bytes(
-            reserved_bytes
-        ):
-            raise MlCapacityError(
-                f"ML database capacity reached: {self.max_bytes} bytes"
+        with self._audited_write(
+            reserved_bytes=reserved_bytes,
+            growth_bytes=reserved_bytes,
+            initialize=True,
+        ) as conn:
+            for statement in statements:
+                conn.execute(statement)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (SCHEMA_VERSION, now),
             )
-        with self._connect_writable() as conn:
-            self._ensure_capacity(conn)
-            conn.execute("PRAGMA journal_mode=WAL")
-            with self._write_transaction(
-                conn,
-                reserved_bytes=reserved_bytes,
-                growth_bytes=reserved_bytes,
-            ):
-                for statement in statements:
-                    conn.execute(statement)
-                conn.execute(
-                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (SCHEMA_VERSION, now),
-                )
-                conn.execute(
-                    """INSERT OR IGNORE INTO ml_runtime_state(
-                       singleton, active_model_id, permission_level, updated_at
-                       ) VALUES (1, NULL, 0, ?)""",
-                    (now,),
-                )
+            conn.execute(
+                """INSERT OR IGNORE INTO ml_runtime_state(
+                   singleton, active_model_id, permission_level, updated_at
+                   ) VALUES (1, NULL, 0, ?)""",
+                (now,),
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -223,34 +224,32 @@ class MlStore:
         reserved_bytes = _write_reserve_bytes(
             (values for _, values in rows), len(rows), btrees_per_write=3
         )
-        with self._connect_writable() as conn:
-            with self._write_transaction(
-                conn,
-                reserved_bytes=reserved_bytes,
-                growth_bytes=reserved_bytes,
-            ):
-                for sample, values in rows:
-                    content_sha256 = str(values[-2])
-                    cursor = conn.execute(
-                        """INSERT OR IGNORE INTO ml_candidate_samples(
-                           sample_id, source, dataset_id, trade_date, decision_at, code,
-                           strategy_version, parameter_version, feature_schema_version,
-                           features_json, selected, rejection_stage, rejection_code,
-                           content_sha256, created_at
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        values,
+        with self._audited_write(
+            reserved_bytes=reserved_bytes,
+            growth_bytes=reserved_bytes,
+        ) as conn:
+            for sample, values in rows:
+                content_sha256 = str(values[-2])
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO ml_candidate_samples(
+                       sample_id, source, dataset_id, trade_date, decision_at, code,
+                       strategy_version, parameter_version, feature_schema_version,
+                       features_json, selected, rejection_stage, rejection_code,
+                       content_sha256, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    values,
+                )
+                if cursor.rowcount == 1:
+                    changed += 1
+                    continue
+                row = conn.execute(
+                    "SELECT content_sha256 FROM ml_candidate_samples WHERE sample_id=?",
+                    (sample.sample_id,),
+                ).fetchone()
+                if row is None or str(row[0]) != content_sha256:
+                    raise MlDataConflict(
+                        f"immutable candidate conflict: {sample.sample_id}"
                     )
-                    if cursor.rowcount == 1:
-                        changed += 1
-                        continue
-                    row = conn.execute(
-                        "SELECT content_sha256 FROM ml_candidate_samples WHERE sample_id=?",
-                        (sample.sample_id,),
-                    ).fetchone()
-                    if row is None or str(row[0]) != content_sha256:
-                        raise MlDataConflict(
-                            f"immutable candidate conflict: {sample.sample_id}"
-                        )
         return changed
 
     def upsert_labels(self, labels: list[LabelRecord]) -> int:
@@ -284,27 +283,25 @@ class MlStore:
             len(rows),
             btrees_per_write=2,
         )
-        with self._connect_writable() as conn:
-            with self._write_transaction(
-                conn,
-                reserved_bytes=reserved_bytes,
-                growth_bytes=reserved_bytes,
-            ):
-                for label, values in rows:
-                    row = conn.execute(
-                        f"SELECT {','.join(columns)} FROM ml_labels WHERE sample_id=?",
-                        (label.sample_id,),
-                    ).fetchone()
-                    if row is not None and tuple(row) == values:
-                        continue
-                    conn.execute(
-                        f"""INSERT INTO ml_labels(sample_id,{','.join(columns)})
-                            VALUES (?,{','.join('?' for _ in columns)})
-                            ON CONFLICT(sample_id) DO UPDATE SET
-                            {','.join(f'{column}=excluded.{column}' for column in columns)}""",
-                        (label.sample_id, *values),
-                    )
-                    changed += 1
+        with self._audited_write(
+            reserved_bytes=reserved_bytes,
+            growth_bytes=reserved_bytes,
+        ) as conn:
+            for label, values in rows:
+                row = conn.execute(
+                    f"SELECT {','.join(columns)} FROM ml_labels WHERE sample_id=?",
+                    (label.sample_id,),
+                ).fetchone()
+                if row is not None and tuple(row) == values:
+                    continue
+                conn.execute(
+                    f"""INSERT INTO ml_labels(sample_id,{','.join(columns)})
+                        VALUES (?,{','.join('?' for _ in columns)})
+                        ON CONFLICT(sample_id) DO UPDATE SET
+                        {','.join(f'{column}=excluded.{column}' for column in columns)}""",
+                    (label.sample_id, *values),
+                )
+                changed += 1
         return changed
 
     def record_predictions(self, predictions: list[PredictionRecord]) -> int:
@@ -343,31 +340,29 @@ class MlStore:
             len(rows),
             btrees_per_write=2,
         )
-        with self._connect_writable() as conn:
-            with self._write_transaction(
-                conn,
-                reserved_bytes=reserved_bytes,
-                growth_bytes=reserved_bytes,
-            ):
-                for prediction, values in rows:
-                    cursor = conn.execute(
-                        f"""INSERT OR IGNORE INTO ml_predictions(
-                           sample_id,model_id,{','.join(columns)})
-                           VALUES (?,?,{','.join('?' for _ in columns)})""",
-                        (prediction.sample_id, prediction.model_id, *values),
+        with self._audited_write(
+            reserved_bytes=reserved_bytes,
+            growth_bytes=reserved_bytes,
+        ) as conn:
+            for prediction, values in rows:
+                cursor = conn.execute(
+                    f"""INSERT OR IGNORE INTO ml_predictions(
+                       sample_id,model_id,{','.join(columns)})
+                       VALUES (?,?,{','.join('?' for _ in columns)})""",
+                    (prediction.sample_id, prediction.model_id, *values),
+                )
+                if cursor.rowcount == 1:
+                    changed += 1
+                    continue
+                row = conn.execute(
+                    f"SELECT {','.join(columns)} FROM ml_predictions WHERE sample_id=? AND model_id=?",
+                    (prediction.sample_id, prediction.model_id),
+                ).fetchone()
+                if row is None or tuple(row) != values:
+                    raise MlDataConflict(
+                        "immutable prediction conflict: "
+                        f"{prediction.sample_id}/{prediction.model_id}"
                     )
-                    if cursor.rowcount == 1:
-                        changed += 1
-                        continue
-                    row = conn.execute(
-                        f"SELECT {','.join(columns)} FROM ml_predictions WHERE sample_id=? AND model_id=?",
-                        (prediction.sample_id, prediction.model_id),
-                    ).fetchone()
-                    if row is None or tuple(row) != values:
-                        raise MlDataConflict(
-                            "immutable prediction conflict: "
-                            f"{prediction.sample_id}/{prediction.model_id}"
-                        )
         return changed
 
     def register_model(
@@ -391,11 +386,10 @@ class MlStore:
         reserved_bytes = _write_reserve_bytes(
             ((manifest.model_id, *values),), 1, btrees_per_write=3
         )
-        with self._connect_writable() as conn, self._write_transaction(
-            conn,
+        with self._audited_write(
             reserved_bytes=reserved_bytes,
             growth_bytes=reserved_bytes,
-        ):
+        ) as conn:
             row = conn.execute(
                 """SELECT parent_model_id,status,artifact_path,artifact_sha256,
                           manifest_json,created_at FROM ml_models WHERE model_id=?""",
@@ -459,11 +453,10 @@ class MlStore:
         reserved_bytes = _write_reserve_bytes(
             ((event_id, *values),), 1, btrees_per_write=2
         )
-        with self._connect_writable() as conn, self._write_transaction(
-            conn,
+        with self._audited_write(
             reserved_bytes=reserved_bytes,
             growth_bytes=reserved_bytes,
-        ):
+        ) as conn:
             model = conn.execute(
                 "SELECT artifact_sha256 FROM ml_models WHERE model_id=?", (values[0],)
             ).fetchone()
@@ -531,11 +524,10 @@ class MlStore:
             2 * sum(_parameter_bytes(value) for value in parameters)
             + RUNTIME_RESERVE_BYTES
         )
-        with self._connect_writable() as conn, self._write_transaction(
-            conn,
+        with self._audited_write(
             reserved_bytes=reserved_bytes,
             growth_bytes=0,
-        ):
+        ) as conn:
             cursor = conn.execute(
                 """UPDATE ml_runtime_state
                    SET active_model_id=?, permission_level=?, updated_at=?
@@ -554,6 +546,48 @@ class MlStore:
         with self.connect() as conn:
             row = conn.execute("PRAGMA integrity_check").fetchone()
         return str(row[0]) if row is not None else "missing"
+
+    @contextmanager
+    def _audited_write(
+        self,
+        *,
+        reserved_bytes: int,
+        growth_bytes: int,
+        initialize: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
+        self._raw_write_preflight(reserved_bytes)
+        with self._connect_writable() as conn:
+            if initialize:
+                conn.execute("PRAGMA journal_mode=WAL")
+            with self._write_transaction(
+                conn,
+                reserved_bytes=reserved_bytes,
+                growth_bytes=growth_bytes,
+            ):
+                yield conn
+
+    def _raw_write_preflight(self, reserved_bytes: int) -> None:
+        if reserved_bytes <= 0:
+            raise ValueError("invalid write capacity reservation")
+        main_bytes = self._file_size(self.path)
+        wal_bytes = self._file_size(Path(f"{self.path}-wal"))
+        shm_bytes = self._file_size(Path(f"{self.path}-shm"))
+        physical_bytes = main_bytes + wal_bytes + shm_bytes
+        if main_bytes == 0:
+            required_bytes = physical_bytes + _new_store_minimum_bytes(reserved_bytes)
+        else:
+            required_bytes = (
+                physical_bytes
+                + max(0, 32 - wal_bytes)
+                + max(0, 32_768 - shm_bytes)
+                + reserved_bytes
+            )
+        if physical_bytes > self.max_bytes or required_bytes > self.max_bytes:
+            raise MlCapacityError(
+                "ML database capacity reached before SQLite open: "
+                f"physical={physical_bytes}, required={required_bytes}, "
+                f"limit={self.max_bytes}"
+            )
 
     @contextmanager
     def _write_transaction(
@@ -657,9 +691,21 @@ class MlStore:
                 f"limit={self.max_bytes}"
             )
 
-    def _checkpoint(self, conn: sqlite3.Connection) -> None:
-        if Path(f"{self.path}-wal").exists():
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    def _checkpoint(self, conn: sqlite3.Connection) -> bool:
+        try:
+            if not self._wal_has_content():
+                return True
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            return (
+                row is not None
+                and int(row[0]) == 0
+                and not self._wal_has_content()
+            )
+        except (sqlite3.Error, OSError, TypeError, ValueError):
+            return False
+
+    def _wal_has_content(self) -> bool:
+        return self._file_size(Path(f"{self.path}-wal")) > 0
 
     @staticmethod
     def _page_size(conn: sqlite3.Connection) -> int:
@@ -671,7 +717,10 @@ class MlStore:
 
     @staticmethod
     def _file_size(path: Path) -> int:
-        return path.stat().st_size if path.exists() else 0
+        try:
+            return path.stat().st_size
+        except FileNotFoundError:
+            return 0
 
 
 def _now() -> str:
@@ -697,8 +746,7 @@ def _aware_iso(value: str, field: str) -> str:
 
 
 def _new_store_minimum_bytes(reserved_bytes: int) -> int:
-    with closing(sqlite3.connect(":memory:")) as conn:
-        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    page_size = 4_096
     reserved_pages = (reserved_bytes + page_size - 1) // page_size
     wal_bytes = 32 + reserved_pages * (page_size + 24)
     main_bytes = (reserved_pages + 1) * page_size

@@ -445,6 +445,67 @@ class MlStoreTest(unittest.TestCase):
         )
         self.assertEqual(store.runtime_state()["active_model_id"], "model-1")
 
+    def test_checkpoint_busy_commit_is_immediately_visible_to_public_reads(self) -> None:
+        store = self.make_store()
+        reader = sqlite3.connect(store.path, timeout=0)
+        reader.execute("BEGIN")
+        self.assertEqual(
+            reader.execute(
+                "SELECT permission_level FROM ml_runtime_state WHERE singleton=1"
+            ).fetchone()[0],
+            0,
+        )
+        try:
+            self.assertTrue(
+                store.compare_and_swap_runtime(
+                    expected_model_id=None,
+                    expected_permission_level=0,
+                    new_model_id=None,
+                    new_permission_level=1,
+                    updated_at="2026-07-15T16:02:00+08:00",
+                )
+            )
+            self.assertGreater(Path(f"{store.path}-wal").stat().st_size, 0)
+            self.assertEqual(store.runtime_state()["permission_level"], 1)
+            with store.connect() as conn:
+                conn.execute("PRAGMA query_only=OFF")
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute(
+                        "UPDATE ml_runtime_state SET permission_level=2 WHERE singleton=1"
+                    )
+        finally:
+            reader.rollback()
+            reader.close()
+
+        self.assertTrue(
+            store.compare_and_swap_runtime(
+                expected_model_id=None,
+                expected_permission_level=1,
+                new_model_id=None,
+                new_permission_level=2,
+                updated_at="2026-07-15T16:03:00+08:00",
+            )
+        )
+        wal = Path(f"{store.path}-wal")
+        self.assertEqual(wal.stat().st_size if wal.exists() else 0, 0)
+        self.assertEqual(store.runtime_state()["permission_level"], 2)
+
+    def test_checkpoint_failure_after_commit_does_not_report_write_failure(self) -> None:
+        store = self.make_store()
+
+        with patch.object(store, "_wal_has_content", side_effect=OSError("busy")):
+            self.assertTrue(
+                store.compare_and_swap_runtime(
+                    expected_model_id=None,
+                    expected_permission_level=0,
+                    new_model_id=None,
+                    new_permission_level=1,
+                    updated_at="2026-07-15T16:02:00+08:00",
+                )
+            )
+
+        self.assertEqual(store.runtime_state()["permission_level"], 1)
+
     def test_transaction_waits_for_configured_busy_timeout(self) -> None:
         store = self.make_store()
         locker = sqlite3.connect(store.path, timeout=0)
@@ -736,6 +797,62 @@ class MlStoreTest(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertFalse(Path(f"{path}-wal").exists())
         self.assertFalse(Path(f"{path}-shm").exists())
+
+    def test_zero_byte_store_is_rejected_without_physical_growth(self) -> None:
+        path = self.root / "zero-byte" / "ml.db"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        files = (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        before = tuple(item.stat().st_size if item.exists() else None for item in files)
+
+        with patch.object(ml_store.sqlite3, "connect", wraps=sqlite3.connect) as connect:
+            with self.assertRaises(MlCapacityError):
+                MlStore(path, max_bytes=1).initialize()
+
+        self.assertFalse(connect.called)
+        self.assertEqual(
+            tuple(item.stat().st_size if item.exists() else None for item in files),
+            before,
+        )
+
+    def test_existing_wal_at_capacity_is_rejected_before_shm_creation(self) -> None:
+        source = self.make_store()
+        keeper = source._connect_writable()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute(
+                "UPDATE ml_runtime_state SET updated_at=? WHERE singleton=1",
+                ("2026-07-15T16:01:00+08:00",),
+            )
+            keeper.commit()
+            source_wal = Path(f"{source.path}-wal")
+            self.assertGreater(source_wal.stat().st_size, 32)
+
+            path = self.root / "wal-at-limit" / "ml.db"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(source.path.read_bytes())
+            Path(f"{path}-wal").write_bytes(source_wal.read_bytes())
+            files = (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+            before = tuple(
+                item.stat().st_size if item.exists() else None for item in files
+            )
+            limit = sum(size or 0 for size in before)
+
+            with self.assertRaises(MlCapacityError):
+                MlStore(path, max_bytes=limit).compare_and_swap_runtime(
+                    expected_model_id=None,
+                    expected_permission_level=0,
+                    new_model_id=None,
+                    new_permission_level=1,
+                    updated_at="2026-07-15T16:02:00+08:00",
+                )
+
+            self.assertEqual(
+                tuple(item.stat().st_size if item.exists() else None for item in files),
+                before,
+            )
+        finally:
+            keeper.close()
 
     def test_initialize_rolls_back_schema_version_and_runtime_on_ddl_error(self) -> None:
         path = self.root / "broken" / "ml.db"
