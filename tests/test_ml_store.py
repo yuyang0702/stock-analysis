@@ -170,6 +170,60 @@ class MlStoreTest(unittest.TestCase):
         self.assertEqual(limited.schema_version(), 1)
         self.assertEqual(limited.counts()["ml_runtime_state"], 1)
 
+    def test_initialize_fails_closed_when_required_index_is_missing(self) -> None:
+        store = self.make_store()
+        with store._connect_writable() as conn:
+            conn.execute("DROP INDEX idx_ml_candidates_date_code")
+            conn.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "schema"):
+            store.initialize()
+
+        with store.transaction() as conn:
+            self.assertIsNone(
+                conn.execute(
+                    """SELECT sql FROM sqlite_master
+                       WHERE type='index' AND name='idx_ml_candidates_date_code'"""
+                ).fetchone()
+            )
+
+    def test_initialize_fails_closed_for_same_version_fake_core_schema(self) -> None:
+        path = self.root / "fake" / "ml.db"
+        path.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(path)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE schema_migrations(
+                  version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+                );
+                INSERT INTO schema_migrations VALUES(1, '2026-07-15T16:00:00+08:00');
+                CREATE TABLE ml_candidate_samples(
+                  sample_id TEXT PRIMARY KEY, trade_date TEXT, code TEXT, decision_at TEXT
+                );
+                CREATE INDEX idx_ml_candidates_date_code
+                ON ml_candidate_samples(trade_date, code, decision_at);
+                CREATE TABLE ml_labels(sample_id TEXT PRIMARY KEY);
+                CREATE TABLE ml_predictions(sample_id TEXT, model_id TEXT);
+                CREATE TABLE ml_models(model_id TEXT PRIMARY KEY);
+                CREATE TABLE ml_model_events(event_id TEXT PRIMARY KEY);
+                CREATE TABLE ml_runtime_state(
+                  singleton INTEGER PRIMARY KEY, active_model_id TEXT,
+                  permission_level INTEGER, updated_at TEXT
+                );
+                INSERT INTO ml_runtime_state
+                VALUES(1, NULL, 0, '2026-07-15T16:00:00+08:00');
+                """
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "schema"):
+            MlStore(path).initialize()
+
+        with closing(sqlite3.connect(path)) as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(ml_candidate_samples)")
+            }
+        self.assertEqual(columns, {"sample_id", "trade_date", "code", "decision_at"})
+
     def test_candidate_write_is_idempotent_and_isolated_from_trading_db(self) -> None:
         trading = self.root / "cache" / "trading" / "trading.db"
         trading.parent.mkdir(parents=True)

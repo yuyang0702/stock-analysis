@@ -120,33 +120,47 @@ class MlStore:
         return conn
 
     def _is_current_schema(self) -> bool:
+        current_version = False
         try:
             with self._connect_readonly() as conn:
-                tables = {
-                    str(row[0])
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    )
-                }
-                if {"schema_migrations", *ML_TABLES} - tables:
-                    return False
                 version = conn.execute(
                     "SELECT MAX(version) FROM schema_migrations"
                 ).fetchone()
+                if version is None or int(version[0] or 0) != SCHEMA_VERSION:
+                    return False
+                current_version = True
+                required = _required_schema_fingerprint()
+                actual = _schema_fingerprint(conn)
+                mismatched = [
+                    key[1]
+                    for key, sql in required.items()
+                    if actual.get(key) != sql
+                ]
+                if mismatched:
+                    raise RuntimeError(
+                        "ML schema structure mismatch for version "
+                        f"{SCHEMA_VERSION}: {', '.join(sorted(mismatched))}"
+                    )
                 runtime = conn.execute(
                     """SELECT permission_level, updated_at FROM ml_runtime_state
                        WHERE singleton=1"""
                 ).fetchone()
-        except sqlite3.Error:
+        except RuntimeError:
+            raise
+        except sqlite3.Error as exc:
+            if current_version:
+                raise RuntimeError(
+                    f"ML schema validation failed for version {SCHEMA_VERSION}"
+                ) from exc
             return False
         try:
-            if version is None or int(version[0] or 0) != SCHEMA_VERSION:
-                return False
             if runtime is None or not 0 <= int(runtime[0]) <= 3:
-                return False
+                raise ValueError("invalid runtime row")
             _aware_iso(str(runtime[1]), "updated_at")
-        except (TypeError, ValueError):
-            return False
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"ML runtime state is invalid for schema version {SCHEMA_VERSION}"
+            ) from exc
         return True
 
     def _connect_writable(self) -> sqlite3.Connection:
@@ -752,6 +766,27 @@ def _schema_statements(script: str) -> Iterator[str]:
             pending = ""
     if pending.strip():
         yield pending.strip()
+
+
+def _schema_fingerprint(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
+    return {
+        (str(row[0]), str(row[1])): " ".join(str(row[2]).split()).casefold()
+        for row in conn.execute(
+            """SELECT type, name, sql FROM sqlite_master
+               WHERE type IN ('table', 'index')
+                 AND sql IS NOT NULL
+                 AND name NOT LIKE 'sqlite_%'"""
+        )
+    }
+
+
+def _required_schema_fingerprint() -> dict[tuple[str, str], str]:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        for statement in _schema_statements(SCHEMA):
+            conn.execute(statement)
+        return _schema_fingerprint(conn)
 
 
 def _aware_iso(value: str, field: str) -> str:
