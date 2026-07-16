@@ -229,7 +229,9 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertTrue(events_file.exists())
             cycle = store.get_active_position_cycles()["600000"]
             self.assertEqual(cycle["current_qty"], 1000)
-            self.assertEqual(cycle["initial_stop_price"], 9.65)
+            self.assertEqual(cycle["initial_stop_price"], 9.4)
+            self.assertEqual(payload["positions"][0]["effective_stop_price"], 9.4)
+            self.assertIsNone(payload["positions"][0]["manual_stop_price"])
 
             report = joinquant_sync.build_position_migration_report(payload["positions"], store.get_active_position_cycles())
             self.assertIn("600000", report)

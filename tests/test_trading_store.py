@@ -17,11 +17,11 @@ from trading_store import (
 
 
 class TradingStoreTest(unittest.TestCase):
-    def test_schema_v7_tracks_signal_lifecycle_and_execution_issue_transitions(self) -> None:
+    def test_schema_v8_tracks_signal_lifecycle_and_execution_issue_transitions(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
-            self.assertEqual(store.health().schema_version, 7)
+            self.assertEqual(store.health().schema_version, 8)
             with store.transaction() as conn:
                 signal_columns = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
                 intent_columns = {row[1] for row in conn.execute("PRAGMA table_info(exit_intents)")}
@@ -108,7 +108,7 @@ class TradingStoreTest(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(reason, "ledger unavailable")
 
-    def test_initialize_creates_version_seven_schema_and_pragmas(self) -> None:
+    def test_initialize_creates_version_eight_schema_and_pragmas(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
@@ -117,7 +117,7 @@ class TradingStoreTest(unittest.TestCase):
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
                 busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-                self.assertEqual(version, 7)
+                self.assertEqual(version, 8)
             self.assertTrue({
                 "strategy_runs", "signals", "risk_decisions", "system_state",
                 "position_cycles", "order_events", "exit_intents", "trade_cooldowns",
@@ -149,7 +149,7 @@ class TradingStoreTest(unittest.TestCase):
             store.initialize()
             with store.connect() as conn:
                 count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-                self.assertEqual(count, 7)
+                self.assertEqual(count, 8)
 
     def test_execution_issue_preserves_stage_start_until_state_changes(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -190,7 +190,7 @@ class TradingStoreTest(unittest.TestCase):
             store = TradingStore(path)
             store.initialize()
 
-            self.assertEqual(store.health().schema_version, 7)
+            self.assertEqual(store.health().schema_version, 8)
             self.assertEqual(store.get_system_state("legacy"), "keep")
 
     def test_prune_execution_history_keeps_mismatch_evidence(self) -> None:
@@ -244,8 +244,8 @@ class TradingStoreTest(unittest.TestCase):
                     "current_price": 12.0, "stop_price": 8.0, "mode": "mid", "atr14": 0.8,
                 }], "2026-07-14 09:31:00")
             cycle = store.get_active_position_cycles()["600000"]
-            self.assertEqual(cycle["initial_stop_price"], 9.2)
-            self.assertEqual(cycle["initial_r"], 0.8)
+            self.assertEqual(cycle["initial_stop_price"], 9.3)
+            self.assertEqual(cycle["initial_r"], 0.7)
             self.assertEqual(cycle["highest_price"], 12.0)
             self.assertEqual(cycle["mode"], "short")
 
@@ -293,8 +293,8 @@ class TradingStoreTest(unittest.TestCase):
                 }], "2026-07-14 09:31:00")
             cycle = store.get_active_position_cycles()["600000"]
             self.assertEqual(cycle["entry_price"], 10.5)
-            self.assertEqual(cycle["initial_stop_price"], 9.2)
-            self.assertEqual(cycle["initial_r"], 1.3)
+            self.assertEqual(cycle["initial_stop_price"], 9.87)
+            self.assertEqual(cycle["initial_r"], 0.63)
 
     def test_new_position_cycle_uses_latest_buy_signal_risk_snapshot(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -315,9 +315,28 @@ class TradingStoreTest(unittest.TestCase):
                 }], "2026-07-13 09:32:00")
             cycle = store.get_active_position_cycles()["600000"]
             self.assertEqual(cycle["entry_signal_id"], "buy-1")
-            self.assertEqual(cycle["initial_stop_price"], 9.1)
+            self.assertEqual(cycle["initial_stop_price"], 9.3)
             self.assertEqual(cycle["mode"], "short")
             self.assertEqual(cycle["atr14"], 0.4)
+
+    def test_manual_stop_is_optional_upward_only_and_audited(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 100, "cost_price": 10,
+                    "current_price": 10, "stop_price": 9.3,
+                }], "2026-07-16 09:31:00")
+                store.set_manual_stop(conn, "600000", 9.6, "收紧风险", now="2026-07-16 09:32:00")
+                with self.assertRaisesRegex(ValueError, "只允许上调"):
+                    store.set_manual_stop(conn, "600000", 9.5, "尝试放宽")
+            cycle = store.get_active_position_cycles()["600000"]
+            self.assertEqual(cycle["manual_stop_price"], 9.6)
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM control_events WHERE action='set_manual_stop'"
+                ).fetchone()[0], 1)
 
     def test_active_position_classification_is_recovered_from_entry_signal(self) -> None:
         with TemporaryDirectory() as tmp:

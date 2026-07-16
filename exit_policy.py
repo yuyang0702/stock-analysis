@@ -18,6 +18,16 @@ class PositionExitState:
     atr14: float
     take_profit_stage: int
     holding_trade_days: int
+    manual_stop_price: float = 0.0
+
+
+@dataclass(frozen=True)
+class EffectiveStop:
+    initial_stop_price: float
+    manual_stop_price: float
+    trailing_stop_price: float
+    effective_stop_price: float
+    source: str
 
 
 @dataclass(frozen=True)
@@ -26,6 +36,8 @@ class ExitDecision:
     target_qty: int | None
     initial_stop_price: float
     trailing_stop_price: float
+    manual_stop_price: float
+    effective_stop_price: float
     r_multiple: float
     reason: str
 
@@ -112,6 +124,47 @@ def board_type(code: str, entry_price: float, atr14: float) -> str:
     return "main_active"
 
 
+def validated_initial_stop_price(
+    code: str,
+    fill_price: float,
+    signal_stop_price: float,
+    atr14: float = 0.0,
+) -> float:
+    """Tighten an entry stop against the actual fill; never loosen the signal stop."""
+    if fill_price <= 0:
+        return round(max(signal_stop_price, 0.0), 2)
+    board = board_type(code, fill_price, atr14)
+    max_loss_pct = _BOARD_LIMITS[board][1]
+    fill_guard = fill_price * (1 - max_loss_pct)
+    stop = max(signal_stop_price if signal_stop_price > 0 else 0.0, fill_guard)
+    return round(min(stop, fill_price - 0.01), 2)
+
+
+def resolve_effective_stop(state: PositionExitState, market_state: str) -> EffectiveStop:
+    trailing_stop = 0.0
+    if state.take_profit_stage >= 1 and state.atr14 > 0:
+        trail_mult = 2.0 if state.mode == "short" else 3.0
+        if market_regime(market_state) == "RISK_OFF":
+            trail_mult = max(1.5, trail_mult - 0.5)
+        trailing_stop = round(max(
+            state.initial_stop_price,
+            state.highest_price - trail_mult * state.atr14,
+        ), 2)
+    candidates = [(state.initial_stop_price, "initial")]
+    if state.manual_stop_price > 0:
+        candidates.append((state.manual_stop_price, "manual"))
+    if trailing_stop > 0:
+        candidates.append((trailing_stop, "trailing"))
+    effective, source = max(candidates, key=lambda item: item[0])
+    return EffectiveStop(
+        initial_stop_price=round(state.initial_stop_price, 2),
+        manual_stop_price=round(max(state.manual_stop_price, 0.0), 2),
+        trailing_stop_price=trailing_stop,
+        effective_stop_price=round(effective, 2),
+        source=source,
+    )
+
+
 def risk_position_pct(
     entry_price: float,
     stop_price: float,
@@ -170,29 +223,26 @@ def evaluate_exit(
 ) -> ExitDecision:
     risk = max(state.entry_price - state.initial_stop_price, 0.0)
     r_multiple = (current_price - state.entry_price) / risk if risk > 0 else 0.0
-    trail_mult = 2.0 if state.mode == "short" else 3.0
-    if market_state == "RISK_OFF":
-        trail_mult = max(1.5, trail_mult - 0.5)
-    trailing_stop = max(
-        state.initial_stop_price,
-        state.highest_price - trail_mult * state.atr14 if state.atr14 > 0 else state.initial_stop_price,
-    )
-    trailing_stop = round(trailing_stop, 2)
+    resolved = resolve_effective_stop(state, market_state)
 
     def decision(action: str, target_qty: int | None, reason: str) -> ExitDecision:
         return ExitDecision(
             action=action,
             target_qty=target_qty,
             initial_stop_price=state.initial_stop_price,
-            trailing_stop_price=trailing_stop,
+            trailing_stop_price=resolved.trailing_stop_price,
+            manual_stop_price=resolved.manual_stop_price,
+            effective_stop_price=resolved.effective_stop_price,
             r_multiple=round(r_multiple, 2),
             reason=reason,
         )
 
-    if current_price <= state.initial_stop_price:
-        return decision("hard_stop", 0, "现价触及冻结初始止损")
-    if state.take_profit_stage >= 1 and current_price <= trailing_stop:
-        return decision("trailing_stop", 0, "首段止盈后触及移动止盈")
+    if current_price <= resolved.effective_stop_price:
+        if resolved.source == "trailing":
+            return decision("trailing_stop", 0, "首段止盈后触及移动止盈")
+        if resolved.source == "manual":
+            return decision("hard_stop", 0, "现价触及人工上调止损")
+        return decision("hard_stop", 0, "现价触及成交校验后的冻结初始止损")
     if state.take_profit_stage == 0 and r_multiple >= 2:
         target_qty = state.initial_qty // 2 // 100 * 100
         return decision("take_profit_1", target_qty, "达到2R，目标降至初始持仓一半")

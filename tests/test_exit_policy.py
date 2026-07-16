@@ -4,6 +4,41 @@ import exit_policy
 
 
 class ExitPolicyTest(unittest.TestCase):
+    def test_fill_validated_stop_never_loosens_signal_or_board_guard(self) -> None:
+        self.assertEqual(
+            exit_policy.validated_initial_stop_price("301379", 37.49, 26.62, 0),
+            34.12,
+        )
+        self.assertEqual(
+            exit_policy.validated_initial_stop_price("600000", 10.0, 9.6, 0.1),
+            9.6,
+        )
+        self.assertEqual(
+            exit_policy.validated_initial_stop_price("600000", 10.0, 10.5, 0.1),
+            9.99,
+        )
+
+    def test_effective_stop_uses_highest_active_source(self) -> None:
+        state = exit_policy.PositionExitState(
+            code="600000", mode="short", initial_qty=1000, current_qty=500,
+            entry_price=10, initial_stop_price=9.3, highest_price=12, atr14=0.4,
+            take_profit_stage=1, holding_trade_days=1, manual_stop_price=11.3,
+        )
+        resolved = exit_policy.resolve_effective_stop(state, "NORMAL")
+        self.assertEqual(resolved.trailing_stop_price, 11.2)
+        self.assertEqual(resolved.effective_stop_price, 11.3)
+        self.assertEqual(resolved.source, "manual")
+
+    def test_trailing_stop_is_inactive_before_first_take_profit(self) -> None:
+        state = exit_policy.PositionExitState(
+            code="600000", mode="short", initial_qty=1000, current_qty=1000,
+            entry_price=10, initial_stop_price=9.3, highest_price=12, atr14=0.4,
+            take_profit_stage=0, holding_trade_days=1,
+        )
+        resolved = exit_policy.resolve_effective_stop(state, "NORMAL")
+        self.assertEqual(resolved.trailing_stop_price, 0)
+        self.assertEqual(resolved.effective_stop_price, 9.3)
+
     def state(self, **changes):
         values = {
             "code": "600000",

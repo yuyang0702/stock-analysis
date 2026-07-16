@@ -9,6 +9,18 @@ from trading_store import TradingStore
 
 
 class JoinQuantSignalServerTest(unittest.TestCase):
+    def test_accepts_bearer_token_without_query_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            signal_file = root / "signals.json"
+            signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
+            app = joinquant_signal_server.create_app(
+                token="secret", signal_file=signal_file,
+                account_file=root / "account.json", api_event_file=root / "events.jsonl",
+            )
+            response = app.test_client().get("/joinquant/signals", headers={"Authorization": "Bearer secret"})
+            self.assertEqual(response.status_code, 200)
+
     @staticmethod
     def _snapshot() -> dict:
         return {

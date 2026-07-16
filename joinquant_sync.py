@@ -12,6 +12,7 @@ from order_ledger import normalize_fill, normalize_order
 from reconciliation import persist_issue_transitions, reconcile_snapshot
 from trading_control import apply_automatic_buy_recovery, apply_reconciliation_control
 from trading_store import TradingStore, canonical_json
+from exit_policy import PositionExitState, resolve_effective_stop
 
 
 def _code(value: Any) -> str:
@@ -69,8 +70,6 @@ def _position(item: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     code = _code(item.get("code") or item.get("jq_code"))
     avg_cost = _num(item.get("avg_cost"))
     price = _num(item.get("price"))
-    stop_price = round(avg_cost * 0.965, 2) if avg_cost else None
-    take_price = round(avg_cost * 1.07, 2) if avg_cost else None
     return {
         "code": code,
         "jq_code": str(item.get("jq_code") or "").strip(),
@@ -81,10 +80,10 @@ def _position(item: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
         "today_qty": int(_num(item.get("today_amount"), 0) or 0),
         "cost_price": avg_cost,
         "current_price": price,
-        "stop_pct": 3.5,
-        "take_pct": 7.0,
-        "stop_price": stop_price,
-        "take_price": take_price,
+        "stop_pct": None,
+        "take_pct": None,
+        "stop_price": None,
+        "take_price": None,
         "position_ratio": _num(item.get("position_ratio")),
         "market_value": _num(item.get("market_value")),
         "pnl": _num(item.get("pnl"), 0.0),
@@ -95,6 +94,36 @@ def _position(item: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
         "updated_at": _now(),
         "raw": item,
     }
+
+
+def apply_cycle_risk_fields(
+    positions: list[dict[str, Any]], cycles: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    for item in positions:
+        cycle = cycles.get(item["code"])
+        if not cycle:
+            continue
+        resolved = resolve_effective_stop(PositionExitState(
+            code=item["code"], mode=str(cycle.get("mode") or "legacy_fixed"),
+            initial_qty=int(cycle.get("initial_qty") or item["qty"]), current_qty=item["qty"],
+            entry_price=float(cycle.get("entry_price") or item.get("cost_price") or 0),
+            initial_stop_price=float(cycle.get("initial_stop_price") or 0),
+            highest_price=max(float(cycle.get("highest_price") or 0), float(item.get("current_price") or 0)),
+            atr14=float(cycle.get("atr14") or 0),
+            take_profit_stage=int(cycle.get("take_profit_stage") or 0), holding_trade_days=0,
+            manual_stop_price=float(cycle.get("manual_stop_price") or 0),
+        ), str(cycle.get("market_state") or "NORMAL"))
+        item.update({
+            "initial_stop_price": resolved.initial_stop_price,
+            "manual_stop_price": resolved.manual_stop_price or None,
+            "trailing_stop_price": resolved.trailing_stop_price or None,
+            "effective_stop_price": resolved.effective_stop_price,
+            "stop_price": resolved.effective_stop_price,
+            "stop_source": resolved.source,
+            "take_profit_stage": int(cycle.get("take_profit_stage") or 0),
+            "position_cycle_id": cycle.get("position_cycle_id"),
+        })
+    return positions
 
 
 def _snapshot_state(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -361,6 +390,9 @@ def sync_account_snapshot(
             if pos["code"] and pos["qty"] > 0:
                 positions.append(pos)
 
+    store = store or TradingStore(app_config.TRADING_DB_FILE)
+    ingest_snapshot_payload(snapshot, store, str(snapshot.get("received_at") or _now()))
+    apply_cycle_risk_fields(positions, store.get_active_position_cycles())
     payload = {
         "updated_at": _now(),
         "source": "joinquant",
@@ -387,8 +419,6 @@ def sync_account_snapshot(
     events_file.parent.mkdir(parents=True, exist_ok=True)
     with events_file.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"ts": _now(), "action": "joinquant_sync", "count": len(positions)}, ensure_ascii=False) + "\n")
-    store = store or TradingStore(app_config.TRADING_DB_FILE)
-    ingest_snapshot_payload(snapshot, store, str(snapshot.get("received_at") or _now()))
     if migration_report_file is not None:
         migration_report_file.parent.mkdir(parents=True, exist_ok=True)
         migration_report_file.write_text(

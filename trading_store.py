@@ -5,11 +5,12 @@ import json
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class SignalConflictError(RuntimeError):
@@ -313,6 +314,10 @@ CREATE INDEX IF NOT EXISTS idx_execution_issue_state_active
 ON execution_issue_state(recovered_at, severity, last_seen_at);
 """
 
+SCHEMA_V8 = """
+-- Columns are added idempotently in initialize() for SQLite compatibility.
+"""
+
 
 @dataclass(frozen=True)
 class StoreHealth:
@@ -400,6 +405,11 @@ class TradingStore:
             )
             conn.executescript(SCHEMA_V7)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, datetime('now'))")
+            cycle_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(position_cycles)")}
+            if "manual_stop_price" not in cycle_columns:
+                conn.execute("ALTER TABLE position_cycles ADD COLUMN manual_stop_price REAL")
+            conn.executescript(SCHEMA_V8)
+            conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, datetime('now'))")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -643,8 +653,6 @@ class TradingStore:
             entry_price = float(item.get("cost_price") or item.get("avg_cost") or 0)
             current_price = float(item.get("current_price") or item.get("price") or entry_price)
             stop_price = float(item.get("stop_price") or 0)
-            if stop_price <= 0 and entry_price > 0:
-                stop_price = round(entry_price * 0.93, 2)
             row = conn.execute(
                 "SELECT * FROM position_cycles WHERE stock_code=? AND status='active'",
                 (code,),
@@ -658,8 +666,11 @@ class TradingStore:
                 ).fetchone()
                 signal = json.loads(signal_row["raw_json"]) if signal_row is not None else {}
                 signal_stop = float(signal.get("stop_loss") or 0)
-                if signal_stop > 0:
-                    stop_price = signal_stop
+                from exit_policy import validated_initial_stop_price
+                stop_price = validated_initial_stop_price(
+                    code, entry_price, signal_stop or stop_price,
+                    float(signal.get("atr14") or item.get("atr14") or 0),
+                )
                 cycle_id = f"{code}-{snapshot_at.replace(' ', 'T')}-{uuid.uuid4().hex[:8]}"
                 initial_r = round(max(entry_price - stop_price, 0.01), 4)
                 conn.execute(
@@ -684,16 +695,66 @@ class TradingStore:
             stage = max(int(row["take_profit_stage"]), int(qty <= target_half))
             added = qty > int(row["current_qty"])
             updated_entry = entry_price if added else float(row["entry_price"])
-            updated_r = round(max(updated_entry - float(row["initial_stop_price"]), 0.01), 4)
+            from exit_policy import validated_initial_stop_price
+            repaired_stop = max(
+                float(row["initial_stop_price"]),
+                validated_initial_stop_price(
+                    code, updated_entry, float(row["initial_stop_price"]), float(row["atr14"]),
+                ),
+            )
+            if repaired_stop > float(row["initial_stop_price"]):
+                conn.execute(
+                    """INSERT INTO control_events(event_id, action, operator, old_value, new_value,
+                       reason, created_at) VALUES (?, 'repair_initial_stop', 'system:migration-v8', ?, ?,
+                       '按真实持仓成本和板块最大亏损边界只上调修复', ?)""",
+                    (f"stop-repair-{row['position_cycle_id']}", str(row["initial_stop_price"]), str(repaired_stop), snapshot_at),
+                )
+            updated_r = round(max(updated_entry - repaired_stop, 0.01), 4)
             conn.execute(
-                """UPDATE position_cycles SET current_qty=?, entry_price=?, initial_r=?, highest_price=?,
+                """UPDATE position_cycles SET current_qty=?, entry_price=?, initial_stop_price=?, initial_r=?, highest_price=?,
                    take_profit_stage=?, last_snapshot_at=?, updated_at=datetime('now')
                    WHERE position_cycle_id=?""",
                 (
-                    qty, updated_entry, updated_r, max(float(row["highest_price"]), current_price), stage,
+                    qty, updated_entry, repaired_stop, updated_r, max(float(row["highest_price"]), current_price), stage,
                     snapshot_at, row["position_cycle_id"],
                 ),
             )
+
+    def set_manual_stop(
+        self,
+        conn: sqlite3.Connection,
+        code: str,
+        value: float | None,
+        reason: str,
+        operator: str = "portfolio_web",
+        now: str = "",
+    ) -> dict:
+        row = conn.execute(
+            "SELECT * FROM position_cycles WHERE stock_code=? AND status='active'", (code,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"未找到活动持仓周期：{code}")
+        old = float(row["manual_stop_price"] or 0)
+        new = float(value or 0)
+        if new < 0:
+            raise ValueError("人工止损必须大于 0")
+        if new and new < float(row["initial_stop_price"]):
+            raise ValueError("人工止损不能低于冻结初始止损")
+        if old and new and new < old:
+            raise ValueError("人工止损只允许上调；需要放宽时请先清除并重新评审")
+        if not reason.strip():
+            raise ValueError("修改人工止损必须填写原因")
+        conn.execute(
+            "UPDATE position_cycles SET manual_stop_price=?, updated_at=datetime('now') WHERE position_cycle_id=?",
+            (new or None, row["position_cycle_id"]),
+        )
+        event_time = now or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """INSERT INTO control_events(event_id, action, operator, old_value, new_value, reason, created_at)
+               VALUES (?, 'set_manual_stop', ?, ?, ?, ?, ?)""",
+            (f"manual-stop-{uuid.uuid4().hex}", operator, str(old or ""), str(new or ""), reason.strip(), event_time),
+        )
+        return {**dict(row), "manual_stop_price": new or None}
 
     def get_active_position_cycles(self) -> dict[str, dict]:
         with self.connect() as conn:

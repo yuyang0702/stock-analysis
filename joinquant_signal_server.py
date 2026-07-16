@@ -54,8 +54,16 @@ def _append_api_event(path: Path, endpoint: str, status_code: int, **extra: Any)
 def _check_token(expected: str) -> None:
     if not expected:
         abort(503, description="JOINQUANT_SYNC_TOKEN is not configured")
-    if request.args.get("token") != expected:
+    authorization = request.headers.get("Authorization", "")
+    supplied = authorization[7:].strip() if authorization.startswith("Bearer ") else request.args.get("token", "")
+    if supplied != expected:
         abort(403)
+    if request.args.get("token"):
+        request.environ["QUERY_STRING"] = "token=REDACTED"
+        for key in ("RAW_URI", "REQUEST_URI"):
+            raw = str(request.environ.get(key) or "")
+            if "?" in raw:
+                request.environ[key] = raw.split("?", 1)[0] + "?token=REDACTED"
 
 
 def _validate_snapshot(payload: Any) -> dict[str, Any]:

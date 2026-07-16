@@ -94,7 +94,7 @@ def main() -> Path:
     draw_box(draw, font, colors, 620, 340, 1100, 470, "5. 生成技术面快照\nMA5 / MA10 / MA20 / MA30 / ATR14\n支撑位 / 压力位 / 趋势状态", box_fill_2)
     draw_box(draw, font, colors, 1230, 340, 1710, 470, "6. 风控引擎决策\n识别 short / mid\n计算入场价 / 止损 / 止盈 / 仓位 / 置信度", box_fill_3)
 
-    draw_box(draw, font, colors, 90, 540, 500, 670, "7. 持仓联动\n读取手机持仓页 / 手工录入 / OCR 持仓", box_fill_4)
+    draw_box(draw, font, colors, 90, 540, 500, 670, "7. 持仓联动\n读取 JoinQuant 快照 / 统一有效止损", box_fill_4)
     draw_box(draw, font, colors, 620, 540, 1100, 670, "8. 分流处理\n候选票 -> 入场建议\n持仓票 -> 风控建议", box_fill_2)
     draw_box(draw, font, colors, 1230, 540, 1710, 670, "9. 输出结果\nCSV / Markdown / 终端摘要", box_fill_3)
 

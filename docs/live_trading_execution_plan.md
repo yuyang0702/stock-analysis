@@ -8,6 +8,8 @@
 
 > 2026-07-15 成交对账修复当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`：完整模式只对当前快照交易日做成交存在性比较，不改变 SQLite 历史账本、交易策略、控制严重度或自动恢复门槛。代码提交 `cd83f26` 的 Linux全量326/326、正式账本检查、配置不变、三个服务重启和启动后ERROR日志均已通过；真实交易日行为仍待观察。
 
+> 2026-07-16 止损与网页增量以 `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` 为准。唯一卖出止损改为成交校验后的冻结 initial、可选 manual 与首段止盈后 trailing 的最大值；网页与策略共用解析器。schema 8、认证交易面板、OCR 删除和 bearer 模板当前为 `implemented（本地，待提交部署） / not deployed / not observed / not validated`。部署不会自动构成真实交易日观察；T+1、停牌、跌停和可卖数量不足仍保留退出意图，停买不阻止合法卖出。
+
 ## 目标
 
 把当前项目从“能扫描、能模拟下单”升级为“可长期稳定运行、具备风控、回测、审计和实盘接入能力的股票量化工具”。

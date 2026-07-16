@@ -28,6 +28,7 @@ from exit_policy import (
     exit_priority,
     market_regime,
     normalize_exit_action,
+    resolve_effective_stop,
 )
 from global_market_context import load_global_context
 from paper_trading import apply_paper_trades, build_paper_trade_markdown, load_account, save_account
@@ -383,13 +384,21 @@ def merge_holding_stop_loss_rows(
         effective_stop = stop_price
         if cycle:
             if safe_text(cycle.get("mode")) == "legacy_fixed":
-                if price <= _float_value(cycle.get("initial_stop_price"), stop_price):
+                resolved = resolve_effective_stop(PositionExitState(
+                    code=code, mode="legacy_fixed", initial_qty=int(qty), current_qty=int(qty),
+                    entry_price=_float_value(cycle.get("entry_price")),
+                    initial_stop_price=_float_value(cycle.get("initial_stop_price"), stop_price),
+                    highest_price=_float_value(cycle.get("highest_price"), price), atr14=0,
+                    take_profit_stage=0, holding_trade_days=0,
+                    manual_stop_price=_float_value(cycle.get("manual_stop_price")),
+                ), market_state)
+                if price <= resolved.effective_stop_price:
                     action = "hard_stop"
-                    note = "旧持仓触及冻结固定硬止损"
+                    note = "旧持仓触及统一有效硬止损"
                     exit_signal_id = f"{cycle.get('position_cycle_id')}-hard_stop-0"
                 if not action:
                     continue
-                effective_stop = _float_value(cycle.get("initial_stop_price"), stop_price)
+                effective_stop = resolved.effective_stop_price
             else:
                 opened_raw = safe_text(cycle.get("opened_at"))[:10]
                 try:
@@ -410,11 +419,12 @@ def merge_holding_stop_loss_rows(
                     atr14=_float_value(cycle.get("atr14")),
                     take_profit_stage=int(_float_value(cycle.get("take_profit_stage"))),
                     holding_trade_days=holding_trade_days,
+                    manual_stop_price=_float_value(cycle.get("manual_stop_price")),
                 ), price, market_state)
                 if decision.action != "hold":
                     action = decision.action
                     target_qty = int(decision.target_qty or 0)
-                    effective_stop = decision.initial_stop_price
+                    effective_stop = decision.effective_stop_price
                     note = decision.reason
                     exit_signal_id = f"{cycle.get('position_cycle_id')}-{decision.action}-{cycle.get('take_profit_stage', 0)}"
         elif stop_price > 0 and price <= stop_price:

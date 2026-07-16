@@ -10,7 +10,6 @@ Only use https:// after adding an HTTPS reverse proxy such as Nginx.
 
 from datetime import datetime, timedelta
 import json
-import urllib.parse
 import urllib.request
 
 
@@ -23,7 +22,7 @@ MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_POSITIONS = 5
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-15.1-execution-state-recovery"
+STRATEGY_TEMPLATE_VERSION = "2026-07-16.1-unified-effective-stop"
 
 
 def _ensure_runtime_state(context):
@@ -82,21 +81,18 @@ def startup_self_test(context):
     log.info("startup self test ok")
 
 
-def _url(base):
-    return base + ("&" if "?" in base else "?") + urllib.parse.urlencode({"token": SYNC_TOKEN})
-
-
 def _get_json(url):
-    with urllib.request.urlopen(_url(url), timeout=8) as response:
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + SYNC_TOKEN})
+    with urllib.request.urlopen(request, timeout=8) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
 def _post_json(url, payload):
     data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
     request = urllib.request.Request(
-        _url(url),
+        url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + SYNC_TOKEN},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=8) as response:

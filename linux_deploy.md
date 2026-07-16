@@ -106,7 +106,7 @@ bash run_ubuntu.sh install \
 bash run_ubuntu.sh install --cash 200000
 bash run_ubuntu.sh install --web-port 8080
 bash run_ubuntu.sh install --signal-port 8010
-bash run_ubuntu.sh install --skip-ocr
+bash run_ubuntu.sh install
 bash run_ubuntu.sh install --skip-install
 bash run_ubuntu.sh install --no-start
 ```
@@ -376,6 +376,6 @@ bash run_ubuntu.sh status-all
 ```bash
 cd /opt/stock-analysis
 git pull origin main
-bash run_ubuntu.sh install --skip-install --skip-ocr
+bash run_ubuntu.sh install --skip-install
 bash run_ubuntu.sh status-all
 ```

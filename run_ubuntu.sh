@@ -43,7 +43,7 @@ usage() {
   cat <<'EOF'
 Usage:
   bash run_ubuntu.sh
-  bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--skip-ocr] [--no-start]
+  bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
   bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|historical-backtest|historical-backtest-validate|backup|backup-drill|backup-status|test|show-env
@@ -255,15 +255,9 @@ require_project_files() {
 }
 
 install_system_packages() {
-  local install_ocr="$1"
   log "Installing system packages"
   sudo apt-get update
   sudo apt-get install -y python3 python3-venv python3-pip git curl openssl
-  if [[ "${install_ocr}" == "yes" ]]; then
-    sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim
-  else
-    warn "Skipped OCR packages"
-  fi
 }
 
 install_python_deps() {
@@ -712,7 +706,6 @@ install_all() {
   local web_port="8000"
   local signal_port="8010"
   local skip_install="no"
-  local install_ocr="yes"
   local start_services="yes"
 
   while [[ $# -gt 0 ]]; do
@@ -723,7 +716,6 @@ install_all() {
       --web-port|--port) web_port="${2:-}"; shift 2 ;;
       --signal-port) signal_port="${2:-}"; shift 2 ;;
       --skip-install) skip_install="yes"; shift ;;
-      --skip-ocr) install_ocr="no"; shift ;;
       --no-start) start_services="no"; shift ;;
       *) die "Unknown install option: $1" ;;
     esac
@@ -734,7 +726,7 @@ install_all() {
   sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "/opt/stock-analysis-backups"
   [[ -n "${token}" ]] || token="$(generate_token)"
   if [[ "${skip_install}" == "no" ]]; then
-    install_system_packages "${install_ocr}"
+    install_system_packages
     install_python_deps
   fi
   write_env_file "${webhook}" "${token}" "${cash}" "${web_port}"

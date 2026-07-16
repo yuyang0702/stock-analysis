@@ -4,4 +4,3 @@ requests>=2.31.0
 openai>=1.0.0
 flask>=3.0.0
 pillow>=10.0.0
-pytesseract>=0.3.13

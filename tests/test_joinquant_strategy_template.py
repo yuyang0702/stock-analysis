@@ -28,8 +28,9 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
         config_text = Path("config.py").read_text(encoding="utf-8")
 
-        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-15.1-execution-state-recovery"', text)
-        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-15.1-execution-state-recovery"', config_text)
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-16.1-unified-effective-stop"', text)
+        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-16.1-unified-effective-stop"', config_text)
+        self.assertIn('"Authorization": "Bearer " + SYNC_TOKEN', text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
 
     def test_template_rechecks_five_positions_and_eighty_percent_total(self) -> None:
