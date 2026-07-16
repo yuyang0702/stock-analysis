@@ -27,6 +27,12 @@ class ConfigEnvTest(unittest.TestCase):
                 self.assertEqual(reloaded.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT, 80)
                 self.assertTrue(reloaded.JOINQUANT_ALLOW_BUY_DEFAULT)
                 self.assertTrue(reloaded.JOINQUANT_ALLOW_SELL_DEFAULT)
+                self.assertEqual(reloaded.ML_DB_FILE, reloaded.CACHE_DIR / "ml" / "ml.db")
+                self.assertEqual(reloaded.ML_MODEL_DIR, reloaded.CACHE_DIR / "ml" / "models")
+                self.assertEqual(reloaded.ML_DB_MAX_BYTES, 2_000_000_000)
+                self.assertFalse(reloaded.ML_TRAINED_SHADOW_ENABLE)
+                self.assertEqual(reloaded.ML_PERMISSION_LEVEL_MAX, 0)
+                self.assertEqual(reloaded.ML_INFERENCE_TIMEOUT_SEC, 1.0)
         finally:
             importlib.reload(config)
 
@@ -52,6 +58,12 @@ class ConfigEnvTest(unittest.TestCase):
             "TRADING_BACKUP_DAILY_KEEP": "8",
             "TRADING_BACKUP_WEEKLY_KEEP": "5",
             "TRADING_BACKUP_MONTHLY_KEEP": "13",
+            "ML_DB_FILE": "custom/ml.db",
+            "ML_MODEL_DIR": "custom/models",
+            "ML_DB_MAX_BYTES": "123456",
+            "ML_TRAINED_SHADOW_ENABLE": "1",
+            "ML_PERMISSION_LEVEL_MAX": "2",
+            "ML_INFERENCE_TIMEOUT_SEC": "0.75",
         }
         old_values = {key: os.environ.get(key) for key in updates}
         try:
@@ -76,6 +88,12 @@ class ConfigEnvTest(unittest.TestCase):
             self.assertEqual(reloaded.TRADING_BACKUP_DAILY_KEEP, 8)
             self.assertEqual(reloaded.TRADING_BACKUP_WEEKLY_KEEP, 5)
             self.assertEqual(reloaded.TRADING_BACKUP_MONTHLY_KEEP, 13)
+            self.assertEqual(reloaded.ML_DB_FILE, Path("custom/ml.db"))
+            self.assertEqual(reloaded.ML_MODEL_DIR, Path("custom/models"))
+            self.assertEqual(reloaded.ML_DB_MAX_BYTES, 123456)
+            self.assertTrue(reloaded.ML_TRAINED_SHADOW_ENABLE)
+            self.assertEqual(reloaded.ML_PERMISSION_LEVEL_MAX, 2)
+            self.assertEqual(reloaded.ML_INFERENCE_TIMEOUT_SEC, 0.75)
         finally:
             for key, value in old_values.items():
                 if value is None:
