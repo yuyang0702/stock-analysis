@@ -61,6 +61,8 @@ class JoinQuantExportRuntimeTest(unittest.TestCase):
                 a_share_strategy.run_joinquant_export(a_share_strategy.Config(), rows)
 
             kwargs = export.call_args.kwargs
+            self.assertEqual(kwargs["cohort_mode"], "after")
+            self.assertEqual(kwargs["cohort_interval_sec"], 300)
             self.assertEqual(kwargs["current_position_count"], 2)
             self.assertEqual(kwargs["sector_exposure_pct"], {"银行": 25.0})
             self.assertEqual(kwargs["theme_exposure_pct"], {"高股息": 25.0})

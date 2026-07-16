@@ -3425,6 +3425,8 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
         account_drawdown_pct=account_metrics.get("account_drawdown_pct", 0),
         consecutive_losses=int(account_metrics.get("consecutive_losses", 0)),
         enforce_execution_contract=True,
+        cohort_mode=cfg.mode,
+        cohort_interval_sec=cfg.interval,
     )
     print(f"JoinQuant signals exported: {path}", flush=True)
     if notifier and notifier.enabled and (cfg.notify_non_trading_day or is_a_share_trading_day()):

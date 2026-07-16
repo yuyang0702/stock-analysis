@@ -10,6 +10,8 @@ from typing import Any
 import pandas as pd
 
 import config as app_config
+from ml_contracts import CandidateSample, TimedFeature
+from ml_store import MlStore
 
 
 FEATURE_COLUMNS = [
@@ -73,6 +75,70 @@ DEFAULT_LABELS = {
     "hit_take": None,
     "net_pnl": None,
 }
+
+
+def _code(value: Any) -> str:
+    digits = "".join(filter(str.isdigit, str(value or "")))[:6]
+    return digits.zfill(6) if digits else ""
+
+
+def build_candidate_samples(
+    rows: pd.DataFrame,
+    decisions: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> list[CandidateSample]:
+    ordered_rows = [row for _, row in rows.iterrows()]
+    if len(ordered_rows) != len(decisions) or any(
+        _code(row.get("code")) != _code(decision.get("code"))
+        for row, decision in zip(ordered_rows, decisions)
+    ):
+        raise ValueError("CANDIDATE_DECISION_SET_MISMATCH")
+
+    decision_at = str(context["decision_at"])
+    cohort_mode = str(context.get("cohort_mode") or "audit")
+    cohort_interval_sec = context.get("cohort_interval_sec")
+    samples = []
+    for row, decision in zip(ordered_rows, decisions):
+        features = {
+            key: TimedFeature(_value(row.get(key)), decision_at)
+            for key in FEATURE_COLUMNS
+            if key in row.index
+        }
+        features["cohort_mode"] = TimedFeature(cohort_mode, decision_at)
+        features["cohort_interval_sec"] = TimedFeature(cohort_interval_sec, decision_at)
+        features["training_eligible"] = TimedFeature(
+            cohort_mode == "intraday" and cohort_interval_sec == 300, decision_at
+        )
+        selected = bool(decision["selected"])
+        stage = str(decision["rejection_stage"])
+        samples.append(CandidateSample.from_values(
+            source=context["source"],
+            dataset_id=context["dataset_id"],
+            decision_at=decision_at,
+            code=_code(row.get("code")),
+            strategy_version=context["strategy_version"],
+            parameter_version=context["parameter_version"],
+            feature_schema_version=context["feature_schema_version"],
+            features=features,
+            selected=selected,
+            rejection_stage=stage,
+            rejection_code=str(decision["rejection_code"]),
+            final_action="selected" if selected else f"{stage}_rejected",
+            universe_hash=context["universe_hash"],
+            market_data_version=context["market_data_version"],
+            code_hash=context["code_hash"],
+            generator_hash=context["generator_hash"],
+        ))
+    return samples
+
+
+def record_candidate_batch(
+    rows: pd.DataFrame,
+    decisions: list[dict[str, Any]],
+    context: dict[str, Any],
+    store: MlStore,
+) -> int:
+    return store.record_candidates(build_candidate_samples(rows, decisions, context))
 
 
 def _text(value: Any) -> str:

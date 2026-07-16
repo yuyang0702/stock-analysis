@@ -11,6 +11,7 @@ import pandas as pd
 import a_share_strategy
 import exit_policy
 import joinquant_exporter
+from ml_store import MlCapacityError, MlStore
 from trading_store import TradingStore
 
 
@@ -25,6 +26,215 @@ class JoinQuantExporterTest(unittest.TestCase):
         )
         self._db_patch.start()
         self.addCleanup(self._db_patch.stop)
+
+    def test_rejection_stage_exhaustively_maps_current_buy_reasons(self) -> None:
+        expected = {
+            "": "selected",
+            "buy_low_score": "score",
+            "buy_suspended": "tradability", "buy_st": "tradability",
+            "buy_delisting": "tradability", "buy_special_listing_stage": "tradability",
+            "buy_quote_stale": "tradability", "buy_chasing": "tradability",
+            "buy_illiquid": "tradability", "buy_invalid_price": "tradability",
+            "buy_near_limit_up": "tradability",
+            "buy_disabled": "risk", "buy_max_positions": "risk",
+            "buy_daily_new_positions_limit": "risk", "buy_daily_orders_limit": "risk",
+            "buy_daily_turnover_limit": "risk", "buy_daily_loss_limit": "risk",
+            "buy_account_drawdown_limit": "risk", "buy_consecutive_loss_limit": "risk",
+            "buy_cooldown": "risk", "buy_risk_disallowed": "risk",
+            "buy_bad_position": "risk", "buy_open_risk_limit": "risk",
+            "buy_sector_limit": "risk", "buy_theme_limit": "risk",
+            "buy_uncategorized_limit": "risk", "buy_insufficient_available_cash": "risk",
+            "buy_total_position_limit": "risk", "buy_too_small_for_board_lot": "risk",
+            "not_buy_sell_signal": "execution", "buy_execution_plan_missing": "execution",
+            "buy_execution_plan_invalid": "execution", "buy_invalid_take_profit": "execution",
+            "buy_invalid_stop_loss": "execution", "buy_not_reached_entry": "execution",
+        }
+        self.assertEqual(
+            {reason: joinquant_exporter.rejection_stage(reason) for reason in expected},
+            expected,
+        )
+        with self.assertRaisesRegex(ValueError, "UNKNOWN_REJECTION_CODE"):
+            joinquant_exporter.rejection_stage("buy_future_reason")
+
+    def test_export_records_selected_and_rejected_candidates(self) -> None:
+        rows = pd.DataFrame([
+            {"code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+             "take_profit": 11, "position_pct": 5, "final_score": 90},
+            {"code": "600001", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+             "take_profit": 11, "position_pct": 5, "final_score": 70},
+            {"code": "600002", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+             "take_profit": 11, "position_pct": 5, "final_score": 95,
+             "execution_allowed": False},
+            {"code": "600003", "price": 10, "signal_action": "sell", "has_holding": True},
+        ])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "_base_payload",
+            return_value={"schema_version": 1, "trade_date": "2026-07-15",
+                          "generated_at": "2026-07-15 10:05:00", "run_id": "r1",
+                          "source": "a_share_strategy", "dry_run": False, "signals": []},
+        ):
+            base = Path(tmp)
+            ml_store = MlStore(base / "ml.db")
+            joinquant_exporter.export_signals(
+                rows, run_id="r1", trade_date="2026-07-15",
+                output_path=base / "signals.json", ml_store=ml_store,
+                cohort_mode="intraday", cohort_interval_sec=300,
+            )
+            with ml_store.transaction() as conn:
+                saved = conn.execute(
+                    "SELECT code, selected, rejection_stage, rejection_code, decision_at, features_json "
+                    "FROM ml_candidate_samples ORDER BY code"
+                ).fetchall()
+        self.assertEqual(len(saved), 4)
+        self.assertEqual(sum(int(row["selected"]) for row in saved), 1)
+        self.assertEqual(
+            {row["rejection_code"] for row in saved},
+            {"", "buy_low_score", "buy_risk_disallowed", "not_buy_sell_signal"},
+        )
+        self.assertEqual({row["decision_at"] for row in saved}, {"2026-07-15T10:05:00+08:00"})
+        self.assertTrue(all(json.loads(row["features_json"])["training_eligible"]["value"] for row in saved))
+
+    def test_repeated_export_run_is_idempotent_despite_later_wall_clock(self) -> None:
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+            "take_profit": 11, "position_pct": 5, "final_score": 90,
+        }])
+        generated = iter(("2026-07-15 10:05:00", "2026-07-15 10:06:00"))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "_base_payload",
+            side_effect=lambda run_id, trade_date, dry_run: {
+                "schema_version": 1, "trade_date": "2026-07-15",
+                "generated_at": next(generated), "run_id": run_id,
+                "source": "a_share_strategy", "dry_run": dry_run, "signals": [],
+            },
+        ):
+            base = Path(tmp)
+            ml_store = MlStore(base / "ml.db")
+            trading_store = TradingStore(base / "trading.db")
+            for output in ("first.json", "second.json"):
+                joinquant_exporter.export_signals(
+                    rows, run_id="same-run", trade_date="2026-07-15",
+                    output_path=base / output, store=trading_store, ml_store=ml_store,
+                    cohort_mode="intraday",
+                )
+            self.assertEqual(ml_store.counts()["ml_candidate_samples"], 1)
+
+    def test_ml_write_failure_keeps_export_bytes_equal_to_disabled_path(self) -> None:
+        class FailingMlStore:
+            def initialize(self):
+                raise sqlite3.OperationalError("ml locked")
+
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+            "take_profit": 11, "position_pct": 5, "final_score": 90,
+        }])
+        fixed = {"schema_version": 1, "trade_date": "2026-07-15",
+                 "generated_at": "2026-07-15 10:05:00", "run_id": "r1",
+                 "source": "a_share_strategy", "dry_run": False, "signals": []}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "_base_payload", side_effect=lambda *args: dict(fixed, signals=[])
+        ):
+            base = Path(tmp)
+            no_ml = joinquant_exporter.export_signals(
+                rows, run_id="r1", output_path=base / "no-ml.json",
+                store=TradingStore(base / "no-ml-trading.db"),
+            ).read_bytes()
+            failed_ml = joinquant_exporter.export_signals(
+                rows, run_id="r1", output_path=base / "failed-ml.json",
+                store=TradingStore(base / "failed-ml-trading.db"), ml_store=FailingMlStore(),
+                cohort_mode="intraday", cohort_interval_sec=300,
+            ).read_bytes()
+        self.assertEqual(failed_ml, no_ml)
+
+    def test_ml_capacity_refusal_keeps_rule_export_available(self) -> None:
+        class FullMlStore:
+            def initialize(self):
+                raise MlCapacityError("full")
+
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+            "take_profit": 11, "position_pct": 5, "final_score": 90,
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = joinquant_exporter.export_signals(
+                rows, run_id="capacity", output_path=Path(tmp) / "signals.json",
+                store=TradingStore(Path(tmp) / "trading.db"), ml_store=FullMlStore(),
+                cohort_mode="intraday",
+            )
+            self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))["signals"]), 1)
+
+    def test_legacy_ml_append_runtime_failure_does_not_block_export(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "append_signal_samples", side_effect=RuntimeError("append failed")
+        ):
+            path = joinquant_exporter.export_signals(
+                pd.DataFrame(), output_path=Path(tmp) / "signals.json",
+            )
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["signals"], [])
+
+    def test_ml_memory_error_is_not_swallowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "append_signal_samples", side_effect=MemoryError("oom")
+        ):
+            with self.assertRaises(MemoryError):
+                joinquant_exporter.export_signals(
+                    pd.DataFrame(), output_path=Path(tmp) / "signals.json",
+                )
+
+    def test_ml_disabled_does_not_create_default_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter.app_config, "ML_TRAINED_SHADOW_ENABLE", False
+        ), patch.object(joinquant_exporter.app_config, "ML_DB_FILE", Path(tmp) / "ml.db"):
+            joinquant_exporter.export_signals(
+                pd.DataFrame(), output_path=Path(tmp) / "signals.json",
+            )
+            self.assertFalse((Path(tmp) / "ml.db").exists())
+
+    def test_enabled_default_ml_store_is_created_lazily(self) -> None:
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+            "take_profit": 11, "position_pct": 5, "final_score": 90,
+        }])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter.app_config, "ML_TRAINED_SHADOW_ENABLE", True
+        ), patch.object(joinquant_exporter.app_config, "ML_DB_FILE", Path(tmp) / "ml.db"):
+            joinquant_exporter.export_signals(
+                rows, run_id="lazy-ml", output_path=Path(tmp) / "signals.json",
+                store=TradingStore(Path(tmp) / "trading.db"), cohort_mode="intraday",
+            )
+            store = MlStore(Path(tmp) / "ml.db")
+            self.assertEqual(store.counts()["ml_candidate_samples"], 1)
+
+    def test_unknown_rejection_code_skips_ml_without_changing_rule_export(self) -> None:
+        class RecordingMlStore:
+            initialized = False
+
+            def initialize(self):
+                self.initialized = True
+
+            def record_candidates(self, samples):
+                raise AssertionError("invalid cohort must not be written")
+
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "position_pct": 5, "final_score": 90,
+        }])
+        fixed = {"schema_version": 1, "trade_date": "2026-07-15",
+                 "generated_at": "2026-07-15 10:05:00", "run_id": "r1",
+                 "source": "a_share_strategy", "dry_run": False, "signals": []}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter, "_base_payload", side_effect=lambda *args: dict(fixed, signals=[])
+        ), patch.object(joinquant_exporter, "_buy_reject_reason", return_value="buy_future_reason"):
+            base = Path(tmp)
+            disabled = joinquant_exporter.export_signals(
+                rows, run_id="r1", output_path=base / "disabled.json",
+                store=TradingStore(base / "disabled.db"),
+            ).read_bytes()
+            enabled = joinquant_exporter.export_signals(
+                rows, run_id="r1", output_path=base / "enabled.json",
+                store=TradingStore(base / "enabled.db"), ml_store=RecordingMlStore(),
+                cohort_mode="intraday",
+            ).read_bytes()
+        self.assertEqual(enabled, disabled)
 
     def test_buy_signal_persists_normalized_classification(self) -> None:
         row = pd.Series({

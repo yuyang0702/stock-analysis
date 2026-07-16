@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +13,62 @@ import pandas as pd
 import config as app_config
 from exit_policy import EXECUTION_PLAN_VERSION, build_buy_execution_plan, market_regime
 from pre_trade_check import PortfolioState, RiskLimits, evaluate_observation
+from ml_contracts import canonical_hash
+from ml_dataset import FEATURE_COLUMNS, append_signal_samples, record_candidate_batch
+from ml_store import MlCapacityError, MlDataConflict, MlStore
 from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore, canonical_json
 from trade_safety import tradability_reject_reason
 
 
 UNCATEGORIZED = "__UNCATEGORIZED__"
+SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
+
+_REJECTION_STAGES = {
+    "score": {"buy_low_score"},
+    "tradability": {
+        "buy_suspended", "buy_st", "buy_delisting", "buy_special_listing_stage",
+        "buy_quote_stale", "buy_chasing", "buy_illiquid", "buy_invalid_price",
+        "buy_near_limit_up",
+    },
+    "risk": {
+        "buy_disabled", "buy_max_positions", "buy_daily_new_positions_limit",
+        "buy_daily_orders_limit", "buy_daily_turnover_limit", "buy_daily_loss_limit",
+        "buy_account_drawdown_limit", "buy_consecutive_loss_limit", "buy_cooldown",
+        "buy_risk_disallowed", "buy_bad_position", "buy_open_risk_limit",
+        "buy_sector_limit", "buy_theme_limit", "buy_uncategorized_limit",
+        "buy_insufficient_available_cash", "buy_total_position_limit",
+        "buy_too_small_for_board_lot",
+    },
+    "execution": {
+        "not_buy_sell_signal", "buy_execution_plan_missing", "buy_execution_plan_invalid",
+        "buy_invalid_take_profit", "buy_invalid_stop_loss", "buy_not_reached_entry",
+    },
+}
+
+
+def rejection_stage(reason: str) -> str:
+    if not reason:
+        return "selected"
+    for stage, reasons in _REJECTION_STAGES.items():
+        if reason in reasons:
+            return stage
+    raise ValueError(f"UNKNOWN_REJECTION_CODE: {reason}")
+
+
+def _ml_decision_at(generated_at: str) -> str:
+    value = datetime.fromisoformat(generated_at)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=SHANGHAI_TIMEZONE)
+    return value.astimezone(SHANGHAI_TIMEZONE).isoformat()
+
+
+def _ml_code_hash() -> str:
+    digest = hashlib.sha256()
+    for name in ("joinquant_exporter.py", "ml_dataset.py"):
+        path = Path(__file__).with_name(name)
+        digest.update(name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def clean_code(value: Any) -> str:
@@ -332,13 +384,20 @@ def export_signals(
     consecutive_losses: int = 0,
     enforce_execution_contract: bool = False,
     store: TradingStore | None = None,
+    ml_store: MlStore | None = None,
+    cohort_mode: str = "audit",
+    cohort_interval_sec: int | None = None,
 ) -> Path:
     dry_run = app_config.JOINQUANT_DRY_RUN_DEFAULT if dry_run is None else dry_run
     min_score = app_config.JOINQUANT_MIN_SCORE_DEFAULT if min_score is None else min_score
     output_path = output_path or app_config.JOINQUANT_SIGNAL_FILE
     payload = _base_payload(run_id, trade_date, dry_run)
+    candidate_generated_at = str(payload["generated_at"])
 
     sample_rows: list[tuple[pd.Series, dict[str, Any]]] = []
+    candidate_rows: list[pd.Series] = []
+    candidate_decisions: list[dict[str, Any]] = []
+    candidate_contract_error: ValueError | None = None
     reject_reasons: Counter[str] = Counter()
     if df is not None and not df.empty:
         signals: list[dict[str, Any]] = []
@@ -360,6 +419,18 @@ def export_signals(
                 consecutive_losses=consecutive_losses,
                 enforce_execution_contract=enforce_execution_contract,
             )
+            try:
+                stage = rejection_stage(buy_reject_reason)
+            except ValueError as exc:
+                candidate_contract_error = candidate_contract_error or exc
+            else:
+                candidate_rows.append(row)
+                candidate_decisions.append({
+                    "code": clean_code(row.get("code")),
+                    "selected": not bool(buy_reject_reason),
+                    "rejection_stage": stage,
+                    "rejection_code": buy_reject_reason,
+                })
             if not buy_reject_reason:
                 signal = _buy_signal(row, run_id, index)
                 signals.append(signal)
@@ -445,6 +516,10 @@ def export_signals(
                 strategy_version="a_share_strategy",
                 parameter_version="risk-observe-v1",
             ))
+            candidate_generated_at = str(conn.execute(
+                "SELECT started_at FROM strategy_runs WHERE run_id=?",
+                (ledger_run_id,),
+            ).fetchone()[0])
             for signal, decision in decisions:
                 existing = conn.execute(
                     "SELECT generated_at, raw_json FROM signals WHERE signal_id=?",
@@ -506,14 +581,49 @@ def export_signals(
         payload["diagnostics"]["ledger_error"] = str(exc)
         payload["diagnostics"]["buy_publication_blocked"] = had_buys
 
-    try:
-        from ml_dataset import append_signal_samples
+    if ml_store is None and app_config.ML_TRAINED_SHADOW_ENABLE:
+        ml_store = MlStore(app_config.ML_DB_FILE, app_config.ML_DB_MAX_BYTES)
+    if ml_store is not None:
+        try:
+            if candidate_contract_error is not None:
+                raise candidate_contract_error
+            ml_store.initialize()
+            decision_at = _ml_decision_at(candidate_generated_at)
+            candidate_frame = pd.DataFrame(candidate_rows)
+            record_candidate_batch(
+                candidate_frame,
+                candidate_decisions,
+                {
+                    "source": "joinquant_live",
+                    "dataset_id": str(run_id or ledger_run_id),
+                    "decision_at": decision_at,
+                    "strategy_version": "a_share_strategy-v1",
+                    "parameter_version": "risk-observe-v1",
+                    "feature_schema_version": "live-candidate-v1",
+                    "cohort_mode": cohort_mode,
+                    "cohort_interval_sec": cohort_interval_sec,
+                    "universe_hash": canonical_hash([decision["code"] for decision in candidate_decisions]),
+                    "market_data_version": "live-scan-v1",
+                    "code_hash": _ml_code_hash(),
+                    "generator_hash": canonical_hash({
+                        "rejection_stages": _REJECTION_STAGES,
+                        "feature_columns": FEATURE_COLUMNS,
+                    }),
+                },
+                ml_store,
+            )
+        except (MlCapacityError, MlDataConflict, sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            detail = str(exc).replace("\n", " ")[:200]
+            print(f"ML candidate batch skipped: {type(exc).__name__}: {detail}", flush=True)
 
+    try:
         published_ids = {signal["id"] for signal in payload["signals"]}
         append_signal_samples(
             [(row, signal) for row, signal in sample_rows if signal["id"] in published_ids],
             payload, ml_sample_path,
         )
+    except (KeyboardInterrupt, SystemExit, MemoryError):
+        raise
     except Exception as exc:
         print(f"ML sample append skipped: {exc}", flush=True)
 
