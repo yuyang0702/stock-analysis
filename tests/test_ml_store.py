@@ -93,6 +93,7 @@ class MlStoreTest(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            self.assertEqual(conn.execute("PRAGMA cache_spill").fetchone()[0], 0)
         self.assertTrue(
             {
                 "ml_candidate_samples",
@@ -290,8 +291,13 @@ class MlStoreTest(unittest.TestCase):
         started = time.monotonic()
         try:
             with self.assertRaises(sqlite3.OperationalError):
-                with store.transaction():
-                    pass
+                store.compare_and_swap_runtime(
+                    expected_model_id=None,
+                    expected_permission_level=0,
+                    new_model_id=None,
+                    new_permission_level=1,
+                    updated_at="2026-07-15T16:02:00+08:00",
+                )
         finally:
             locker.rollback()
             locker.close()
@@ -363,6 +369,185 @@ class MlStoreTest(unittest.TestCase):
             ),
             max_bytes,
         )
+
+    def test_capacity_limit_never_spills_large_payload_past_limit(self) -> None:
+        store = self.make_store()
+        store.record_candidates([self.sample])
+        max_bytes = store.path.stat().st_size + 3_000_000
+
+        class TinyCacheMlStore(MlStore):
+            def connect(self) -> sqlite3.Connection:
+                conn = super().connect()
+                conn.execute("PRAGMA cache_size=1")
+                if conn.execute("PRAGMA cache_spill").fetchone()[0] != 0:
+                    conn.execute("PRAGMA cache_spill=1")
+                return conn
+
+        observed_sizes = []
+        candidate_inserts = []
+        original_execute = ml_store._ClosingConnection.execute
+
+        def observed_execute(
+            conn: sqlite3.Connection, sql: str, parameters: tuple = ()
+        ) -> sqlite3.Cursor:
+            cursor = original_execute(conn, sql, parameters)
+            if "INSERT" in sql and "ml_candidate_samples" in sql:
+                candidate_inserts.append(sql)
+            observed_sizes.append(
+                sum(
+                    path.stat().st_size
+                    for path in (
+                        store.path,
+                        Path(f"{store.path}-wal"),
+                        Path(f"{store.path}-shm"),
+                    )
+                    if path.exists()
+                )
+            )
+            return cursor
+
+        large = replace(
+            self.sample,
+            sample_id="",
+            code="600001",
+            features={
+                "payload": TimedFeature(
+                    "x" * 120_000, "2026-07-15T09:34:59+08:00"
+                )
+            },
+        )
+        changed = replace(large, rejection_code="different")
+        limited = TinyCacheMlStore(store.path, max_bytes=max_bytes)
+        with patch.object(ml_store._ClosingConnection, "execute", observed_execute):
+            with self.assertRaises(MlDataConflict):
+                limited.record_candidates([large, changed])
+
+        self.assertTrue(observed_sizes)
+        self.assertTrue(candidate_inserts)
+        self.assertLessEqual(max(observed_sizes), max_bytes)
+        self.assertEqual(store.counts()["ml_candidate_samples"], 1)
+
+    def test_record_candidates_rejects_large_payload_before_dml(self) -> None:
+        store = self.make_store()
+        max_bytes = store.path.stat().st_size + 100_000
+        large = replace(
+            self.sample,
+            features={
+                "payload": TimedFeature(
+                    "x" * 300_000, "2026-07-15T09:34:59+08:00"
+                )
+            },
+        )
+        candidate_inserts = []
+        original_execute = ml_store._ClosingConnection.execute
+
+        def recording_execute(
+            conn: sqlite3.Connection, sql: str, parameters: tuple = ()
+        ) -> sqlite3.Cursor:
+            if "INSERT OR IGNORE INTO ml_candidate_samples" in sql:
+                candidate_inserts.append(sql)
+            return original_execute(conn, sql, parameters)
+
+        limited = MlStore(store.path, max_bytes=max_bytes)
+        with patch.object(ml_store._ClosingConnection, "execute", recording_execute):
+            with self.assertRaises(MlCapacityError):
+                limited.record_candidates([large])
+
+        self.assertFalse(candidate_inserts)
+        self.assertEqual(store.counts()["ml_candidate_samples"], 0)
+
+    def test_large_database_runtime_cas_succeeds_with_100kb_headroom(self) -> None:
+        store = self.make_store()
+        large = replace(
+            self.sample,
+            features={
+                "payload": TimedFeature(
+                    "x" * 300_000, "2026-07-15T09:34:59+08:00"
+                )
+            },
+        )
+        store.record_candidates([large])
+        keeper = store.connect()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute(
+                "UPDATE ml_runtime_state SET updated_at=? WHERE singleton=1",
+                ("2026-07-15T16:01:00+08:00",),
+            )
+            keeper.commit()
+            physical_bytes = sum(
+                path.stat().st_size
+                for path in (
+                    store.path,
+                    Path(f"{store.path}-wal"),
+                    Path(f"{store.path}-shm"),
+                )
+                if path.exists()
+            )
+            max_bytes = physical_bytes + 100_000
+            self.assertGreater(Path(f"{store.path}-wal").stat().st_size, 32)
+            self.assertGreater(store.path.stat().st_size, max_bytes // 2)
+
+            limited = MlStore(store.path, max_bytes=max_bytes)
+            self.assertTrue(
+                limited.compare_and_swap_runtime(
+                    expected_model_id=None,
+                    expected_permission_level=0,
+                    new_model_id=None,
+                    new_permission_level=1,
+                    updated_at="2026-07-15T16:02:00+08:00",
+                )
+            )
+        finally:
+            keeper.close()
+
+    def test_capacity_reserves_main_growth_while_checkpoint_keeps_wal(self) -> None:
+        store = self.make_store()
+        keeper = store.connect()
+        candidate_inserts = []
+        original_execute = ml_store._ClosingConnection.execute
+
+        def recording_execute(
+            conn: sqlite3.Connection, sql: str, parameters: tuple = ()
+        ) -> sqlite3.Cursor:
+            if "INSERT OR IGNORE INTO ml_candidate_samples" in sql:
+                candidate_inserts.append(sql)
+            return original_execute(conn, sql, parameters)
+
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute(
+                "UPDATE ml_runtime_state SET updated_at=? WHERE singleton=1",
+                ("2026-07-15T16:01:00+08:00",),
+            )
+            keeper.commit()
+            self.assertGreater(Path(f"{store.path}-wal").stat().st_size, 32)
+
+            limited = MlStore(store.path, max_bytes=600_000)
+            with patch.object(ml_store._ClosingConnection, "execute", recording_execute):
+                with self.assertRaises(MlCapacityError):
+                    limited.record_candidates([self.sample])
+        finally:
+            keeper.close()
+
+        self.assertFalse(candidate_inserts)
+        self.assertEqual(store.counts()["ml_candidate_samples"], 0)
+
+    def test_transaction_is_read_only_even_if_query_only_is_disabled(self) -> None:
+        store = self.make_store()
+        before = store.runtime_state()
+
+        with self.assertRaises(sqlite3.OperationalError):
+            with store.transaction() as conn:
+                conn.execute("PRAGMA query_only=OFF")
+                conn.execute(
+                    """UPDATE ml_runtime_state
+                       SET updated_at=zeroblob(80000) WHERE singleton=1"""
+                )
+        with self.assertRaises(TypeError):
+            store.transaction(reserve_bytes=1)
+
+        self.assertEqual(store.runtime_state(), before)
 
     def test_capacity_limit_rejects_runtime_cas_without_changing_state(self) -> None:
         store = self.make_store()
