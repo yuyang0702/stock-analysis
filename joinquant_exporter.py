@@ -5,6 +5,7 @@ import json
 import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,16 @@ from trade_safety import tradability_reject_reason
 
 UNCATEGORIZED = "__UNCATEGORIZED__"
 SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
+IMPLEMENTATION_HASH_FILES = (
+    "a_share_strategy.py",
+    "candidate_core.py",
+    "joinquant_exporter.py",
+    "ml_dataset.py",
+    "trade_safety.py",
+    "exit_policy.py",
+    "execution_contract.py",
+    "config.py",
+)
 
 _REJECTION_STAGES = {
     "score": {"buy_low_score"},
@@ -62,13 +73,102 @@ def _ml_decision_at(generated_at: str) -> str:
     return value.astimezone(SHANGHAI_TIMEZONE).isoformat()
 
 
+@lru_cache(maxsize=1)
 def _ml_code_hash() -> str:
     digest = hashlib.sha256()
-    for name in ("joinquant_exporter.py", "ml_dataset.py"):
+    for name in IMPLEMENTATION_HASH_FILES:
         path = Path(__file__).with_name(name)
         digest.update(name.encode("utf-8"))
-        digest.update(path.read_bytes())
+        try:
+            content = path.read_bytes()
+        except FileNotFoundError:
+            content = b"<missing>"
+        digest.update(content)
     return digest.hexdigest()
+
+
+def _ml_parameter_snapshot(
+    min_score: float,
+    enforce_execution_contract: bool,
+) -> dict[str, float | int | bool]:
+    return {
+        "min_score": float(min_score),
+        "caution_min_score": 85.0,
+        "near_limit_up_pct": 9.8,
+        "board_lot_size": 100,
+        "special_listing_days": 5,
+        "quote_stale_sec": 120,
+        "chasing_max_pct": 0.02,
+        "chasing_atr_multiplier": 0.5,
+        "min_tradable_amount": 20_000_000,
+        "enforce_execution_contract": bool(enforce_execution_contract),
+        "portfolio_risk_enabled": bool(app_config.JOINQUANT_PORTFOLIO_RISK_ENABLE_DEFAULT),
+        "max_positions": int(app_config.JOINQUANT_MAX_POSITIONS_DEFAULT),
+        "max_new_positions_per_day": int(app_config.MAX_NEW_POSITIONS_PER_DAY),
+        "max_orders_per_day": int(app_config.MAX_ORDERS_PER_DAY),
+        "max_daily_turnover_pct": float(app_config.MAX_DAILY_TURNOVER_PCT),
+        "daily_loss_warn_pct": float(app_config.DAILY_LOSS_WARN_PCT),
+        "account_drawdown_warn_pct": float(app_config.ACCOUNT_DRAWDOWN_WARN_PCT),
+        "max_consecutive_losses": int(app_config.MAX_CONSECUTIVE_LOSSES),
+        "exit_cooldown_enabled": bool(app_config.JOINQUANT_EXIT_COOLDOWN_ENABLE_DEFAULT),
+        "tradability_filter_enabled": bool(app_config.JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT),
+        "max_uncategorized_position_pct": float(app_config.MAX_UNCATEGORIZED_POSITION_PCT),
+        "max_open_risk_caution_pct": float(app_config.MAX_OPEN_RISK_CAUTION_PCT),
+        "max_open_risk_normal_pct": float(app_config.MAX_OPEN_RISK_NORMAL_PCT),
+        "max_industry_position_pct": float(app_config.MAX_INDUSTRY_POSITION_PCT),
+        "max_theme_position_pct": float(app_config.MAX_THEME_POSITION_PCT),
+        "max_total_position_pct": float(app_config.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT),
+    }
+
+
+def _finalize_candidate_decisions(
+    decisions: list[dict[str, Any]],
+    payload: dict[str, Any],
+    *,
+    allow_buy: bool,
+    allow_sell: bool,
+) -> None:
+    diagnostics = payload["diagnostics"]
+    published_ids = {signal["id"] for signal in payload["signals"]}
+    kill_switch = diagnostics["kill_switch"] == "1"
+    buy_disabled = diagnostics["buy_enabled"] == "0" or not allow_buy
+    ledger_error = bool(diagnostics["ledger_error"])
+    controlled_batch = kill_switch or buy_disabled or ledger_error
+    for decision in decisions:
+        signal_id = decision.get("signal_id")
+        if decision["is_sell"]:
+            if not decision["has_holding"]:
+                action = "sell_rejected_no_holding"
+            elif not allow_sell:
+                action = "sell_blocked_disabled"
+            elif signal_id in published_ids:
+                action = "sell_published"
+            elif kill_switch:
+                action = "sell_blocked_kill_switch"
+            else:
+                action = "rule_rejected"
+            eligible = False
+        else:
+            reason = decision["rejection_code"]
+            if reason:
+                action = (
+                    "buy_blocked_disabled"
+                    if reason == "buy_disabled" and not allow_buy
+                    else "rule_rejected"
+                )
+            elif signal_id in published_ids:
+                action = "buy_published"
+            elif kill_switch:
+                action = "buy_blocked_kill_switch"
+            elif ledger_error:
+                action = "buy_blocked_ledger_error"
+            elif buy_disabled:
+                action = "buy_blocked_disabled"
+            else:
+                action = "rule_rejected"
+            eligible = not controlled_batch and action in {"buy_published", "rule_rejected"}
+        decision["final_action"] = action
+        decision["training_eligible"] = eligible
 
 
 def clean_code(value: Any) -> str:
@@ -392,6 +492,7 @@ def export_signals(
     min_score = app_config.JOINQUANT_MIN_SCORE_DEFAULT if min_score is None else min_score
     output_path = output_path or app_config.JOINQUANT_SIGNAL_FILE
     payload = _base_payload(run_id, trade_date, dry_run)
+    parameter_snapshot = _ml_parameter_snapshot(min_score, enforce_execution_contract)
     candidate_generated_at = str(payload["generated_at"])
 
     sample_rows: list[tuple[pd.Series, dict[str, Any]]] = []
@@ -419,20 +520,26 @@ def export_signals(
                 consecutive_losses=consecutive_losses,
                 enforce_execution_contract=enforce_execution_contract,
             )
+            candidate_decision = None
             try:
                 stage = rejection_stage(buy_reject_reason)
             except ValueError as exc:
                 candidate_contract_error = candidate_contract_error or exc
             else:
                 candidate_rows.append(row)
-                candidate_decisions.append({
+                candidate_decision = {
                     "code": clean_code(row.get("code")),
                     "selected": not bool(buy_reject_reason),
                     "rejection_stage": stage,
                     "rejection_code": buy_reject_reason,
-                })
+                    "is_sell": _is_sell(row),
+                    "has_holding": _has_holding(row),
+                }
+                candidate_decisions.append(candidate_decision)
             if not buy_reject_reason:
                 signal = _buy_signal(row, run_id, index)
+                if candidate_decision is not None:
+                    candidate_decision["signal_id"] = signal["id"]
                 signals.append(signal)
                 current_position_count += 1
                 current_position_pct += float(signal.get("position_pct") or 0)
@@ -457,6 +564,8 @@ def export_signals(
             elif _is_sell(row) and _has_holding(row) and allow_sell:
                 sell = _sell_signal(row, run_id, index)
                 if sell:
+                    if candidate_decision is not None:
+                        candidate_decision["signal_id"] = sell["id"]
                     signals.append(sell)
                     sample_rows.append((row, sell))
             elif _is_sell(row) and _has_holding(row):
@@ -516,6 +625,8 @@ def export_signals(
                 strategy_version="a_share_strategy",
                 parameter_version="risk-observe-v1",
             ))
+            # A repeated run_id is a replay of the original decision cohort,
+            # so its ML identity keeps the ledger's immutable first start time.
             candidate_generated_at = str(conn.execute(
                 "SELECT started_at FROM strategy_runs WHERE run_id=?",
                 (ledger_run_id,),
@@ -581,6 +692,13 @@ def export_signals(
         payload["diagnostics"]["ledger_error"] = str(exc)
         payload["diagnostics"]["buy_publication_blocked"] = had_buys
 
+    _finalize_candidate_decisions(
+        candidate_decisions,
+        payload,
+        allow_buy=allow_buy,
+        allow_sell=allow_sell,
+    )
+
     if ml_store is None and app_config.ML_TRAINED_SHADOW_ENABLE:
         ml_store = MlStore(app_config.ML_DB_FILE, app_config.ML_DB_MAX_BYTES)
     if ml_store is not None:
@@ -598,10 +716,13 @@ def export_signals(
                     "dataset_id": str(run_id or ledger_run_id),
                     "decision_at": decision_at,
                     "strategy_version": "a_share_strategy-v1",
-                    "parameter_version": "risk-observe-v1",
+                    "parameter_version": (
+                        f"risk-observe-v1:{canonical_hash(parameter_snapshot)[:12]}"
+                    ),
                     "feature_schema_version": "live-candidate-v1",
                     "cohort_mode": cohort_mode,
                     "cohort_interval_sec": cohort_interval_sec,
+                    "parameter_snapshot": parameter_snapshot,
                     "universe_hash": canonical_hash([decision["code"] for decision in candidate_decisions]),
                     "market_data_version": "live-scan-v1",
                     "code_hash": _ml_code_hash(),

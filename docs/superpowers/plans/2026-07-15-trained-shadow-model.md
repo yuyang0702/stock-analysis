@@ -201,7 +201,10 @@ CREATE TABLE ml_candidate_samples(
   strategy_version TEXT NOT NULL, parameter_version TEXT NOT NULL,
   feature_schema_version TEXT NOT NULL, features_json TEXT NOT NULL,
   selected INTEGER NOT NULL, rejection_stage TEXT NOT NULL,
-  rejection_code TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+  rejection_code TEXT NOT NULL, final_action TEXT NOT NULL,
+  universe_hash TEXT NOT NULL, market_data_version TEXT NOT NULL,
+  code_hash TEXT NOT NULL, generator_hash TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 CREATE INDEX idx_ml_candidates_date_code ON ml_candidate_samples(trade_date, code, decision_at);
@@ -237,6 +240,8 @@ CREATE TABLE ml_runtime_state(
   updated_at TEXT NOT NULL
 );
 ```
+
+This is the pre-deployment schema-v1 contract, not a deployed migration: ML v1 has not yet been deployed or observed, so the first real database must be created with the five auditable `final_action`/provenance columns above. `record_candidates` must write and conflict-check them, and online backup/restore must preserve them.
 
 Add `ML_DB_FILE`, `ML_MODEL_DIR`, `ML_DB_MAX_BYTES`, `ML_TRAINED_SHADOW_ENABLE=False`, `ML_PERMISSION_LEVEL_MAX=0` and `ML_INFERENCE_TIMEOUT_SEC=1.0` to `config.py`. Defaults must not activate a model.
 
@@ -308,7 +313,11 @@ candidate_decisions.append({
 
 `rejection_stage` must be a stable pure mapping: empty reason to `selected`, score threshold to `score`, existing tradability reasons to `tradability`, existing portfolio/capacity/risk reasons to `risk`, and publication/execution reasons to `execution`; unknown non-empty reasons are rejected as data-contract errors rather than silently regrouped. Only intraday five-minute batches are training-eligible; other modes may be retained with their cohort mode for audit but are excluded by the training allowlist.
 
+`selected` records the rule decision before trading-ledger controls. After the ledger transaction and its publication filters, set an independent stable `final_action`: `buy_published`, `sell_published`, `rule_rejected`, `buy_blocked_kill_switch`, `buy_blocked_disabled`, `buy_blocked_ledger_error`, `sell_blocked_kill_switch`, `sell_blocked_disabled`, or `sell_rejected_no_holding` as the real path requires. Sell rows and any batch affected by ledger/control blocking are audit-only (`training_eligible=false`); ordinary rejected buy candidates remain eligible in a valid intraday five-minute batch. Never persist ledger exception text in a sample.
+
 After the trading-ledger transaction and before JSON publication, call `record_candidate_batch` inside its own `try/except (MlDataConflict, sqlite3.Error, OSError, ValueError)`. The context must use the payload `generated_at` as `decision_at`, include strategy/parameter/feature versions, and mark live-derived feature times as that observed runtime timestamp. Keep the old JSONL call for published signals until the migration observation gate passes.
+
+The live `parameter_version` suffix must hash a non-secret snapshot containing `min_score`, `enforce_execution_contract`, all `_buy_reject_reason` configuration limits and its fixed thresholds; persist the same snapshot as a timed batch feature. It must not contain account identifiers, tokens, URLs, webhooks or environment content. The cached implementation hash must list `a_share_strategy.py`, `candidate_core.py`, `joinquant_exporter.py`, `ml_dataset.py`, `trade_safety.py`, `exit_policy.py`, `execution_contract.py` and `config.py`; a currently absent listed file contributes an explicit missing-file sentinel so its later appearance changes the hash. A repeated `run_id` is a replay and reuses the immutable first ledger `started_at` as the ML decision time.
 
 - [ ] **Step 4: Run focused and export-contract tests**
 

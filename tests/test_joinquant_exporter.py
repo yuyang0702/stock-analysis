@@ -82,7 +82,9 @@ class JoinQuantExporterTest(unittest.TestCase):
             )
             with ml_store.transaction() as conn:
                 saved = conn.execute(
-                    "SELECT code, selected, rejection_stage, rejection_code, decision_at, features_json "
+                    "SELECT code, selected, rejection_stage, rejection_code, final_action, "
+                    "universe_hash, market_data_version, code_hash, generator_hash, "
+                    "decision_at, parameter_version, features_json "
                     "FROM ml_candidate_samples ORDER BY code"
                 ).fetchall()
         self.assertEqual(len(saved), 4)
@@ -91,8 +93,152 @@ class JoinQuantExporterTest(unittest.TestCase):
             {row["rejection_code"] for row in saved},
             {"", "buy_low_score", "buy_risk_disallowed", "not_buy_sell_signal"},
         )
+        self.assertEqual(
+            {row["code"]: row["final_action"] for row in saved},
+            {"600000": "buy_published", "600001": "rule_rejected",
+             "600002": "rule_rejected", "600003": "sell_published"},
+        )
+        self.assertTrue(all(row["universe_hash"] and row["market_data_version"] for row in saved))
+        self.assertTrue(all(row["code_hash"] and row["generator_hash"] for row in saved))
         self.assertEqual({row["decision_at"] for row in saved}, {"2026-07-15T10:05:00+08:00"})
-        self.assertTrue(all(json.loads(row["features_json"])["training_eligible"]["value"] for row in saved))
+        eligibility = {
+            row["code"]: json.loads(row["features_json"])["training_eligible"]["value"]
+            for row in saved
+        }
+        self.assertEqual(eligibility, {"600000": True, "600001": True, "600002": True, "600003": False})
+        snapshot = json.loads(saved[0]["features_json"])["parameter_snapshot"]["value"]
+        self.assertEqual(snapshot["min_score"], 75.0)
+        self.assertFalse(snapshot["enforce_execution_contract"])
+        self.assertTrue(saved[0]["parameter_version"].startswith("risk-observe-v1:"))
+
+    def test_implementation_hash_covers_all_live_decision_modules_and_is_cached(self) -> None:
+        expected = (
+            "a_share_strategy.py", "candidate_core.py", "joinquant_exporter.py",
+            "ml_dataset.py", "trade_safety.py", "exit_policy.py",
+            "execution_contract.py", "config.py",
+        )
+        self.assertEqual(joinquant_exporter.IMPLEMENTATION_HASH_FILES, expected)
+        joinquant_exporter._ml_code_hash.cache_clear()
+        self.addCleanup(joinquant_exporter._ml_code_hash.cache_clear)
+        with patch.object(Path, "read_bytes", autospec=True, return_value=b"same") as read:
+            first = joinquant_exporter._ml_code_hash()
+            second = joinquant_exporter._ml_code_hash()
+        self.assertEqual(first, second)
+        self.assertEqual(read.call_count, len(expected))
+
+    def test_parameter_snapshot_covers_buy_thresholds_without_runtime_secrets(self) -> None:
+        snapshot = joinquant_exporter._ml_parameter_snapshot(81.5, True)
+        self.assertEqual(snapshot["min_score"], 81.5)
+        self.assertTrue(snapshot["enforce_execution_contract"])
+        self.assertEqual(set(snapshot), {
+            "min_score", "caution_min_score", "near_limit_up_pct", "board_lot_size",
+            "special_listing_days", "quote_stale_sec", "chasing_max_pct",
+            "chasing_atr_multiplier", "min_tradable_amount", "enforce_execution_contract",
+            "portfolio_risk_enabled", "max_positions", "max_new_positions_per_day",
+            "max_orders_per_day", "max_daily_turnover_pct", "daily_loss_warn_pct",
+            "account_drawdown_warn_pct", "max_consecutive_losses", "exit_cooldown_enabled",
+            "tradability_filter_enabled", "max_uncategorized_position_pct",
+            "max_open_risk_caution_pct", "max_open_risk_normal_pct",
+            "max_industry_position_pct", "max_theme_position_pct",
+            "max_total_position_pct",
+        })
+        self.assertFalse(any(token in json.dumps(snapshot).lower() for token in (
+            "token", "webhook", "url", "private_key",
+        )))
+
+    def test_ledger_controls_are_final_actions_and_make_batch_audit_only(self) -> None:
+        rows = pd.DataFrame([
+            {"code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+             "take_profit": 11, "position_pct": 5, "final_score": 90},
+            {"code": "000001", "price": 12, "signal_action": "sell", "has_holding": True},
+        ])
+        for state_key, expected in (
+            ("buy_enabled", {"600000": "buy_blocked_disabled", "000001": "sell_published"}),
+            ("kill_switch", {"600000": "buy_blocked_kill_switch", "000001": "sell_blocked_kill_switch"}),
+        ):
+            with self.subTest(state_key=state_key), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                trading = TradingStore(base / "trading.db")
+                trading.initialize()
+                with trading.transaction() as conn:
+                    trading.set_system_state(conn, state_key, "1" if state_key == "kill_switch" else "0", "test")
+                ml_store = MlStore(base / "ml.db")
+                joinquant_exporter.export_signals(
+                    rows, run_id=f"control-{state_key}", output_path=base / "signals.json",
+                    store=trading, ml_store=ml_store, cohort_mode="intraday",
+                    cohort_interval_sec=300,
+                )
+                with ml_store.transaction() as conn:
+                    saved = conn.execute(
+                        "SELECT code, final_action, features_json FROM ml_candidate_samples"
+                    ).fetchall()
+                self.assertEqual({row["code"]: row["final_action"] for row in saved}, expected)
+                self.assertTrue(all(
+                    not json.loads(row["features_json"])["training_eligible"]["value"]
+                    for row in saved
+                ))
+
+    def test_ledger_error_blocks_only_buy_final_action_and_does_not_store_error_text(self) -> None:
+        class LockedStore:
+            def initialize(self):
+                pass
+
+            @contextmanager
+            def transaction(self):
+                raise sqlite3.OperationalError("secret-ish database detail")
+                yield
+
+        rows = pd.DataFrame([
+            {"code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+             "take_profit": 11, "position_pct": 5, "final_score": 90},
+            {"code": "000001", "price": 12, "signal_action": "sell", "has_holding": True},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ml_store = MlStore(base / "ml.db")
+            joinquant_exporter.export_signals(
+                rows, run_id="ledger-error", output_path=base / "signals.json",
+                store=LockedStore(), ml_store=ml_store, cohort_mode="intraday",
+                cohort_interval_sec=300,
+            )
+            with ml_store.transaction() as conn:
+                saved = conn.execute(
+                    "SELECT code, final_action, features_json FROM ml_candidate_samples"
+                ).fetchall()
+        self.assertEqual(
+            {row["code"]: row["final_action"] for row in saved},
+            {"600000": "buy_blocked_ledger_error", "000001": "sell_published"},
+        )
+        self.assertNotIn("secret-ish", json.dumps([
+            {"final_action": row["final_action"], "features": json.loads(row["features_json"])}
+            for row in saved
+        ]))
+
+    def test_sell_disabled_and_no_holding_have_explicit_audit_actions(self) -> None:
+        rows = pd.DataFrame([
+            {"code": "000001", "price": 12, "signal_action": "sell", "has_holding": True},
+            {"code": "000002", "price": 12, "signal_action": "sell", "has_holding": False},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ml_store = MlStore(base / "ml.db")
+            joinquant_exporter.export_signals(
+                rows, run_id="sell-audit", output_path=base / "signals.json",
+                ml_store=ml_store, allow_sell=False, cohort_mode="intraday",
+                cohort_interval_sec=300,
+            )
+            with ml_store.transaction() as conn:
+                saved = conn.execute(
+                    "SELECT code, final_action, features_json FROM ml_candidate_samples"
+                ).fetchall()
+        self.assertEqual(
+            {row["code"]: row["final_action"] for row in saved},
+            {"000001": "sell_blocked_disabled", "000002": "sell_rejected_no_holding"},
+        )
+        self.assertTrue(all(
+            not json.loads(row["features_json"])["training_eligible"]["value"]
+            for row in saved
+        ))
 
     def test_repeated_export_run_is_idempotent_despite_later_wall_clock(self) -> None:
         rows = pd.DataFrame([{

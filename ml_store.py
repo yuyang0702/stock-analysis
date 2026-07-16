@@ -52,7 +52,10 @@ CREATE TABLE IF NOT EXISTS ml_candidate_samples(
   strategy_version TEXT NOT NULL, parameter_version TEXT NOT NULL,
   feature_schema_version TEXT NOT NULL, features_json TEXT NOT NULL,
   selected INTEGER NOT NULL, rejection_stage TEXT NOT NULL,
-  rejection_code TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+  rejection_code TEXT NOT NULL, final_action TEXT NOT NULL,
+  universe_hash TEXT NOT NULL, market_data_version TEXT NOT NULL,
+  code_hash TEXT NOT NULL, generator_hash TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ml_candidates_date_code
@@ -249,6 +252,11 @@ class MlStore:
                         int(sample.selected),
                         sample.rejection_stage,
                         sample.rejection_code,
+                        sample.final_action,
+                        sample.universe_hash,
+                        sample.market_data_version,
+                        sample.code_hash,
+                        sample.generator_hash,
                         content_sha256,
                         _now(),
                     ),
@@ -270,8 +278,9 @@ class MlStore:
                        sample_id, source, dataset_id, trade_date, decision_at, code,
                        strategy_version, parameter_version, feature_schema_version,
                        features_json, selected, rejection_stage, rejection_code,
-                       content_sha256, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       final_action, universe_hash, market_data_version, code_hash,
+                       generator_hash, content_sha256, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     values,
                 )
                 if cursor.rowcount == 1:

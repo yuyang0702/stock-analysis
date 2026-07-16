@@ -81,13 +81,11 @@ class CandidateSample:
             self.selected
             and rejection_stage == "selected"
             and not rejection_code
-            and self.final_action == "selected"
         ) or (
             not self.selected
             and bool(rejection_stage)
             and rejection_stage != "selected"
             and bool(rejection_code)
-            and self.final_action == f"{rejection_stage}_rejected"
         )
         if not decision_is_valid:
             raise ValueError("CANDIDATE_DECISION_MISMATCH")

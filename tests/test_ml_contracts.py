@@ -135,14 +135,14 @@ class MlContractsTest(unittest.TestCase):
             selected=True,
             rejection_stage="selected",
             rejection_code="",
-            final_action="selected",
+            final_action="buy_blocked_disabled",
         )
         self.assertTrue(selected.selected)
+        self.assertEqual(selected.final_action, "buy_blocked_disabled")
         for overrides in (
-            {"selected": True},
+            {"selected": True, "rejection_stage": "score", "rejection_code": "buy_low_score"},
             {"rejection_code": ""},
-            {"final_action": "risk_rejected"},
-            {"rejection_stage": "", "final_action": "_rejected"},
+            {"rejection_stage": ""},
         ):
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(ValueError, "CANDIDATE_DECISION_MISMATCH"):

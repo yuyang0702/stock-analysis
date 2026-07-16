@@ -234,12 +234,28 @@ class MlStoreTest(unittest.TestCase):
         self.assertEqual(store.record_candidates([self.sample]), 0)
         self.assertEqual(trading.read_bytes(), b"ledger-sentinel")
         with store.transaction() as conn:
-            features = json.loads(
-                conn.execute(
-                    "SELECT features_json FROM ml_candidate_samples"
-                ).fetchone()[0]
-            )
+            row = conn.execute(
+                """SELECT features_json, final_action, universe_hash,
+                          market_data_version, code_hash, generator_hash
+                   FROM ml_candidate_samples"""
+            ).fetchone()
+            features = json.loads(row["features_json"])
         self.assertEqual(features["context"]["value"]["levels"], [1, 2])
+        self.assertEqual(row["final_action"], self.sample.final_action)
+        self.assertEqual(row["universe_hash"], self.sample.universe_hash)
+        self.assertEqual(row["market_data_version"], self.sample.market_data_version)
+        self.assertEqual(row["code_hash"], self.sample.code_hash)
+        self.assertEqual(row["generator_hash"], self.sample.generator_hash)
+
+    def test_candidate_schema_has_recoverable_provenance_columns(self) -> None:
+        store = self.make_store()
+        with store.transaction() as conn:
+            info = {row[1]: row for row in conn.execute("PRAGMA table_info(ml_candidate_samples)")}
+        for name in (
+            "final_action", "universe_hash", "market_data_version", "code_hash", "generator_hash",
+        ):
+            self.assertIn(name, info)
+            self.assertEqual(info[name][3], 1)
 
     def test_successful_write_is_immediately_visible_to_public_transaction(self) -> None:
         store = self.make_store()
@@ -306,6 +322,19 @@ class MlStoreTest(unittest.TestCase):
             store.record_candidates([self.sample, changed])
 
         self.assertEqual(store.counts()["ml_candidate_samples"], 0)
+
+    def test_changed_final_action_is_an_immutable_candidate_conflict(self) -> None:
+        store = self.make_store()
+        store.record_candidates([self.sample])
+
+        with self.assertRaises(MlDataConflict):
+            store.record_candidates([replace(self.sample, final_action="buy_blocked_disabled")])
+
+        with store.transaction() as conn:
+            self.assertEqual(
+                conn.execute("SELECT final_action FROM ml_candidate_samples").fetchone()[0],
+                self.sample.final_action,
+            )
 
     def test_label_foreign_key_and_upsert(self) -> None:
         store = self.make_store()
@@ -997,6 +1026,15 @@ class MlStoreTest(unittest.TestCase):
         self.assertEqual(restored.integrity_check(), "ok")
         self.assertEqual(restored.schema_version(), 1)
         self.assertEqual(restored.counts(), store.counts())
+        with restored.transaction() as conn:
+            row = conn.execute(
+                """SELECT final_action, universe_hash, market_data_version,
+                          code_hash, generator_hash FROM ml_candidate_samples"""
+            ).fetchone()
+        self.assertEqual(tuple(row), (
+            self.sample.final_action, self.sample.universe_hash,
+            self.sample.market_data_version, self.sample.code_hash, self.sample.generator_hash,
+        ))
 
     def test_all_persisted_timestamps_are_timezone_aware_iso(self) -> None:
         store = self.make_store()

@@ -20,6 +20,7 @@ class MlDatasetTest(unittest.TestCase):
             "feature_schema_version": "features-v1",
             "cohort_mode": "intraday",
             "cohort_interval_sec": 300,
+            "parameter_snapshot": {"min_score": 75.0},
             "universe_hash": "universe-v1",
             "market_data_version": "market-v1",
             "code_hash": "code-v1",
@@ -34,8 +35,8 @@ class MlDatasetTest(unittest.TestCase):
             {"code": "000001", "price": 12.0, "final_score": 70.0},
         ])
         decisions = [
-            {"code": "600000", "selected": True, "rejection_stage": "selected", "rejection_code": ""},
-            {"code": "000001", "selected": False, "rejection_stage": "score", "rejection_code": "buy_low_score"},
+            {"code": "600000", "selected": True, "rejection_stage": "selected", "rejection_code": "", "final_action": "buy_published", "training_eligible": True},
+            {"code": "000001", "selected": False, "rejection_stage": "score", "rejection_code": "buy_low_score", "final_action": "rule_rejected", "training_eligible": True},
         ]
 
         samples = ml_dataset.build_candidate_samples(rows, decisions, self._context())
@@ -46,13 +47,13 @@ class MlDatasetTest(unittest.TestCase):
         self.assertEqual(samples[0].features["price"].available_at, samples[0].decision_at)
         self.assertTrue(samples[0].features["training_eligible"].value)
         self.assertEqual(samples[0].features["cohort_mode"].value, "intraday")
-        self.assertEqual(samples[0].final_action, "selected")
-        self.assertEqual(samples[1].final_action, "score_rejected")
+        self.assertEqual(samples[0].final_action, "buy_published")
+        self.assertEqual(samples[1].final_action, "rule_rejected")
 
     def test_non_intraday_candidate_is_auditable_but_not_training_eligible(self) -> None:
         samples = ml_dataset.build_candidate_samples(
             pd.DataFrame([{"code": "600000", "price": 10.0}]),
-            [{"code": "600000", "selected": False, "rejection_stage": "risk", "rejection_code": "buy_disabled"}],
+            [{"code": "600000", "selected": False, "rejection_stage": "risk", "rejection_code": "buy_disabled", "final_action": "rule_rejected", "training_eligible": True}],
             self._context(cohort_mode="after"),
         )
 
@@ -62,7 +63,7 @@ class MlDatasetTest(unittest.TestCase):
     def test_non_five_minute_intraday_candidate_is_not_training_eligible(self) -> None:
         samples = ml_dataset.build_candidate_samples(
             pd.DataFrame([{"code": "600000", "price": 10.0}]),
-            [{"code": "600000", "selected": True, "rejection_stage": "selected", "rejection_code": ""}],
+            [{"code": "600000", "selected": True, "rejection_stage": "selected", "rejection_code": "", "final_action": "buy_published", "training_eligible": True}],
             self._context(cohort_interval_sec=60),
         )
 
@@ -71,7 +72,7 @@ class MlDatasetTest(unittest.TestCase):
 
     def test_record_candidate_batch_is_idempotent_and_conflicts_on_changed_content(self) -> None:
         rows = pd.DataFrame([{"code": "600000", "price": 10.0, "final_score": 90.0}])
-        decisions = [{"code": "600000", "selected": True, "rejection_stage": "selected", "rejection_code": ""}]
+        decisions = [{"code": "600000", "selected": True, "rejection_stage": "selected", "rejection_code": "", "final_action": "buy_published", "training_eligible": True}]
         with tempfile.TemporaryDirectory() as tmp:
             store = MlStore(Path(tmp) / "ml.db")
             store.initialize()
@@ -86,6 +87,17 @@ class MlDatasetTest(unittest.TestCase):
         rows = pd.DataFrame([{"code": "600000", "price": 10.0}])
         with self.assertRaisesRegex(ValueError, "CANDIDATE_DECISION_SET_MISMATCH"):
             ml_dataset.build_candidate_samples(rows, [], self._context())
+
+    def test_rule_selected_but_control_blocked_candidate_is_audit_only(self) -> None:
+        sample = ml_dataset.build_candidate_samples(
+            pd.DataFrame([{"code": "600000", "price": 10.0}]),
+            [{"code": "600000", "selected": True, "rejection_stage": "selected", "rejection_code": "", "final_action": "buy_blocked_kill_switch", "training_eligible": False}],
+            self._context(),
+        )[0]
+
+        self.assertTrue(sample.selected)
+        self.assertEqual(sample.final_action, "buy_blocked_kill_switch")
+        self.assertFalse(sample.features["training_eligible"].value)
 
     def test_updates_order_labels_from_joinquant_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

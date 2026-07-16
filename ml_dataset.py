@@ -106,8 +106,14 @@ def build_candidate_samples(
         }
         features["cohort_mode"] = TimedFeature(cohort_mode, decision_at)
         features["cohort_interval_sec"] = TimedFeature(cohort_interval_sec, decision_at)
+        features["parameter_snapshot"] = TimedFeature(
+            context["parameter_snapshot"], decision_at
+        )
         features["training_eligible"] = TimedFeature(
-            cohort_mode == "intraday" and cohort_interval_sec == 300, decision_at
+            cohort_mode == "intraday"
+            and cohort_interval_sec == 300
+            and bool(decision.get("training_eligible")),
+            decision_at,
         )
         selected = bool(decision["selected"])
         stage = str(decision["rejection_stage"])
@@ -123,7 +129,7 @@ def build_candidate_samples(
             selected=selected,
             rejection_stage=stage,
             rejection_code=str(decision["rejection_code"]),
-            final_action="selected" if selected else f"{stage}_rejected",
+            final_action=decision["final_action"],
             universe_hash=context["universe_hash"],
             market_data_version=context["market_data_version"],
             code_hash=context["code_hash"],
