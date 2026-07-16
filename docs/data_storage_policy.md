@@ -181,7 +181,7 @@ output/
 | 账户权益摘要 | 长期 | 可压缩 | 长期保留 |
 | 盘中扫描文件 | 30天 | 180天压缩 | 每日最终版长期 |
 | 策略信号样本 | 长期 | 定期备份 | 逐步迁入SQLite |
-| ML五分钟候选、标签和预测 | 最近400个自然日热数据 | 标签完整后按年度只读归档 | 独立 `cache/ml/ml.db`；目标低于1GB/年，超过1GB/年告警，超过2GB/年暂停新增明细并人工评审；当前为planned |
+| ML五分钟候选、标签和预测 | 最近400个自然日热数据 | 标签完整后按年度只读归档 | 独立 `cache/ml/ml.db`；目标低于1GB/年，超过1GB/年告警，超过2GB/年暂停新增明细并人工评审；schema/实时候选为implemented（未部署），标签/预测仍planned |
 | SQLite交易账本 | 长期 | 多级备份 | 不按日志清理 |
 | 历史回测库 | 长期、可重建 | 独立备份或从有版本的数据源重建 | 年度目标低于2GB；达到3GB导入上限即拒绝，不自动删除；不得写入正式交易账本 |
 | 参数版本、评价和人工决定 | 长期 | 随SQLite多级备份 | 低频审计数据；每次最多5个候选，不复制全量行情/订单 |
@@ -349,7 +349,7 @@ SQLite WAL持续异常增长：warning
 
 ### 14.2 2026-07-15 ML-7 训练型影子模型计划增量
 
-本增量当前只有已确认设计，严格为 `planned / not implemented / not deployed / not observed / not validated`。详细设计见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`。
+2026-07-16 状态：实施计划 Task 1–3 已实现并推送，包含独立 schema v1、容量/并发/备份边界和完整实时候选采集；Task 4–12 尚未实现。整体严格为 `partially implemented / not deployed / not observed / not validated`，服务器尚未创建或启用该库。详细设计见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`。
 
 - 高频候选、标签、预测和模型登记使用独立 `cache/ml/ml.db`，不得写入正式 `cache/trading/trading.db`。
 - strict 历史行情和历史五分钟候选继续位于 `cache/backtest/history.db`，训练按日期读取，不复制进 ML 库。

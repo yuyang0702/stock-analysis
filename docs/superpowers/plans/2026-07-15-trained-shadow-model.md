@@ -8,6 +8,14 @@
 
 **Tech Stack:** Python 3.11+, pandas, SQLite, scikit-learn 1.9.0, joblib, hashlib/json/pathlib, existing unittest suite and `run_ubuntu.sh`.
 
+## Implementation Status (2026-07-16)
+
+- Task 1 complete and independently approved: shared candidate scoring and immutable strict-time ML contracts.
+- Task 2 complete and independently approved: bounded independent ML SQLite schema v1, state, backup and integrity primitives.
+- Task 3 complete and independently approved: complete live five-minute cohorts, post-ledger provenance, strict replay refusal and disabled-by-default wiring.
+- Tasks 4–12 remain planned: strict historical imports, labels, training datasets, challenger training, governance, L0 runtime, reports/maintenance, full verification and separately authorized deployment/observation.
+- Current overall state: `partially implemented / not deployed / not observed / not validated`. No trained model exists and ML does not affect trading.
+
 ## Global Constraints
 
 - Follow `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` exactly.

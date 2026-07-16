@@ -14,7 +14,7 @@
 
 > 上一服务器外部检查点（用户提供）：2026-07-14 20:06，服务器 HEAD 为 `131118213f22bbdaecd5cd8ab89a87db9aaf7f85`，分支与 `origin/main` 一致且干净；SQLite schema 6 完整性/可写检查通过，环境文件哈希未变，三个核心服务均 active。该历史检查点已被本次 `52b3653` 服务器与 JoinQuant 部署证据取代，但仍可用于追溯部署前基线。
 
-> 仍为 `planned`：ML-7 训练型模型，以及 ML-8/Batch G 的候选登记、评价准入、人工决定、激活和回滚。ML-7 设计已于 2026-07-15 确认，见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`；当前 `shadow_score.py` 仍只是规则型影子评分，尚无训练模型、`cache/ml/ml.db`、模型包或模型权限状态。自动分析未来仍必须止于 challenger/候选和证据，发布需人工批准和当次单独授权。
+> 2026-07-16 ML-7 基础增量：实施计划 Task 1–3 已实现并推送，包括共享候选评分/严格样本契约、独立有界 `cache/ml/ml.db` schema v1、以及完整五分钟实时候选采集与发布来源审计；Windows 可运行回归 402 项和 Linux 静态测试 2 项通过，最终独立审查无 Critical/Important/Minor。严格状态为 `partially implemented（基础能力已推送） / not deployed / not observed / not validated`。服务器尚无该 ML 库或运行证据，`ML_TRAINED_SHADOW_ENABLE` 默认关闭；尚未训练模型。Task 4–12 以及 ML-8/Batch G 的候选治理仍为 `planned`。
 
 > 本文件用于新电脑、新Codex对话和跨环境交接，是一个可提交到Git的时间点快照。`docs/project_roadmap.md`仍是唯一主文档；如两者冲突，以主文档为准。服务器、JoinQuant和运行数据状态必须重新验证，不能仅凭本文件认定为当前事实。
 
@@ -48,6 +48,7 @@ Git不能恢复：
 - SQLite Batch 1策略运行、信号和观察型风控账本。
 - JSON/SQLite信号一致性检查和readiness报告。
 - 信号样本、影子评分、策略对照和信号级回测。
+- ML-7 共享候选评分/严格样本契约、独立 ML SQLite schema v1 和完整五分钟实时候选采集代码；默认关闭且尚未部署。
 - 分层退出、组合风险和可交易性保护，以及自动备份恢复基础。
 - Codex只读观察与阶段评估方案。
 - 数据存储、文件增长与保留规范。
@@ -110,7 +111,7 @@ git ls-remote origin refs/heads/main
 | 成交回报幂等与 D+N 全量复盘 | deployed | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘已随 `52b3653` 部署；尚未观察或验证。 |
 | 完整历史回测 | deployed（框架） | 与信号级回测并存且代码已在服务器；真实 6 个月/1 年 strict 数据尚未导入、运行或人工验证。 |
 | 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |
-| ML-7 训练型影子模型 | planned（设计已确认） | 计划按每5分钟完整候选批次、1年 strict 历史主训练和 JoinQuant 现实校准实施；当前没有训练模型、独立 ML SQLite 或模型权限，不能描述为 implemented/deployed。 |
+| ML-7 训练型影子模型 | partially implemented（Task 1–3 已推送） | 共享评分/契约、独立 ML SQLite schema 和实时完整候选采集已实现；服务器未部署且默认关闭。strict 历史导入、标签、训练、治理与 L0 推理仍待实现；没有模型，不得写成 deployed/observed/validated。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。
@@ -141,7 +142,7 @@ Batch 1当前主要保存：
 - 手续费和滑点账本。
 - 信号到订单、成交和收益的完整关联。
 - 参数候选、评价、人工决定、激活和回滚记录；这些表属于 2026-07-14 Batch G 计划，不属于服务器 schema 1 或本地 schema 6 的当前实际范围。
-- 五分钟完整 ML 候选、训练标签、模型预测、模型登记和人工模型事件；独立 `cache/ml/ml.db` 属于 ML-7 计划，当前尚不存在。
+- 服务器当前仍不应假设存在五分钟 ML 候选、训练标签、模型预测、模型登记或人工模型事件。代码已具备独立 `cache/ml/ml.db` schema v1 和实时候选写入能力，但尚未部署、启用或产生服务器实际库；标签、预测和训练能力仍未实现。
 
 ## 6. 关键文档读取顺序
 
