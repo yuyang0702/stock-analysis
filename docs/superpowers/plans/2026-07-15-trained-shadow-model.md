@@ -192,7 +192,7 @@ Expected: `ml_store` import fails and ML DB configuration fields are absent.
 
 - [ ] **Step 3: Implement schema and bounded APIs**
 
-Use WAL, foreign keys, a 5-second busy timeout and explicit transactions. The core schema must include:
+Use WAL, foreign keys, a 5-second busy timeout and explicit transactions. Read the live mutable WAL database through normal read-only WAL-aware connections; never use `immutable=1`. Apply `ML_DB_MAX_BYTES` to logical main-database capacity plus reserved WAL data growth, while monitoring but excluding SQLite's fixed SHM coordination file from the data quota. Full schema reservation is required only for first creation or migration; repeated initialization of an already valid schema is an idempotent validation. The core schema must include:
 
 ```sql
 CREATE TABLE ml_candidate_samples(
