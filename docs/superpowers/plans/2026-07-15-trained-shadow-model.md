@@ -207,8 +207,9 @@ CREATE TABLE ml_candidate_samples(
 CREATE INDEX idx_ml_candidates_date_code ON ml_candidate_samples(trade_date, code, decision_at);
 CREATE TABLE ml_labels(
   sample_id TEXT PRIMARY KEY REFERENCES ml_candidate_samples(sample_id),
-  label_version TEXT NOT NULL, label_source TEXT NOT NULL, fill_label INTEGER,
-  fill_delay_sec REAL, ret_3d_net REAL, ret_5d_net REAL, ret_10d_net REAL,
+  label_version TEXT NOT NULL, label_source TEXT NOT NULL, cost_version TEXT NOT NULL,
+  fill_label INTEGER, fill_delay_sec REAL, fill_price REAL,
+  ret_3d_net REAL, ret_5d_net REAL, ret_10d_net REAL,
   mfe_10d REAL, mae_10d REAL, hit_stop INTEGER, hit_take INTEGER,
   actual_net_pnl REAL, market_data_sha256 TEXT NOT NULL, matured_at TEXT NOT NULL
 );
