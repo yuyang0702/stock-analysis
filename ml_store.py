@@ -104,22 +104,11 @@ class MlStore:
         self.path = Path(path)
         self.max_bytes = int(max_bytes)
 
-    def connect(self) -> sqlite3.Connection:
-        """Open a public read-only connection that includes committed WAL data."""
+    def _connect_readonly(self) -> sqlite3.Connection:
         if not self.path.exists():
             raise RuntimeError("ML store is not initialized")
-        if self._wal_has_content():
-            return self._connect_readonly(immutable=False)
-        conn = self._connect_readonly(immutable=True)
-        if self._wal_has_content():
-            conn.close()
-            return self._connect_readonly(immutable=False)
-        return conn
-
-    def _connect_readonly(self, *, immutable: bool) -> sqlite3.Connection:
-        query = "mode=ro&immutable=1" if immutable else "mode=ro"
         conn = sqlite3.connect(
-            f"{self.path.resolve().as_uri()}?{query}",
+            f"{self.path.resolve().as_uri()}?mode=ro",
             uri=True,
             timeout=5.0,
             factory=_ClosingConnection,
@@ -129,6 +118,36 @@ class MlStore:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA cache_spill=OFF")
         return conn
+
+    def _is_current_schema(self) -> bool:
+        try:
+            with self._connect_readonly() as conn:
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                if {"schema_migrations", *ML_TABLES} - tables:
+                    return False
+                version = conn.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()
+                runtime = conn.execute(
+                    """SELECT permission_level, updated_at FROM ml_runtime_state
+                       WHERE singleton=1"""
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        try:
+            if version is None or int(version[0] or 0) != SCHEMA_VERSION:
+                return False
+            if runtime is None or not 0 <= int(runtime[0]) <= 3:
+                return False
+            _aware_iso(str(runtime[1]), "updated_at")
+        except (TypeError, ValueError):
+            return False
+        return True
 
     def _connect_writable(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +162,8 @@ class MlStore:
         return conn
 
     def initialize(self) -> None:
+        if self._file_size(self.path) > 0 and self._is_current_schema():
+            return
         statements = tuple(_schema_statements(SCHEMA))
         now = _now()
         reserved_bytes = (
@@ -170,7 +191,7 @@ class MlStore:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Open a SQLite-enforced read-only snapshot transaction."""
-        with self.connect() as conn:
+        with self._connect_readonly() as conn:
             conn.execute("BEGIN")
             try:
                 yield conn
@@ -180,12 +201,12 @@ class MlStore:
                 raise
 
     def schema_version(self) -> int:
-        with self.connect() as conn:
+        with self._connect_readonly() as conn:
             row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
         return int(row[0] or 0) if row is not None else 0
 
     def counts(self) -> dict[str, int]:
-        with self.connect() as conn:
+        with self._connect_readonly() as conn:
             return {
                 table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in ML_TABLES
@@ -480,7 +501,7 @@ class MlStore:
         return True
 
     def runtime_state(self) -> dict[str, object]:
-        with self.connect() as conn:
+        with self._connect_readonly() as conn:
             row = conn.execute(
                 """SELECT active_model_id, permission_level, updated_at
                    FROM ml_runtime_state WHERE singleton=1"""
@@ -539,11 +560,13 @@ class MlStore:
     def backup_to(self, destination: Path) -> None:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as source, closing(sqlite3.connect(destination)) as target:
+        with self._connect_readonly() as source, closing(
+            sqlite3.connect(destination)
+        ) as target:
             source.backup(target)
 
     def integrity_check(self) -> str:
-        with self.connect() as conn:
+        with self._connect_readonly() as conn:
             row = conn.execute("PRAGMA integrity_check").fetchone()
         return str(row[0]) if row is not None else "missing"
 
@@ -572,20 +595,19 @@ class MlStore:
         main_bytes = self._file_size(self.path)
         wal_bytes = self._file_size(Path(f"{self.path}-wal"))
         shm_bytes = self._file_size(Path(f"{self.path}-shm"))
-        physical_bytes = main_bytes + wal_bytes + shm_bytes
+        data_bytes = main_bytes + wal_bytes
         if main_bytes == 0:
-            required_bytes = physical_bytes + _new_store_minimum_bytes(reserved_bytes)
+            required_bytes = data_bytes + _new_store_minimum_bytes(reserved_bytes)
         else:
             required_bytes = (
-                physical_bytes
+                data_bytes
                 + max(0, 32 - wal_bytes)
-                + max(0, 32_768 - shm_bytes)
                 + reserved_bytes
             )
-        if physical_bytes > self.max_bytes or required_bytes > self.max_bytes:
+        if data_bytes > self.max_bytes or required_bytes > self.max_bytes:
             raise MlCapacityError(
                 "ML database capacity reached before SQLite open: "
-                f"physical={physical_bytes}, required={required_bytes}, "
+                f"data={data_bytes}, shm={shm_bytes}, required={required_bytes}, "
                 f"limit={self.max_bytes}"
             )
 
@@ -647,11 +669,11 @@ class MlStore:
         main_bytes = self._file_size(self.path)
         wal_bytes = self._file_size(Path(f"{self.path}-wal"))
         shm_bytes = self._file_size(Path(f"{self.path}-shm"))
-        physical_bytes = main_bytes + wal_bytes + shm_bytes
-        if logical_bytes > self.max_bytes or physical_bytes > self.max_bytes:
+        data_bytes = main_bytes + wal_bytes
+        if logical_bytes > self.max_bytes or data_bytes > self.max_bytes:
             raise MlCapacityError(
                 "ML database capacity reached: "
-                f"logical={logical_bytes}, physical={physical_bytes}, "
+                f"logical={logical_bytes}, data={data_bytes}, shm={shm_bytes}, "
                 f"limit={self.max_bytes}"
             )
         if reserve_bytes <= 0:
@@ -661,33 +683,27 @@ class MlStore:
         growth_pages = (growth_bytes + page_size - 1) // page_size
         frame_bytes = page_size + 24
         commit_wal_bytes = (32 if wal_bytes == 0 else 0) + reserved_pages * frame_bytes
-        existing_frames = max(0, wal_bytes - 32) // frame_bytes
-        total_frames = existing_frames + reserved_pages
-        commit_shm_bytes = ((total_frames + 3_999) // 4_000) * 32_768
-        commit_physical_bytes = (
+        commit_data_bytes = (
             main_bytes
             + wal_bytes
             + commit_wal_bytes
-            + max(shm_bytes, commit_shm_bytes)
         )
         future_main_bytes = max(
             main_bytes, logical_bytes + growth_pages * page_size
         )
-        checkpoint_physical_bytes = (
+        checkpoint_data_bytes = (
             future_main_bytes
             + wal_bytes
             + commit_wal_bytes
-            + max(shm_bytes, commit_shm_bytes)
         )
-        conservative_physical_bytes = max(
-            commit_physical_bytes, checkpoint_physical_bytes
-        )
-        if conservative_physical_bytes > self.max_bytes:
+        conservative_data_bytes = max(commit_data_bytes, checkpoint_data_bytes)
+        if conservative_data_bytes > self.max_bytes:
             raise MlCapacityError(
                 "ML transaction would exceed capacity: "
                 f"logical={logical_bytes}, "
                 f"reserved={reserve_bytes}, "
-                f"conservative_physical={conservative_physical_bytes}, "
+                f"shm={shm_bytes}, "
+                f"conservative_data={conservative_data_bytes}, "
                 f"limit={self.max_bytes}"
             )
 
@@ -750,7 +766,7 @@ def _new_store_minimum_bytes(reserved_bytes: int) -> int:
     reserved_pages = (reserved_bytes + page_size - 1) // page_size
     wal_bytes = 32 + reserved_pages * (page_size + 24)
     main_bytes = (reserved_pages + 1) * page_size
-    return main_bytes + wal_bytes + 32_768
+    return main_bytes + wal_bytes
 
 
 def _write_reserve_bytes(

@@ -123,6 +123,53 @@ class MlStoreTest(unittest.TestCase):
             },
         )
 
+    def test_public_transaction_always_uses_normal_readonly_uri(self) -> None:
+        store = self.make_store()
+
+        with patch.object(ml_store.sqlite3, "connect", wraps=sqlite3.connect) as connect:
+            with store.transaction() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT permission_level FROM ml_runtime_state").fetchone()[0],
+                    0,
+                )
+
+        uri = str(connect.call_args_list[0].args[0])
+        self.assertIn("mode=ro", uri)
+        self.assertNotIn("immutable", uri)
+
+    def test_shm_is_excluded_from_quota_and_read_connection_stays_read_only(self) -> None:
+        store = self.make_store()
+        limited = MlStore(store.path, max_bytes=store.path.stat().st_size + 80_000)
+        shm = Path(f"{store.path}-shm")
+
+        with limited.transaction() as conn:
+            conn.execute("PRAGMA query_only=OFF")
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute(
+                    "UPDATE ml_runtime_state SET permission_level=1 WHERE singleton=1"
+                )
+            self.assertEqual(shm.stat().st_size, 32_768)
+
+        self.assertTrue(
+            limited.compare_and_swap_runtime(
+                expected_model_id=None,
+                expected_permission_level=0,
+                new_model_id=None,
+                new_permission_level=1,
+                updated_at="2026-07-15T16:02:00+08:00",
+            )
+        )
+        self.assertEqual(limited.runtime_state()["permission_level"], 1)
+
+    def test_repeated_initialize_validates_current_schema_without_full_reserve(self) -> None:
+        store = self.make_store()
+        limited = MlStore(store.path, max_bytes=store.path.stat().st_size)
+
+        limited.initialize()
+
+        self.assertEqual(limited.schema_version(), 1)
+        self.assertEqual(limited.counts()["ml_runtime_state"], 1)
+
     def test_candidate_write_is_idempotent_and_isolated_from_trading_db(self) -> None:
         trading = self.root / "cache" / "trading" / "trading.db"
         trading.parent.mkdir(parents=True)
@@ -140,52 +187,62 @@ class MlStoreTest(unittest.TestCase):
             )
         self.assertEqual(features["context"]["value"]["levels"], [1, 2])
 
-    def test_successful_write_is_immediately_visible_to_public_connect(self) -> None:
+    def test_successful_write_is_immediately_visible_to_public_transaction(self) -> None:
         store = self.make_store()
 
         self.assertEqual(store.record_candidates([self.sample]), 1)
 
-        with store.connect() as conn:
+        with store.transaction() as conn:
             row = conn.execute(
                 "SELECT sample_id FROM ml_candidate_samples"
             ).fetchone()
         self.assertEqual(row[0], self.sample.sample_id)
 
-    def test_public_connect_is_immutable_and_never_creates_sidecars(self) -> None:
+    def test_normal_readonly_connection_can_create_shm_at_data_capacity(self) -> None:
         store = self.make_store()
-        before = store.runtime_state()
         max_bytes = store.path.stat().st_size
         limited = MlStore(store.path, max_bytes=max_bytes)
-        sidecars = (Path(f"{store.path}-wal"), Path(f"{store.path}-shm"))
-        self.assertFalse(any(path.exists() for path in sidecars))
+        wal = Path(f"{store.path}-wal")
+        shm = Path(f"{store.path}-shm")
 
-        with limited.connect() as conn:
+        with limited.transaction() as conn:
             conn.execute("PRAGMA query_only=OFF")
             with self.assertRaises(sqlite3.OperationalError):
                 conn.execute(
                     "UPDATE ml_runtime_state SET updated_at=? WHERE singleton=1",
                     ("2026-07-15T16:02:00+08:00",),
                 )
-            self.assertFalse(any(path.exists() for path in sidecars))
+            self.assertEqual(shm.stat().st_size, 32_768)
 
-        self.assertFalse(any(path.exists() for path in sidecars))
-        self.assertEqual(store.runtime_state(), before)
+        self.assertEqual(wal.stat().st_size if wal.exists() else 0, 0)
+        self.assertEqual(store.runtime_state()["permission_level"], 0)
 
-    def test_public_transaction_never_creates_sidecars_at_capacity(self) -> None:
+    def test_open_read_transaction_keeps_its_sqlite_snapshot(self) -> None:
         store = self.make_store()
-        max_bytes = store.path.stat().st_size
-        limited = MlStore(store.path, max_bytes=max_bytes)
-        sidecars = (Path(f"{store.path}-wal"), Path(f"{store.path}-shm"))
-        self.assertFalse(any(path.exists() for path in sidecars))
-
-        with limited.transaction() as conn:
+        with store.transaction() as reader:
             self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM ml_runtime_state").fetchone()[0],
-                1,
+                reader.execute(
+                    "SELECT permission_level FROM ml_runtime_state"
+                ).fetchone()[0],
+                0,
             )
-            self.assertFalse(any(path.exists() for path in sidecars))
+            self.assertTrue(
+                store.compare_and_swap_runtime(
+                    expected_model_id=None,
+                    expected_permission_level=0,
+                    new_model_id=None,
+                    new_permission_level=1,
+                    updated_at="2026-07-15T16:02:00+08:00",
+                )
+            )
+            self.assertEqual(
+                reader.execute(
+                    "SELECT permission_level FROM ml_runtime_state"
+                ).fetchone()[0],
+                0,
+            )
 
-        self.assertFalse(any(path.exists() for path in sidecars))
+        self.assertEqual(store.runtime_state()["permission_level"], 1)
 
     def test_conflicting_candidate_rolls_back_batch(self) -> None:
         store = self.make_store()
@@ -467,7 +524,7 @@ class MlStoreTest(unittest.TestCase):
             )
             self.assertGreater(Path(f"{store.path}-wal").stat().st_size, 0)
             self.assertEqual(store.runtime_state()["permission_level"], 1)
-            with store.connect() as conn:
+            with store.transaction() as conn:
                 conn.execute("PRAGMA query_only=OFF")
                 with self.assertRaises(sqlite3.OperationalError):
                     conn.execute(
@@ -564,7 +621,6 @@ class MlStoreTest(unittest.TestCase):
                 for path in (
                     store.path,
                     Path(f"{store.path}-wal"),
-                    Path(f"{store.path}-shm"),
                 )
                 if path.exists()
             ),
@@ -575,7 +631,7 @@ class MlStoreTest(unittest.TestCase):
             limited.record_candidates([large])
 
         self.assertEqual(store.counts()["ml_candidate_samples"], 1)
-        with store.connect() as conn:
+        with store.transaction() as conn:
             page_size = conn.execute("PRAGMA page_size").fetchone()[0]
             page_count = conn.execute("PRAGMA page_count").fetchone()[0]
         self.assertLessEqual(page_size * page_count, max_bytes)
@@ -585,7 +641,6 @@ class MlStoreTest(unittest.TestCase):
                 for path in (
                     store.path,
                     Path(f"{store.path}-wal"),
-                    Path(f"{store.path}-shm"),
                 )
                 if path.exists()
             ),
@@ -621,7 +676,6 @@ class MlStoreTest(unittest.TestCase):
                     for path in (
                         store.path,
                         Path(f"{store.path}-wal"),
-                        Path(f"{store.path}-shm"),
                     )
                     if path.exists()
                 )
@@ -697,16 +751,15 @@ class MlStoreTest(unittest.TestCase):
                 ("2026-07-15T16:01:00+08:00",),
             )
             keeper.commit()
-            physical_bytes = sum(
+            data_bytes = sum(
                 path.stat().st_size
                 for path in (
                     store.path,
                     Path(f"{store.path}-wal"),
-                    Path(f"{store.path}-shm"),
                 )
                 if path.exists()
             )
-            max_bytes = physical_bytes + 100_000
+            max_bytes = data_bytes + 100_000
             self.assertGreater(Path(f"{store.path}-wal").stat().st_size, 32)
             self.assertGreater(store.path.stat().st_size, max_bytes // 2)
 
