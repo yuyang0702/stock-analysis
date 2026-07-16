@@ -132,8 +132,7 @@ def _finalize_candidate_decisions(
     published_ids = {signal["id"] for signal in payload["signals"]}
     kill_switch = diagnostics["kill_switch"] == "1"
     buy_disabled = diagnostics["buy_enabled"] == "0" or not allow_buy
-    ledger_error = bool(diagnostics["ledger_error"])
-    controlled_batch = kill_switch or buy_disabled or ledger_error
+    controlled_batch = kill_switch or buy_disabled
     for decision in decisions:
         signal_id = decision.get("signal_id")
         if decision["is_sell"]:
@@ -160,8 +159,6 @@ def _finalize_candidate_decisions(
                 action = "buy_published"
             elif kill_switch:
                 action = "buy_blocked_kill_switch"
-            elif ledger_error:
-                action = "buy_blocked_ledger_error"
             elif buy_disabled:
                 action = "buy_blocked_disabled"
             else:

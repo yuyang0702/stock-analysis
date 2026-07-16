@@ -15,7 +15,7 @@ CANDIDATE_FINAL_ACTIONS = frozenset({
     "execution_rejected", "buy_published", "rule_rejected", "sell_published",
     "sell_rejected_no_holding", "sell_blocked_disabled",
     "sell_blocked_kill_switch", "buy_blocked_disabled",
-    "buy_blocked_kill_switch", "buy_blocked_ledger_error",
+    "buy_blocked_kill_switch",
 })
 
 
