@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 from types import MappingProxyType
 
@@ -23,6 +23,9 @@ class TimedFeature:
             _aware_datetime(self.available_at, "available_at").isoformat(),
         )
 
+    def __hash__(self) -> int:
+        return _stable_hash(self)
+
 
 @dataclass(frozen=True)
 class CandidateSample:
@@ -39,11 +42,11 @@ class CandidateSample:
     selected: bool
     rejection_stage: str
     rejection_code: str
-    final_action: str = ""
-    universe_hash: str = ""
-    market_data_version: str = ""
-    code_hash: str = ""
-    generator_hash: str = ""
+    final_action: str
+    universe_hash: str
+    market_data_version: str
+    code_hash: str
+    generator_hash: str
 
     def __post_init__(self) -> None:
         supplied_id = str(self.sample_id)
@@ -55,14 +58,39 @@ class CandidateSample:
             "feature_schema_version",
             "rejection_stage",
             "rejection_code",
+        ):
+            object.__setattr__(self, field_name, str(getattr(self, field_name)))
+        for field_name in (
             "final_action",
             "universe_hash",
             "market_data_version",
             "code_hash",
             "generator_hash",
         ):
-            object.__setattr__(self, field_name, str(getattr(self, field_name)))
+            object.__setattr__(
+                self,
+                field_name,
+                _required_text(getattr(self, field_name), field_name),
+            )
         object.__setattr__(self, "selected", bool(self.selected))
+        rejection_stage = self.rejection_stage.strip()
+        rejection_code = self.rejection_code.strip()
+        object.__setattr__(self, "rejection_stage", rejection_stage)
+        object.__setattr__(self, "rejection_code", rejection_code)
+        decision_is_valid = (
+            self.selected
+            and rejection_stage == "selected"
+            and not rejection_code
+            and self.final_action == "selected"
+        ) or (
+            not self.selected
+            and bool(rejection_stage)
+            and rejection_stage != "selected"
+            and bool(rejection_code)
+            and self.final_action == f"{rejection_stage}_rejected"
+        )
+        if not decision_is_valid:
+            raise ValueError("CANDIDATE_DECISION_MISMATCH")
 
         decision_time = _aware_datetime(self.decision_at, "decision_at")
         decision_at = decision_time.isoformat()
@@ -90,6 +118,9 @@ class CandidateSample:
             raise ValueError("SAMPLE_ID_MISMATCH")
         object.__setattr__(self, "sample_id", expected_id)
 
+    def __hash__(self) -> int:
+        return _stable_hash(self)
+
     @classmethod
     def from_values(
         cls,
@@ -105,11 +136,11 @@ class CandidateSample:
         selected: bool,
         rejection_stage: str,
         rejection_code: str,
-        final_action: str = "",
-        universe_hash: str = "",
-        market_data_version: str = "",
-        code_hash: str = "",
-        generator_hash: str = "",
+        final_action: str,
+        universe_hash: str,
+        market_data_version: str,
+        code_hash: str,
+        generator_hash: str,
     ) -> "CandidateSample":
         decision_time = _aware_datetime(decision_at, "decision_at")
         return cls(
@@ -126,11 +157,11 @@ class CandidateSample:
             selected=bool(selected),
             rejection_stage=str(rejection_stage),
             rejection_code=str(rejection_code),
-            final_action=str(final_action),
-            universe_hash=str(universe_hash),
-            market_data_version=str(market_data_version),
-            code_hash=str(code_hash),
-            generator_hash=str(generator_hash),
+            final_action=final_action,
+            universe_hash=universe_hash,
+            market_data_version=market_data_version,
+            code_hash=code_hash,
+            generator_hash=generator_hash,
         )
 
 
@@ -152,13 +183,25 @@ class LabelRecord:
     hit_take: int | None = None
     actual_net_pnl: float | None = None
     market_data_sha256: str = ""
-    matured_at: str = ""
+    matured_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.matured_at is not None:
+            object.__setattr__(
+                self,
+                "matured_at",
+                _aware_datetime(self.matured_at, "matured_at").isoformat(),
+            )
+
+    def __hash__(self) -> int:
+        return _stable_hash(self)
 
 
 @dataclass(frozen=True)
 class PredictionRecord:
     sample_id: str
     model_id: str
+    created_at: str
     expected_ret_3d: float | None = None
     expected_ret_5d: float | None = None
     expected_ret_10d: float | None = None
@@ -168,7 +211,16 @@ class PredictionRecord:
     ml_filter: bool | None = None
     position_multiplier: float | None = None
     confidence: float | None = None
-    created_at: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "created_at",
+            _aware_datetime(self.created_at, "created_at").isoformat(),
+        )
+
+    def __hash__(self) -> int:
+        return _stable_hash(self)
 
 
 @dataclass(frozen=True)
@@ -190,19 +242,27 @@ class ModelManifest:
     cost_version: str
     dependency_versions: Mapping[str, str]
     metrics: Mapping[str, object]
+    created_at: str
     split_sha256: str = ""
     search_inputs_hash: str = ""
     holdout_metrics: Mapping[str, object] = MappingProxyType({})
     permission_level: int = 0
-    created_at: str = ""
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "created_at",
+            _aware_datetime(self.created_at, "created_at").isoformat(),
+        )
         object.__setattr__(self, "feature_names", tuple(self.feature_names))
         object.__setattr__(
             self, "dependency_versions", _freeze(self.dependency_versions)
         )
         object.__setattr__(self, "metrics", _freeze(self.metrics))
         object.__setattr__(self, "holdout_metrics", _freeze(self.holdout_metrics))
+
+    def __hash__(self) -> int:
+        return _stable_hash(self)
 
 
 def canonical_hash(value: object) -> str:
@@ -214,6 +274,10 @@ def canonical_hash(value: object) -> str:
         allow_nan=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stable_hash(value: object) -> int:
+    return int(canonical_hash(value)[:15], 16)
 
 
 def candidate_sample_id(sample: CandidateSample) -> str:
@@ -248,6 +312,13 @@ def _normalize_code(value: str) -> str:
     return code
 
 
+def _required_text(value: object, field: str) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        raise ValueError(f"REQUIRED_FIELD: {field}")
+    return text
+
+
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
@@ -259,6 +330,11 @@ def _freeze(value: object) -> object:
 
 
 def _canonical_value(value: object) -> object:
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _canonical_value(getattr(value, field.name))
+            for field in fields(value)
+        }
     if isinstance(value, Mapping):
         return {key: _canonical_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

@@ -3,9 +3,6 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
-import pandas as pd
-
-from candidate_core import score_candidate_frame
 from historical_data import HistoricalStore, STRICT_FEATURES
 from historical_strategy import generate_daily_candidates
 
@@ -41,13 +38,19 @@ class HistoricalStrategyTest(unittest.TestCase):
                 "INSERT INTO daily_universe VALUES (?, ?, ?)", ("d1", trade_date, code)
             )
 
-    def _insert_features(self, store: HistoricalStore, day: str, values: dict[str, object]) -> None:
+    def _insert_features(
+        self,
+        store: HistoricalStore,
+        day: str,
+        values: dict[str, object],
+        code: str = "600000",
+    ) -> None:
         with store.connect() as connection:
             for name in STRICT_FEATURES:
                 value = values.get(name, "unknown" if name in {"industry", "theme"} else 0)
                 connection.execute(
                     "INSERT INTO point_in_time_features VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    ("d1", day, "600000", name, str(value), f"{day}T14:00:00", f"{day}T14:00:00"),
+                    ("d1", day, code, name, str(value), f"{day}T14:00:00", f"{day}T14:00:00"),
                 )
 
     def test_strict_reproduces_score_aggregation_and_ignores_future_feature(self) -> None:
@@ -84,16 +87,57 @@ class HistoricalStrategyTest(unittest.TestCase):
             candidates = generate_daily_candidates(
                 store, "d1", day, mode="strict", parameter_version="v1", min_score=0
             )
-            expected = score_candidate_frame(
-                pd.DataFrame(
-                    [{"score": 70, "news_score": 2, "pct_chg": 3, "turnover": 4}]
-                )
-            ).iloc[0]["final_score"]
-
             self.assertEqual(len(candidates), 1)
-            self.assertAlmostEqual(candidates[0].score, expected)
+            self.assertAlmostEqual(candidates[0].score, 79.4)
             self.assertEqual(candidates[0].entry_price, 10)
             self.assertFalse(candidates[0].evidence["proxy_only"])
+
+    def test_strict_uses_live_average_ties_and_includes_threshold_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            day = "2025-01-02"
+            rows = (
+                ("600000", 70, 3, 4),
+                ("600001", 70, 3, 2),
+                ("600002", 68, 1, 2),
+            )
+            for code, score, pct_chg, turnover in rows:
+                self._insert_market_day(store, day, code, 10.0)
+                self._insert_features(
+                    store,
+                    day,
+                    {
+                        "score": score,
+                        "news_score": 0,
+                        "pct_chg": pct_chg,
+                        "turnover": turnover,
+                        "position_pct": 10,
+                        "entry_price": 10,
+                        "stop_loss": 9.3,
+                        "take_profit": 11.4,
+                        "atr14": 0.3,
+                        "support_level": 9.5,
+                        "strategy_mode": "short",
+                        "market_regime": "NORMAL",
+                        "industry": "bank",
+                        "theme": "value",
+                    },
+                    code,
+                )
+
+            candidates = generate_daily_candidates(
+                store,
+                "d1",
+                day,
+                mode="strict",
+                parameter_version="v1",
+                min_score=75.1667,
+            )
+
+            self.assertEqual(
+                [(candidate.code, candidate.score) for candidate in candidates],
+                [("600000", 76.1667), ("600001", 75.1667)],
+            )
 
     def test_price_core_is_deterministic_and_excludes_ineligible_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

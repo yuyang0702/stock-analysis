@@ -7,6 +7,22 @@ from a_share_strategy import Config, build_pool
 
 
 class CandidateCoreTest(unittest.TestCase):
+    def test_live_score_keeps_average_rank_semantics_for_ties(self) -> None:
+        rows = pd.DataFrame(
+            [
+                {"score": 70, "news_score": 0, "pct_chg": 3, "turnover": 4},
+                {"score": 70, "news_score": 0, "pct_chg": 3, "turnover": 2},
+                {"score": 68, "news_score": 0, "pct_chg": 1, "turnover": 2},
+            ]
+        )
+
+        scored = score_candidate_frame(rows)
+
+        self.assertEqual(
+            [round(value, 4) for value in scored["final_score"]],
+            [76.1667, 75.1667, 70.6667],
+        )
+
     def test_shared_pool_keeps_top_30_and_reproduces_live_score(self) -> None:
         rows = pd.DataFrame(
             [
