@@ -32,8 +32,8 @@
 | `docs/superpowers/plans/2026-07-15-trained-shadow-model.md` | ML-7 训练型影子模型的测试驱动实施、验证、部署与观察顺序 | 执行训练模型代码或核验实施范围时读取；Task 1–3 已实现，Task 4–12 尚未完成，整体为 partially implemented 且未部署。 |
 | `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` | 调度边界、信号生命周期、退出执行状态、告警转换和安全自动恢复 | 修改扫描调度、信号时效、自动对账或买入恢复时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已手动更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
-| `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、人工/移动/有效止损唯一事实源、交易运行面板和网页安全 | 修改止损、持仓网页或止损迁移时必读；当前为 `implemented（本地，待提交部署） / not deployed / not observed / not validated`。 |
-| `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、测试与部署顺序 | Tasks 1–8 已完成本地实现与可运行回归；提交、服务器部署和真实交易日观察尚未完成。 |
+| `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、人工/移动/有效止损唯一事实源、交易运行面板和网页安全 | 修改止损、持仓网页或止损迁移时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`。 |
+| `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；后续用于新模板回传、真实卖出观察和验收。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
@@ -43,7 +43,9 @@
 
 SQLite 目标 schema version 为 8，只给 `position_cycles` 增加可空 `manual_stop_price`，不持久化重复有效止损。手机网页已改为认证后的交易运行面板，展示运行状态、活动异常、持仓四类止损与执行轨迹；手工区只维护人工止损，不提供直接买卖。截图上传、OCR、确认和文件访问路由及 Tesseract 依赖已删除，历史上传文件保留。JoinQuant API/模板改为优先使用 Authorization bearer，服务器暂时保留 query token 兼容并对有效 query 凭据做访问日志脱敏。
 
-当前严格状态为 `implemented（本地，专项回归85/85、Windows可运行全量409项通过、3项Linux脚本测试因本机无bash未运行） / not deployed / not observed / not validated`。部署前必须在 Linux 补跑测试、备份 schema 7 正式账本、保持环境文件和现有 token 值不变、迁移 schema 8、更新 JoinQuant 网站模板并核验三个服务；完成前旧服务器仍按 schema 7 / 旧模板状态报告。
+实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72` 已推送到 `origin/main` 并部署服务器。服务器到 GitHub 两次超时后，使用本地和服务器均通过 `git bundle verify` 的 `0e246c2 → 8db92bf` 增量 bundle 做 fast-forward，并把服务器 `origin/main` 跟踪引用同步到同一提交。部署前 schema 7 正式账本在线备份成功且 `integrity_check=ok`；Linux 全量 414/414、目标模块编译、schema 8 `ledger-check` 健康/可写、环境文件哈希不变、三个核心服务 active。部署后手工运行一次持仓同步成功刷新2个 JoinQuant 持仓；网页未认证请求返回302登录跳转，信号 API 未认证请求返回403，重启后五分钟三个服务无 ERROR 日志。用户随后确认已在 JoinQuant 网站手工更新模板 `2026-07-16.1-unified-effective-stop`，但尚无新交易日快照回传证明网站实际运行版本。
+
+当前严格状态为 `implemented（已推送） / deployed（服务器；JoinQuant 网站为用户确认） / not observed / not validated`。Windows 可运行全量409项、专项85/85和服务器 Linux全量414/414均通过；部署和非交易时段同步不能替代新模板交易日回传、止损触发/受阻/成交闭环与连续观察验收。
 
 ## 2026-07-15 schema 7 部署检查点
 

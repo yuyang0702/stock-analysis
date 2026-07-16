@@ -14,3 +14,6 @@
 9. 更新主文档索引、交接、执行计划和存储规范，严格标记 implemented/deployed/observed/validated。
 10. 提交并推送 main；服务器先备份 SQLite 和环境文件哈希，再拉取、测试、ledger-check/migration、重启三个服务、完整对账并核验状态。不得修改或输出现有 token。
 
+## 实施结果
+
+Tasks 1–10 已完成。实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72` 已推送并通过验证后的增量 bundle fast-forward 部署；服务器 Linux 全量414/414、schema 8健康/可写、环境文件哈希不变、三个服务active，部署后同步2个持仓。用户确认 JoinQuant 网站模板 `2026-07-16.1-unified-effective-stop` 已手工更新。严格状态为 `implemented / deployed / not observed / not validated`；下一步只做交易日快照版本回传、止损执行闭环和连续观察验收。

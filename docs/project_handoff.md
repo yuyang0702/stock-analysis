@@ -1,6 +1,6 @@
 # 项目接管与新环境恢复说明
 
-> 2026-07-16 统一有效止损与交易运行面板增量已在本地实现，尚未提交或部署：schema 8 增加可空 `position_cycles.manual_stop_price`；成交成本保护校验后的 frozen initial、明确人工止损、首段止盈后移动止损共同解析唯一 effective stop；网页和策略不再各算一套。网页已移除 OCR/截图和直接清仓入口，增加认证、CSRF、运行/异常/风险/轨迹视图；JoinQuant 模板改用 bearer token 且 token 值不变。当前为 `implemented（本地） / not deployed / not observed / not validated`；服务器仍以重新核验结果为准，不得提前写成 schema 8 或新模板已部署。
+> 2026-07-16 统一有效止损与交易运行面板增量已随 `8db92bf6448466827a50560ae2fb8c7fde142c72` 推送并部署：schema 8 增加可空 `position_cycles.manual_stop_price`；成交成本保护校验后的 frozen initial、明确人工止损、首段止盈后移动止损共同解析唯一 effective stop；网页和策略不再各算一套。网页已移除 OCR/截图和直接清仓入口，增加认证、CSRF、运行/异常/风险/轨迹视图；JoinQuant 模板改用 bearer token 且 token 值未改变。部署前 schema 7 备份完整性为 `ok`，Linux全量414/414、编译、schema 8健康/可写、环境哈希不变、三个服务active、同步2个持仓、网页302登录保护、API未认证403及重启后ERROR日志为空均已核验。用户确认网站模板已手工更新为 `2026-07-16.1-unified-effective-stop`；新模板尚无交易日快照回传。当前严格为 `implemented（已推送） / deployed（服务器；网站由用户确认） / not observed / not validated`。
 
 > 2026-07-15 最新部署增量：成交全量对账已改为仅比较快照交易日的 SQLite 成交与 JoinQuant 当日 `get_trades()`；跨日历史成交不再产生假 `FILL_MISSING_PLATFORM`，同日缺失与平台侧未落账的严重度保持不变。代码提交 `cd83f26` 已推送并部署；SQLite 备份完整性、Linux全量326/326、Python编译、schema 7健康/可写、配置未变、三个服务active及重启后ERROR日志为空均已核验。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
@@ -114,7 +114,7 @@ git ls-remote origin refs/heads/main
 | 完整历史回测 | deployed（框架） | 与信号级回测并存且代码已在服务器；真实 6 个月/1 年 strict 数据尚未导入、运行或人工验证。 |
 | 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |
 | ML-7 训练型影子模型 | partially implemented（Task 1–3 已推送） | 共享评分/契约、独立 ML SQLite schema 和实时完整候选采集已实现；服务器未部署且默认关闭。strict 历史导入、标签、训练、治理与 L0 推理仍待实现；没有模型，不得写成 deployed/observed/validated。 |
-| 统一有效止损与交易运行面板 | implemented（本地待提交） | schema 8、成交后只收紧校验、manual/trailing/effective stop、认证面板和 OCR 删除已实现；服务器和 JoinQuant 新模板未部署，真实卖出未观察或验证。 |
+| 统一有效止损与交易运行面板 | deployed | schema 8、成交后只收紧校验、manual/trailing/effective stop、认证面板和 OCR 删除已部署；网站模板由用户确认更新，但新快照和真实卖出仍未观察或验证。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。
