@@ -34,6 +34,7 @@
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
 | `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、人工/移动/有效止损唯一事实源、交易运行面板和网页安全 | 修改止损、持仓网页或止损迁移时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；后续用于新模板回传、真实卖出观察和验收。 |
+| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `planned / not implemented / not deployed / not observed / not validated`，尚未改变当前买入行为。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
@@ -46,6 +47,14 @@ SQLite 目标 schema version 为 8，只给 `position_cycles` 增加可空 `manu
 实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72` 已推送到 `origin/main` 并部署服务器。服务器到 GitHub 两次超时后，使用本地和服务器均通过 `git bundle verify` 的 `0e246c2 → 8db92bf` 增量 bundle 做 fast-forward，并把服务器 `origin/main` 跟踪引用同步到同一提交。部署前 schema 7 正式账本在线备份成功且 `integrity_check=ok`；Linux 全量 414/414、目标模块编译、schema 8 `ledger-check` 健康/可写、环境文件哈希不变、三个核心服务 active。部署后手工运行一次持仓同步成功刷新2个 JoinQuant 持仓；网页未认证请求返回302登录跳转，信号 API 未认证请求返回403，重启后五分钟三个服务无 ERROR 日志。用户随后确认已在 JoinQuant 网站手工更新模板 `2026-07-16.1-unified-effective-stop`，但尚无新交易日快照回传证明网站实际运行版本。
 
 当前严格状态为 `implemented（已推送） / deployed（服务器；JoinQuant 网站为用户确认） / not observed / not validated`。Windows 可运行全量409项、专项85/85和服务器 Linux全量414/414均通过；部署和非交易时段同步不能替代新模板交易日回传、止损触发/受阻/成交闭环与连续观察验收。
+
+## 2026-07-18 跳空越价后二次确认入场规划
+
+已确认新增一条独立的补充买入路径：股票必须在当前五分钟批次重新入选，旧计划只提供原入场、原止损和冻结风险单位；价格上限为 `原入场 + 0.5R`。封死涨停不排队，开板后至少经过两次独立有效扫描确认，回封重置，一天最多两次开板观察；14:45 后不启动，14:50 后不新增仓位。确认后生成全新信号和执行契约，禁止恢复旧信号。
+
+正常风险仓位不足 100 股时只进入最小一手例外检查；100 股必须同时满足现金、单笔风险、单票/行业/题材/总仓位、持仓数量和开放风险边界，否则放弃。`RISK_OFF`、人工停止买入、kill switch、健康/对账门、行情陈旧、同股持仓或未完成订单等继续优先。计划增加事件级有界机会账本支持成交与拒绝机会的反事实复盘，不新增逐扫描无限文件。
+
+专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。当前严格为 `planned / not implemented / not deployed / not observed / not validated`，现有服务器和 JoinQuant 行为未改变；必须先完成测试驱动实施计划、代码、迁移和回归，再经单独授权部署及启用。
 
 ## 2026-07-15 schema 7 部署检查点
 
