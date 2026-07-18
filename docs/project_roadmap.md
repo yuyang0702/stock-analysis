@@ -35,6 +35,7 @@
 | `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、人工/移动/有效止损唯一事实源、交易运行面板和网页安全 | 修改止损、持仓网页或止损迁移时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；后续用于新模板回传、真实卖出观察和验收。 |
 | `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `planned / not implemented / not deployed / not observed / not validated`，尚未改变当前买入行为。 |
+| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | 实施或核验该能力时必读；当前计划已编写，代码尚未开始。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
