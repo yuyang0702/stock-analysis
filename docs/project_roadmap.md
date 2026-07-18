@@ -34,8 +34,8 @@
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
 | `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、人工/移动/有效止损唯一事实源、交易运行面板和网页安全 | 修改止损、持仓网页或止损迁移时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；后续用于新模板回传、真实卖出观察和验收。 |
-| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `planned / not implemented / not deployed / not observed / not validated`，尚未改变当前买入行为。 |
-| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | 实施或核验该能力时必读；当前计划已编写，代码尚未开始。 |
+| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（功能分支，待合并） / not deployed / not observed / not validated`，开关默认关闭。 |
+| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | 实施或核验该能力时必读；Tasks 1–7 已在功能分支完成，待最终审查、合并和另行授权部署。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
@@ -55,7 +55,7 @@ SQLite 目标 schema version 为 8，只给 `position_cycles` 增加可空 `manu
 
 正常风险仓位不足 100 股时只进入最小一手例外检查；100 股必须同时满足现金、单笔风险、单票/行业/题材/总仓位、持仓数量和开放风险边界，否则放弃。`RISK_OFF`、人工停止买入、kill switch、健康/对账门、行情陈旧、同股持仓或未完成订单等继续优先。计划增加事件级有界机会账本支持成交与拒绝机会的反事实复盘，不新增逐扫描无限文件。
 
-专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。当前严格为 `planned / not implemented / not deployed / not observed / not validated`，现有服务器和 JoinQuant 行为未改变；必须先完成测试驱动实施计划、代码、迁移和回归，再经单独授权部署及启用。
+专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。功能分支已实现纯状态机、schema 9 事件级机会账本、当前候选重新验证、两轮开板确认、最小一手风险复核、全新执行契约、JoinQuant 最终价格复核及回封/超价撤单。Windows 全量 429 项中 426 项通过，3 项仅因当前 Windows 无 Bash 无法启动 Linux `ledger-check`，与实施前基线一致。当前严格为 `implemented（功能分支，待合并） / not deployed / not observed / not validated`；`GAP_REENTRY_ENABLE` 默认关闭，现有服务器和 JoinQuant 行为未改变。
 
 ## 2026-07-15 schema 7 部署检查点
 

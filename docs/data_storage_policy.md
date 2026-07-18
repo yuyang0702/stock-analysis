@@ -1,5 +1,7 @@
 # 数据存储、文件增长与保留规范
 
+> 2026-07-18 schema 9 功能分支增量：正式交易库新增 `gap_reentry_opportunities`，每只股票、每个交易日、每个机会只插入一行并按状态更新，不保存逐扫描历史；索引只覆盖交易日/状态与股票/交易日。该表纳入现有在线备份、SHA-256、完整性检查、核心表计数和7/4/12轮转，不新增 JSONL、逐轮报告或秘密字段。按最多30只候选×250交易日估算上限约7500行/年，年度容量复核并沿用交易账本长期审计策略。当前为 `implemented（功能分支） / not deployed / not observed / not validated`。
+
 > 主文档：`docs/project_roadmap.md`。本文是项目所有运行数据、日志、缓存、快照、报告和数据库的长期开发约束；如业务状态与主文档冲突，以主文档为准。
 
 > 2026-07-15 schema 7 增量：`signals` 与 `exit_intents` 增加生命周期时间列，`execution_issue_state` 按问题对象保存一行最高严重度的当前/恢复状态及最近成功通知时间，`system_state` 保存一个有界的 ERROR 对账自动恢复所有权标记。它不逐分钟追加重复问题事件；CRITICAL 不持有自动恢复所有权，粘性 CRITICAL 只能由有审计原因的人工恢复确认处理。订单、成交、对账差异和控制事件继续作为长期证据，高频账户/持仓仍执行366天热保留。服务器已在完整 schema 6 备份后幂等迁移到7并通过健康/可写检查。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。

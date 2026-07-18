@@ -1,5 +1,7 @@
 # Gap Reentry Confirmation Implementation Plan
 
+状态：Tasks 1–7 已在 `feature/gap-reentry-confirmation` 完成；待最终审查、合并和另行授权部署。`GAP_REENTRY_ENABLE` 保持默认关闭。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an auditable, risk-limited JoinQuant simulation entry path for stocks that gap above a prior plan and become tradable after a limit-up opens.

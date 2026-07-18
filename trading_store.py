@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class SignalConflictError(RuntimeError):
@@ -318,6 +318,39 @@ SCHEMA_V8 = """
 -- Columns are added idempotently in initialize() for SQLite compatibility.
 """
 
+SCHEMA_V9 = """
+CREATE TABLE IF NOT EXISTS gap_reentry_opportunities (
+    opportunity_id TEXT PRIMARY KEY,
+    trade_date TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    parent_signal_id TEXT NOT NULL,
+    new_signal_id TEXT,
+    state TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    original_entry_price REAL NOT NULL,
+    original_stop_price REAL NOT NULL,
+    original_risk_r REAL NOT NULL,
+    reentry_cap_price REAL NOT NULL,
+    first_open_at TEXT,
+    first_open_price REAL,
+    first_batch_id TEXT,
+    confirmation_count INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    planned_entry_price REAL,
+    planned_stop_price REAL,
+    planned_take_profit REAL,
+    planned_qty INTEGER,
+    order_status TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(trade_date, stock_code, opportunity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gap_reentry_trade_state
+ON gap_reentry_opportunities(trade_date, state);
+CREATE INDEX IF NOT EXISTS idx_gap_reentry_code_date
+ON gap_reentry_opportunities(stock_code, trade_date);
+"""
+
 
 @dataclass(frozen=True)
 class StoreHealth:
@@ -410,6 +443,8 @@ class TradingStore:
                 conn.execute("ALTER TABLE position_cycles ADD COLUMN manual_stop_price REAL")
             conn.executescript(SCHEMA_V8)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, datetime('now'))")
+            conn.executescript(SCHEMA_V9)
+            conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (9, datetime('now'))")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -444,6 +479,87 @@ class TradingStore:
             (run.run_id, run.trade_date, run.started_at, run.strategy_version, run.parameter_version),
         )
         return cursor.rowcount == 1
+
+    def upsert_gap_reentry_opportunity(self, conn: sqlite3.Connection, event: dict) -> None:
+        columns = (
+            "opportunity_id", "trade_date", "stock_code", "parent_signal_id",
+            "new_signal_id", "state", "reason", "original_entry_price",
+            "original_stop_price", "original_risk_r", "reentry_cap_price",
+            "first_open_at", "first_open_price", "first_batch_id", "confirmation_count",
+            "attempt_count", "planned_entry_price", "planned_stop_price",
+            "planned_take_profit", "planned_qty", "order_status",
+        )
+        values = [event.get(name) for name in columns]
+        conn.execute(
+            f"""
+            INSERT INTO gap_reentry_opportunities(
+                {", ".join(columns)}, created_at, updated_at
+            ) VALUES ({", ".join("?" for _ in columns)}, datetime('now'), datetime('now'))
+            ON CONFLICT(opportunity_id) DO UPDATE SET
+                new_signal_id=excluded.new_signal_id,
+                state=excluded.state,
+                reason=excluded.reason,
+                first_open_at=COALESCE(excluded.first_open_at, gap_reentry_opportunities.first_open_at),
+                first_open_price=COALESCE(excluded.first_open_price, gap_reentry_opportunities.first_open_price),
+                first_batch_id=COALESCE(excluded.first_batch_id, gap_reentry_opportunities.first_batch_id),
+                confirmation_count=excluded.confirmation_count,
+                attempt_count=excluded.attempt_count,
+                planned_entry_price=excluded.planned_entry_price,
+                planned_stop_price=excluded.planned_stop_price,
+                planned_take_profit=excluded.planned_take_profit,
+                planned_qty=excluded.planned_qty,
+                order_status=excluded.order_status,
+                updated_at=datetime('now')
+            """,
+            values,
+        )
+
+    def get_gap_reentry_opportunity(self, opportunity_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM gap_reentry_opportunities WHERE opportunity_id=?",
+                (opportunity_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def mark_gap_reentry_signal(
+        self, conn: sqlite3.Connection, opportunity_id: str, signal: dict
+    ) -> None:
+        conn.execute(
+            """UPDATE gap_reentry_opportunities SET
+                   new_signal_id=?, planned_entry_price=?, planned_stop_price=?,
+                   planned_take_profit=?, planned_qty=?, updated_at=datetime('now')
+               WHERE opportunity_id=?""",
+            (
+                signal.get("id"), signal.get("entry_price"), signal.get("stop_loss"),
+                signal.get("take_profit"), signal.get("target_qty"), opportunity_id,
+            ),
+        )
+
+    def get_gap_reentry_for_stock_date(self, trade_date: str, stock_code: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM gap_reentry_opportunities
+                   WHERE trade_date=? AND stock_code=?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (trade_date, stock_code),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def latest_prior_buy_signal(self, stock_code: str, generated_before: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT signal_id, generated_at, raw_json FROM signals
+                   WHERE stock_code=? AND action='buy' AND generated_at<?
+                   ORDER BY generated_at DESC LIMIT 1""",
+                (stock_code, generated_before),
+            ).fetchone()
+        if row is None:
+            return None
+        result = json.loads(str(row["raw_json"]))
+        result["id"] = str(result.get("id") or row["signal_id"])
+        result["_ledger_generated_at"] = str(row["generated_at"])
+        return result
 
     def record_signal(self, conn: sqlite3.Connection, signal: SignalRecord) -> bool:
         cursor = conn.execute(

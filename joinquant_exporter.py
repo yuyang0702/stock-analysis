@@ -19,6 +19,10 @@ from ml_dataset import FEATURE_COLUMNS, append_signal_samples, record_candidate_
 from ml_store import MlCapacityError, MlDataConflict, MlStore
 from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore, canonical_json
 from trade_safety import tradability_reject_reason
+from gap_reentry import (
+    GapReentryInput, estimated_limit_up_price, evaluate_gap_reentry,
+    minimum_lot_position,
+)
 
 
 UNCATEGORIZED = "__UNCATEGORIZED__"
@@ -31,6 +35,7 @@ IMPLEMENTATION_HASH_FILES = (
     "trade_safety.py",
     "exit_policy.py",
     "trading_store.py",
+    "gap_reentry.py",
     "config.py",
 )
 
@@ -40,6 +45,11 @@ _REJECTION_STAGES = {
         "buy_suspended", "buy_st", "buy_delisting", "buy_special_listing_stage",
         "buy_quote_stale", "buy_chasing", "buy_illiquid", "buy_invalid_price",
         "buy_near_limit_up",
+        "gap_reentry_locked_limit", "gap_reentry_open_observing",
+        "gap_reentry_resealed", "gap_reentry_too_far", "gap_reentry_falling",
+        "gap_reentry_attempts_exhausted", "gap_reentry_too_late",
+        "gap_reentry_parent_invalid", "gap_reentry_current_score_low",
+        "gap_reentry_quote_stale",
     },
     "risk": {
         "buy_disabled", "buy_max_positions", "buy_daily_new_positions_limit",
@@ -49,12 +59,23 @@ _REJECTION_STAGES = {
         "buy_sector_limit", "buy_theme_limit", "buy_uncategorized_limit",
         "buy_insufficient_available_cash", "buy_total_position_limit",
         "buy_too_small_for_board_lot",
+        "gap_reentry_min_lot_risk_exceeded", "gap_reentry_insufficient_cash",
+        "gap_reentry_pending_order", "gap_reentry_current_risk_disallowed",
     },
     "execution": {
         "not_buy_sell_signal", "buy_execution_plan_missing", "buy_execution_plan_invalid",
         "buy_invalid_take_profit", "buy_invalid_stop_loss", "buy_not_reached_entry",
     },
 }
+
+
+def _confirmed_gap_reentry(row: pd.Series) -> bool:
+    return (
+        app_config.GAP_REENTRY_ENABLE_DEFAULT
+        and _text(row.get("entry_path")) == "gap_reentry"
+        and _text(row.get("gap_reentry_state")) == "OPEN_CONFIRMED"
+        and bool(_text(row.get("parent_signal_id")))
+    )
 
 
 def rejection_stage(reason: str) -> str:
@@ -71,6 +92,136 @@ def _ml_decision_at(generated_at: str) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=SHANGHAI_TIMEZONE)
     return value.astimezone(SHANGHAI_TIMEZONE).isoformat()
+
+
+def _prepare_gap_reentry_row(
+    row: pd.Series,
+    *,
+    store: TradingStore,
+    run_id: str | None,
+    trade_date: str,
+    generated_at: str,
+    min_score: float,
+    allow_buy: bool,
+) -> pd.Series:
+    if not app_config.GAP_REENTRY_ENABLE_DEFAULT or not allow_buy or _is_sell(row):
+        return row
+    code = clean_code(row.get("code"))
+    existing = store.get_gap_reentry_for_stock_date(trade_date, code)
+    if existing and _text(existing.get("new_signal_id")):
+        prepared = row.copy()
+        prepared["entry_path"] = "gap_reentry"
+        prepared["gap_reentry_state"] = "ALREADY_PUBLISHED"
+        prepared["gap_reentry_reason"] = "gap_reentry_pending_order"
+        prepared["parent_signal_id"] = existing["parent_signal_id"]
+        prepared["gap_reentry_opportunity_id"] = existing["opportunity_id"]
+        prepared["reentry_cap_price"] = existing["reentry_cap_price"]
+        prepared["gap_reentry_transitioned"] = False
+        return prepared
+    parent = store.latest_prior_buy_signal(code, generated_at)
+    if not parent:
+        return row
+    try:
+        parent_age = (
+            datetime.fromisoformat(generated_at).date()
+            - datetime.fromisoformat(_text(parent.get("_ledger_generated_at"))).date()
+        ).days
+    except ValueError:
+        return row
+    if parent_age < 1 or parent_age > 14 or bool(row.get("corporate_action")):
+        return row
+    original_entry = _num(parent.get("entry_price"))
+    original_stop = _num(parent.get("stop_loss"))
+    price = _num(row.get("price"))
+    if min(original_entry, original_stop, price) <= 0 or price <= original_entry:
+        return row
+    limit_up = _num(row.get("limit_up_price"))
+    if limit_up <= 0:
+        limit_up = estimated_limit_up_price(code, _num(row.get("prev_close")))
+    if limit_up <= 0:
+        return row
+    locked = price >= limit_up - 0.005
+    prior_state = _text((existing or {}).get("state"))
+    resealed = locked and prior_state == "OPEN_OBSERVING"
+    attempts = int((existing or {}).get("attempt_count") or 0)
+    first_open_at = _text((existing or {}).get("first_open_at"))
+    first_open_price = _num((existing or {}).get("first_open_price"))
+    if not locked and prior_state in {"", "LOCKED_LIMIT", "RESEALED"}:
+        attempts += 1
+        first_open_at = ""
+        first_open_price = 0.0
+    decision = evaluate_gap_reentry(GapReentryInput(
+        trade_date=trade_date,
+        code=code,
+        parent_signal_id=_text(parent.get("id")),
+        batch_id=run_id or generated_at,
+        now=generated_at,
+        price=price,
+        limit_up_price=limit_up,
+        original_entry_price=original_entry,
+        original_stop_price=original_stop,
+        market_state=market_regime(_text(row.get("market_state"))),
+        current_score=_num(row.get("final_score")),
+        required_score=max(min_score, 85.0) if market_regime(_text(row.get("market_state"))) == "CAUTION" else min_score,
+        quote_age_sec=_num(row.get("quote_age_sec")),
+        first_open_at=first_open_at,
+        first_open_price=first_open_price,
+        first_batch_id=_text((existing or {}).get("first_batch_id")),
+        confirmation_count=int((existing or {}).get("confirmation_count") or 0),
+        attempt_count=attempts,
+        at_limit=locked,
+        resealed=resealed,
+        buy_enabled=allow_buy,
+    ))
+    opportunity_id = _text((existing or {}).get("opportunity_id")) or (
+        f"gap-{trade_date.replace('-', '')}-{code}-{_text(parent.get('id'))[:12]}"
+    )
+    if decision.state == "OPEN_OBSERVING" and not first_open_at:
+        first_open_at, first_open_price = generated_at, price
+    event = {
+        "opportunity_id": opportunity_id, "trade_date": trade_date,
+        "stock_code": code, "parent_signal_id": _text(parent.get("id")),
+        "state": decision.state, "reason": decision.reason,
+        "original_entry_price": original_entry, "original_stop_price": original_stop,
+        "original_risk_r": original_entry - original_stop,
+        "reentry_cap_price": decision.cap_price, "first_open_at": first_open_at or None,
+        "first_open_price": first_open_price or None,
+        "first_batch_id": (
+            (run_id or generated_at) if decision.state == "OPEN_OBSERVING"
+            and not _text((existing or {}).get("first_batch_id"))
+            else _text((existing or {}).get("first_batch_id")) or None
+        ),
+        "confirmation_count": decision.confirmation_count,
+        "attempt_count": decision.attempt_count,
+    }
+    prepared = row.copy()
+    prepared["entry_path"] = "gap_reentry"
+    prepared["gap_reentry_state"] = decision.state
+    prepared["gap_reentry_reason"] = decision.reason
+    prepared["parent_signal_id"] = parent["id"]
+    prepared["gap_reentry_opportunity_id"] = opportunity_id
+    prepared["original_entry_price"] = original_entry
+    prepared["original_stop_price"] = original_stop
+    prepared["reentry_cap_price"] = decision.cap_price
+    prepared["gap_reentry_transitioned"] = prior_state != decision.state
+    if decision.allowed:
+        stop = max(original_stop, _num(row.get("stop_loss")))
+        risk = price - stop
+        if risk <= 0:
+            event.update({"state": "RISK_REJECTED", "reason": "gap_reentry_rr_invalid"})
+        else:
+            prepared["gap_reentry_state"] = "OPEN_CONFIRMED"
+            prepared["gap_reentry_reason"] = ""
+            prepared["entry_price"] = price
+            prepared["stop_loss"] = stop
+            prepared["take_profit"] = price + 2 * risk
+            event.update({
+                "planned_entry_price": price, "planned_stop_price": stop,
+                "planned_take_profit": price + 2 * risk,
+            })
+    with store.transaction() as conn:
+        store.upsert_gap_reentry_opportunity(conn, event)
+    return prepared
 
 
 @lru_cache(maxsize=1)
@@ -281,6 +432,8 @@ def _resolved_buy_plan(row: pd.Series) -> dict[str, Any]:
             float(result["position_pct"]),
             app_config.MAX_UNCATEGORIZED_POSITION_PCT,
         )
+    if _confirmed_gap_reentry(row) and int(_num(row.get("target_qty"))) != 100:
+        result["position_pct"] = float(result["position_pct"]) / 3.0
     return result
 
 
@@ -336,12 +489,23 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
         return "buy_risk_disallowed"
     if take > 0 and take <= entry:
         return "buy_invalid_take_profit"
-    tradability_reason = tradability_reject_reason(row) if app_config.JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT else ""
-    if tradability_reason:
-        return tradability_reason
+    if (
+        app_config.GAP_REENTRY_ENABLE_DEFAULT
+        and _text(row.get("entry_path")) == "gap_reentry"
+        and _text(row.get("gap_reentry_state")) != "OPEN_CONFIRMED"
+    ):
+        return _text(row.get("gap_reentry_reason")) or "gap_reentry_parent_invalid"
     regime = market_regime(_text(row.get("market_state")))
     if regime == "RISK_OFF":
         return "buy_disabled"
+    gap_reentry = _confirmed_gap_reentry(row)
+    if gap_reentry and price > _num(row.get("reentry_cap_price")):
+        return "gap_reentry_too_far"
+    tradability_reason = tradability_reject_reason(row) if app_config.JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT else ""
+    if gap_reentry and tradability_reason == "buy_chasing":
+        tradability_reason = ""
+    if tradability_reason:
+        return tradability_reason
     required_score = max(min_score, 85.0) if regime == "CAUTION" else min_score
     if _num(row.get("final_score")) < required_score:
         return "buy_low_score"
@@ -356,6 +520,23 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
     adjusted_position_pct = float(plan["position_pct"])
     if stop <= 0 or stop >= entry:
         return "buy_invalid_stop_loss"
+    open_risk_limit = app_config.MAX_OPEN_RISK_CAUTION_PCT if regime == "CAUTION" else app_config.MAX_OPEN_RISK_NORMAL_PCT
+    if account_total_value > 0 and account_total_value * adjusted_position_pct / 100.0 < entry * 100:
+        if not gap_reentry:
+            return "buy_too_small_for_board_lot"
+        lot = minimum_lot_position(
+            entry_price=entry, stop_price=stop, account_value=account_total_value,
+            available_cash=float(available_cash or 0),
+            risk_budget_pct=max(0.0, open_risk_limit - current_open_risk_pct),
+            current_position_pct=current_position_pct,
+            max_total_position_pct=app_config.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT,
+            max_single_position_pct=app_config.MAX_SINGLE_POSITION_PCT,
+        )
+        if not lot.allowed:
+            return lot.reason
+        adjusted_position_pct = lot.position_pct
+        row["position_pct"] = lot.position_pct
+        row["target_qty"] = lot.qty
     sector = _industry(row)
     theme = _theme(row)
     if not sector and not theme:
@@ -363,7 +544,6 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
         if risk_enabled and (sector_exposure_pct or {}).get(UNCATEGORIZED, 0) + adjusted_position_pct > app_config.MAX_UNCATEGORIZED_POSITION_PCT:
             return "buy_uncategorized_limit"
     added_risk = adjusted_position_pct * max(entry - stop, 0) / entry if entry > 0 else 0
-    open_risk_limit = app_config.MAX_OPEN_RISK_CAUTION_PCT if regime == "CAUTION" else app_config.MAX_OPEN_RISK_NORMAL_PCT
     if risk_enabled and current_open_risk_pct + added_risk > open_risk_limit:
         return "buy_open_risk_limit"
     if risk_enabled and sector and (sector_exposure_pct or {}).get(sector, 0) + adjusted_position_pct > app_config.MAX_INDUSTRY_POSITION_PCT:
@@ -411,7 +591,7 @@ def _buy_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, Any
     stop = float(plan["stop_loss"])
     take = float(plan["take_profit"])
     position_pct = float(plan["position_pct"])
-    return {
+    signal = {
         "id": _signal_id(run_id, code, "buy", index),
         "code": code,
         "jq_code": to_jq_code(code),
@@ -434,6 +614,18 @@ def _buy_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, Any
         "industry": _industry(row),
         "theme": _theme(row),
     }
+    if _confirmed_gap_reentry(row):
+        signal.update({
+            "entry_path": "gap_reentry",
+            "parent_signal_id": _text(row.get("parent_signal_id")),
+            "original_entry_price": _num(row.get("original_entry_price")),
+            "original_stop_price": _num(row.get("original_stop_price")),
+            "reentry_cap_price": _num(row.get("reentry_cap_price")),
+            "gap_reentry_state": "OPEN_CONFIRMED",
+        })
+    if _num(row.get("target_qty")) > 0:
+        signal["target_qty"] = int(_num(row.get("target_qty")))
+    return signal
 
 
 def _sell_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, Any] | None:
@@ -491,6 +683,13 @@ def export_signals(
     payload = _base_payload(run_id, trade_date, dry_run)
     parameter_snapshot = _ml_parameter_snapshot(min_score, enforce_execution_contract)
     candidate_generated_at = str(payload["generated_at"])
+    store = store or TradingStore(app_config.TRADING_DB_FILE)
+    gap_store_ready = False
+    try:
+        store.initialize()
+        gap_store_ready = True
+    except (OSError, sqlite3.Error):
+        pass
 
     sample_rows: list[tuple[pd.Series, dict[str, Any]]] = []
     candidate_rows: list[pd.Series] = []
@@ -499,7 +698,14 @@ def export_signals(
     reject_reasons: Counter[str] = Counter()
     if df is not None and not df.empty:
         signals: list[dict[str, Any]] = []
-        ordered_rows = [row for _, row in df.iterrows()]
+        ordered_rows = [
+            _prepare_gap_reentry_row(
+                row, store=store, run_id=run_id,
+                trade_date=str(payload["trade_date"]), generated_at=candidate_generated_at,
+                min_score=min_score, allow_buy=allow_buy,
+            ) if gap_store_ready else row
+            for _, row in df.iterrows()
+        ]
         if not any(_is_sell(row) for row in ordered_rows):
             ordered_rows.sort(key=lambda row: -_num(row.get("final_score")))
         for index, row in enumerate(ordered_rows):
@@ -535,6 +741,10 @@ def export_signals(
                 candidate_decisions.append(candidate_decision)
             if not buy_reject_reason:
                 signal = _buy_signal(row, run_id, index)
+                opportunity_id = _text(row.get("gap_reentry_opportunity_id"))
+                if opportunity_id:
+                    with store.transaction() as conn:
+                        store.mark_gap_reentry_signal(conn, opportunity_id, signal)
                 if candidate_decision is not None:
                     candidate_decision["signal_id"] = signal["id"]
                 signals.append(signal)
@@ -591,9 +801,17 @@ def export_signals(
         "buy_publication_blocked": False,
         "buy_enabled": "1",
         "kill_switch": "0",
+        "gap_reentry_transitions": [
+            {
+                "code": clean_code(row.get("code")),
+                "state": _text(row.get("gap_reentry_state")),
+                "reason": _text(row.get("gap_reentry_reason")),
+            }
+            for row in (ordered_rows if df is not None and not df.empty else [])
+            if bool(row.get("gap_reentry_transitioned"))
+        ],
     }
 
-    store = store or TradingStore(app_config.TRADING_DB_FILE)
     limits = RiskLimits(
         max_single_position_pct=app_config.MAX_SINGLE_POSITION_PCT,
         max_total_position_pct=app_config.MAX_TOTAL_POSITION_PCT,

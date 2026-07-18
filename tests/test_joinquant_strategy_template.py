@@ -3,6 +3,13 @@ import unittest
 
 
 class JoinQuantStrategyTemplateTest(unittest.TestCase):
+    def test_gap_reentry_rechecks_absolute_cap_before_order(self) -> None:
+        text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
+        self.assertIn('signal.get("entry_path") == "gap_reentry"', text)
+        self.assertIn('return False, "gap_reentry_price_moved"', text)
+        self.assertIn("def _cancel_invalid_gap_reentry_orders", text)
+        self.assertIn("cancel_order(order)", text)
+
     def test_template_defaults_to_joinquant_simulated_orders(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
 
@@ -28,8 +35,8 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
         config_text = Path("config.py").read_text(encoding="utf-8")
 
-        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-16.1-unified-effective-stop"', text)
-        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-16.1-unified-effective-stop"', config_text)
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-07-18.1-gap-reentry"', text)
+        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-07-18.1-gap-reentry"', config_text)
         self.assertIn('"Authorization": "Bearer " + SYNC_TOKEN', text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
 
