@@ -142,7 +142,7 @@ class TradingStoreTest(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(reason, "ledger unavailable")
 
-    def test_initialize_creates_version_eight_schema_and_pragmas(self) -> None:
+    def test_initialize_creates_current_schema_and_pragmas(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()

@@ -65,6 +65,7 @@ _REJECTION_STAGES = {
     "execution": {
         "not_buy_sell_signal", "buy_execution_plan_missing", "buy_execution_plan_invalid",
         "buy_invalid_take_profit", "buy_invalid_stop_loss", "buy_not_reached_entry",
+        "gap_reentry_rr_invalid",
     },
 }
 
@@ -209,6 +210,8 @@ def _prepare_gap_reentry_row(
         risk = price - stop
         if risk <= 0:
             event.update({"state": "RISK_REJECTED", "reason": "gap_reentry_rr_invalid"})
+            prepared["gap_reentry_state"] = "RISK_REJECTED"
+            prepared["gap_reentry_reason"] = "gap_reentry_rr_invalid"
         else:
             prepared["gap_reentry_state"] = "OPEN_CONFIRMED"
             prepared["gap_reentry_reason"] = ""
@@ -743,8 +746,7 @@ def export_signals(
                 signal = _buy_signal(row, run_id, index)
                 opportunity_id = _text(row.get("gap_reentry_opportunity_id"))
                 if opportunity_id:
-                    with store.transaction() as conn:
-                        store.mark_gap_reentry_signal(conn, opportunity_id, signal)
+                    signal["gap_reentry_opportunity_id"] = opportunity_id
                 if candidate_decision is not None:
                     candidate_decision["signal_id"] = signal["id"]
                 signals.append(signal)
@@ -842,6 +844,12 @@ def export_signals(
                 parameter_version="risk-observe-v1",
             ))
             for signal, decision in decisions:
+                opportunity_id = _text(signal.get("gap_reentry_opportunity_id"))
+                if (
+                    opportunity_id and signal["action"] == "buy"
+                    and buy_enabled != "0" and kill_switch != "1"
+                ):
+                    store.mark_gap_reentry_signal(conn, opportunity_id, signal)
                 existing = conn.execute(
                     "SELECT generated_at, raw_json FROM signals WHERE signal_id=?",
                     (signal["id"],),

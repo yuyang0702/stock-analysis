@@ -176,7 +176,12 @@ def _can_execute(context, signal):
                 cap = float(signal.get("reentry_cap_price") or 0)
                 if cap <= 0 or current_price > cap:
                     return False, "gap_reentry_price_moved"
-            target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+            target_qty = int(signal.get("target_qty") or 0)
+            target_value = (
+                current_price * target_qty * 1.001
+                if target_qty > 0 else
+                context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+            )
             if target_value > float(_position_attr(context.portfolio, "available_cash", context.portfolio.cash) or 0):
                 return False, "insufficient_cash"
             entry = float(signal.get("entry_price") or signal.get("price") or 0)
@@ -254,9 +259,16 @@ def _cancel_invalid_gap_reentry_orders():
         price = float(_order_attr(quote, "last_price", 0) or 0)
         high_limit = float(_order_attr(quote, "high_limit", float("inf")) or float("inf"))
         cap = float(meta.get("reentry_cap_price") or 0)
-        if price >= high_limit or cap <= 0 or price > cap:
+        amount = abs(float(_order_attr(order, "amount", 0) or 0))
+        filled = abs(float(_order_attr(order, "filled", 0) or 0))
+        partial_fill = 0 < filled < amount
+        if partial_fill or price >= high_limit or cap <= 0 or price > cap:
             cancel_order(order)
-            _record_order(meta, "cancelled", "gap_reentry_resealed_or_price_moved", order)
+            reason = (
+                "gap_reentry_partial_fill_complete"
+                if partial_fill else "gap_reentry_resealed_or_price_moved"
+            )
+            _record_order(meta, "cancelled", reason, order)
             g.gap_reentry_orders.pop(order_id, None)
 
 def _record_order(signal, status, reason="", order=None):
@@ -321,8 +333,12 @@ def execute_signals(context):
             _record_order(signal, "dry_run", "not_submitted")
         elif action == "buy":
             try:
-                target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
-                order = order_target_value(jq_code, target_value)
+                target_qty = int(signal.get("target_qty") or 0)
+                if target_qty > 0:
+                    order = order_target(jq_code, target_qty)
+                else:
+                    target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+                    order = order_target_value(jq_code, target_value)
                 if order is None:
                     _record_order(signal, "failed", "limit_up_or_suspended_or_rejected")
                 else:

@@ -1,6 +1,6 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-07-16
+更新日期：2026-07-18
 
 本文档是当前项目规划的唯一主说明，合并已有能力、JoinQuant 接入方案、服务器部署流程，以及后续机器学习优化路线。其他早期设计文档只作为历史参考；如果口径冲突，以本文档为准。
 
@@ -34,8 +34,8 @@
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
 | `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、人工/移动/有效止损唯一事实源、交易运行面板和网页安全 | 修改止损、持仓网页或止损迁移时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；后续用于新模板回传、真实卖出观察和验收。 |
-| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（功能分支，待合并） / not deployed / not observed / not validated`，开关默认关闭。 |
-| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | 实施或核验该能力时必读；Tasks 1–7 已在功能分支完成，待最终审查、合并和另行授权部署。 |
+| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（功能分支，复查完成，待合并） / not deployed / not observed / not validated`，开关默认关闭。 |
+| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | 实施或核验该能力时必读；Tasks 1–7 已在功能分支完成并复查，待合并和另行授权部署。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
@@ -43,7 +43,7 @@
 
 本地代码已经把网页和卖出引擎收敛到同一个有效止损解析器：`initial_stop_price` 是按真实持仓成本和板块最大亏损边界只收紧校验后的冻结止损；`manual_stop_price` 默认空，只允许用户明确上调或清除并写 `control_events`；`trailing_stop_price` 只在首段止盈后派生；`effective_stop_price=max(initial, manual, activated trailing)` 是唯一卖出阈值。JoinQuant 快照不再按成本价自动生成 3.5% 网页止损，活动旧周期只允许上调修复且不把旧网页显示值伪装成人工指令。
 
-SQLite 目标 schema version 为 8，只给 `position_cycles` 增加可空 `manual_stop_price`，不持久化重复有效止损。手机网页已改为认证后的交易运行面板，展示运行状态、活动异常、持仓四类止损与执行轨迹；手工区只维护人工止损，不提供直接买卖。截图上传、OCR、确认和文件访问路由及 Tesseract 依赖已删除，历史上传文件保留。JoinQuant API/模板改为优先使用 Authorization bearer，服务器暂时保留 query token 兼容并对有效 query 凭据做访问日志脱敏。
+统一止损增量当时把 SQLite 升至 schema version 8，只给 `position_cycles` 增加可空 `manual_stop_price`，不持久化重复有效止损；当前功能分支因跳空机会账本已把本地目标升至 schema 9，服务器仍以已部署版本为准。手机网页已改为认证后的交易运行面板，展示运行状态、活动异常、持仓四类止损与执行轨迹；手工区只维护人工止损，不提供直接买卖。截图上传、OCR、确认和文件访问路由及 Tesseract 依赖已删除，历史上传文件保留。JoinQuant API/模板改为优先使用 Authorization bearer，服务器暂时保留 query token 兼容并对有效 query 凭据做访问日志脱敏。
 
 实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72` 已推送到 `origin/main` 并部署服务器。服务器到 GitHub 两次超时后，使用本地和服务器均通过 `git bundle verify` 的 `0e246c2 → 8db92bf` 增量 bundle 做 fast-forward，并把服务器 `origin/main` 跟踪引用同步到同一提交。部署前 schema 7 正式账本在线备份成功且 `integrity_check=ok`；Linux 全量 414/414、目标模块编译、schema 8 `ledger-check` 健康/可写、环境文件哈希不变、三个核心服务 active。部署后手工运行一次持仓同步成功刷新2个 JoinQuant 持仓；网页未认证请求返回302登录跳转，信号 API 未认证请求返回403，重启后五分钟三个服务无 ERROR 日志。用户随后确认已在 JoinQuant 网站手工更新模板 `2026-07-16.1-unified-effective-stop`，但尚无新交易日快照回传证明网站实际运行版本。
 
@@ -55,7 +55,7 @@ SQLite 目标 schema version 为 8，只给 `position_cycles` 增加可空 `manu
 
 正常风险仓位不足 100 股时只进入最小一手例外检查；100 股必须同时满足现金、单笔风险、单票/行业/题材/总仓位、持仓数量和开放风险边界，否则放弃。`RISK_OFF`、人工停止买入、kill switch、健康/对账门、行情陈旧、同股持仓或未完成订单等继续优先。计划增加事件级有界机会账本支持成交与拒绝机会的反事实复盘，不新增逐扫描无限文件。
 
-专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。功能分支已实现纯状态机、schema 9 事件级机会账本、当前候选重新验证、两轮开板确认、最小一手风险复核、全新执行契约、JoinQuant 最终价格复核及回封/超价撤单。Windows 全量 429 项中 426 项通过，3 项仅因当前 Windows 无 Bash 无法启动 Linux `ledger-check`，与实施前基线一致。当前严格为 `implemented（功能分支，待合并） / not deployed / not observed / not validated`；`GAP_REENTRY_ENABLE` 默认关闭，现有服务器和 JoinQuant 行为未改变。
+专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。功能分支已实现纯状态机、schema 9 事件级机会账本、当前候选重新验证、两轮开板确认、最小一手风险复核、全新执行契约和 JoinQuant 最终复核。最终复查补齐：100股信号按数量而非金额下单、按当前价加费用缓冲复核现金、任意部分成交后撤销余单且不再补仓、交易控制拦截的信号不误标为已发布、无效风险单位在候选与账本中一致标为拒绝。Windows 全量 435 项中 432 项通过，3 项仅因当前 Windows 无 Bash 无法启动 Linux `ledger-check`，与实施前基线一致。当前严格为 `implemented（功能分支，复查完成，待合并） / not deployed / not observed / not validated`；`GAP_REENTRY_ENABLE` 默认关闭，现有服务器和 JoinQuant 行为未改变。
 
 ## 2026-07-15 schema 7 部署检查点
 

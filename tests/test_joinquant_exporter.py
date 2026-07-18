@@ -154,6 +154,101 @@ class JoinQuantExporterTest(unittest.TestCase):
         self.assertEqual(signals[0]["entry_path"], "gap_reentry")
         self.assertEqual(signals[0]["parent_signal_id"], "parent-signal")
 
+    def test_blocked_gap_signal_is_not_marked_as_published(self) -> None:
+        store = TradingStore(Path(self._ledger_tmp.name) / "trading.db")
+        store.initialize()
+        with store.transaction() as conn:
+            store.record_strategy_run(conn, joinquant_exporter.StrategyRunRecord(
+                "parent-run", "2026-07-16", "2026-07-16 10:00:00", "v", "p"
+            ))
+            parent = {
+                "id": "parent-signal", "code": "002432", "jq_code": "002432.XSHE",
+                "action": "buy", "entry_price": 10.0, "stop_loss": 9.0,
+                "take_profit": 12.0, "position_pct": 5.0,
+            }
+            store.record_signal(conn, joinquant_exporter.SignalRecord(
+                "parent-signal", "parent-run", "2026-07-16", "002432",
+                "002432.XSHE", "buy", 5.0, "2026-07-16 10:00:00", "",
+                json.dumps(parent),
+            ))
+        rows = pd.DataFrame([{
+            "code": "002432", "price": 10.3, "prev_close": 10.0,
+            "high": 11.0, "pct_chg": 9.7, "limit_quality": "炸板/回落",
+            "entry_price": 10.3, "stop_loss": 9.5, "take_profit": 11.9,
+            "position_pct": 9.0, "final_score": 90,
+            "market_state": "NORMAL", "atr14": 0.4, "amount": 100_000_000,
+        }])
+        payloads = [
+            {"schema_version": 1, "trade_date": "2026-07-17",
+             "generated_at": "2026-07-17 10:00:00", "run_id": "scan-1",
+             "source": "a_share_strategy", "dry_run": False, "signals": []},
+            {"schema_version": 1, "trade_date": "2026-07-17",
+             "generated_at": "2026-07-17 10:05:00", "run_id": "scan-2",
+             "source": "a_share_strategy", "dry_run": False, "signals": []},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter.app_config, "GAP_REENTRY_ENABLE_DEFAULT", True
+        ), patch.object(joinquant_exporter, "_base_payload", side_effect=payloads):
+            joinquant_exporter.export_signals(
+                rows, run_id="scan-1", store=store,
+                output_path=Path(tmp) / "one.json",
+            )
+            with store.transaction() as conn:
+                store.set_system_state(conn, "kill_switch", "1", "test")
+            result = joinquant_exporter.export_signals(
+                rows, run_id="scan-2", store=store,
+                output_path=Path(tmp) / "two.json",
+            )
+            published = json.loads(result.read_text(encoding="utf-8"))["signals"]
+
+        self.assertEqual(published, [])
+        opportunity = store.get_gap_reentry_for_stock_date("2026-07-17", "002432")
+        self.assertIsNotNone(opportunity)
+        self.assertIsNone(opportunity["new_signal_id"])
+
+    def test_invalid_gap_risk_updates_candidate_and_ledger_to_rejected(self) -> None:
+        store = TradingStore(Path(self._ledger_tmp.name) / "trading.db")
+        store.initialize()
+        with store.transaction() as conn:
+            store.record_strategy_run(conn, joinquant_exporter.StrategyRunRecord(
+                "parent-run", "2026-07-16", "2026-07-16 10:00:00", "v", "p"
+            ))
+            store.record_signal(conn, joinquant_exporter.SignalRecord(
+                "parent-signal", "parent-run", "2026-07-16", "002432",
+                "002432.XSHE", "buy", 5.0, "2026-07-16 10:00:00", "",
+                json.dumps({
+                    "id": "parent-signal", "code": "002432", "action": "buy",
+                    "entry_price": 10.0, "stop_loss": 9.0,
+                }),
+            ))
+        row = pd.Series({
+            "code": "002432", "price": 10.3, "prev_close": 10.0,
+            "stop_loss": 10.4, "final_score": 90, "market_state": "NORMAL",
+        })
+        with patch.object(
+            joinquant_exporter.app_config, "GAP_REENTRY_ENABLE_DEFAULT", True
+        ):
+            first = joinquant_exporter._prepare_gap_reentry_row(
+                row, store=store, run_id="scan-1", trade_date="2026-07-17",
+                generated_at="2026-07-17 10:00:00", min_score=75,
+                allow_buy=True,
+            )
+            second = joinquant_exporter._prepare_gap_reentry_row(
+                row, store=store, run_id="scan-2", trade_date="2026-07-17",
+                generated_at="2026-07-17 10:05:00", min_score=75,
+                allow_buy=True,
+            )
+
+        self.assertEqual(first["gap_reentry_state"], "OPEN_OBSERVING")
+        self.assertEqual(second["gap_reentry_state"], "RISK_REJECTED")
+        self.assertEqual(second["gap_reentry_reason"], "gap_reentry_rr_invalid")
+        opportunity = store.get_gap_reentry_for_stock_date("2026-07-17", "002432")
+        self.assertEqual(opportunity["state"], "RISK_REJECTED")
+        self.assertEqual(
+            joinquant_exporter.rejection_stage("gap_reentry_rr_invalid"),
+            "execution",
+        )
+
     def test_rejection_stage_exhaustively_maps_current_buy_reasons(self) -> None:
         expected = {
             "": "selected",

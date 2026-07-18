@@ -1,8 +1,89 @@
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
+
+import joinquant_strategy
 
 
 class JoinQuantStrategyTemplateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        joinquant_strategy.g = SimpleNamespace(
+            gap_reentry_orders={},
+            executed_signal_ids=set(),
+            signals=[],
+            order_events=[],
+            order_signal_ids={},
+        )
+        joinquant_strategy.log = SimpleNamespace(info=Mock(), warn=Mock())
+
+    def test_gap_reentry_partial_fill_cancels_remaining_order(self) -> None:
+        order = SimpleNamespace(
+            order_id="gap-order-1", security="002432.XSHE",
+            amount=200, filled=100,
+        )
+        quote = SimpleNamespace(last_price=10.50, high_limit=11.00)
+        joinquant_strategy.g.gap_reentry_orders["gap-order-1"] = {
+            "id": "gap-signal-1", "jq_code": "002432.XSHE",
+            "reentry_cap_price": 10.80,
+        }
+
+        with patch.object(joinquant_strategy, "get_open_orders", return_value={"gap-order-1": order}, create=True), \
+             patch.object(joinquant_strategy, "get_current_data", return_value={"002432.XSHE": quote}, create=True), \
+             patch.object(joinquant_strategy, "cancel_order", create=True) as cancel, \
+             patch.object(joinquant_strategy, "_record_order") as record:
+            joinquant_strategy._cancel_invalid_gap_reentry_orders()
+
+        cancel.assert_called_once_with(order)
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[2], "gap_reentry_partial_fill_complete")
+        self.assertNotIn("gap-order-1", joinquant_strategy.g.gap_reentry_orders)
+
+    def test_gap_reentry_exact_lot_uses_quantity_order(self) -> None:
+        signal = {
+            "id": "gap-signal-1", "action": "buy", "code": "002432",
+            "jq_code": "002432.XSHE", "position_pct": 7.6,
+            "target_qty": 100, "entry_path": "gap_reentry",
+        }
+        joinquant_strategy.g.signals = [signal]
+        context = SimpleNamespace(
+            portfolio=SimpleNamespace(total_value=100_000, positions={}),
+        )
+        order = SimpleNamespace(order_id="gap-order-1", status="held")
+
+        with patch.object(joinquant_strategy, "_cancel_invalid_gap_reentry_orders"), \
+             patch.object(joinquant_strategy, "_can_execute", return_value=(True, "")), \
+             patch.object(joinquant_strategy, "order_target", return_value=order, create=True) as by_qty, \
+             patch.object(joinquant_strategy, "order_target_value", create=True) as by_value:
+            joinquant_strategy.execute_signals(context)
+
+        by_qty.assert_called_once_with("002432.XSHE", 100)
+        by_value.assert_not_called()
+
+    def test_gap_reentry_cash_guard_uses_current_price_and_exact_quantity(self) -> None:
+        signal = {
+            "id": "gap-signal-1", "action": "buy", "code": "002432",
+            "jq_code": "002432.XSHE", "position_pct": 0.5,
+            "target_qty": 100, "entry_path": "gap_reentry",
+            "reentry_cap_price": 11.0,
+            "entry_price": 10.0, "price": 10.0, "final_score": 90,
+            "created_at": "2026-07-18 10:00:00",
+        }
+        context = SimpleNamespace(portfolio=SimpleNamespace(
+            total_value=100_000, available_cash=1_000, cash=1_000, positions={},
+        ))
+        quote = SimpleNamespace(
+            last_price=10.0, paused=False, low_limit=9.0, high_limit=11.0,
+        )
+
+        with patch.object(joinquant_strategy, "_signal_is_fresh", return_value=True), \
+             patch.object(joinquant_strategy, "get_current_data", return_value={"002432.XSHE": quote}, create=True), \
+             patch.object(joinquant_strategy, "get_open_orders", return_value={}, create=True):
+            allowed, reason = joinquant_strategy._can_execute(context, signal)
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "insufficient_cash")
+
     def test_gap_reentry_rechecks_absolute_cap_before_order(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
         self.assertIn('signal.get("entry_path") == "gap_reentry"', text)
