@@ -1,5 +1,7 @@
 # 实盘化执行方案
 
+> 2026-07-18 跳空二次确认入场代码已实现、复查并合并本地 `main`，但尚未推送或部署：服务器仅在当前候选重新验证、开板两个独立五分钟批次稳定、价格不超过原入场 `+0.5R` 且全部风险门通过后生成全新信号；JoinQuant 在下单前再次检查实际涨停价、绝对价格上限、持仓、挂单和现金。最小一手使用 `target_qty=100` 精确按数量下单，现金按当前价加费用缓冲复核；任意部分成交立即撤销余单并依靠持仓/信号幂等禁止当日补仓。交易控制最终拦截的信号不会把机会误标成已发布。schema 9 保存有界机会账本，`GAP_REENTRY_ENABLE` 默认关闭。状态为 `implemented（已合并本地 main） / not deployed / not observed / not validated`。
+
 > 主文档：`docs/project_roadmap.md`。本文是实盘化与策略升级的可执行细化方案；如果状态、已实现能力或部署口径与主文档冲突，以主文档为准。
 
 > 文档边界：本文负责阶段路线和真实资金前门槛；当前买入、卖出和风险规则以 `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` 为基础，五项执行正确性 P0 以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为最新增量，具体实施以对应计划为准。已归档的早期 JoinQuant、硬止损和实施计划不再定义当前流程。

@@ -3312,6 +3312,12 @@ def build_joinquant_dry_run_markdown(payload: dict[str, Any]) -> str:
                 "buy_bad_position": "仓位无效",
                 "buy_near_limit_up": "接近涨停",
                 "buy_not_reached_entry": "未到入场价",
+                "gap_reentry_locked_limit": "涨停锁定，未追入",
+                "gap_reentry_open_observing": "跳空二次确认观察中",
+                "gap_reentry_resealed": "开板后回封，确认已重置",
+                "gap_reentry_too_far": "超过二次入场价格上限",
+                "gap_reentry_min_lot_risk_exceeded": "最小一手风险超限",
+                "gap_reentry_insufficient_cash": "最小一手现金不足",
                 "sell_without_holding": "未持仓不卖出",
             }
             summary = "；".join(
@@ -3319,6 +3325,21 @@ def build_joinquant_dry_run_markdown(payload: dict[str, Any]) -> str:
                 for key, value in sorted(reasons.items(), key=lambda item: item[1], reverse=True)[:5]
             )
             lines.append(f"> 过滤原因：{summary}")
+        transitions = diagnostics.get("gap_reentry_transitions")
+        if isinstance(transitions, list):
+            state_labels = {
+                "LOCKED_LIMIT": "涨停锁定：未追入",
+                "OPEN_OBSERVING": "跳空二次确认：观察中",
+                "RESEALED": "开板后回封：确认已重置",
+                "OPEN_CONFIRMED": "二次确认通过：已生成新买入计划",
+                "TOO_FAR": "超过二次入场价格上限：放弃买入",
+                "RISK_REJECTED": "风险检查未通过：放弃买入",
+            }
+            for transition in transitions[:8]:
+                lines.append(
+                    f"> {transition.get('code', '')} "
+                    f"{state_labels.get(str(transition.get('state')), transition.get('reason', ''))}"
+                )
         return "\n".join(lines)
 
     for item in signals[:8]:
@@ -3329,9 +3350,10 @@ def build_joinquant_dry_run_markdown(payload: dict[str, Any]) -> str:
         reason = compact_text(item.get("reason", ""), 48)
         if item.get("action") == "buy":
             shadow = f" | 影子 {item.get('enhanced_score')}" if item.get("enhanced_score") not in (None, "") else ""
+            entry_path = " | 跳空二次确认" if item.get("entry_path") == "gap_reentry" else ""
             lines.append(
                 f"- {action} {code} {name} | 目标仓位 {item.get('position_pct', 0)}% | "
-                f"价格 {price} | 分数 {item.get('final_score', '-')}{shadow}"
+                f"价格 {price} | 分数 {item.get('final_score', '-')}{shadow}{entry_path}"
             )
         else:
             lines.append(f"- {action} {code} {name} | 价格 {price}")

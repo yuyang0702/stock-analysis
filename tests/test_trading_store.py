@@ -4,6 +4,7 @@ import sqlite3
 import unittest
 
 from trading_store import (
+    SCHEMA_VERSION,
     SCHEMA_V1,
     SCHEMA_V2,
     SCHEMA_V3,
@@ -17,11 +18,44 @@ from trading_store import (
 
 
 class TradingStoreTest(unittest.TestCase):
+    def test_schema_v9_upserts_one_gap_opportunity_per_identity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            event = {
+                "opportunity_id": "gap-20260717-002432",
+                "trade_date": "2026-07-17",
+                "stock_code": "002432",
+                "parent_signal_id": "parent-1",
+                "state": "OPEN_OBSERVING",
+                "reason": "gap_reentry_open_observing",
+                "original_entry_price": 74.72,
+                "original_stop_price": 69.49,
+                "original_risk_r": 5.23,
+                "reentry_cap_price": 77.335,
+                "confirmation_count": 1,
+                "attempt_count": 1,
+            }
+            with store.transaction() as conn:
+                store.upsert_gap_reentry_opportunity(conn, event)
+                store.upsert_gap_reentry_opportunity(
+                    conn, {**event, "state": "OPEN_CONFIRMED", "reason": "",
+                           "confirmation_count": 2, "planned_qty": 100}
+                )
+            self.assertEqual(store.health().schema_version, 9)
+            row = store.get_gap_reentry_opportunity(event["opportunity_id"])
+            self.assertEqual(row["state"], "OPEN_CONFIRMED")
+            self.assertEqual(row["planned_qty"], 100)
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM gap_reentry_opportunities"
+                ).fetchone()[0], 1)
+
     def test_schema_v8_tracks_signal_lifecycle_and_execution_issue_transitions(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
-            self.assertEqual(store.health().schema_version, 8)
+            self.assertEqual(store.health().schema_version, SCHEMA_VERSION)
             with store.transaction() as conn:
                 signal_columns = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
                 intent_columns = {row[1] for row in conn.execute("PRAGMA table_info(exit_intents)")}
@@ -108,7 +142,7 @@ class TradingStoreTest(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(reason, "ledger unavailable")
 
-    def test_initialize_creates_version_eight_schema_and_pragmas(self) -> None:
+    def test_initialize_creates_current_schema_and_pragmas(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
@@ -117,7 +151,7 @@ class TradingStoreTest(unittest.TestCase):
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
                 busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-                self.assertEqual(version, 8)
+            self.assertEqual(version, SCHEMA_VERSION)
             self.assertTrue({
                 "strategy_runs", "signals", "risk_decisions", "system_state",
                 "position_cycles", "order_events", "exit_intents", "trade_cooldowns",
@@ -149,7 +183,7 @@ class TradingStoreTest(unittest.TestCase):
             store.initialize()
             with store.connect() as conn:
                 count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-                self.assertEqual(count, 8)
+            self.assertEqual(count, SCHEMA_VERSION)
 
     def test_execution_issue_preserves_stage_start_until_state_changes(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -190,7 +224,7 @@ class TradingStoreTest(unittest.TestCase):
             store = TradingStore(path)
             store.initialize()
 
-            self.assertEqual(store.health().schema_version, 8)
+            self.assertEqual(store.health().schema_version, SCHEMA_VERSION)
             self.assertEqual(store.get_system_state("legacy"), "keep")
 
     def test_prune_execution_history_keeps_mismatch_evidence(self) -> None:

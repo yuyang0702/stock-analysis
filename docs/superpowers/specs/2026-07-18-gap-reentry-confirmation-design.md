@@ -1,7 +1,9 @@
 # 跳空越价后二次确认入场设计
 
 日期：2026-07-18
-状态：`planned / not implemented / not deployed / not observed / not validated`
+状态：`implemented（已合并本地 main） / not deployed / not observed / not validated`
+
+实现检查点：本地 `main` 已包含纯状态机、schema 9 机会账本、当前候选重新验证、两轮开板确认、`0.5R` 上限、三分之一试仓、最小一手完整风险复核、全新信号、JoinQuant 执行前复核、回封/超价撤单、部分成交撤余单、通知标签、健康指标和备份计数。最终复查确认最小一手按 `target_qty=100` 精确下单，执行前现金按当前价加费用缓冲复核；交易控制最终拦截不会写入 `new_signal_id`；无效风险单位在候选与账本中统一拒绝。开关 `GAP_REENTRY_ENABLE` 默认关闭。合并后 Windows 全量440项中437项通过；其余3项是基线已存在的 Windows无Bash导致 `run_ubuntu.sh ledger-check` 无法启动，仍须在Linux验证。代码尚未推送、部署或启用。
 
 ## 1. 目标
 

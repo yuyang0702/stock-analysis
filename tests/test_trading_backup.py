@@ -65,6 +65,7 @@ class TradingBackupTest(unittest.TestCase):
             self.assertTrue({
                 "orders", "fills", "account_snapshots", "position_snapshots",
                 "daily_equity", "reconciliation_runs", "reconciliation_items", "control_events",
+                "gap_reentry_opportunities",
             }.issubset(saved["table_counts"]))
 
     def test_rejects_backup_root_inside_project(self) -> None:

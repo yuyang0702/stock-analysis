@@ -34,6 +34,7 @@ CORE_TABLES = (
     "reconciliation_items",
     "control_events",
     "execution_issue_state",
+    "gap_reentry_opportunities",
 )
 
 

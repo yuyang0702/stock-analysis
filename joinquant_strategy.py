@@ -22,7 +22,7 @@ MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_POSITIONS = 5
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-16.1-unified-effective-stop"
+STRATEGY_TEMPLATE_VERSION = "2026-07-18.1-gap-reentry"
 
 
 def _ensure_runtime_state(context):
@@ -34,6 +34,8 @@ def _ensure_runtime_state(context):
         g.order_events = []
     if not isinstance(getattr(g, "order_signal_ids", None), dict):
         g.order_signal_ids = {}
+    if not isinstance(getattr(g, "gap_reentry_orders", None), dict):
+        g.gap_reentry_orders = {}
     total = float(context.portfolio.total_value or 0)
     today = datetime.now().strftime("%Y-%m-%d")
     if not getattr(g, "metrics_trade_date", None):
@@ -53,6 +55,7 @@ def initialize(context):
     g.executed_signal_ids = set()
     g.order_events = []
     g.order_signal_ids = {}
+    g.gap_reentry_orders = {}
     g.metrics_trade_date = datetime.now().strftime("%Y-%m-%d")
     g.day_start_value = float(context.portfolio.total_value or 0)
     g.peak_value = g.day_start_value
@@ -169,7 +172,16 @@ def _can_execute(context, signal):
         if signal.get("action") == "buy":
             if current_price >= float(_order_attr(quote, "high_limit", float("inf")) or float("inf")):
                 return False, "limit_up"
-            target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+            if signal.get("entry_path") == "gap_reentry":
+                cap = float(signal.get("reentry_cap_price") or 0)
+                if cap <= 0 or current_price > cap:
+                    return False, "gap_reentry_price_moved"
+            target_qty = int(signal.get("target_qty") or 0)
+            target_value = (
+                current_price * target_qty * 1.001
+                if target_qty > 0 else
+                context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+            )
             if target_value > float(_position_attr(context.portfolio, "available_cash", context.portfolio.cash) or 0):
                 return False, "insufficient_cash"
             entry = float(signal.get("entry_price") or signal.get("price") or 0)
@@ -230,6 +242,35 @@ def _order_status_text(value):
     status = text.split(".")[-1].lower() if text else ""
     return {"held": "submitted", "canceled": "cancelled"}.get(status, status)
 
+
+def _cancel_invalid_gap_reentry_orders():
+    try:
+        orders = get_open_orders()
+        quotes = get_current_data()
+    except Exception:
+        return
+    for order in list(orders.values()):
+        order_id = str(_order_attr(order, "order_id", "") or "")
+        meta = getattr(g, "gap_reentry_orders", {}).get(order_id)
+        if not meta:
+            continue
+        jq_code = str(meta.get("jq_code") or "")
+        quote = quotes[jq_code]
+        price = float(_order_attr(quote, "last_price", 0) or 0)
+        high_limit = float(_order_attr(quote, "high_limit", float("inf")) or float("inf"))
+        cap = float(meta.get("reentry_cap_price") or 0)
+        amount = abs(float(_order_attr(order, "amount", 0) or 0))
+        filled = abs(float(_order_attr(order, "filled", 0) or 0))
+        partial_fill = 0 < filled < amount
+        if partial_fill or price >= high_limit or cap <= 0 or price > cap:
+            cancel_order(order)
+            reason = (
+                "gap_reentry_partial_fill_complete"
+                if partial_fill else "gap_reentry_resealed_or_price_moved"
+            )
+            _record_order(meta, "cancelled", reason, order)
+            g.gap_reentry_orders.pop(order_id, None)
+
 def _record_order(signal, status, reason="", order=None):
     if not isinstance(getattr(g, "order_events", None), list):
         g.order_events = []
@@ -268,6 +309,7 @@ def _record_order(signal, status, reason="", order=None):
 
 
 def execute_signals(context):
+    _cancel_invalid_gap_reentry_orders()
     event_count = 0
     for signal in list(getattr(g, "signals", [])):
         ok, reason = _can_execute(context, signal)
@@ -275,7 +317,10 @@ def execute_signals(context):
             if reason == "duplicate":
                 continue
             log.info("skip %s: %s" % (signal.get("id"), reason))
-            explicit = {"suspended", "limit_down", "limit_up", "t_plus_one", "insufficient_cash", "price_moved"}
+            explicit = {
+                "suspended", "limit_down", "limit_up", "t_plus_one",
+                "insufficient_cash", "price_moved", "gap_reentry_price_moved",
+            }
             _record_order(signal, reason if reason in explicit else "skipped", reason)
             if signal.get("action") == "buy" and signal.get("id"):
                 g.executed_signal_ids.add(signal["id"])
@@ -288,12 +333,18 @@ def execute_signals(context):
             _record_order(signal, "dry_run", "not_submitted")
         elif action == "buy":
             try:
-                target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
-                order = order_target_value(jq_code, target_value)
+                target_qty = int(signal.get("target_qty") or 0)
+                if target_qty > 0:
+                    order = order_target(jq_code, target_qty)
+                else:
+                    target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
+                    order = order_target_value(jq_code, target_value)
                 if order is None:
                     _record_order(signal, "failed", "limit_up_or_suspended_or_rejected")
                 else:
                     _record_order(signal, _order_attr(order, "status", "submitted"), order=order)
+                    if signal.get("entry_path") == "gap_reentry" and _order_attr(order, "order_id"):
+                        g.gap_reentry_orders[str(_order_attr(order, "order_id"))] = dict(signal)
             except Exception as exc:
                 _record_order(signal, "failed", str(exc))
         elif action == "sell":

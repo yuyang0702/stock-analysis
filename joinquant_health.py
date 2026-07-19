@@ -234,6 +234,20 @@ def _position_map(payload: dict[str, Any]) -> dict[str, int]:
     return result
 
 
+def _gap_reentry_metrics(db_file: Path, trade_date: str) -> dict[str, int]:
+    try:
+        with TradingStore(db_file).connect() as conn:
+            rows = conn.execute(
+                """SELECT state, COUNT(*) AS count
+                   FROM gap_reentry_opportunities WHERE trade_date=?
+                   GROUP BY state""",
+                (trade_date,),
+            ).fetchall()
+        return {str(row["state"]): int(row["count"]) for row in rows}
+    except Exception:
+        return {}
+
+
 def _position_consistency(snapshot_payload: dict[str, Any], positions_file: Path) -> tuple[str, list[str]]:
     if not positions_file.exists():
         return "missing", []
@@ -339,6 +353,7 @@ def build_health_report(
     signal_ids = {str(item.get("id")) for item in signals if isinstance(item, dict) and item.get("id")}
     ledger_ok, ledger_schema_version, ledger_signal_count, ledger_json_parity, ledger_error = _ledger_status(db_file, signals)
     execution_metrics = _execution_ledger_metrics(db_file)
+    gap_reentry_metrics = _gap_reentry_metrics(db_file, today) if ledger_ok else {}
     positions = snapshot_payload.get("positions", []) if isinstance(snapshot_payload.get("positions"), list) else []
     expected_template_version = app_config.JOINQUANT_TEMPLATE_VERSION
     strategy_template_version = str(snapshot_payload.get("strategy_template_version") or "").strip()
@@ -439,6 +454,7 @@ def build_health_report(
         "json_signal_count": len(signal_ids),
         "ledger_json_parity": ledger_json_parity,
         "ledger_error": ledger_error,
+        "gap_reentry_states": gap_reentry_metrics,
         "signal_age_min": round(signal_age, 1) if signal_age is not None else None,
         "snapshot_age_min": round(snapshot_age, 1) if snapshot_age is not None else None,
         "snapshot_count_today": len(history_today),
@@ -482,6 +498,7 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         f"- SQLite schema_version：{result.get('ledger_schema_version', 0)}",
         f"- SQLite/JSON 信号一致：{'是' if result.get('ledger_json_parity') else '否'}",
         f"- SQLite 错误：{_sanitize_ledger_error(result.get('ledger_error') or '') or '-'}",
+        f"- 跳空二次确认状态：{json.dumps(result.get('gap_reentry_states') or {}, ensure_ascii=False, sort_keys=True)}",
         f"- 信号年龄：{result.get('signal_age_min')} 分钟",
         f"- 快照年龄：{result.get('snapshot_age_min')} 分钟",
         f"- 今日信号拉取：{result.get('signal_pull_count_today', 0)} 次",
