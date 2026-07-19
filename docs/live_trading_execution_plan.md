@@ -10,6 +10,12 @@
 
 > 2026-07-16 止损与网页增量以 `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` 为准。唯一卖出止损改为成交校验后的冻结 initial、可选 manual 与首段止盈后 trailing 的最大值；网页与策略共用解析器。提交 `8db92bf`、schema 8 和认证交易面板已部署服务器，Linux全量414/414、环境哈希、三个服务、同步和认证门均通过；用户确认 JoinQuant 网站已手工更新 bearer 模板 `2026-07-16.1-unified-effective-stop`。当前为 `implemented（已推送） / deployed（服务器；网站由用户确认） / not observed / not validated`。T+1、停牌、跌停和可卖数量不足仍保留退出意图，停买不阻止合法卖出；部署和非交易时段同步不构成交易日观察。
 
+> 2026-07-19 同一专项文档追加的网页可观测性增强已经实现但尚未部署：页面只读复用
+现有账本的有界查询，分别展示数据年龄和模板回传、未完成执行原因、持仓 R 风险/入场
+来源/交易链路及研究能力阶段；人工止损仍是唯一交易相关写入口。该增量不改变任何
+买卖、止盈止损、对账恢复或 JoinQuant 执行语义，当前为
+`implemented / not deployed / not observed / not validated`。
+
 ## 目标
 
 把当前项目从“能扫描、能模拟下单”升级为“可长期稳定运行、具备风控、回测、审计和实盘接入能力的股票量化工具”。

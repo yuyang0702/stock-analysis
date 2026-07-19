@@ -6,6 +6,12 @@
 
 > 2026-07-16 schema 8 增量：只给 `position_cycles` 增加一个可空 `manual_stop_price`，人工修改和旧周期只收紧修复复用长期 `control_events`；effective/trailing stop 均为派生值，不新增重复列、表、JSONL、截图或逐轮文件。OCR 新写入与 Tesseract 依赖已移除，历史上传目录只读保留、不自动删除。部署前 schema 7 在线备份完整性为 `ok`，迁移后 schema 8 健康/可写且环境文件哈希不变；366天高频保留和7/4/12备份轮转不变。当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
+> 2026-07-19 网页可观测性增强只读取现有 SQLite 与当前持仓快照：活动异常和待执行对象
+各最多30条，每只持仓最多30条交易链路、200个最近价格快照，能力清单固定有界。刷新
+页面不写账本、不生成报告、不追加 JSONL，不新增表、列、数据库或依赖；人工止损仍是
+唯一写操作并沿用 `control_events`。当前为
+`implemented / not deployed / not observed / not validated`。
+
 ## 1. 目标
 
 本规范用于防止项目随着长期运行出现以下问题：

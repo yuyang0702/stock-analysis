@@ -20,7 +20,7 @@ Tasks 1–10 已完成。实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72`
 
 ## 第二阶段：网页可观测性增强
 
-状态：confirmed / not implemented / not deployed / not observed / not validated。
+状态：implemented / not deployed / not observed / not validated。
 
 11. 先以失败测试固定独立数据时效、预期/实际 JoinQuant 版本和缺失数据降级语义。
 12. 增加待执行订单、未完成退出意图、等待时间、阻塞原因和影响范围的有界只读视图。
@@ -31,3 +31,42 @@ Tasks 1–10 已完成。实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72`
 16. 更新主文档、交接、执行计划和存储规范，运行专项、全量测试、编译、diff 和秘密扫描。
 17. 实现完成后仅标记 implemented；推送、服务器部署、真实交易日观察和连续验收分别
     需要独立证据，不得随代码完成自动升级。
+
+### 执行文件与接口
+
+- 修改 `tests/test_holdings_web.py`：先增加数据时效/版本、待执行原因、持仓风险/链路、
+  能力状态和降级语义测试，并逐项确认在实现前失败。
+- 修改 `holdings_web.py`：增加纯时间格式化、异常解释、能力状态和页面只读数据组装；
+  `_dashboard_data()` 继续作为唯一页面查询入口，所有列表保留 `LIMIT`。
+- 修改 `docs/project_roadmap.md`、`docs/project_handoff.md`、
+  `docs/live_trading_execution_plan.md`、`docs/data_storage_policy.md` 和本专项文档：
+  只在测试与实现完成后把增强阶段更新为
+  `implemented / not deployed / not observed / not validated`。
+
+### 测试驱动顺序
+
+1. 增加 `test_dashboard_shows_independent_freshness_and_template_confirmation`，构造扫描、
+   信号和 JoinQuant 快照，断言预期版本、实际回传版本和独立时间状态；先运行并确认
+   因页面缺少字段而失败，再实现时间/版本卡并复跑通过。
+2. 增加 `test_dashboard_explains_pending_execution_and_issue_impact`，构造部分成交订单、
+   活动退出意图和执行问题，断言等待状态、原因及“停买不影响卖出”；先失败，再实现
+   最多30条的待执行与异常解释查询并复跑。
+3. 增加 `test_dashboard_traces_position_risk_and_signal_provenance`，构造入场信号和持仓周期，
+   断言持仓天数、1R、收益倍数、入场路径以及信号/订单/成交/对账轨迹；先失败，再实现
+   每只持仓最多30条轨迹和有限快照派生。
+4. 增加 `test_dashboard_shows_strict_capability_states_without_controls`，断言研究区逐项显示
+   planned / implemented / deployed / observed / validated，且不存在模型启用、自动解锁
+   或直接交易按钮；先失败，再实现固定只读能力清单。
+5. 每个红绿循环运行对应单测和 `python -m unittest tests.test_holdings_web -v`；最后运行
+   `python -m unittest discover -s tests -v`、`python -m py_compile holdings_web.py` 和
+   `git diff --check`。本机缺少 `bash.exe` 导致的三个 Linux 脚本测试作为已批准环境限制，
+   必须在服务器部署前补跑，不得记为本地通过。
+
+### 第二阶段实施结果
+
+Tasks 11–16 已完成：网页采用三个锚点分区，增加独立数据时效和预期/实际模板版本、
+待执行与未完成退出解释、异常影响提示、持仓 R 风险与信号来源、30条有界交易链路以及
+只读研究状态和数据库异常安全降级。未新增 schema、运行文件、第三方依赖或交易/解锁
+入口。新增网页测试5项，专项7/7通过；Windows 全量419项中416项通过，另外3项因本机不存在 `bash.exe`
+无法启动 Linux `run_ubuntu.sh ledger-check`，该环境限制已由用户确认可留待服务器部署
+前补跑。当前未提交推送、未部署、未观察、未验证。

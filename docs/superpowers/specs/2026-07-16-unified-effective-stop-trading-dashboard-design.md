@@ -1,7 +1,7 @@
 # 统一有效止损与交易运行面板设计
 
 日期：2026-07-16  
-状态：基础能力 implemented / deployed / not observed / not validated；可观测性增强 confirmed / not implemented / not deployed / not observed / not validated
+状态：基础能力 implemented / deployed / not observed / not validated；可观测性增强 implemented / not deployed / not observed / not validated
 从属关系：从属于 `docs/project_roadmap.md`；卖出优先级继续从属于分层退出设计，本文只统一止损事实源、成交后校验与网页展示/维护边界。
 
 ## 目标

@@ -2,6 +2,13 @@
 
 > 2026-07-16 统一有效止损与交易运行面板增量已随 `8db92bf6448466827a50560ae2fb8c7fde142c72` 推送并部署：schema 8 增加可空 `position_cycles.manual_stop_price`；成交成本保护校验后的 frozen initial、明确人工止损、首段止盈后移动止损共同解析唯一 effective stop；网页和策略不再各算一套。网页已移除 OCR/截图和直接清仓入口，增加认证、CSRF、运行/异常/风险/轨迹视图；JoinQuant 模板改用 bearer token 且 token 值未改变。部署前 schema 7 备份完整性为 `ok`，Linux全量414/414、编译、schema 8健康/可写、环境哈希不变、三个服务active、同步2个持仓、网页302登录保护、API未认证403及重启后ERROR日志为空均已核验。用户确认网站模板已手工更新为 `2026-07-16.1-unified-effective-stop`；新模板尚无交易日快照回传。当前严格为 `implemented（已推送） / deployed（服务器；网站由用户确认） / not observed / not validated`。
 
+> 2026-07-19 网页可观测性增强已在隔离分支实现：今日运行区分别显示扫描、信号、快照
+和对账年龄，并严格区分预期与实际回传模板；待执行区解释部分成交、未完成退出和异常
+影响；持仓区增加 R 风险、入场来源及最多30条交易链路；研究区只读显示严格阶段。
+不新增 schema、持久化、直接交易、自动解锁或模型/参数入口。网页专项7/7通过，Windows
+可运行全量416项通过，3项 Linux 脚本测试因本机无 `bash.exe` 留待服务器补跑。当前为
+`implemented / not deployed / not observed / not validated`。
+
 > 2026-07-18 新增“跳空越价后二次确认入场”专项设计：旧计划只作为价格和风险锚点，当前策略必须重新选中；封死涨停不排队，开板后两次独立有效扫描确认，回封重置，价格上限为原入场加 `0.5R`；不足 100 股仅在完整风险预算允许时使用最小一手。确认后必须产生全新信号，不能恢复旧信号。当前严格为 `planned / not implemented / not deployed / not observed / not validated`，没有改变服务器或 JoinQuant 当前行为。权威边界见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。
 
 > 2026-07-15 最新部署增量：成交全量对账已改为仅比较快照交易日的 SQLite 成交与 JoinQuant 当日 `get_trades()`；跨日历史成交不再产生假 `FILL_MISSING_PLATFORM`，同日缺失与平台侧未落账的严重度保持不变。代码提交 `cd83f26` 已推送并部署；SQLite 备份完整性、Linux全量326/326、Python编译、schema 7健康/可写、配置未变、三个服务active及重启后ERROR日志为空均已核验。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
