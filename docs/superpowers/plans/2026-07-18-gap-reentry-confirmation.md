@@ -1,8 +1,8 @@
 # Gap Reentry Confirmation Implementation Plan
 
-状态：Tasks 1–7 已实现、通过最终复查并合并本地 `main`；待推送和另行授权部署。`GAP_REENTRY_ENABLE` 保持默认关闭。最终复查补齐精确100股下单、当前价费用缓冲、部分成交撤余单、交易控制拦截不误标发布，以及无效风险单位状态一致性。
+状态：Tasks 1–7 已实现、通过最终复查、推送并部署服务器；`GAP_REENTRY_ENABLE=False`，JoinQuant 网站模板尚未确认更新，未观察、未验证。最终复查补齐精确100股下单、当前价费用缓冲、部分成交撤余单、交易控制拦截不误标发布，以及无效风险单位状态一致性。
 
-执行记录：Tasks 1–7 的首轮实现提交为 `11e887e`，最终复查提交为 `6cde4b1`；下列逐任务提交命令是原计划检查点，实际未拆成七个提交。合并后 Windows 全量440项中437项通过，其余3项仍是本机无Bash导致 Linux脚本无法启动。
+执行记录：Tasks 1–7 的首轮实现提交为 `11e887e`，最终复查提交为 `6cde4b1`，服务器部署实现检查点为 `5ad0ad539ef66aa7cf1073ad7142fde116d74ea5`；下列逐任务提交命令是原计划检查点，实际未拆成七个提交。服务器虚拟环境 Linux 全量440/440、Python编译、schema 9健康/可写、环境哈希与三个服务均已核验。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

@@ -20,7 +20,7 @@ Tasks 1–10 已完成。实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72`
 
 ## 第二阶段：网页可观测性增强
 
-状态：implemented / not deployed / not observed / not validated。
+状态：implemented / deployed（服务器） / not observed / not validated。
 
 11. 先以失败测试固定独立数据时效、预期/实际 JoinQuant 版本和缺失数据降级语义。
 12. 增加待执行订单、未完成退出意图、等待时间、阻塞原因和影响范围的有界只读视图。

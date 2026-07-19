@@ -2,22 +2,24 @@
 
 > 2026-07-16 统一有效止损与交易运行面板增量已随 `8db92bf6448466827a50560ae2fb8c7fde142c72` 推送并部署：schema 8 增加可空 `position_cycles.manual_stop_price`；成交成本保护校验后的 frozen initial、明确人工止损、首段止盈后移动止损共同解析唯一 effective stop；网页和策略不再各算一套。网页已移除 OCR/截图和直接清仓入口，增加认证、CSRF、运行/异常/风险/轨迹视图；JoinQuant 模板改用 bearer token 且 token 值未改变。部署前 schema 7 备份完整性为 `ok`，Linux全量414/414、编译、schema 8健康/可写、环境哈希不变、三个服务active、同步2个持仓、网页302登录保护、API未认证403及重启后ERROR日志为空均已核验。用户确认网站模板已手工更新为 `2026-07-16.1-unified-effective-stop`；新模板尚无交易日快照回传。当前严格为 `implemented（已推送） / deployed（服务器；网站由用户确认） / not observed / not validated`。
 
-> 2026-07-19 网页可观测性增强已在隔离分支实现：今日运行区分别显示扫描、信号、快照
+> 2026-07-19 网页可观测性增强已随 `5ad0ad539ef66aa7cf1073ad7142fde116d74ea5` 推送并部署服务器：今日运行区分别显示扫描、信号、快照
 和对账年龄，并严格区分预期与实际回传模板；待执行区解释部分成交、未完成退出和异常
 影响；持仓区增加 R 风险、入场来源及最多30条交易链路；研究区只读显示严格阶段。
 不新增 schema、持久化、直接交易、自动解锁或模型/参数入口。网页专项7/7通过，Windows
-可运行全量416项通过，3项 Linux 脚本测试因本机无 `bash.exe` 留待服务器补跑。当前为
-`implemented / not deployed / not observed / not validated`。
+服务器虚拟环境全量440/440、编译、schema 9健康/可写、环境哈希、三个服务和重启后
+warning 及以上日志均已核验。当前为
+`implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
-> 2026-07-18 “跳空越价后二次确认入场”已实现、完成复查并合并本地 main：旧计划只作
+> 2026-07-19 “跳空越价后二次确认入场”已实现、完成复查、推送并部署服务器：旧计划只作
 锚点，当前候选重新验证；封板不排队，开板两次独立扫描确认，回封重置，上限为原入场
 加 `0.5R`；不足100股只在完整风险预算允许时提升为一手。schema 9 新增每股/每日/机会
 一行的 `gap_reentry_opportunities`，备份和健康报告已覆盖；JoinQuant 模板版本为
 `2026-07-18.1-gap-reentry`，100股例外按精确数量下单并按当前价加费用缓冲复核现金，
-部分成交立即撤余单，交易控制拦截不会把机会误标为已发布。合并后验证结果应以本次
-main 回归为准。当前严格为
-`implemented（已合并本地 main） / not deployed / not observed / not validated`，
-开关默认关闭，服务器与网站模板均未改变。
+部分成交立即撤余单，交易控制拦截不会把机会误标为已发布。部署前 schema 8 在线备份
+完整性为 `ok`；服务器 Linux 全量440/440、编译、schema 9健康/可写、环境哈希不变、
+三个服务active且重启后无 warning 及以上日志。当前严格为
+`implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`。
+`GAP_REENTRY_ENABLE=False`，JoinQuant 网站模板尚未确认更新，不能把服务器部署写成端到端部署。
 
 > 2026-07-15 最新部署增量：成交全量对账已改为仅比较快照交易日的 SQLite 成交与 JoinQuant 当日 `get_trades()`；跨日历史成交不再产生假 `FILL_MISSING_PLATFORM`，同日缺失与平台侧未落账的严重度保持不变。代码提交 `cd83f26` 已推送并部署；SQLite 备份完整性、Linux全量326/326、Python编译、schema 7健康/可写、配置未变、三个服务active及重启后ERROR日志为空均已核验。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
@@ -132,7 +134,7 @@ git ls-remote origin refs/heads/main
 | 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |
 | ML-7 训练型影子模型 | partially implemented（Task 1–3 已推送） | 共享评分/契约、独立 ML SQLite schema 和实时完整候选采集已实现；服务器未部署且默认关闭。strict 历史导入、标签、训练、治理与 L0 推理仍待实现；没有模型，不得写成 deployed/observed/validated。 |
 | 统一有效止损与交易运行面板 | deployed | schema 8、成交后只收紧校验、manual/trailing/effective stop、认证面板和 OCR 删除已部署；网站模板由用户确认更新，但新快照和真实卖出仍未观察或验证。 |
-| 跳空越价后二次确认入场 | implemented（已合并本地 main） | 本地 schema 9、二次确认、精确一手、部分成交撤余单和机会账本已实现并复查；默认关闭，服务器与 JoinQuant 均未部署、未观察、未验证。 |
+| 跳空越价后二次确认入场 | deployed（服务器代码，功能关闭） | schema 9、二次确认、精确一手、部分成交撤余单和机会账本已部署；默认关闭，JoinQuant 网站模板尚未确认更新，未观察、未验证。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。

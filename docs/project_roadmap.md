@@ -1,6 +1,6 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-07-18
+更新日期：2026-07-19
 
 本文档是当前项目规划的唯一主说明，合并已有能力、JoinQuant 接入方案、服务器部署流程，以及后续机器学习优化路线。其他早期设计文档只作为历史参考；如果口径冲突，以本文档为准。
 
@@ -32,10 +32,10 @@
 | `docs/superpowers/plans/2026-07-15-trained-shadow-model.md` | ML-7 训练型影子模型的测试驱动实施、验证、部署与观察顺序 | 执行训练模型代码或核验实施范围时读取；Task 1–3 已实现，Task 4–12 尚未完成，整体为 partially implemented 且未部署。 |
 | `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` | 调度边界、信号生命周期、退出执行状态、告警转换和安全自动恢复 | 修改扫描调度、信号时效、自动对账或买入恢复时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已手动更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
-| `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、四类止损唯一事实源、交易运行面板、网页安全和可观测性增强 | 修改止损、持仓网页或止损迁移时必读；基础能力为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`；可观测性增强为 `implemented / not deployed / not observed / not validated`。 |
-| `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、可观测性增强、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；Tasks 11–16 已实现，Task 17 的推送、部署、观察和验收尚未执行。 |
-| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（已合并本地 main） / not deployed / not observed / not validated`，开关默认关闭。 |
-| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | Tasks 1–7 已实现并复查，已合并本地 main；待验证、推送和另行授权部署。 |
+| `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、四类止损唯一事实源、交易运行面板、网页安全和可观测性增强 | 修改止损、持仓网页或止损迁移时必读；基础能力和可观测性增强均为 `implemented（已推送） / deployed（服务器） / not observed / not validated`；JoinQuant 网站仍以用户此前确认的模板状态为准。 |
+| `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、可观测性增强、测试与部署顺序 | Tasks 1–17 的实现、推送和服务器部署已完成；交易日观察与验收尚未完成。 |
+| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`；JoinQuant 网站模板尚未确认更新。 |
+| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | Tasks 1–7 已实现、复查、推送并部署服务器；开关保持关闭，网站模板、交易日观察和验收尚未完成。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
@@ -63,7 +63,7 @@
 
 正常风险仓位不足 100 股时只进入最小一手例外检查；100 股必须同时满足现金、单笔风险、单票/行业/题材/总仓位、持仓数量和开放风险边界，否则放弃。`RISK_OFF`、人工停止买入、kill switch、健康/对账门、行情陈旧、同股持仓或未完成订单等继续优先。计划增加事件级有界机会账本支持成交与拒绝机会的反事实复盘，不新增逐扫描无限文件。
 
-专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。本地 `main` 已实现纯状态机、schema 9 事件级机会账本、当前候选重新验证、两轮开板确认、最小一手风险复核、全新执行契约和 JoinQuant 最终复核。最终复查补齐：100股信号按数量而非金额下单、按当前价加费用缓冲复核现金、任意部分成交后撤销余单且不再补仓、交易控制拦截的信号不误标为已发布、无效风险单位在候选与账本中一致标为拒绝。合并后 Windows 全量440项中437项通过，3项仅因当前Windows无Bash无法启动Linux `ledger-check`，与实施前基线一致。当前严格为 `implemented（已合并本地 main） / not deployed / not observed / not validated`；`GAP_REENTRY_ENABLE` 默认关闭，现有服务器和 JoinQuant 行为未改变。
+专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。提交 `5ad0ad539ef66aa7cf1073ad7142fde116d74ea5` 已实现并部署服务器：纯状态机、schema 9 事件级机会账本、当前候选重新验证、两轮开板确认、最小一手风险复核、全新执行契约和 JoinQuant 最终复核均已进入运行代码。2026-07-19 部署前在线备份完整性为 `ok`，服务器虚拟环境 Linux 全量440/440、Python编译、schema 9健康/可写、环境文件哈希不变、三个服务active且重启后无 warning 及以上日志。当前严格为 `implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`；`GAP_REENTRY_ENABLE=False`，JoinQuant 网站模板 `2026-07-18.1-gap-reentry` 尚未确认更新，因此不会产生该路径的新买单。
 
 ## 2026-07-15 schema 7 部署检查点
 
