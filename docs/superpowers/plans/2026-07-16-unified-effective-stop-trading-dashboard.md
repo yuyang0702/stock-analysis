@@ -17,3 +17,17 @@
 ## 实施结果
 
 Tasks 1–10 已完成。实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72` 已推送并通过验证后的增量 bundle fast-forward 部署；服务器 Linux 全量414/414、schema 8健康/可写、环境文件哈希不变、三个服务active，部署后同步2个持仓。用户确认 JoinQuant 网站模板 `2026-07-16.1-unified-effective-stop` 已手工更新。严格状态为 `implemented / deployed / not observed / not validated`；下一步只做交易日快照版本回传、止损执行闭环和连续观察验收。
+
+## 第二阶段：网页可观测性增强
+
+状态：confirmed / not implemented / not deployed / not observed / not validated。
+
+11. 先以失败测试固定独立数据时效、预期/实际 JoinQuant 版本和缺失数据降级语义。
+12. 增加待执行订单、未完成退出意图、等待时间、阻塞原因和影响范围的有界只读视图。
+13. 扩展单只持仓风险与交易链路，关联信号、订单、成交、退出意图和对账差异。
+14. 增加只读研究与验证区，严格显示 planned / implemented / deployed / observed /
+    validated，不提供模型、参数或部署写入口。
+15. 保留现有登录、CSRF、人工止损审计和 OCR 路由移除行为；不增加直接交易或自动解锁。
+16. 更新主文档、交接、执行计划和存储规范，运行专项、全量测试、编译、diff 和秘密扫描。
+17. 实现完成后仅标记 implemented；推送、服务器部署、真实交易日观察和连续验收分别
+    需要独立证据，不得随代码完成自动升级。

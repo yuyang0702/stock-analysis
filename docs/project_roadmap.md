@@ -32,8 +32,8 @@
 | `docs/superpowers/plans/2026-07-15-trained-shadow-model.md` | ML-7 训练型影子模型的测试驱动实施、验证、部署与观察顺序 | 执行训练模型代码或核验实施范围时读取；Task 1–3 已实现，Task 4–12 尚未完成，整体为 partially implemented 且未部署。 |
 | `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` | 调度边界、信号生命周期、退出执行状态、告警转换和安全自动恢复 | 修改扫描调度、信号时效、自动对账或买入恢复时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已手动更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
-| `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、人工/移动/有效止损唯一事实源、交易运行面板和网页安全 | 修改止损、持仓网页或止损迁移时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`。 |
-| `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；后续用于新模板回传、真实卖出观察和验收。 |
+| `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、四类止损唯一事实源、交易运行面板、网页安全和可观测性增强 | 修改止损、持仓网页或止损迁移时必读；基础能力为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已更新） / not observed / not validated`；可观测性增强为 `confirmed / not implemented / not deployed / not observed / not validated`。 |
+| `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、可观测性增强、测试与部署顺序 | Tasks 1–10 和服务器部署已完成；Tasks 11–17 为已确认、尚未实现的网页增强阶段。 |
 | `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `planned / not implemented / not deployed / not observed / not validated`，尚未改变当前买入行为。 |
 | `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | 实施或核验该能力时必读；当前计划已编写，代码尚未开始。 |
 
@@ -44,6 +44,13 @@
 本地代码已经把网页和卖出引擎收敛到同一个有效止损解析器：`initial_stop_price` 是按真实持仓成本和板块最大亏损边界只收紧校验后的冻结止损；`manual_stop_price` 默认空，只允许用户明确上调或清除并写 `control_events`；`trailing_stop_price` 只在首段止盈后派生；`effective_stop_price=max(initial, manual, activated trailing)` 是唯一卖出阈值。JoinQuant 快照不再按成本价自动生成 3.5% 网页止损，活动旧周期只允许上调修复且不把旧网页显示值伪装成人工指令。
 
 SQLite 目标 schema version 为 8，只给 `position_cycles` 增加可空 `manual_stop_price`，不持久化重复有效止损。手机网页已改为认证后的交易运行面板，展示运行状态、活动异常、持仓四类止损与执行轨迹；手工区只维护人工止损，不提供直接买卖。截图上传、OCR、确认和文件访问路由及 Tesseract 依赖已删除，历史上传文件保留。JoinQuant API/模板改为优先使用 Authorization bearer，服务器暂时保留 query token 兼容并对有效 query 凭据做访问日志脱敏。
+
+2026-07-19 已确认在原交易运行面板内增加三分区可观测性：今日运行补充各数据源时效、
+版本确认、异常影响和待执行原因；交易与持仓补充风险倍数、入场依据和完整交易链路；
+研究与验证严格区分 planned / implemented / deployed / observed / validated。该增强
+复用现有 SQLite 有界查询，不新增持久化或直接交易、自动解锁、参数修改和模型启用
+入口。当前严格为 `confirmed / not implemented / not deployed / not observed /
+not validated`。
 
 实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72` 已推送到 `origin/main` 并部署服务器。服务器到 GitHub 两次超时后，使用本地和服务器均通过 `git bundle verify` 的 `0e246c2 → 8db92bf` 增量 bundle 做 fast-forward，并把服务器 `origin/main` 跟踪引用同步到同一提交。部署前 schema 7 正式账本在线备份成功且 `integrity_check=ok`；Linux 全量 414/414、目标模块编译、schema 8 `ledger-check` 健康/可写、环境文件哈希不变、三个核心服务 active。部署后手工运行一次持仓同步成功刷新2个 JoinQuant 持仓；网页未认证请求返回302登录跳转，信号 API 未认证请求返回403，重启后五分钟三个服务无 ERROR 日志。用户随后确认已在 JoinQuant 网站手工更新模板 `2026-07-16.1-unified-effective-stop`，但尚无新交易日快照回传证明网站实际运行版本。
 
