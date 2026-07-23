@@ -1,6 +1,6 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-07-19
+更新日期：2026-07-23
 
 本文档是当前项目规划的唯一主说明，合并已有能力、JoinQuant 接入方案、服务器部署流程，以及后续机器学习优化路线。其他早期设计文档只作为历史参考；如果口径冲突，以本文档为准。
 
@@ -36,8 +36,24 @@
 | `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、可观测性增强、测试与部署顺序 | Tasks 1–17 的实现、推送和服务器部署已完成；交易日观察与验收尚未完成。 |
 | `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`；JoinQuant 网站模板尚未确认更新。 |
 | `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | Tasks 1–7 已实现、复查、推送并部署服务器；开关保持关闭，网站模板、交易日观察和验收尚未完成。 |
+| `docs/superpowers/specs/2026-07-23-pandas-holding-series-health-fix-design.md` | 持仓候选触发扫描失败的根因、最小修复和验证边界 | 当前为 `implemented / not deployed / not observed / not validated`；部署或核验该扫描健康事故时读取。 |
+| `docs/superpowers/plans/2026-07-23-pandas-holding-series-health-fix.md` | 持仓 Series 布尔歧义的测试驱动修复与发布检查 | 本地代码和测试已完成；提交、推送、Linux 验证、部署和真实扫描观察尚未执行。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
+
+## 2026-07-23 持仓候选扫描健康事故
+
+服务器只读诊断确认，2026-07-23 10:32 后多轮盘中扫描在持仓股票进入主候选或扩大
+观察池时失败，`signals.json` 因此不能继续刷新。完整 traceback 定位到
+`build_risk_decision` 对 `pd.Series` 持仓使用 `if holding`，触发 Pandas 布尔歧义；
+服务、SQLite、账户快照、模板和 API 本身并非本次根因。
+
+本地修复把共享存在性判断改为 `holding is not None`，没有调整买卖、止盈止损、评分、
+仓位、通知或数据存储规则。回归测试完成 RED/GREEN 验证，风险引擎专项 7/7、目标模块
+编译和不依赖 Linux Bash 的 Windows 测试 436 项通过。当前严格状态为
+`implemented / not deployed / not observed / not validated`；Windows 缺少 Bash 导致
+3 个 Linux 脚本用例无法本机运行，提交、推送、服务器 Linux 全量测试、部署、重启和
+真实扫描文件刷新均需另行授权与验证。
 
 ## 2026-07-16 统一有效止损与交易运行面板
 

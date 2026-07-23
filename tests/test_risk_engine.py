@@ -53,6 +53,18 @@ class RiskEngineTest(unittest.TestCase):
         self.assertGreater(decision.position_pct, 0)
         self.assertIn("突破", decision.reason)
 
+    def test_build_risk_decision_accepts_series_holding(self) -> None:
+        holding = pd.Series({"current_price": 10.1, "cost_price": 9.5})
+
+        decision = build_risk_decision(
+            self.row,
+            self.market_info,
+            profile=build_strategy_profile("short"),
+            holding=holding,
+        )
+
+        self.assertGreaterEqual(decision.entry_price, 10.1)
+
     def test_weak_market_blocks_trade(self) -> None:
         weak_row = dict(self.row)
         weak_row["market_state"] = "风险释放"

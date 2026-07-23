@@ -306,7 +306,7 @@ def build_risk_decision(
 
     allowed, disallow_reasons = _allowed_trade(row, market_info)
     price = _price(row)
-    if holding:
+    if holding is not None:
         price = _float(holding.get("current_price"), price) or price
         if price <= 0:
             price = _float(holding.get("cost_price"), price)
