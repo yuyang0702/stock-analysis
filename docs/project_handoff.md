@@ -1,13 +1,16 @@
 # 项目接管与新环境恢复说明
 
-> 2026-07-23 盘中扫描健康事故已在本地定位并修复：当当前持仓股票进入候选池时，
+> 2026-07-23 盘中扫描健康事故已修复、推送、部署并完成首轮真实观察：当当前持仓股票进入候选池时，
 `build_risk_bundle` 把整行 `pd.Series` 传给风险引擎，后者的 `if holding` 触发 Pandas
 布尔歧义并终止整轮扫描，导致信号文件停止刷新。共享判断已改为
 `holding is not None`，不改变任何交易或风控规则。回归测试完成 RED/GREEN，风险引擎
-专项 7/7、目标模块编译和不依赖 Linux Bash 的 Windows 测试 436 项通过；3 个 Linux
-脚本用例因本机无 Bash 未运行。当前为
-`implemented / not deployed / not observed / not validated`，尚未提交、推送、部署或
-重启，服务器仍运行故障版本，获准部署后必须验证 Linux 全量测试和真实信号刷新。
+专项 7/7、Windows 可运行测试 436 项和服务器 Linux 全量 441/441 通过。提交
+`2cb90485290e75883379dada2b934637d87ffa37` 已进入 `origin/main` 与服务器；部署前备份
+完整性、schema 9 健康/可写、环境哈希不变、三服务 active 且无 warning 均已核验。
+13:05:58 首轮真实扫描成功处理南山铝业“持仓风控”并刷新扫描文件和 `signals.json`，
+随后增量对账 matched、0 差异，`buy_enabled=1 / kill_switch=0`。当前为
+`implemented（已推送） / deployed（服务器） / observed / not validated`；连续稳定性
+仍需后续交易时段观察。
 
 > 2026-07-16 统一有效止损与交易运行面板增量已随 `8db92bf6448466827a50560ae2fb8c7fde142c72` 推送并部署：schema 8 增加可空 `position_cycles.manual_stop_price`；成交成本保护校验后的 frozen initial、明确人工止损、首段止盈后移动止损共同解析唯一 effective stop；网页和策略不再各算一套。网页已移除 OCR/截图和直接清仓入口，增加认证、CSRF、运行/异常/风险/轨迹视图；JoinQuant 模板改用 bearer token 且 token 值未改变。部署前 schema 7 备份完整性为 `ok`，Linux全量414/414、编译、schema 8健康/可写、环境哈希不变、三个服务active、同步2个持仓、网页302登录保护、API未认证403及重启后ERROR日志为空均已核验。用户确认网站模板已手工更新为 `2026-07-16.1-unified-effective-stop`；新模板尚无交易日快照回传。当前严格为 `implemented（已推送） / deployed（服务器；网站由用户确认） / not observed / not validated`。
 

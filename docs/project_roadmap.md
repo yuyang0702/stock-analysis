@@ -36,8 +36,8 @@
 | `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、可观测性增强、测试与部署顺序 | Tasks 1–17 的实现、推送和服务器部署已完成；交易日观察与验收尚未完成。 |
 | `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`；JoinQuant 网站模板尚未确认更新。 |
 | `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | Tasks 1–7 已实现、复查、推送并部署服务器；开关保持关闭，网站模板、交易日观察和验收尚未完成。 |
-| `docs/superpowers/specs/2026-07-23-pandas-holding-series-health-fix-design.md` | 持仓候选触发扫描失败的根因、最小修复和验证边界 | 当前为 `implemented / not deployed / not observed / not validated`；部署或核验该扫描健康事故时读取。 |
-| `docs/superpowers/plans/2026-07-23-pandas-holding-series-health-fix.md` | 持仓 Series 布尔歧义的测试驱动修复与发布检查 | 本地代码和测试已完成；提交、推送、Linux 验证、部署和真实扫描观察尚未执行。 |
+| `docs/superpowers/specs/2026-07-23-pandas-holding-series-health-fix-design.md` | 持仓候选触发扫描失败的根因、最小修复和验证边界 | 当前为 `implemented（已推送） / deployed（服务器） / observed / not validated`；部署或核验该扫描健康事故时读取。 |
+| `docs/superpowers/plans/2026-07-23-pandas-holding-series-health-fix.md` | 持仓 Series 布尔歧义的测试驱动修复与发布检查 | 代码、测试、推送、Linux 验证、服务器部署和首轮真实扫描观察已完成；连续稳定性验证尚未完成。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
@@ -50,10 +50,17 @@
 
 本地修复把共享存在性判断改为 `holding is not None`，没有调整买卖、止盈止损、评分、
 仓位、通知或数据存储规则。回归测试完成 RED/GREEN 验证，风险引擎专项 7/7、目标模块
-编译和不依赖 Linux Bash 的 Windows 测试 436 项通过。当前严格状态为
-`implemented / not deployed / not observed / not validated`；Windows 缺少 Bash 导致
-3 个 Linux 脚本用例无法本机运行，提交、推送、服务器 Linux 全量测试、部署、重启和
-真实扫描文件刷新均需另行授权与验证。
+编译和不依赖 Linux Bash 的 Windows 测试 436 项通过。提交
+`2cb90485290e75883379dada2b934637d87ffa37` 已推送并部署；服务器 GitHub 拉取失败后，
+使用两端 `git bundle verify` 通过的增量 bundle 快进。部署前正式 SQLite 备份
+`integrity_check=ok`；Linux 全量 441/441、目标模块编译、schema 9 `ledger-check`
+健康/可写、环境文件哈希不变，三个服务重启后 active 且无 warning。
+
+13:00 后首轮真实扫描成功越过主候选和扩大观察池处理，南山铝业按“持仓风控”路径
+处理，13:05:58 写出 `scan_20260723_130558.*` 并刷新 `signals.json`；13:06:10 增量
+对账为 `matched / INFO / 0差异`，交易控制为 `buy_enabled=1 / kill_switch=0`。当前严格
+状态为 `implemented（已推送） / deployed（服务器） / observed / not validated`；仍需
+连续代表性交易时段无同类扫描中断，才能标记 `validated`。
 
 ## 2026-07-16 统一有效止损与交易运行面板
 

@@ -4,7 +4,7 @@
 
 ## 状态
 
-`implemented / not deployed / not observed / not validated`
+`implemented（已推送） / deployed（服务器） / observed / not validated`
 
 ## 问题
 
@@ -55,3 +55,10 @@ Pandas 抛出布尔歧义异常并终止整轮扫描。
 本地实现证据：回归测试先以生产相同的 Pandas 布尔歧义异常失败，修复后风险引擎
 专项 7/7 通过；目标模块编译通过，不依赖 Linux Bash 的 Windows 测试 436 项通过。
 Windows 缺少 Bash，3 个 `run_ubuntu.sh ledger-check` 用例留待获准后的 Linux 验证。
+
+部署证据：提交 `2cb90485290e75883379dada2b934637d87ffa37` 已进入
+`origin/main` 和服务器。部署前正式 SQLite 备份完整性为 `ok`；服务器 Linux 全量
+441/441、目标模块编译、schema 9 `ledger-check` 健康/可写、环境文件哈希不变，三个
+服务重启后 active 且无 warning。13:00 后首轮真实扫描成功处理包含持仓的南山铝业，
+13:05:58 写出新扫描文件并刷新 `signals.json`；13:06:10 增量对账 matched、0 差异。
+单轮真实证据足以标记 `observed`，连续交易时段稳定性尚未达到 `validated`。

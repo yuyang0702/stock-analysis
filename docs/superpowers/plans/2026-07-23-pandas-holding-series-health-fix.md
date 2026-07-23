@@ -107,3 +107,14 @@ Expected: no whitespace errors; only the planned code, test, and documentation f
 - [x] **Step 4: Stop before repository or server mutations**
 
 Do not commit, push, deploy, edit server configuration, or restart services without separate user authorization.
+
+## Deployment Evidence
+
+The user separately authorized commit, merge, push, Linux verification, deployment, and restart.
+Commit `2cb90485290e75883379dada2b934637d87ffa37` was pushed to `origin/main` and
+fast-forwarded on the server with a bundle verified on both sides after GitHub TLS failures.
+The production SQLite backup passed integrity checking; Linux tests passed 441/441, compilation
+and schema 9 `ledger-check` passed, the environment hash stayed unchanged, and all three services
+were active without warnings after restart. The 13:00 live scan processed a current holding and
+refreshed scan outputs and `signals.json` at 13:05:58. Status is
+`implemented / deployed / observed / not validated`.
