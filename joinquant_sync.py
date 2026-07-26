@@ -129,7 +129,7 @@ def apply_cycle_risk_fields(
 def _snapshot_state(snapshot: dict[str, Any]) -> dict[str, Any]:
     account_keys = (
         "cash", "available_cash", "total_value", "daily_turnover_pct", "daily_pnl_pct",
-        "account_drawdown_pct", "consecutive_losses", "pending_buy_position_pct",
+        "account_drawdown_pct", "realized_pnl", "consecutive_losses", "pending_buy_position_pct",
         "pending_buy_risk_pct",
     )
     position_keys = (
@@ -139,7 +139,7 @@ def _snapshot_state(snapshot: dict[str, Any]) -> dict[str, Any]:
     order_keys = ("order_id", "id", "code", "jq_code", "action", "amount", "filled", "avg_price", "status")
     trade_keys = (
         "trade_id", "fill_id", "id", "order_id", "code", "jq_code", "action", "amount",
-        "qty", "price", "commission", "stamp_tax", "other_fee",
+        "qty", "price", "commission", "stamp_tax", "other_fee", "fee_data_status",
     )
 
     def rows(name: str, keys: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -289,10 +289,16 @@ def persist_account_snapshot(
             "filled_at": fill.get("filled_at"),
         })
 
-    fees = conn.execute(
-        "SELECT COALESCE(sum(commission+stamp_tax+other_fee),0) FROM fills WHERE substr(filled_at,1,10)=?",
+    fee_row = conn.execute(
+        """SELECT COALESCE(sum(commission+stamp_tax+other_fee),0),
+                  sum(CASE WHEN fee_data_status='unknown' THEN 1 ELSE 0 END)
+           FROM fills WHERE substr(filled_at,1,10)=?""",
         (trade_date,),
-    ).fetchone()[0]
+    ).fetchone()
+    fees = fee_row[0]
+    fee_data_status = "unknown" if int(fee_row[1] or 0) else "reported"
+    realized_pnl = _num(snapshot.get("realized_pnl"))
+    realized_pnl_status = "reported" if realized_pnl is not None else "unknown"
     unrealized = sum(float(_num(item.get("pnl"), 0) or 0) for item in positions)
     total_value = float(_num(snapshot.get("total_value"), 0) or 0)
     drawdown = float(_num(snapshot.get("account_drawdown_pct"), 0) or 0)
@@ -300,20 +306,28 @@ def persist_account_snapshot(
         """INSERT INTO daily_equity(
            trade_date, opening_equity, closing_equity, cash, position_market_value,
            realized_pnl, unrealized_pnl, fees, net_deposit, max_drawdown_pct,
-           first_snapshot_at, last_snapshot_at
-           ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?)
+           first_snapshot_at, last_snapshot_at, fee_data_status, realized_pnl_status
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
            ON CONFLICT(trade_date) DO UPDATE SET
            closing_equity=CASE WHEN excluded.last_snapshot_at>=last_snapshot_at THEN excluded.closing_equity ELSE closing_equity END,
            cash=CASE WHEN excluded.last_snapshot_at>=last_snapshot_at THEN excluded.cash ELSE cash END,
            position_market_value=CASE WHEN excluded.last_snapshot_at>=last_snapshot_at THEN excluded.position_market_value ELSE position_market_value END,
            unrealized_pnl=CASE WHEN excluded.last_snapshot_at>=last_snapshot_at THEN excluded.unrealized_pnl ELSE unrealized_pnl END,
            fees=excluded.fees,
+           fee_data_status=excluded.fee_data_status,
+           realized_pnl=CASE
+               WHEN excluded.realized_pnl_status='reported' THEN excluded.realized_pnl
+               ELSE realized_pnl END,
+           realized_pnl_status=CASE
+               WHEN excluded.realized_pnl_status='reported' THEN 'reported'
+               ELSE realized_pnl_status END,
            max_drawdown_pct=min(max_drawdown_pct, excluded.max_drawdown_pct),
            first_snapshot_at=min(first_snapshot_at, excluded.first_snapshot_at),
            last_snapshot_at=max(last_snapshot_at, excluded.last_snapshot_at)""",
         (
             trade_date, total_value, total_value, _num(snapshot.get("cash"), 0), market_value,
-            unrealized, fees, drawdown, generated_at, generated_at,
+            realized_pnl or 0, unrealized, fees, drawdown, generated_at, generated_at,
+            fee_data_status, realized_pnl_status,
         ),
     )
     return {

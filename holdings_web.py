@@ -421,7 +421,9 @@ def login():
         abort(503, description="交易运行面板尚未配置认证凭据")
     error = False
     if request.method == "POST":
-        if secrets.compare_digest(request.form.get("token", ""), _web_token()):
+        submitted = request.form.get("token", "").encode("utf-8")
+        expected = _web_token().encode("utf-8")
+        if secrets.compare_digest(submitted, expected):
             session = {"nonce": secrets.token_urlsafe(24)}
             response = make_response(redirect(url_for("index")))
             response.set_cookie(SESSION_COOKIE, _serializer().dumps(session), httponly=True, secure=request.is_secure, samesite="Strict", max_age=12 * 60 * 60)

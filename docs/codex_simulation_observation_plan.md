@@ -6,7 +6,13 @@
 
 > 2026-07-15 成交对账日期范围修复已随代码提交 `cd83f26` 推送并部署服务器，状态为 `implemented（已推送） / deployed / not observed / not validated`。只读审核应确认：历史交易日成交不会出现在当前日 `FILL_MISSING_PLATFORM`，同日真实缺失仍保留告警；在新交易日快照出现前不得标记 observed 或 validated。
 
-> 2026-07-18 跳空二次确认能力已完成代码复查并合并本地 `main`，状态为 `implemented / not deployed / not observed / not validated`，`GAP_REENTRY_ENABLE` 默认关闭。Codex 定时审核员只能在未来部署并启用后读取 schema 9 的机会状态计数、信号/订单/成交关联、精确一手与部分成交撤余单证据；不得启用开关、生成补单、恢复被交易控制拦截的信号，或把无事件交易日当作该能力已观察。
+> 2026-07-18 跳空二次确认能力已部署并开启，JoinQuant 网站模板一致；机会账本截至2026-07-26仍为空，状态为 `implemented / deployed / not observed / not validated`。Codex 定时审核员只能读取 schema 9 的机会状态计数、信号/订单/成交关联、精确一手与部分成交撤余单证据；不得切换开关、生成补单、恢复被交易控制拦截的信号，或把无事件交易日当作该能力已观察。
+
+> 2026-07-26 运行证据完整性修复已本地实现但未部署。部署后 Codex 应以 schema 10 的
+`strategy_runs.result/data_status`、费用与已实现盈亏来源状态、健康报告
+`system_status/freshness_status/observation_status/observation_day_status`，以及通知队列
+`pending/dead` 为审核依据。盘外陈旧为 `not_applicable`，不得计入无效交易日；交易时段
+陈旧仍是 invalid。当前为 `implemented（未推送） / not deployed / not observed / not validated`。
 
 ## 1. 目标与边界
 
@@ -139,7 +145,8 @@ Codex 的新增价值不是“发现有没有 stale”，而是把已有证据�
 | 五项执行正确性 P0 | deployed（服务器与 JoinQuant 模板） | 已随 `52b3653` 推送；服务器专项测试 123/123、编译和 `ledger-check` 通过，JoinQuant 已持久化 `2026-07-14.2-p0-execution-contract`。仍为 `not observed / not validated`。 |
 | 完整历史回测 | deployed（框架） | 代码已在服务器，自动审核仍只能只读既有报告；真实 strict 数据尚未导入、运行或验证。 |
 | 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |
-| 跳空越价后二次确认入场 | implemented（已合并本地 main） | schema 9、有界机会状态、精确一手和部分成交撤余单已实现并复查；默认关闭，尚未部署、观察或验证。自动审核无权启用或补单。 |
+| 跳空越价后二次确认入场 | deployed（功能已开启） | schema 9、有界机会状态、精确一手和部分成交撤余单已部署，模板一致；机会账本为空，尚未观察或验证。自动审核无权切换开关或补单。 |
+| 运行证据完整性修复 | implemented（未推送） | schema 10 和新审核字段已本地通过测试；服务器未部署，自动审核仍只能按服务器 schema 9 旧口径报告。 |
 
 ## 5. 定时分析任务
 

@@ -9,9 +9,12 @@ JoinQuant 模板均为 `2026-07-18.1-gap-reentry`，服务器
 均 matched；但扫描失败未写入 `strategy_runs`、信号结构化列为空、费用和已实现盈亏
 缺少可信度标识、盘外陈旧污染健康评分、6 条 `errcode=40058` 通知被反复重试，且
 `/login` 存在非 ASCII 错误令牌异常。修复专项设计为
-`docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md`，当前严格为
-`planned / not implemented / not deployed / not observed / not validated`；不得提前写成
-已修复，也不得借此改变交易策略、交易控制或任何 Token。
+`docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md`。代码已在隔离
+分支实现 schema 10、扫描终态、信号结构化列、来源可信度、盘内/盘外健康、通知 dead 状态
+和 Unicode 登录修复；目标专项142项、Windows可运行全量454项和编译通过，3项Linux脚本
+测试待服务器补齐。当前严格为
+`implemented（隔离分支，未推送） / not deployed / not observed / not validated`；没有
+修改交易策略、交易控制、服务器或任何 Token。
 
 > 2026-07-23 盘中扫描健康事故已修复、推送、部署并完成首轮真实观察：当当前持仓股票进入候选池时，
 `build_risk_bundle` 把整行 `pd.Series` 传给风险引擎，后者的 `if holding` 触发 Pandas
@@ -161,6 +164,7 @@ git ls-remote origin refs/heads/main
 | ML-7 训练型影子模型 | partially implemented（Task 1–3 已推送） | 共享评分/契约、独立 ML SQLite schema 和实时完整候选采集已实现；服务器未部署且默认关闭。strict 历史导入、标签、训练、治理与 L0 推理仍待实现；没有模型，不得写成 deployed/observed/validated。 |
 | 统一有效止损与交易运行面板 | deployed | schema 8、成交后只收紧校验、manual/trailing/effective stop、认证面板和 OCR 删除已部署；网站模板由用户确认更新，但新快照和真实卖出仍未观察或验证。 |
 | 跳空越价后二次确认入场 | deployed（服务器与网站模板，功能已开启） | schema 9、二次确认、精确一手、部分成交撤余单和机会账本已部署；开关已开启且模板一致，但机会账本为空，未观察、未验证。 |
+| 运行证据完整性修复 | implemented（隔离分支，未推送） | schema 10、扫描终态、信号结构化字段、费用/盈亏状态、健康会话口径、通知有限重试和 Unicode 登录已实现；服务器仍是 schema 9，未部署、未观察、未验证。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。

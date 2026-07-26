@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import re
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class SignalConflictError(RuntimeError):
@@ -351,6 +352,10 @@ CREATE INDEX IF NOT EXISTS idx_gap_reentry_code_date
 ON gap_reentry_opportunities(stock_code, trade_date);
 """
 
+SCHEMA_V10 = """
+-- Evidence-status columns are added idempotently in initialize().
+"""
+
 
 @dataclass(frozen=True)
 class StoreHealth:
@@ -366,6 +371,8 @@ class StrategyRunRecord:
     started_at: str
     strategy_version: str
     parameter_version: str
+    data_status: str = "pending"
+    result: str = "running"
 
 
 @dataclass(frozen=True)
@@ -382,6 +389,11 @@ class SignalRecord:
     raw_json: str
     validated_at: str = ""
     published_at: str = ""
+    signal_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    final_score: float | None = None
+    strategy_mode: str = ""
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -445,6 +457,22 @@ class TradingStore:
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, datetime('now'))")
             conn.executescript(SCHEMA_V9)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (9, datetime('now'))")
+            fill_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(fills)")}
+            if "fee_data_status" not in fill_columns:
+                conn.execute(
+                    "ALTER TABLE fills ADD COLUMN fee_data_status TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            equity_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(daily_equity)")}
+            if "fee_data_status" not in equity_columns:
+                conn.execute(
+                    "ALTER TABLE daily_equity ADD COLUMN fee_data_status TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            if "realized_pnl_status" not in equity_columns:
+                conn.execute(
+                    "ALTER TABLE daily_equity ADD COLUMN realized_pnl_status TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            conn.executescript(SCHEMA_V10)
+            conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (10, datetime('now'))")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -472,13 +500,41 @@ class TradingStore:
             """
             INSERT INTO strategy_runs(
                 run_id, trade_date, started_at, strategy_version, parameters_version,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                data_status, result, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             ON CONFLICT(run_id) DO NOTHING
             """,
-            (run.run_id, run.trade_date, run.started_at, run.strategy_version, run.parameter_version),
+            (
+                run.run_id, run.trade_date, run.started_at, run.strategy_version,
+                run.parameter_version, run.data_status, run.result,
+            ),
         )
         return cursor.rowcount == 1
+
+    def finish_strategy_run(
+        self,
+        conn: sqlite3.Connection,
+        run_id: str,
+        *,
+        result: str,
+        data_status: str,
+        finished_at: str,
+        error_message: str | None = None,
+    ) -> None:
+        error = None
+        if error_message:
+            error = " ".join(str(error_message).split())
+            error = re.sub(
+                r"(?i)(token|key|secret|password)=([^&\s]+)",
+                r"\1=[REDACTED]",
+                error,
+            )[:500]
+        conn.execute(
+            """UPDATE strategy_runs
+               SET result=?, data_status=?, finished_at=?, error_message=?, updated_at=datetime('now')
+               WHERE run_id=?""",
+            (result, data_status, finished_at, error, run_id),
+        )
 
     def upsert_gap_reentry_opportunity(self, conn: sqlite3.Connection, event: dict) -> None:
         columns = (
@@ -566,14 +622,17 @@ class TradingStore:
             """
             INSERT OR IGNORE INTO signals(
                 signal_id, run_id, trade_date, stock_code, jq_code, action,
-                target_position, generated_at, expires_at, raw_json, created_at,
+                target_position, signal_price, stop_loss, take_profit, final_score,
+                strategy_mode, generated_at, expires_at, raw_json, created_at,
                 validated_at, published_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)
             """,
             (
                 signal.signal_id, signal.run_id, signal.trade_date, signal.code,
-                signal.jq_code, signal.action, signal.position_pct, signal.generated_at,
-                signal.expires_at, signal.raw_json,
+                signal.jq_code, signal.action, signal.position_pct, signal.signal_price,
+                signal.stop_loss, signal.take_profit, signal.final_score,
+                signal.strategy_mode or None, signal.generated_at, signal.expires_at,
+                signal.raw_json,
                 signal.validated_at or signal.generated_at,
                 signal.published_at or signal.generated_at,
             ),
@@ -1020,6 +1079,14 @@ class TradingStore:
             actual = tuple(existing[key] for key in keys[:-1]) + (canonical_json(existing["raw_json"]),)
             if actual != expected:
                 raise FillConflictError(f"immutable fill conflict: {fill['fill_id']}")
+            if (
+                str(existing["fee_data_status"]) == "unknown"
+                and str(fill.get("fee_data_status") or "unknown") == "reported"
+            ):
+                conn.execute(
+                    "UPDATE fills SET fee_data_status='reported' WHERE fill_id=?",
+                    (fill["fill_id"],),
+                )
             return False
         client_id = fill.get("client_order_id")
         if client_id and conn.execute("SELECT 1 FROM orders WHERE client_order_id=?", (client_id,)).fetchone() is None:
@@ -1029,12 +1096,14 @@ class TradingStore:
             signal_id = None
         conn.execute(
             """INSERT INTO fills(fill_id, client_order_id, order_id, signal_id, stock_code,
-               action, qty, price, commission, stamp_tax, other_fee, filled_at, raw_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               action, qty, price, commission, stamp_tax, other_fee, filled_at, raw_json,
+               fee_data_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 fill["fill_id"], client_id, fill.get("order_id"), signal_id, fill["stock_code"],
                 fill["action"], fill["qty"], fill["price"], fill["commission"], fill["stamp_tax"],
                 fill["other_fee"], fill["filled_at"], fill["raw_json"],
+                fill.get("fee_data_status") or "unknown",
             ),
         )
         return True
@@ -1152,7 +1221,17 @@ class TradingStore:
                )""",
             (cutoff_date[:10],),
         ).rowcount
+        strategy_runs = conn.execute(
+            """DELETE FROM strategy_runs
+               WHERE trade_date < ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM signals
+                   WHERE signals.run_id=strategy_runs.run_id
+               )""",
+            (cutoff_date[:10],),
+        ).rowcount
         return {
             "account_snapshots": max(0, int(snapshots)),
             "reconciliation_runs": max(0, int(runs)),
+            "strategy_runs": max(0, int(strategy_runs)),
         }

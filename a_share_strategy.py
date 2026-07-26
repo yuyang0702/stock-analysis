@@ -36,7 +36,7 @@ from risk_engine import RiskDecision, build_risk_decision, build_signal_lifecycl
 from shadow_score import apply_shadow_scores
 from strategy_profile import build_strategy_profile
 from notifier import WeComNotifier
-from trading_store import TradingStore
+from trading_store import StrategyRunRecord, TradingStore
 
 try:
     from openai import OpenAI
@@ -3364,10 +3364,16 @@ def build_joinquant_dry_run_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotifier | None = None) -> Path:
+def run_joinquant_export(
+    cfg: Config,
+    result: pd.DataFrame,
+    notifier: WeComNotifier | None = None,
+    *,
+    run_id: str | None = None,
+) -> Path:
     from joinquant_exporter import export_signals
 
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = run_id or datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     allow_buy = app_config.JOINQUANT_ALLOW_BUY_DEFAULT and is_a_share_trading_time()
     allow_sell = app_config.JOINQUANT_ALLOW_SELL_DEFAULT
     if app_config.JOINQUANT_ENFORCE_HEALTH_GATE_DEFAULT and allow_buy:
@@ -3475,7 +3481,13 @@ def run_joinquant_export(cfg: Config, result: pd.DataFrame, notifier: WeComNotif
     return path
 
 
-def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = None) -> pd.DataFrame | None:
+def run_once(
+    cfg: Config,
+    cache: DiskCache,
+    notifier: WeComNotifier | None = None,
+    *,
+    run_id: str | None = None,
+) -> pd.DataFrame | None:
     print("获取全市场实时行情...", flush=True)
     spot = fetch_spot_data()
     print("读取大盘状态...", flush=True)
@@ -3739,7 +3751,9 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
             market_state=confirmed_regime,
             current_day=date.today(),
         )
-        run_joinquant_export(cfg, export_source, notifier if cfg.notify else None)
+        run_joinquant_export(
+            cfg, export_source, notifier if cfg.notify else None, run_id=run_id,
+        )
     if cfg.paper_trade:
         paper_source = watch_result if cfg.mode == "intraday" and not watch_result.empty else result
         run_paper_trading(cfg, paper_source, notifier if cfg.notify else None)
@@ -3756,6 +3770,71 @@ def run_once(cfg: Config, cache: DiskCache, notifier: WeComNotifier | None = Non
             ai_overview=ai_overview,
         )
 
+    return result
+
+
+def _run_once_with_ledger(
+    cfg: Config,
+    cache: DiskCache,
+    notifier: WeComNotifier | None = None,
+    *,
+    store: TradingStore | None = None,
+    run_id: str | None = None,
+) -> pd.DataFrame | None:
+    run_id = run_id or datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    store = store or TradingStore(app_config.TRADING_DB_FILE)
+    ledger_ready = False
+    try:
+        store.initialize()
+        with store.transaction() as conn:
+            store.record_strategy_run(
+                conn,
+                StrategyRunRecord(
+                    run_id=run_id,
+                    trade_date=started_at[:10],
+                    started_at=started_at,
+                    strategy_version="a_share_strategy",
+                    parameter_version="risk-observe-v1",
+                ),
+            )
+        ledger_ready = True
+    except (OSError, sqlite3.Error) as exc:
+        print(f"Strategy run ledger start skipped: {type(exc).__name__}: {exc}", flush=True)
+
+    try:
+        result = run_once(cfg, cache, notifier, run_id=run_id)
+    except Exception as exc:
+        if ledger_ready:
+            try:
+                with store.transaction() as conn:
+                    store.finish_strategy_run(
+                        conn,
+                        run_id,
+                        result="failed",
+                        data_status="failed",
+                        finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        error_message=f"{type(exc).__name__}: {exc}",
+                    )
+            except (OSError, sqlite3.Error) as ledger_exc:
+                print(
+                    f"Strategy run ledger finish skipped: {type(ledger_exc).__name__}: {ledger_exc}",
+                    flush=True,
+                )
+        raise
+
+    if ledger_ready:
+        try:
+            with store.transaction() as conn:
+                store.finish_strategy_run(
+                    conn,
+                    run_id,
+                    result="success",
+                    data_status="empty" if result is None or result.empty else "complete",
+                    finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+        except (OSError, sqlite3.Error) as exc:
+            print(f"Strategy run ledger finish skipped: {type(exc).__name__}: {exc}", flush=True)
     return result
 
 
@@ -4199,7 +4278,7 @@ def main() -> None:
 
     auto_daemon = cfg.mode == "auto"
     if not cfg.watch and not auto_daemon:
-        run_once(cfg, cache, notifier if cfg.notify else None)
+        _run_once_with_ledger(cfg, cache, notifier if cfg.notify else None)
         return
 
     print("进入常驻模式，脚本会自动识别盘前、盘中、盘后。", flush=True)
@@ -4226,7 +4305,7 @@ def main() -> None:
                 continue
 
             runtime_cfg = replace(cfg, mode=runtime_phase)
-            run_once(runtime_cfg, cache, notifier if cfg.notify else None)
+            _run_once_with_ledger(runtime_cfg, cache, notifier if cfg.notify else None)
             last_stage_key = stage_key
         except Exception as exc:
             print(f"本轮执行失败：{exc}", flush=True)

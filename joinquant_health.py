@@ -65,13 +65,17 @@ def _ledger_status(db_file: Path, signals: list[dict[str, Any]]) -> tuple[bool, 
         return False, health.schema_version, 0, False, _sanitize_ledger_error(str(exc))
 
 
-def _execution_ledger_metrics(db_file: Path) -> dict[str, Any]:
+def _execution_ledger_metrics(
+    db_file: Path, trade_date: str | None = None
+) -> dict[str, Any]:
     metrics = {
         "buy_enabled": "1", "kill_switch": "0", "latest_reconciliation_result": "",
         "latest_reconciliation_severity": "", "reconciliation_mismatch_count": 0,
         "account_snapshot_count": 0, "order_count": 0, "fill_count": 0,
         "recovery_ready": False, "active_execution_issue_count": 0,
         "active_execution_error_count": 0, "auto_resume_owned": False,
+        "strategy_run_count_today": 0, "strategy_run_failed_count_today": 0,
+        "latest_strategy_run_result": "",
     }
     try:
         with TradingStore(db_file).connect() as conn:
@@ -92,6 +96,23 @@ def _execution_ledger_metrics(db_file: Path) -> dict[str, Any]:
             ).fetchone()[0])
             metrics["order_count"] = int(conn.execute("SELECT count(*) FROM orders").fetchone()[0])
             metrics["fill_count"] = int(conn.execute("SELECT count(*) FROM fills").fetchone()[0])
+            if trade_date:
+                metrics["strategy_run_count_today"] = int(conn.execute(
+                    "SELECT count(*) FROM strategy_runs WHERE trade_date=?",
+                    (trade_date,),
+                ).fetchone()[0])
+                metrics["strategy_run_failed_count_today"] = int(conn.execute(
+                    """SELECT count(*) FROM strategy_runs
+                       WHERE trade_date=? AND result='failed'""",
+                    (trade_date,),
+                ).fetchone()[0])
+                latest_run = conn.execute(
+                    """SELECT result FROM strategy_runs WHERE trade_date=?
+                       ORDER BY started_at DESC LIMIT 1""",
+                    (trade_date,),
+                ).fetchone()
+                if latest_run:
+                    metrics["latest_strategy_run_result"] = str(latest_run[0] or "")
             metrics["active_execution_issue_count"] = int(conn.execute(
                 "SELECT count(*) FROM execution_issue_state WHERE recovered_at IS NULL"
             ).fetchone()[0])
@@ -300,6 +321,29 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
 
 
+def _observation_day_status(
+    history: list[dict[str, Any]],
+    current_status: str,
+    *,
+    today: str,
+) -> str:
+    statuses = [
+        str(row.get("observation_status") or "")
+        for row in history
+        if str(row.get("generated_at") or "")[:10] == today
+        and bool(row.get("is_trading_time"))
+    ]
+    if current_status != "not_applicable":
+        statuses.append(current_status)
+    if "invalid" in statuses:
+        return "invalid"
+    if "degraded" in statuses:
+        return "degraded"
+    if "valid" in statuses:
+        return "valid"
+    return "not_observed"
+
+
 def build_health_report(
     signal_file: Path | None = None,
     snapshot_file: Path | None = None,
@@ -344,7 +388,9 @@ def build_health_report(
     snapshot_payload, snapshot_error = _load_json(snapshot_file)
     history = _read_jsonl(history_file)
     api_events = _read_jsonl(api_event_file)
+    health_history = _read_jsonl(health_history_file)
     today = now.date().isoformat()
+    is_trading_time = _is_a_share_trading_time(now)
     history_today = [row for row in history if _snapshot_time(row)[:10] == today]
     snapshots_for_orders = history_today if history_today else ([snapshot_payload] if snapshot_payload else [])
     signal_age = _age_minutes(signal_payload.get("generated_at"), now)
@@ -352,7 +398,7 @@ def build_health_report(
     signals = signal_payload.get("signals", []) if isinstance(signal_payload.get("signals"), list) else []
     signal_ids = {str(item.get("id")) for item in signals if isinstance(item, dict) and item.get("id")}
     ledger_ok, ledger_schema_version, ledger_signal_count, ledger_json_parity, ledger_error = _ledger_status(db_file, signals)
-    execution_metrics = _execution_ledger_metrics(db_file)
+    execution_metrics = _execution_ledger_metrics(db_file, today)
     gap_reentry_metrics = _gap_reentry_metrics(db_file, today) if ledger_ok else {}
     positions = snapshot_payload.get("positions", []) if isinstance(snapshot_payload.get("positions"), list) else []
     expected_template_version = app_config.JOINQUANT_TEMPLATE_VERSION
@@ -381,6 +427,11 @@ def build_health_report(
     if execution_metrics["latest_reconciliation_result"] == "mismatch":
         issue_codes.append("reconciliation_mismatch")
         issues.append("最近一次自动对账存在差异")
+    if is_trading_time and execution_metrics["strategy_run_failed_count_today"] > 0:
+        issue_codes.append("strategy_run_failures_today")
+        issues.append(
+            f"今日策略扫描失败 {execution_metrics['strategy_run_failed_count_today']} 次"
+        )
 
     if signal_error:
         issue_codes.append("signal_file_error")
@@ -391,7 +442,7 @@ def build_health_report(
     elif signal_age is None:
         issue_codes.append("signal_time_missing")
         issues.append("信号生成时间缺失")
-    elif signal_age > signal_max_age_min:
+    elif is_trading_time and signal_age > signal_max_age_min:
         issue_codes.append("signal_stale")
         issues.append(f"信号文件超时 {signal_age:.1f} 分钟")
 
@@ -404,7 +455,7 @@ def build_health_report(
     elif snapshot_age is None:
         issue_codes.append("snapshot_time_missing")
         issues.append("账户快照回传时间缺失")
-    elif snapshot_age > snapshot_max_age_min:
+    elif is_trading_time and snapshot_age > snapshot_max_age_min:
         issue_codes.append("snapshot_stale")
         issues.append(f"账户快照超时 {snapshot_age:.1f} 分钟")
 
@@ -432,8 +483,32 @@ def build_health_report(
         actual = strategy_template_version or "missing"
         issues.append(f"JoinQuant 网站模板未更新：当前 {actual}，期望 {expected_template_version}")
 
+    freshness_issue_codes = {
+        "signal_file_error", "signal_schema_invalid", "signal_time_missing", "signal_stale",
+        "snapshot_file_error", "snapshot_schema_invalid", "snapshot_time_missing", "snapshot_stale",
+    }
+    non_freshness_issues = [
+        code for code in issue_codes if code not in {"signal_stale", "snapshot_stale"}
+    ]
+    system_status = "ok" if not non_freshness_issues else "critical"
+    if not is_trading_time:
+        freshness_status = "not_applicable"
+        observation_status = "not_applicable"
+    else:
+        freshness_status = (
+            "invalid" if freshness_issue_codes.intersection(issue_codes) else "valid"
+        )
+        degraded_codes = {"api_errors", "failed_orders_high"}
+        if not issue_codes:
+            observation_status = "valid"
+        elif set(issue_codes) <= degraded_codes:
+            observation_status = "degraded"
+        else:
+            observation_status = "invalid"
+    observation_day_status = _observation_day_status(
+        health_history, observation_status, today=today,
+    )
     status = "ok" if not issues else "critical"
-    is_trading_time = _is_a_share_trading_time(now)
     fresh_executable_buy = signal_age is not None and signal_age <= signal_max_age_min and any(
         isinstance(item, dict) and str(item.get("action") or "").lower() == "buy"
         for item in signals
@@ -443,6 +518,10 @@ def build_health_report(
     result = {
         "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         "status": status,
+        "system_status": system_status,
+        "freshness_status": freshness_status,
+        "observation_status": observation_status,
+        "observation_day_status": observation_day_status,
         "is_trading_time": is_trading_time,
         "alert_required": alert_required,
         "issues": issues,
@@ -471,7 +550,11 @@ def build_health_report(
         "snapshot_post_count_today": api_counts["snapshot_post_count_today"],
         "api_error_count_today": api_counts["api_error_count_today"],
         "stability_score": stability_score,
-        "stable_gate_pass": status == "ok" and stability_score >= 80,
+        "stable_gate_pass": (
+            system_status == "ok"
+            and observation_day_status == "valid"
+            and stability_score >= 80
+        ),
         "latest_total_value": _num(snapshot_payload.get("total_value")),
         "latest_cash": _num(snapshot_payload.get("cash")),
         **execution_metrics,
@@ -489,6 +572,10 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         "",
         f"- 生成时间：{result.get('generated_at')}",
         f"- 状态：{status_text}",
+        f"- 系统状态：{result.get('system_status', '-')}",
+        f"- 会话新鲜度：{result.get('freshness_status', '-')}",
+        f"- 当前观察点：{result.get('observation_status', '-')}",
+        f"- 当日观察结论：{result.get('observation_day_status', '-')}",
         f"- 当前交易时段：{'是' if result.get('is_trading_time') else '否'}",
         f"- 是否触发微信报警：{'是' if result.get('alert_required') else '否'}",
         f"- 稳定性评分：{result.get('stability_score', 0)}",
@@ -506,6 +593,8 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         f"- 今日快照回传：{result.get('snapshot_post_count_today', 0)} 次",
         f"- 今日 API 异常：{result.get('api_error_count_today', 0)} 次",
         f"- 今日快照：{result.get('snapshot_count_today', 0)} 次",
+        f"- 今日策略扫描：{result.get('strategy_run_count_today', 0)} 次",
+        f"- 今日策略扫描失败：{result.get('strategy_run_failed_count_today', 0)} 次",
         f"- 今日失败订单：{result.get('failed_orders_today', 0)} 笔",
         f"- 持仓一致性：{result.get('position_consistency', '-')}",
         f"- JoinQuant 模板版本：{result.get('strategy_template_version') or 'missing'}",

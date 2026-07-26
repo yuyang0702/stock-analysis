@@ -24,6 +24,16 @@ def _float(value: Any) -> float:
         return 0.0
 
 
+def _reported_number(event: dict[str, object], key: str) -> bool:
+    if key not in event or event.get(key) in (None, ""):
+        return False
+    try:
+        float(event[key])
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def client_order_id(event: dict[str, object], trade_date: str, strategy_version: str) -> str:
     signal_id = _text(event.get("id") or event.get("signal_id"))
     order_id = _text(event.get("order_id"))
@@ -84,6 +94,8 @@ def normalize_fill(
 ) -> dict[str, object]:
     order_id = _text(trade.get("order_id"))
     order = orders.get(order_id, {})
+    fee_fields = ("commission", "stamp_tax", "other_fee")
+    source_fee_status = _text(trade.get("fee_data_status")).lower()
     return {
         "fill_id": fill_id(trade),
         "client_order_id": order.get("client_order_id"),
@@ -96,6 +108,12 @@ def normalize_fill(
         "commission": _float(trade.get("commission")),
         "stamp_tax": _float(trade.get("stamp_tax")),
         "other_fee": _float(trade.get("other_fee")),
+        "fee_data_status": (
+            "reported"
+            if source_fee_status == "reported"
+            and all(_reported_number(trade, key) for key in fee_fields)
+            else "unknown"
+        ),
         "filled_at": _text(trade.get("datetime") or trade.get("filled_at")),
         "raw_json": canonical_json(trade),
     }

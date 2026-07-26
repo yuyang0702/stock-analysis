@@ -1624,5 +1624,36 @@ class JoinQuantExporterTest(unittest.TestCase):
                           "final_score": 95, "signal_action": "continue"})
         with patch.object(joinquant_exporter.app_config, "JOINQUANT_PORTFOLIO_RISK_ENABLE_DEFAULT", False):
             self.assertEqual(joinquant_exporter._buy_reject_reason(safe, 75, orders_today=999), "")
+
+    def test_export_populates_structured_signal_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            rows = pd.DataFrame([{
+                "code": "600000", "name": "Example", "price": 10.2,
+                "entry_price": 10.1, "stop_loss": 9.5, "take_profit": 11.3,
+                "support_level": 9.5, "atr14": 0.3, "position_pct": 10,
+                "final_score": 88.6, "mode": "short", "signal_action": "continue",
+            }])
+
+            output = joinquant_exporter.export_signals(
+                rows,
+                run_id="structured-run",
+                trade_date="2026-07-26",
+                output_path=base / "signals.json",
+                store=store,
+            )
+
+            with store.connect() as conn:
+                row = conn.execute(
+                    """SELECT signal_price, stop_loss, take_profit, final_score, strategy_mode
+                       FROM signals WHERE run_id='structured-run'"""
+                ).fetchone()
+            signal = json.loads(output.read_text(encoding="utf-8"))["signals"][0]
+            self.assertEqual(row["signal_price"], signal["entry_price"])
+            self.assertEqual(row["stop_loss"], signal["stop_loss"])
+            self.assertEqual(row["take_profit"], signal["take_profit"])
+            self.assertEqual(row["final_score"], signal["final_score"])
+            self.assertEqual(row["strategy_mode"], signal["signal_type"])
 if __name__ == "__main__":
     unittest.main()

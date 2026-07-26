@@ -36,6 +36,7 @@ class JoinQuantSyncTest(unittest.TestCase):
                 "trade_id": "20", "order_id": "10", "code": "600000",
                 "action": "buy", "amount": 1000, "price": 10.0,
                 "commission": 5.0, "stamp_tax": 0.0, "other_fee": 0.2,
+                "fee_data_status": "reported",
                 "datetime": "2026-07-07 10:05:00",
             }],
         }
@@ -60,7 +61,32 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertEqual(equity["opening_equity"], 100000)
             self.assertEqual(equity["closing_equity"], 100000)
             self.assertAlmostEqual(equity["fees"], 5.2)
+            self.assertEqual(equity["fee_data_status"], "reported")
+            self.assertEqual(equity["realized_pnl_status"], "unknown")
             self.assertEqual(equity["unrealized_pnl"], 500)
+
+    def test_missing_fee_fields_are_not_reported_as_known_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            snapshot = self._ledger_snapshot()
+            for key in ("commission", "stamp_tax", "other_fee"):
+                snapshot["trades"][0].pop(key)
+            snapshot["realized_pnl"] = 123.45
+
+            joinquant_sync.ingest_snapshot_payload(
+                snapshot, store, "2026-07-07 10:05:02",
+            )
+
+            with store.connect() as conn:
+                fill = conn.execute("SELECT * FROM fills WHERE fill_id='20'").fetchone()
+                equity = conn.execute(
+                    "SELECT * FROM daily_equity WHERE trade_date='2026-07-07'"
+                ).fetchone()
+            self.assertEqual(fill["commission"], 0)
+            self.assertEqual(fill["fee_data_status"], "unknown")
+            self.assertEqual(equity["fee_data_status"], "unknown")
+            self.assertEqual(equity["realized_pnl"], 123.45)
+            self.assertEqual(equity["realized_pnl_status"], "reported")
 
     def test_snapshot_persists_strategy_template_version_for_recovery_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

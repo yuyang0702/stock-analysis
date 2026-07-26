@@ -10,6 +10,10 @@ from trading_store import (
     SCHEMA_V3,
     SCHEMA_V4,
     SCHEMA_V5,
+    SCHEMA_V6,
+    SCHEMA_V7,
+    SCHEMA_V8,
+    SCHEMA_V9,
     SignalConflictError,
     SignalRecord,
     StrategyRunRecord,
@@ -18,6 +22,84 @@ from trading_store import (
 
 
 class TradingStoreTest(unittest.TestCase):
+    def test_schema_v10_marks_historical_fee_and_pnl_evidence_unknown(self) -> None:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = Path(tmp) / "trading.db"
+            schemas = (
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
+                SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+            )
+            with sqlite3.connect(path) as conn:
+                for version, schema in enumerate(schemas, 1):
+                    conn.executescript(schema)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
+                        (version,),
+                    )
+                conn.execute(
+                    """INSERT INTO fills(
+                       fill_id, stock_code, action, qty, price, commission, stamp_tax,
+                       other_fee, filled_at, raw_json
+                       ) VALUES ('legacy-fill','600000','buy',100,10,0,0,0,
+                       '2026-07-14 10:00:00','{}')"""
+                )
+                conn.execute(
+                    """INSERT INTO daily_equity(
+                       trade_date, opening_equity, closing_equity, cash,
+                       position_market_value, realized_pnl, unrealized_pnl, fees,
+                       net_deposit, max_drawdown_pct, first_snapshot_at, last_snapshot_at
+                       ) VALUES ('2026-07-14',100000,100000,90000,10000,0,0,0,0,0,
+                       '2026-07-14 09:30:00','2026-07-14 15:00:00')"""
+                )
+
+            store = TradingStore(path)
+            store.initialize()
+
+            with store.connect() as conn:
+                fill = conn.execute(
+                    "SELECT fee_data_status FROM fills WHERE fill_id='legacy-fill'"
+                ).fetchone()
+                equity = conn.execute(
+                    """SELECT fee_data_status, realized_pnl_status
+                       FROM daily_equity WHERE trade_date='2026-07-14'"""
+                ).fetchone()
+            self.assertEqual(store.health().schema_version, 10)
+            self.assertEqual(fill["fee_data_status"], "unknown")
+            self.assertEqual(equity["fee_data_status"], "unknown")
+            self.assertEqual(equity["realized_pnl_status"], "unknown")
+
+    def test_finishes_strategy_run_with_bounded_terminal_evidence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.record_strategy_run(
+                    conn,
+                    StrategyRunRecord(
+                        "run-terminal", "2026-07-26", "2026-07-26 09:30:00", "v1", "p1",
+                    ),
+                )
+                store.finish_strategy_run(
+                    conn,
+                    "run-terminal",
+                    result="failed",
+                    data_status="failed",
+                    finished_at="2026-07-26 09:30:05",
+                    error_message="ValueError: https://example.test/api?token=secret-value " + ("x" * 1000),
+                )
+
+            with store.connect() as conn:
+                row = conn.execute(
+                    "SELECT result, data_status, finished_at, error_message FROM strategy_runs WHERE run_id=?",
+                    ("run-terminal",),
+                ).fetchone()
+
+            self.assertEqual(row["result"], "failed")
+            self.assertEqual(row["data_status"], "failed")
+            self.assertEqual(row["finished_at"], "2026-07-26 09:30:05")
+            self.assertLessEqual(len(row["error_message"]), 500)
+            self.assertNotIn("secret-value", row["error_message"])
+
     def test_schema_v9_upserts_one_gap_opportunity_per_identity(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
@@ -42,7 +124,7 @@ class TradingStoreTest(unittest.TestCase):
                     conn, {**event, "state": "OPEN_CONFIRMED", "reason": "",
                            "confirmation_count": 2, "planned_qty": 100}
                 )
-            self.assertEqual(store.health().schema_version, 9)
+            self.assertEqual(store.health().schema_version, SCHEMA_VERSION)
             row = store.get_gap_reentry_opportunity(event["opportunity_id"])
             self.assertEqual(row["state"], "OPEN_CONFIRMED")
             self.assertEqual(row["planned_qty"], 100)
@@ -263,6 +345,41 @@ class TradingStoreTest(unittest.TestCase):
                 self.assertEqual(conn.execute(
                     "SELECT COUNT(*) FROM reconciliation_runs WHERE result <> 'matched'"
                 ).fetchone()[0], 1)
+
+    def test_prune_removes_old_unreferenced_scan_runs_but_keeps_signal_runs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                for run_id in ("old-empty", "old-signal"):
+                    conn.execute(
+                        """INSERT INTO strategy_runs(
+                           run_id, trade_date, started_at, result, data_status,
+                           created_at, updated_at
+                           ) VALUES (?, '2025-01-01', '2025-01-01 10:00:00',
+                           'success', 'complete', '2025-01-01 10:00:00',
+                           '2025-01-01 10:01:00')""",
+                        (run_id,),
+                    )
+                conn.execute(
+                    """INSERT INTO signals(
+                       signal_id, run_id, trade_date, stock_code, jq_code, action,
+                       generated_at, raw_json, created_at
+                       ) VALUES ('old-signal-id','old-signal','2025-01-01','600000',
+                       '600000.XSHG','buy','2025-01-01 10:00:00','{}',
+                       '2025-01-01 10:00:00')"""
+                )
+
+                deleted = store.prune_execution_history(
+                    conn, "2025-07-14", "2026-07-14 16:00:00",
+                )
+
+                self.assertEqual(deleted["strategy_runs"], 1)
+                self.assertEqual([
+                    row[0] for row in conn.execute(
+                        "SELECT run_id FROM strategy_runs ORDER BY run_id"
+                    )
+                ], ["old-signal"])
 
     def test_position_cycle_freezes_initial_risk_and_tracks_high_watermark(self) -> None:
         with TemporaryDirectory() as tmp:

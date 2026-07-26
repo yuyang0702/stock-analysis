@@ -867,6 +867,14 @@ def export_signals(
                     generated_at=payload["generated_at"], expires_at="",
                     raw_json=canonical_json(signal), validated_at=signal["validated_at"],
                     published_at=signal["published_at"],
+                    signal_price=(
+                        float(signal.get("entry_price") or signal.get("price"))
+                        if signal.get("entry_price") or signal.get("price") else None
+                    ),
+                    stop_loss=float(signal["stop_loss"]) if signal.get("stop_loss") else None,
+                    take_profit=float(signal["take_profit"]) if signal.get("take_profit") else None,
+                    final_score=float(signal["final_score"]) if signal.get("final_score") is not None else None,
+                    strategy_mode=str(signal.get("signal_type") or ""),
                 )))
                 if signal["action"] == "sell":
                     store.upsert_exit_intent(

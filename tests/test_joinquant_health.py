@@ -230,6 +230,8 @@ class JoinQuantHealthTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            db_file = base / "trading.db"
+            TradingStore(db_file).initialize()
 
             result = joinquant_health.build_health_report(
                 signal_file,
@@ -241,12 +243,111 @@ class JoinQuantHealthTest(unittest.TestCase):
                 api_event_file=base / "missing_api_events.jsonl",
                 positions_file=base / "missing_positions.json",
                 health_history_file=base / "health_history.jsonl",
+                db_file=db_file,
             )
 
-            self.assertEqual(result["status"], "critical")
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["system_status"], "ok")
+            self.assertEqual(result["freshness_status"], "not_applicable")
+            self.assertEqual(result["observation_status"], "not_applicable")
+            self.assertEqual(result["observation_day_status"], "not_observed")
             self.assertFalse(result["is_trading_time"])
             self.assertFalse(result["alert_required"])
-            self.assertIn("snapshot_stale", result["issue_codes"])
+            self.assertNotIn("snapshot_stale", result["issue_codes"])
+            self.assertNotIn("signal_stale", result["issue_codes"])
+            self.assertEqual(result["stability_score"], 100)
+
+    def test_off_hours_report_preserves_invalid_trading_day_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account.json"
+            history_file = base / "health.jsonl"
+            signal_file.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "generated_at": "2026-07-09 15:00:00",
+                    "signals": [],
+                }),
+                encoding="utf-8",
+            )
+            snapshot_file.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "received_at": "2026-07-09 15:00:00",
+                    "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
+                    "positions": [],
+                    "orders": [],
+                }),
+                encoding="utf-8",
+            )
+            history_file.write_text(
+                json.dumps({
+                    "generated_at": "2026-07-09 10:00:00",
+                    "is_trading_time": True,
+                    "observation_status": "invalid",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            db_file = base / "trading.db"
+            TradingStore(db_file).initialize()
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                report_file=base / "report.md",
+                now=datetime(2026, 7, 9, 21, 0),
+                health_history_file=history_file,
+                db_file=db_file,
+                positions_file=base / "missing.json",
+            )
+
+            self.assertEqual(result["observation_status"], "not_applicable")
+            self.assertEqual(result["observation_day_status"], "invalid")
+
+    def test_failed_scan_run_makes_trading_observation_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account.json"
+            signal_file.write_text(json.dumps({
+                "schema_version": 1,
+                "generated_at": "2026-07-09 09:59:00",
+                "signals": [],
+            }), encoding="utf-8")
+            snapshot_file.write_text(json.dumps({
+                "schema_version": 1,
+                "received_at": "2026-07-09 09:59:00",
+                "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
+                "positions": [],
+                "orders": [],
+            }), encoding="utf-8")
+            db_file = base / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO strategy_runs(
+                       run_id, trade_date, started_at, finished_at, result, data_status,
+                       created_at, updated_at
+                       ) VALUES ('failed-run','2026-07-09','2026-07-09 09:55:00',
+                       '2026-07-09 09:56:00','failed','failed',
+                       '2026-07-09 09:55:00','2026-07-09 09:56:00')"""
+                )
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                report_file=base / "report.md",
+                now=datetime(2026, 7, 9, 10, 0),
+                db_file=db_file,
+                positions_file=base / "missing.json",
+                health_history_file=base / "health.jsonl",
+            )
+
+            self.assertEqual(result["strategy_run_failed_count_today"], 1)
+            self.assertIn("strategy_run_failures_today", result["issue_codes"])
+            self.assertEqual(result["observation_status"], "invalid")
 
     def test_counts_failed_orders_from_today_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

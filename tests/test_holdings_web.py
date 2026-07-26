@@ -47,6 +47,11 @@ class HoldingsWebTest(unittest.TestCase):
     def login(self):
         return self.client.post("/login", data={"token": "secret"}, follow_redirects=True)
 
+    def test_non_ascii_invalid_login_token_returns_login_failure_not_500(self) -> None:
+        response = self.client.post("/login", data={"token": "错误令牌"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("认证失败", response.get_data(as_text=True))
+
     def test_dashboard_requires_login_and_removed_ocr_routes_are_absent(self) -> None:
         self.assertEqual(self.client.get("/").status_code, 302)
         self.assertEqual(self.client.post("/upload").status_code, 404)
