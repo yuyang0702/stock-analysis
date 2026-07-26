@@ -175,3 +175,9 @@ python -m unittest discover -s tests
 6. Merge to `main` only after verification. Push/deploy/restart require the task’s external-action authorization.
 7. Before deployment: preserve the environment hash, create and verify an online backup, run Linux full tests against an isolated test DB, run `ledger-check`, restart only the three stock services, and verify the environment hash is unchanged.
 8. Restore the new backup only into an isolated temporary destination; verify SQLite integrity, schema 10 and bounded table counts. Never overwrite the live database.
+
+Deployment result (2026-07-26): complete for commit `68d7283`. The server passed Linux 457/457,
+target-module compilation, schema 10 ledger migration, a post-migration online backup, and an isolated
+restore drill with matching bounded table counts. The environment hash was unchanged, all three core
+services were active after restart, and the post-restart ERROR count was zero. Status remains
+`not observed / not validated` until real trading-session evidence exists.

@@ -38,7 +38,7 @@
 | `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | Tasks 1–7 已实现、复查、推送并部署服务器；开关已开启且模板已一致，交易日机会样本和验收尚未出现。 |
 | `docs/superpowers/specs/2026-07-23-pandas-holding-series-health-fix-design.md` | 持仓候选触发扫描失败的根因、最小修复和验证边界 | 当前为 `implemented（已推送） / deployed（服务器） / observed / not validated`；部署或核验该扫描健康事故时读取。 |
 | `docs/superpowers/plans/2026-07-23-pandas-holding-series-health-fix.md` | 持仓 Series 布尔歧义的测试驱动修复与发布检查 | 代码、测试、推送、Linux 验证、服务器部署和首轮真实扫描观察已完成；连续稳定性验证尚未完成。 |
-| `docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md` | 扫描运行账本、信号结构化字段、费用/盈亏可信度、交易时段健康口径、通知失败终态和登录异常 | 当前为 `implemented（本地提交，未推送） / not deployed / not observed / not validated`；未改变任何交易策略或控制语义。 |
+| `docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md` | 扫描运行账本、信号结构化字段、费用/盈亏可信度、交易时段健康口径、通知失败终态和登录异常 | 当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`；未改变任何交易策略或控制语义。 |
 | `docs/superpowers/plans/2026-07-26-runtime-evidence-integrity-repair.md` | 上述修复的测试驱动实施、验证、文档、发布与隔离恢复演练步骤 | Tasks 1–7 本地实现与 Windows 验证已完成；Linux 全量、合并、推送、部署和恢复演练尚未完成。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
@@ -60,16 +60,18 @@ Pandas 持仓 Series 布尔歧义，修复后只有 2026-07-24 一个完整交�
 
 专项修复设计见
 `docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md`。当前严格为
-`implemented（本地提交，未推送） / not deployed / not observed / not validated`。本轮只修复
+`implemented（已推送） / deployed（服务器） / not observed / not validated`。本轮只修复
 运行证据、数据可信度、健康口径、通知终态和登录健壮性，不改变买卖、止盈止损、仓位、
 对账控制或 JoinQuant 执行语义。稳定观察时钟应从修复部署后的首个完整有效交易日重新累计。
 
 本地实现已把正式交易库目标升级为 schema 10：只增加成交费用、日费用和日已实现盈亏
 三个来源状态列，历史值标记 `unknown`，明确来源值标记 `reported`；没有重建表或猜测收益。
 扫描生命周期、信号结构化列、四维健康状态、有界通知 dead/pending 队列和 Unicode 登录
-修复均已通过目标专项 142 项。Windows 全量发现457项，其中454项完成通过；另有3项 Linux脚本测试因
-Windows 无 Bash 未启动，须在服务器部署前补齐。目标模块编译与 diff 检查通过。当前没有
-合并、推送、部署、正式库迁移或服务重启。
+修复均已通过目标专项 142 项。Windows 全量发现457项，其中454项完成通过；服务器 Linux
+全量457/457和目标模块编译通过。服务器于2026-07-26快进到 `68d7283`，部署前schema 9在线
+备份完整性为 `ok`，正式库幂等迁移到schema 10并通过健康/可写检查，迁移后在线备份与隔离恢复
+演练完整性均为 `ok` 且表计数一致；配置哈希未变化，三个核心服务active，重启后ERROR日志计数为0。
+这些是部署证据，不是交易日观察或验证证据。
 
 ## 2026-07-23 持仓候选扫描健康事故
 

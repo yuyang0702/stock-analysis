@@ -1,7 +1,13 @@
 # 运行证据完整性修复设计
 
 日期：2026-07-26  
-状态：`implemented（本地提交，未推送） / not deployed / not observed / not validated`
+状态：`implemented（已推送） / deployed（服务器） / not observed / not validated`
+
+部署证据：实现提交 `0731ac5` 与文档提交已进入 `origin/main`，服务器于 2026-07-26
+快进到 `68d7283`。部署前 schema 9 在线备份完整性通过；Linux 全量 457/457、目标模块
+编译、schema 10 `ledger-check`、迁移后在线备份及隔离恢复演练均通过，配置文件哈希未变化，
+三个核心服务 active，重启后 ERROR 日志计数为 0。以上仅证明部署完成，不构成真实交易日
+`observed` 或 `validated`。
 
 ## 1. 背景与目标
 
