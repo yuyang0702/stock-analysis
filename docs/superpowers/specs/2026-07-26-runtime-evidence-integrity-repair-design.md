@@ -1,7 +1,7 @@
 # 运行证据完整性修复设计
 
 日期：2026-07-26  
-状态：`implemented（隔离分支，未推送） / not deployed / not observed / not validated`
+状态：`implemented（本地提交，未推送） / not deployed / not observed / not validated`
 
 ## 1. 背景与目标
 
@@ -171,7 +171,7 @@ schema 10 采用增加状态列而不是重建金额列：
 
 ## 6. 实现证据
 
-2026-07-26 已在隔离分支完成代码和测试：
+2026-07-26 已在本地功能分支完成代码和测试：
 
 - schema 10 增加三个来源状态列，不重建成交或权益表。
 - 扫描在行情请求前创建运行记录，成功、空结果和异常均写终态；同一 `run_id` 贯穿信号导出。
@@ -181,7 +181,7 @@ schema 10 采用增加状态列而不是重建金额列：
 - 企业微信完整 markdown 限制在 4000 UTF-8 字节内；旧/新 `40058` 进入 dead，临时失败最多五次，队列限制为100项/30天。
 - 非 ASCII 错误登录令牌返回普通认证失败，不再产生 500。
 
-目标专项 142 项通过；Windows 可运行全量 454 项通过。另有 3 项
-`test_joinquant_linux_script` 因当前 Windows 环境没有 Bash 而无法启动，不属于断言失败，
+目标专项 142 项通过；Windows 全量发现 457 项，其中 454 项完成通过。另有 3 项
+`test_joinquant_linux_script` 因当前 Windows 环境没有 Bash 而无法启动，不属于业务断言失败，
 需在 Linux 部署前运行全量测试补齐。目标模块 `py_compile` 和 `git diff --check` 通过。
 当前没有推送、部署、迁移正式库或重启服务，因此不得标记 deployed/observed/validated。
