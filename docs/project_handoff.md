@@ -1,5 +1,18 @@
 # 项目接管与新环境恢复说明
 
+> 2026-07-26 两周服务器只读审核确认：本地、`origin/main` 和服务器均为
+`979d327e383212d8da0d8387c1eb9579d40536c3`，三项核心服务 active，实际/期望
+JoinQuant 模板均为 `2026-07-18.1-gap-reentry`，服务器
+`GAP_REENTRY_ENABLE=1`。2026-07-12 至 2026-07-26 有 306 次成功扫描和 150 次失败，
+其中 146 次为 7 月 23 日已修复的 Pandas 持仓 Series 问题；修复后仅有 7 月 24 日
+一个完整交易日，尚不足以 validated。正式订单 7 笔均 filled，7 月 20 至 24 日对账
+均 matched；但扫描失败未写入 `strategy_runs`、信号结构化列为空、费用和已实现盈亏
+缺少可信度标识、盘外陈旧污染健康评分、6 条 `errcode=40058` 通知被反复重试，且
+`/login` 存在非 ASCII 错误令牌异常。修复专项设计为
+`docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md`，当前严格为
+`planned / not implemented / not deployed / not observed / not validated`；不得提前写成
+已修复，也不得借此改变交易策略、交易控制或任何 Token。
+
 > 2026-07-23 盘中扫描健康事故已修复、推送、部署并完成首轮真实观察：当当前持仓股票进入候选池时，
 `build_risk_bundle` 把整行 `pd.Series` 传给风险引擎，后者的 `if holding` 触发 Pandas
 布尔歧义并终止整轮扫描，导致信号文件停止刷新。共享判断已改为
@@ -30,8 +43,9 @@ warning 及以上日志均已核验。当前为
 部分成交立即撤余单，交易控制拦截不会把机会误标为已发布。部署前 schema 8 在线备份
 完整性为 `ok`；服务器 Linux 全量440/440、编译、schema 9健康/可写、环境哈希不变、
 三个服务active且重启后无 warning 及以上日志。当前严格为
-`implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`。
-`GAP_REENTRY_ENABLE=False`，JoinQuant 网站模板尚未确认更新，不能把服务器部署写成端到端部署。
+`implemented（已推送） / deployed（服务器与网站模板，功能已开启） / not observed / not validated`。
+2026-07-26 只读核验确认 `GAP_REENTRY_ENABLE=1`，实际/期望模板均为
+`2026-07-18.1-gap-reentry`；机会账本仍为空，不能把启用状态写成已观察或已验证。
 
 > 2026-07-15 最新部署增量：成交全量对账已改为仅比较快照交易日的 SQLite 成交与 JoinQuant 当日 `get_trades()`；跨日历史成交不再产生假 `FILL_MISSING_PLATFORM`，同日缺失与平台侧未落账的严重度保持不变。代码提交 `cd83f26` 已推送并部署；SQLite 备份完整性、Linux全量326/326、Python编译、schema 7健康/可写、配置未变、三个服务active及重启后ERROR日志为空均已核验。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
@@ -146,7 +160,7 @@ git ls-remote origin refs/heads/main
 | 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |
 | ML-7 训练型影子模型 | partially implemented（Task 1–3 已推送） | 共享评分/契约、独立 ML SQLite schema 和实时完整候选采集已实现；服务器未部署且默认关闭。strict 历史导入、标签、训练、治理与 L0 推理仍待实现；没有模型，不得写成 deployed/observed/validated。 |
 | 统一有效止损与交易运行面板 | deployed | schema 8、成交后只收紧校验、manual/trailing/effective stop、认证面板和 OCR 删除已部署；网站模板由用户确认更新，但新快照和真实卖出仍未观察或验证。 |
-| 跳空越价后二次确认入场 | deployed（服务器代码，功能关闭） | schema 9、二次确认、精确一手、部分成交撤余单和机会账本已部署；默认关闭，JoinQuant 网站模板尚未确认更新，未观察、未验证。 |
+| 跳空越价后二次确认入场 | deployed（服务器与网站模板，功能已开启） | schema 9、二次确认、精确一手、部分成交撤余单和机会账本已部署；开关已开启且模板一致，但机会账本为空，未观察、未验证。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。

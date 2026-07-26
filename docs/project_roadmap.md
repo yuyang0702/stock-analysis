@@ -1,6 +1,6 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-07-23
+更新日期：2026-07-26
 
 本文档是当前项目规划的唯一主说明，合并已有能力、JoinQuant 接入方案、服务器部署流程，以及后续机器学习优化路线。其他早期设计文档只作为历史参考；如果口径冲突，以本文档为准。
 
@@ -34,12 +34,34 @@
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
 | `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、四类止损唯一事实源、交易运行面板、网页安全和可观测性增强 | 修改止损、持仓网页或止损迁移时必读；基础能力和可观测性增强均为 `implemented（已推送） / deployed（服务器） / not observed / not validated`；JoinQuant 网站仍以用户此前确认的模板状态为准。 |
 | `docs/superpowers/plans/2026-07-16-unified-effective-stop-trading-dashboard.md` | schema 8、统一止损、网页重构、可观测性增强、测试与部署顺序 | Tasks 1–17 的实现、推送和服务器部署已完成；交易日观察与验收尚未完成。 |
-| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`；JoinQuant 网站模板尚未确认更新。 |
-| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | Tasks 1–7 已实现、复查、推送并部署服务器；开关保持关闭，网站模板、交易日观察和验收尚未完成。 |
+| `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md` | 跳空越过计划价、涨停开板二次确认、最小一手例外和新信号隔离 | 修改跳空补充入场、炸板确认或最小一手逻辑时必读；当前为 `implemented（已推送） / deployed（服务器与网站模板，功能已开启） / not observed / not validated`；机会账本仍为空。 |
+| `docs/superpowers/plans/2026-07-18-gap-reentry-confirmation.md` | 跳空二次确认的状态机、schema 9、执行契约、最小一手、JoinQuant复核和验收步骤 | Tasks 1–7 已实现、复查、推送并部署服务器；开关已开启且模板已一致，交易日机会样本和验收尚未出现。 |
 | `docs/superpowers/specs/2026-07-23-pandas-holding-series-health-fix-design.md` | 持仓候选触发扫描失败的根因、最小修复和验证边界 | 当前为 `implemented（已推送） / deployed（服务器） / observed / not validated`；部署或核验该扫描健康事故时读取。 |
 | `docs/superpowers/plans/2026-07-23-pandas-holding-series-health-fix.md` | 持仓 Series 布尔歧义的测试驱动修复与发布检查 | 代码、测试、推送、Linux 验证、服务器部署和首轮真实扫描观察已完成；连续稳定性验证尚未完成。 |
+| `docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md` | 扫描运行账本、信号结构化字段、费用/盈亏可信度、交易时段健康口径、通知失败终态和登录异常 | 当前为 `planned / not implemented / not deployed / not observed / not validated`；实施时不得改变任何交易策略或控制语义。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
+
+## 2026-07-26 两周运行审核与证据完整性修复
+
+服务器只读审核区间为 2026-07-12 至 2026-07-26。当前本地、`origin/main` 和服务器均为
+`979d327e383212d8da0d8387c1eb9579d40536c3`，三个核心服务 active，实际 JoinQuant
+模板与期望版本均为 `2026-07-18.1-gap-reentry`，`GAP_REENTRY_ENABLE=1`。这取代本文
+此前“功能关闭、网站模板未确认”的旧状态，但跳空二次入场机会账本仍为空，因此该路径
+仍是 `deployed / not observed / not validated`。
+
+区间内 journal 记录 306 次成功扫描、150 次失败；其中 146 次为 2026-07-23 已修复的
+Pandas 持仓 Series 布尔歧义，修复后只有 2026-07-24 一个完整交易日证据。正式账本中
+7 笔订单均已成交，2026-07-20 至 2026-07-24 的对账全部 matched；但扫描失败没有进入
+`strategy_runs`，信号结构化列未填充，成交费用和日已实现盈亏无法区分真实零与来源
+缺失。健康报告还把盘后/周末的新鲜度陈旧计入 critical，通知队列有 6 条
+`errcode=40058` 永久失败被反复重试，网页登录存在非 ASCII 错误令牌 500 路径。
+
+专项修复设计见
+`docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md`。当前严格为
+`planned / not implemented / not deployed / not observed / not validated`。本轮只修复
+运行证据、数据可信度、健康口径、通知终态和登录健壮性，不改变买卖、止盈止损、仓位、
+对账控制或 JoinQuant 执行语义。稳定观察时钟应从修复部署后的首个完整有效交易日重新累计。
 
 ## 2026-07-23 持仓候选扫描健康事故
 
@@ -86,7 +108,7 @@
 
 正常风险仓位不足 100 股时只进入最小一手例外检查；100 股必须同时满足现金、单笔风险、单票/行业/题材/总仓位、持仓数量和开放风险边界，否则放弃。`RISK_OFF`、人工停止买入、kill switch、健康/对账门、行情陈旧、同股持仓或未完成订单等继续优先。计划增加事件级有界机会账本支持成交与拒绝机会的反事实复盘，不新增逐扫描无限文件。
 
-专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。提交 `5ad0ad539ef66aa7cf1073ad7142fde116d74ea5` 已实现并部署服务器：纯状态机、schema 9 事件级机会账本、当前候选重新验证、两轮开板确认、最小一手风险复核、全新执行契约和 JoinQuant 最终复核均已进入运行代码。2026-07-19 部署前在线备份完整性为 `ok`，服务器虚拟环境 Linux 全量440/440、Python编译、schema 9健康/可写、环境文件哈希不变、三个服务active且重启后无 warning 及以上日志。当前严格为 `implemented（已推送） / deployed（服务器代码，功能关闭） / not observed / not validated`；`GAP_REENTRY_ENABLE=False`，JoinQuant 网站模板 `2026-07-18.1-gap-reentry` 尚未确认更新，因此不会产生该路径的新买单。
+专项设计见 `docs/superpowers/specs/2026-07-18-gap-reentry-confirmation-design.md`。提交 `5ad0ad539ef66aa7cf1073ad7142fde116d74ea5` 已实现并部署服务器：纯状态机、schema 9 事件级机会账本、当前候选重新验证、两轮开板确认、最小一手风险复核、全新执行契约和 JoinQuant 最终复核均已进入运行代码。2026-07-19 部署前在线备份完整性为 `ok`，服务器虚拟环境 Linux 全量440/440、Python编译、schema 9健康/可写、环境文件哈希不变、三个服务active且重启后无 warning 及以上日志。当前严格为 `implemented（已推送） / deployed（服务器与网站模板，功能已开启） / not observed / not validated`；2026-07-26 只读核验确认 `GAP_REENTRY_ENABLE=1`，实际与期望 JoinQuant 网站模板均为 `2026-07-18.1-gap-reentry`，但机会账本仍为空，不能据此标记 observed。
 
 ## 2026-07-15 schema 7 部署检查点
 
