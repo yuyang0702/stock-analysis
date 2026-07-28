@@ -1,11 +1,45 @@
 import unittest
+from decimal import Decimal
 
 import pandas as pd
 
+from execution_contracts import FeeSchedule
 from paper_trading import apply_paper_trades, new_account, summarize_account
 
 
 class PaperTradingTest(unittest.TestCase):
+    def test_reports_versioned_fee_components(self) -> None:
+        fees = FeeSchedule(
+            version="test-v1", effective_from="2026-01-01",
+            buy_commission_rate=Decimal("0.0003"), sell_commission_rate=Decimal("0.0003"),
+            minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
+            transfer_fee_rate=Decimal("0.00001"), other_fee_rate=Decimal("0"),
+            buy_slippage_rate=Decimal("0.001"), sell_slippage_rate=Decimal("0.001"),
+        )
+        account = new_account(10_000)
+
+        events = apply_paper_trades(
+            account,
+            pd.DataFrame([{
+                "code": "600000", "price": 10, "entry_price": 10, "stop_loss": 9.5,
+                "take_profit": 11, "position_pct": 10, "final_score": 90,
+            }]),
+            trade_date="2026-07-07",
+            fee_schedule=fees,
+        )
+
+        self.assertEqual(events[0]["fee_schedule_version"], "test-v1")
+        self.assertEqual(events[0]["price"], 10.0)
+        self.assertEqual(events[0]["fees"], 6.01)
+        self.assertEqual(account["cash"], 8_993.99)
+        self.assertEqual(events[0]["fee_components"], {
+            "commission_yuan": 5.0,
+            "stamp_tax_yuan": 0.0,
+            "transfer_fee_yuan": 0.01,
+            "other_fee_yuan": 0.0,
+            "slippage_yuan": 1.0,
+        })
+
     def test_buys_100_share_lots_from_signal_position_pct(self) -> None:
         account = new_account(100_000)
         rows = pd.DataFrame(

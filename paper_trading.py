@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+import config as app_config
+from execution_contracts import FeeBreakdown, FeeSchedule
 
 
 def new_account(initial_cash: float = 100_000) -> dict[str, Any]:
@@ -76,10 +80,36 @@ def _row_map(rows: pd.DataFrame) -> dict[str, pd.Series]:
     return {_code(row.get("code")): row for _, row in rows.iterrows() if _code(row.get("code"))}
 
 
-def _fee(amount: float, rate: float, min_fee: float = 5.0) -> float:
-    if amount <= 0 or rate <= 0:
-        return 0.0
-    return round(max(amount * rate, min_fee), 2)
+def _fee_schedule(
+    fee_schedule: FeeSchedule | None,
+    commission_rate: float,
+    stamp_tax_rate: float,
+    slippage_pct: float,
+) -> FeeSchedule:
+    if fee_schedule is not None:
+        return fee_schedule
+    base = app_config.SIMULATION_FEE_SCHEDULE
+    if (
+        commission_rate == float(base.buy_commission_rate)
+        and stamp_tax_rate == float(base.stamp_tax_rate)
+        and slippage_pct == float(base.buy_slippage_rate)
+    ):
+        return base
+    no_costs = commission_rate == stamp_tax_rate == slippage_pct == 0
+    return FeeSchedule.simulation(
+        version=f"{base.version}-paper-compat",
+        effective_from=base.effective_from,
+        commission_rate=commission_rate,
+        minimum_commission_yuan=0 if no_costs or commission_rate == 0 else base.minimum_commission_yuan,
+        stamp_tax_rate=stamp_tax_rate,
+        slippage_rate=slippage_pct,
+        transfer_fee_rate=0 if no_costs else base.transfer_fee_rate,
+        other_fee_rate=0 if no_costs else base.other_fee_rate,
+    )
+
+
+def _fee_fields(value: FeeBreakdown) -> dict[str, float]:
+    return {key: float(amount) for key, amount in value.components_dict().items()}
 
 
 def _equity(account: dict[str, Any]) -> float:
@@ -146,7 +176,7 @@ def _buy_qty(
     account: dict[str, Any],
     price: float,
     position_pct: float,
-    commission_rate: float,
+    fees: FeeSchedule,
     max_position_pct: float,
     max_total_position_pct: float,
 ) -> int:
@@ -156,7 +186,8 @@ def _buy_qty(
     qty = int(min(target_value, _num(account.get("cash"))) // (price * 100)) * 100
     while qty >= 100:
         gross = round(qty * price, 2)
-        if gross + _fee(gross, commission_rate) <= _num(account.get("cash")):
+        cost = fees.estimate("buy", Decimal(str(price)), qty).total_yuan
+        if gross + float(cost) <= _num(account.get("cash")):
             return qty
         qty -= 100
     return 0
@@ -168,14 +199,16 @@ def apply_paper_trades(
     trade_date: str | None = None,
     min_score: float = 75.0,
     commission_rate: float = 0.0003,
-    stamp_tax_rate: float = 0.001,
+    stamp_tax_rate: float = 0.0005,
     slippage_pct: float = 0.001,
     cooldown_days: int = 3,
     max_positions: int = 5,
     max_position_pct: float = 20.0,
     max_total_position_pct: float = 80.0,
+    fee_schedule: FeeSchedule | None = None,
 ) -> list[dict[str, Any]]:
     trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
+    fees = _fee_schedule(fee_schedule, commission_rate, stamp_tax_rate, slippage_pct)
     rows_by_code = _row_map(rows)
     positions = account.setdefault("positions", {})
     events: list[dict[str, Any]] = []
@@ -193,10 +226,11 @@ def apply_paper_trades(
             continue
 
         qty = int(_num(pos.get("qty")))
-        deal_price = round(price * (1 - slippage_pct), 3)
+        deal_price = round(price, 3)
         gross = round(qty * deal_price, 2)
-        fees = round(_fee(gross, commission_rate) + gross * stamp_tax_rate, 2)
-        proceeds = round(gross - fees, 2)
+        breakdown = fees.estimate("sell", Decimal(str(deal_price)), qty)
+        fee_total = float(breakdown.total_yuan)
+        proceeds = round(gross - fee_total, 2)
         pnl = round(proceeds - _num(pos.get("cost_amount")), 2)
         account["cash"] = round(_num(account.get("cash")) + proceeds, 2)
         account["realized_pnl"] = round(_num(account.get("realized_pnl")) + pnl, 2)
@@ -211,7 +245,9 @@ def apply_paper_trades(
             "price": deal_price,
             "qty": qty,
             "amount": proceeds,
-            "fees": fees,
+            "fees": fee_total,
+            "fee_schedule_version": fees.version,
+            "fee_components": _fee_fields(breakdown),
             "pnl": pnl,
             "reason": reason,
             "signal_type": _txt(pos.get("signal_type")),
@@ -224,20 +260,21 @@ def apply_paper_trades(
             break
         if code in positions or not _can_buy(row, account, trade_date, min_score):
             continue
-        price = round(_num(row.get("price")) * (1 + slippage_pct), 3)
+        price = round(_num(row.get("price")), 3)
         qty = _buy_qty(
             account,
             price,
             _num(row.get("position_pct")),
-            commission_rate,
+            fees,
             max_position_pct,
             max_total_position_pct,
         )
         if qty < 100:
             continue
         gross = round(qty * price, 2)
-        fees = _fee(gross, commission_rate)
-        cost = round(gross + fees, 2)
+        breakdown = fees.estimate("buy", Decimal(str(price)), qty)
+        fee_total = float(breakdown.total_yuan)
+        cost = round(gross + fee_total, 2)
         signal_type = _signal_type(row)
         account["cash"] = round(_num(account.get("cash")) - cost, 2)
         positions[code] = {
@@ -260,7 +297,9 @@ def apply_paper_trades(
             "price": price,
             "qty": qty,
             "amount": cost,
-            "fees": fees,
+            "fees": fee_total,
+            "fee_schedule_version": fees.version,
+            "fee_components": _fee_fields(breakdown),
             "reason": "signal",
             "signal_type": signal_type,
         }
@@ -268,6 +307,7 @@ def apply_paper_trades(
         events.append(event)
 
     account.setdefault("equity_curve", []).append({"date": trade_date, "equity": _equity(account)})
+    account["fee_schedule_version"] = fees.version
     account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return events
 
@@ -288,6 +328,13 @@ def summarize_account(account: dict[str, Any]) -> dict[str, Any]:
     sells = [trade for trade in trades if trade.get("action") == "sell"]
     wins = [trade for trade in sells if _num(trade.get("pnl")) > 0]
     signal_stats: dict[str, dict[str, Any]] = {}
+    fee_keys = (
+        "commission_yuan",
+        "stamp_tax_yuan",
+        "transfer_fee_yuan",
+        "other_fee_yuan",
+        "slippage_yuan",
+    )
     for trade in sells:
         key = _txt(trade.get("signal_type")) or "signal"
         item = signal_stats.setdefault(key, {"closed": 0, "wins": 0, "pnl": 0.0})
@@ -304,6 +351,11 @@ def summarize_account(account: dict[str, Any]) -> dict[str, Any]:
         "win_rate": round(len(wins) / len(sells) * 100, 2) if sells else 0.0,
         "max_drawdown_pct": _max_drawdown_pct(account.get("equity_curve", [])),
         "signal_stats": signal_stats,
+        "fee_schedule_version": _txt(account.get("fee_schedule_version")) or "not-applicable",
+        "fee_components": {
+            key: round(sum(_num(trade.get("fee_components", {}).get(key)) for trade in trades), 2)
+            for key in fee_keys
+        },
     }
 
 
@@ -331,4 +383,5 @@ def build_paper_trade_markdown(account: dict[str, Any], events: list[dict[str, A
             )
     else:
         lines.append("> 本轮无模拟成交，T+1、冷却或价格条件未满足。")
+    lines.insert(2, f"> Fee schedule: {summary['fee_schedule_version']}")
     return "\n".join(lines)

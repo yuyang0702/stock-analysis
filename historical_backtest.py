@@ -11,9 +11,12 @@ import math
 import statistics
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Iterable
 
+import config as app_config
+from execution_contracts import FeeBreakdown, FeeSchedule, canonical_json
 from exit_policy import PositionExitState, evaluate_exit
 from historical_data import STRICT_FEATURES, HistoricalStore, validate_dataset
 from historical_strategy import Candidate, generate_daily_candidates
@@ -22,14 +25,40 @@ from historical_strategy import Candidate, generate_daily_candidates
 @dataclass(frozen=True)
 class HistoricalBacktestConfig:
     initial_cash: float = 100_000.0
-    commission_rate: float = 0.0003
-    minimum_commission: float = 5.0
-    stamp_tax_rate: float = 0.0005
-    slippage_bps: float = 10.0
+    commission_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.buy_commission_rate)
+    minimum_commission: float = float(app_config.SIMULATION_FEE_SCHEDULE.minimum_commission_yuan)
+    stamp_tax_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.stamp_tax_rate)
+    slippage_bps: float = float(app_config.SIMULATION_FEE_SCHEDULE.buy_slippage_rate * 10_000)
     max_positions: int = 8
     mode: str = "price_core"
     parameter_version: str = "v1"
     min_score: float = 75.0
+    fee_schedule: FeeSchedule | None = None
+
+    def resolved_fee_schedule(self) -> FeeSchedule:
+        if self.fee_schedule is not None:
+            return self.fee_schedule
+        base = app_config.SIMULATION_FEE_SCHEDULE
+        if (
+            self.commission_rate == float(base.buy_commission_rate)
+            and self.minimum_commission == float(base.minimum_commission_yuan)
+            and self.stamp_tax_rate == float(base.stamp_tax_rate)
+            and self.slippage_bps == float(base.buy_slippage_rate * 10_000)
+        ):
+            return base
+        no_costs = (
+            self.commission_rate == self.minimum_commission == self.stamp_tax_rate == self.slippage_bps == 0
+        )
+        return FeeSchedule.simulation(
+            version=f"{base.version}-historical-compat",
+            effective_from=base.effective_from,
+            commission_rate=self.commission_rate,
+            minimum_commission_yuan=self.minimum_commission,
+            stamp_tax_rate=self.stamp_tax_rate,
+            slippage_rate=self.slippage_bps / 10_000,
+            transfer_fee_rate=0 if no_costs else base.transfer_fee_rate,
+            other_fee_rate=0 if no_costs else base.other_fee_rate,
+        )
 
 
 @dataclass
@@ -83,6 +112,22 @@ class HistoricalTrade:
     score: float = 0.0
     industry: str = "unknown"
     theme: str = "unknown"
+    fee_schedule_version: str = "not-applicable"
+    commission_yuan: float = 0.0
+    stamp_tax_yuan: float = 0.0
+    transfer_fee_yuan: float = 0.0
+    other_fee_yuan: float = 0.0
+    slippage_yuan: float = 0.0
+
+    @property
+    def fee_components(self) -> dict[str, float]:
+        return {
+            "commission_yuan": self.commission_yuan,
+            "stamp_tax_yuan": self.stamp_tax_yuan,
+            "transfer_fee_yuan": self.transfer_fee_yuan,
+            "other_fee_yuan": self.other_fee_yuan,
+            "slippage_yuan": self.slippage_yuan,
+        }
 
 
 @dataclass(frozen=True)
@@ -136,10 +181,10 @@ def run_historical_backtest(
     dates = store.trade_dates(dataset_id, start, end)
     result = HistoricalBacktestResult()
     cash = float(config.initial_cash)
+    fees = config.resolved_fee_schedule()
     positions: dict[str, HistoricalPosition] = {}
     pending: list[PendingOrder] = []
     pending_sells: list[PendingSell] = []
-    slip = config.slippage_bps / 10_000
 
     for trade_date in dates:
         rows = {str(row["code"]): row for row in store.daily_slice(dataset_id, trade_date)}
@@ -174,9 +219,10 @@ def run_historical_backtest(
                 _blocked(result, "LIMIT_DOWN_SELL_BLOCKED")
                 continue
             quantity = min(order.quantity, position.quantity)
-            price = round(float(row["open"]) * (1 - slip), 4)
+            price = round(float(row["open"]), 4)
             value = price * quantity
-            fee = round(_commission(value, config) + value * config.stamp_tax_rate, 2)
+            breakdown = fees.estimate("sell", Decimal(str(price)), quantity)
+            fee = float(breakdown.total_yuan)
             cash += value - fee
             pnl = round((price - position.entry_price) * quantity - fee, 2)
             result.trades.append(
@@ -185,6 +231,7 @@ def run_historical_backtest(
                     order.reason, pnl, holding_days=position.holding_trade_days,
                     strategy_mode=position.mode, market_regime=position.market_regime,
                     industry=position.industry, theme=position.theme,
+                    fee_schedule_version=fees.version, **_fee_fields(breakdown),
                 )
             )
             position.quantity -= quantity
@@ -207,16 +254,18 @@ def run_historical_backtest(
                 continue
             if candidate.code in positions or len(positions) >= config.max_positions:
                 continue
-            price = round(open_price * (1 + slip), 4)
+            price = round(open_price, 4)
             target = _account_value(cash, positions, rows) * candidate.position_pct / 100
             quantity = int(target / price / 100) * 100
             if quantity <= 0:
                 _blocked(result, "LOT_TOO_SMALL")
                 continue
-            fee = _commission(price * quantity, config)
-            while quantity > 0 and price * quantity + fee > cash:
+            breakdown = fees.estimate("buy", Decimal(str(price)), quantity)
+            fee = float(breakdown.total_yuan)
+            while quantity > 0 and price * quantity + fee > min(cash, target):
                 quantity -= 100
-                fee = _commission(price * quantity, config) if quantity else 0
+                breakdown = fees.estimate("buy", Decimal(str(price)), quantity)
+                fee = float(breakdown.total_yuan)
             if quantity <= 0:
                 _blocked(result, "INSUFFICIENT_CASH")
                 continue
@@ -238,7 +287,10 @@ def run_historical_backtest(
                 last_adjust_factor=float(row["adjust_factor"]),
             )
             result.trades.append(
-                HistoricalTrade(order.decision_date, trade_date, candidate.code, "buy", quantity, price, fee, "SIGNAL")
+                HistoricalTrade(
+                    order.decision_date, trade_date, candidate.code, "buy", quantity, price, fee,
+                    "SIGNAL", fee_schedule_version=fees.version, **_fee_fields(breakdown),
+                )
             )
         pending = []
 
@@ -262,14 +314,15 @@ def run_historical_backtest(
             if float(row["open"]) <= float(row["limit_down"]):
                 _blocked(result, "LIMIT_DOWN_SELL_BLOCKED")
                 continue
-            price = round(raw_price * (1 - slip), 4)
+            price = round(raw_price, 4)
             if reason == "TAKE_PROFIT_1" and position.take_profit_stage == 0:
                 target_quantity = position.initial_quantity // 2 // 100 * 100
                 quantity = position.quantity - target_quantity
             else:
                 quantity = position.quantity
             value = price * quantity
-            fee = round(_commission(value, config) + value * config.stamp_tax_rate, 2)
+            breakdown = fees.estimate("sell", Decimal(str(price)), quantity)
+            fee = float(breakdown.total_yuan)
             cash += value - fee
             pnl = round((price - position.entry_price) * quantity - fee, 2)
             result.trades.append(
@@ -277,6 +330,7 @@ def run_historical_backtest(
                     trade_date, trade_date, code, "sell", quantity, price, fee, reason, pnl,
                     holding_days=position.holding_trade_days, strategy_mode=position.mode,
                     market_regime=position.market_regime, industry=position.industry, theme=position.theme,
+                    fee_schedule_version=fees.version, **_fee_fields(breakdown),
                 )
             )
             if quantity >= position.quantity:
@@ -325,13 +379,26 @@ def run_historical_backtest(
         result.equity.append(
             EquityPoint(trade_date, round(_account_value(cash, positions, rows), 2), round(cash, 2))
         )
+    result.metadata.update(
+        {
+            "fee_schedule_version": fees.version,
+            "fee_components": {
+                key: round(sum(trade.fee_components[key] for trade in result.trades), 2)
+                for key in (
+                    "commission_yuan",
+                    "stamp_tax_yuan",
+                    "transfer_fee_yuan",
+                    "other_fee_yuan",
+                    "slippage_yuan",
+                )
+            },
+        }
+    )
     return result
 
 
-def _commission(value: float, config: HistoricalBacktestConfig) -> float:
-    if value <= 0:
-        return 0.0
-    return round(max(config.minimum_commission, value * config.commission_rate), 2)
+def _fee_fields(value: FeeBreakdown) -> dict[str, float]:
+    return {key: float(amount) for key, amount in value.components_dict().items()}
 
 
 def _account_value(cash: float, positions: dict[str, HistoricalPosition], rows: dict[str, dict]) -> float:
@@ -472,15 +539,32 @@ def sensitivity_matrix(
     result_factory: Callable[[HistoricalBacktestConfig], HistoricalBacktestResult],
     base_config: HistoricalBacktestConfig,
 ) -> dict[str, HistoricalBacktestResult]:
+    fees = base_config.resolved_fee_schedule()
     variants = {
-        "zero_slippage": replace(base_config, slippage_bps=0),
+        "zero_slippage": replace(
+            base_config,
+            fee_schedule=replace(fees, buy_slippage_rate=Decimal("0"), sell_slippage_rate=Decimal("0")),
+        ),
         "base": base_config,
-        "double_slippage": replace(base_config, slippage_bps=base_config.slippage_bps * 2),
+        "double_slippage": replace(
+            base_config,
+            fee_schedule=replace(
+                fees,
+                buy_slippage_rate=fees.buy_slippage_rate * 2,
+                sell_slippage_rate=fees.sell_slippage_rate * 2,
+            ),
+        ),
         "double_fees": replace(
             base_config,
-            commission_rate=base_config.commission_rate * 2,
-            minimum_commission=base_config.minimum_commission * 2,
-            stamp_tax_rate=base_config.stamp_tax_rate * 2,
+            fee_schedule=replace(
+                fees,
+                buy_commission_rate=fees.buy_commission_rate * 2,
+                sell_commission_rate=fees.sell_commission_rate * 2,
+                minimum_commission_yuan=fees.minimum_commission_yuan * 2,
+                stamp_tax_rate=fees.stamp_tax_rate * 2,
+                transfer_fee_rate=fees.transfer_fee_rate * 2,
+                other_fee_rate=fees.other_fee_rate * 2,
+            ),
         ),
     }
     return {name: result_factory(config) for name, config in variants.items()}
@@ -551,8 +635,15 @@ def _run_id(store: HistoricalStore, args, config: HistoricalBacktestConfig) -> s
         "minimum_commission": config.minimum_commission,
         "stamp_tax": config.stamp_tax_rate,
         "slippage_bps": config.slippage_bps,
+        "fee_schedule": config.resolved_fee_schedule().to_dict(),
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:24]
+
+
+def _config_payload(config: HistoricalBacktestConfig) -> dict[str, object]:
+    payload = asdict(config)
+    payload["fee_schedule"] = config.resolved_fee_schedule().to_dict()
+    return payload
 
 
 def _persist_failure(
@@ -565,7 +656,7 @@ def _persist_failure(
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     message = " ".join(str(error).split())[:240]
     config_payload = {
-        **asdict(config),
+        **_config_payload(config),
         "strategy_version": args.strategy_version,
         "code_hash": _implementation_hash(),
     }
@@ -594,7 +685,7 @@ def _persist_result(
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     metrics = asdict(compute_metrics(result.equity, result.trades))
     config_payload = {
-        **asdict(config),
+        **_config_payload(config),
         "strategy_version": strategy_version,
         "code_hash": _implementation_hash(),
     }
@@ -690,7 +781,7 @@ def main(argv: list[str] | None = None) -> int:
             right_config = json.loads(right["config_json"])
             for key in (
                 "initial_cash", "commission_rate", "minimum_commission", "stamp_tax_rate",
-                "slippage_bps", "strategy_version", "code_hash", "parameter_version",
+                "slippage_bps", "fee_schedule", "strategy_version", "code_hash", "parameter_version",
             ):
                 if left_config.get(key) != right_config.get(key):
                     mismatches.append(f"config:{key}")
@@ -718,6 +809,7 @@ def main(argv: list[str] | None = None) -> int:
         _publish_atomic(Path(args.output_dir), quality_file)
         return 2
     result.metadata = {
+        **result.metadata,
         "run_id": run_id,
         "dataset_hash": quality.input_hash,
         "window": f"{args.start}:{args.end}",
@@ -727,9 +819,10 @@ def main(argv: list[str] | None = None) -> int:
     metrics = asdict(compute_metrics(result.equity, result.trades))
     equity_fields = ["trade_date", "equity", "cash"]
     trade_fields = [field.name for field in HistoricalTrade.__dataclass_fields__.values()]
+    fee_report = json.dumps(result.metadata["fee_components"], sort_keys=True)
     files = {
         **quality_file,
-        "historical_backtest_latest.md": f"# Historical Backtest\n\n- run_id: `{run_id}`\n- mode: `{args.mode}`\n- proxy_only: `{str(quality.proxy_only).lower()}`\n- metrics: `{json.dumps(metrics, sort_keys=True)}`\n",
+        "historical_backtest_latest.md": f"# Historical Backtest\n\n- run_id: `{run_id}`\n- mode: `{args.mode}`\n- proxy_only: `{str(quality.proxy_only).lower()}`\n- fee_schedule: `{result.metadata['fee_schedule_version']}`\n- fee_components: `{fee_report}`\n- metrics: `{json.dumps(metrics, sort_keys=True)}`\n",
         "historical_backtest_equity.csv": _csv_text([asdict(row) for row in result.equity], equity_fields),
         "historical_backtest_trades.csv": _csv_text([asdict(row) for row in result.trades], trade_fields),
     }

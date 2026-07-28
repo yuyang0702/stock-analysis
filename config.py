@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from execution_contracts import FeeSchedule
 
 
 def _env_text(name: str, default: str = "", *aliases: str) -> str:
@@ -32,6 +35,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_decimal(name: str, default: str) -> Decimal:
+    value = _env_text(name, default)
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError(f"{name} must be a decimal") from error
+    if not result.is_finite():
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = _env_text(name).lower()
     if not value:
@@ -54,6 +68,19 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 # 运行缓存目录，保存新闻、龙虎榜、通知去重状态等缓存。
 CACHE_DIR = BASE_DIR / "cache"
+
+SIMULATION_FEE_SCHEDULE = FeeSchedule(
+    version=_env_text("FEE_SCHEDULE_VERSION", "simulation-only-v1"),
+    effective_from=_env_text("FEE_SCHEDULE_EFFECTIVE_FROM", "2026-01-01"),
+    buy_commission_rate=_env_decimal("FEE_BUY_COMMISSION_RATE", "0.0003"),
+    sell_commission_rate=_env_decimal("FEE_SELL_COMMISSION_RATE", "0.0003"),
+    minimum_commission_yuan=_env_decimal("FEE_MINIMUM_COMMISSION_YUAN", "5"),
+    stamp_tax_rate=_env_decimal("FEE_STAMP_TAX_RATE", "0.0005"),
+    transfer_fee_rate=_env_decimal("FEE_TRANSFER_FEE_RATE", "0"),
+    other_fee_rate=_env_decimal("FEE_OTHER_FEE_RATE", "0"),
+    buy_slippage_rate=_env_decimal("FEE_BUY_SLIPPAGE_RATE", "0.001"),
+    sell_slippage_rate=_env_decimal("FEE_SELL_SLIPPAGE_RATE", "0.001"),
+)
 
 # Batch 1 risk evaluation is observation-only. Unsupported modes fail closed at load time.
 RISK_MODE = _env_text("RISK_MODE", "observe").lower()
@@ -240,6 +267,16 @@ ENV_NOTICE_DAYS_BACK = "NOTICE_DAYS_BACK"
 ENV_MAX_CANDIDATES_FOR_NEWS = "MAX_CANDIDATES_FOR_NEWS"
 ENV_STOCK_SCAN_TIMEOUT = "STOCK_SCAN_TIMEOUT"
 ENV_SIGNAL_WATCHLIST_DAYS = "SIGNAL_WATCHLIST_DAYS"
+ENV_FEE_SCHEDULE_VERSION = "FEE_SCHEDULE_VERSION"
+ENV_FEE_SCHEDULE_EFFECTIVE_FROM = "FEE_SCHEDULE_EFFECTIVE_FROM"
+ENV_FEE_BUY_COMMISSION_RATE = "FEE_BUY_COMMISSION_RATE"
+ENV_FEE_SELL_COMMISSION_RATE = "FEE_SELL_COMMISSION_RATE"
+ENV_FEE_MINIMUM_COMMISSION_YUAN = "FEE_MINIMUM_COMMISSION_YUAN"
+ENV_FEE_STAMP_TAX_RATE = "FEE_STAMP_TAX_RATE"
+ENV_FEE_TRANSFER_FEE_RATE = "FEE_TRANSFER_FEE_RATE"
+ENV_FEE_OTHER_FEE_RATE = "FEE_OTHER_FEE_RATE"
+ENV_FEE_BUY_SLIPPAGE_RATE = "FEE_BUY_SLIPPAGE_RATE"
+ENV_FEE_SELL_SLIPPAGE_RATE = "FEE_SELL_SLIPPAGE_RATE"
 ENV_PAPER_TRADE_ENABLE = "PAPER_TRADE_ENABLE"
 ENV_PAPER_TRADE_CASH = "PAPER_TRADE_CASH"
 ENV_PAPER_TRADE_COMMISSION_RATE = "PAPER_TRADE_COMMISSION_RATE"
@@ -306,9 +343,15 @@ ENV_MAX_CONSECUTIVE_LOSSES = "MAX_CONSECUTIVE_LOSSES"
 SIGNAL_WATCHLIST_DAYS_DEFAULT = _env_int("SIGNAL_WATCHLIST_DAYS", 20)
 PAPER_TRADE_ENABLE_DEFAULT = _env_bool("PAPER_TRADE_ENABLE", False)
 PAPER_TRADE_CASH_DEFAULT = _env_float("PAPER_TRADE_CASH", 100_000)
-PAPER_TRADE_COMMISSION_RATE_DEFAULT = _env_float("PAPER_TRADE_COMMISSION_RATE", 0.0003)
-PAPER_TRADE_STAMP_TAX_RATE_DEFAULT = _env_float("PAPER_TRADE_STAMP_TAX_RATE", 0.001)
-PAPER_TRADE_SLIPPAGE_PCT_DEFAULT = _env_float("PAPER_TRADE_SLIPPAGE_PCT", 0.001)
+PAPER_TRADE_COMMISSION_RATE_DEFAULT = _env_float(
+    "PAPER_TRADE_COMMISSION_RATE", float(SIMULATION_FEE_SCHEDULE.buy_commission_rate)
+)
+PAPER_TRADE_STAMP_TAX_RATE_DEFAULT = _env_float(
+    "PAPER_TRADE_STAMP_TAX_RATE", float(SIMULATION_FEE_SCHEDULE.stamp_tax_rate)
+)
+PAPER_TRADE_SLIPPAGE_PCT_DEFAULT = _env_float(
+    "PAPER_TRADE_SLIPPAGE_PCT", float(SIMULATION_FEE_SCHEDULE.buy_slippage_rate)
+)
 PAPER_TRADE_COOLDOWN_DAYS_DEFAULT = _env_int("PAPER_TRADE_COOLDOWN_DAYS", 3)
 PAPER_TRADE_MAX_POSITIONS_DEFAULT = _env_int("PAPER_TRADE_MAX_POSITIONS", 5)
 PAPER_TRADE_MAX_POSITION_PCT_DEFAULT = _env_float("PAPER_TRADE_MAX_POSITION_PCT", 20.0)

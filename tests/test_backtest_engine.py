@@ -1,12 +1,41 @@
 import csv
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from backtest_engine import BacktestConfig, BacktestEngine, load_signal_rows, run_backtest
+from execution_contracts import FeeSchedule
 
 
 class BacktestEngineTest(unittest.TestCase):
+    def test_reports_versioned_fee_components(self) -> None:
+        fees = FeeSchedule(
+            version="test-v1", effective_from="2026-01-01",
+            buy_commission_rate=Decimal("0.0003"), sell_commission_rate=Decimal("0.0003"),
+            minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
+            transfer_fee_rate=Decimal("0.00001"), other_fee_rate=Decimal("0"),
+            buy_slippage_rate=Decimal("0.001"), sell_slippage_rate=Decimal("0.001"),
+        )
+        result = BacktestEngine(BacktestConfig(initial_cash=10_000, fee_schedule=fees)).run(
+            [{
+                "date": "2026-01-02", "code": "600000", "action": "buy", "price": 10,
+                "entry_price": 10, "position_pct": 10, "final_score": 90,
+            }]
+        )
+
+        self.assertEqual(result.fee_schedule_version, "test-v1")
+        self.assertEqual(result.trades[0]["price"], 10.0)
+        self.assertEqual(result.trades[0]["fee"], 6.01)
+        self.assertEqual(result.cash, 8_993.99)
+        self.assertEqual(result.trades[0]["fee_components"], {
+            "commission_yuan": 5.0,
+            "stamp_tax_yuan": 0.0,
+            "transfer_fee_yuan": 0.01,
+            "other_fee_yuan": 0.0,
+            "slippage_yuan": 1.0,
+        })
+
     def test_buys_from_signal_position_and_marks_to_market(self) -> None:
         engine = BacktestEngine(
             BacktestConfig(initial_cash=100000, commission_rate=0, stamp_tax_rate=0, min_commission=0)

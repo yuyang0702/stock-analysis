@@ -1,6 +1,7 @@
 import importlib
 import os
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,6 +9,48 @@ import config
 
 
 class ConfigEnvTest(unittest.TestCase):
+    def test_simulation_fee_schedule_has_one_versioned_default(self) -> None:
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                fees = importlib.reload(config).SIMULATION_FEE_SCHEDULE
+
+                self.assertEqual(fees.version, "simulation-only-v1")
+                self.assertEqual(fees.buy_commission_rate, Decimal("0.0003"))
+                self.assertEqual(fees.sell_commission_rate, Decimal("0.0003"))
+                self.assertEqual(fees.minimum_commission_yuan, Decimal("5"))
+                self.assertEqual(fees.stamp_tax_rate, Decimal("0.0005"))
+                self.assertEqual(fees.buy_slippage_rate, Decimal("0.001"))
+                self.assertEqual(fees.sell_slippage_rate, Decimal("0.001"))
+        finally:
+            importlib.reload(config)
+
+    def test_fee_schedule_environment_values_are_explicit(self) -> None:
+        updates = {
+            "FEE_SCHEDULE_VERSION": "broker-v2",
+            "FEE_SCHEDULE_EFFECTIVE_FROM": "2026-07-01",
+            "FEE_BUY_COMMISSION_RATE": "0.00021",
+            "FEE_SELL_COMMISSION_RATE": "0.00022",
+            "FEE_MINIMUM_COMMISSION_YUAN": "6",
+            "FEE_STAMP_TAX_RATE": "0.0005",
+            "FEE_TRANSFER_FEE_RATE": "0.00001",
+            "FEE_OTHER_FEE_RATE": "0.00002",
+            "FEE_BUY_SLIPPAGE_RATE": "0.0008",
+            "FEE_SELL_SLIPPAGE_RATE": "0.0009",
+        }
+        try:
+            with patch.dict(os.environ, updates, clear=True):
+                fees = importlib.reload(config).SIMULATION_FEE_SCHEDULE
+
+                self.assertEqual(fees.version, "broker-v2")
+                self.assertEqual(fees.effective_from, "2026-07-01")
+                self.assertEqual(fees.buy_commission_rate, Decimal("0.00021"))
+                self.assertEqual(fees.sell_commission_rate, Decimal("0.00022"))
+                self.assertEqual(fees.minimum_commission_yuan, Decimal("6"))
+                self.assertEqual(fees.other_fee_rate, Decimal("0.00002"))
+                self.assertEqual(fees.sell_slippage_rate, Decimal("0.0009"))
+        finally:
+            importlib.reload(config)
+
     def test_signal_watchlist_retention_default_is_twenty_days(self) -> None:
         try:
             with patch.dict(os.environ, {}, clear=True):

@@ -1,7 +1,10 @@
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
+
+from execution_contracts import FeeSchedule
 
 from historical_backtest import (
     EquityPoint,
@@ -20,6 +23,34 @@ from historical_strategy import Candidate
 
 
 class HistoricalBacktestTest(unittest.TestCase):
+    def test_reports_versioned_fee_components(self) -> None:
+        fees = FeeSchedule(
+            version="test-v1", effective_from="2026-01-01",
+            buy_commission_rate=Decimal("0.0003"), sell_commission_rate=Decimal("0.0003"),
+            minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
+            transfer_fee_rate=Decimal("0.00001"), other_fee_rate=Decimal("0"),
+            buy_slippage_rate=Decimal("0.001"), sell_slippage_rate=Decimal("0.001"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(
+                Path(tmp),
+                [("2025-01-02", 9.8, 10.2, 9.7, 10, 0, 11, 9), ("2025-01-03", 10, 10.5, 9.8, 10.4, 0, 11, 9)],
+            )
+            config = HistoricalBacktestConfig(initial_cash=11_000, fee_schedule=fees)
+            with patch("historical_backtest.generate_daily_candidates", side_effect=[[self._candidate()], []]):
+                result = run_historical_backtest(store, "d1", "2025-01-02", "2025-01-03", config)
+
+        self.assertEqual(result.metadata["fee_schedule_version"], "test-v1")
+        self.assertEqual(result.trades[0].price, 10.0)
+        self.assertEqual(result.trades[0].fee, 6.01)
+        self.assertEqual(result.trades[0].fee_components, {
+            "commission_yuan": 5.0,
+            "stamp_tax_yuan": 0.0,
+            "transfer_fee_yuan": 0.01,
+            "other_fee_yuan": 0.0,
+            "slippage_yuan": 1.0,
+        })
+
     def _store(self, root: Path, days: list[tuple]) -> HistoricalStore:
         store = HistoricalStore(root / "history.db")
         store.initialize()
@@ -54,8 +85,9 @@ class HistoricalBacktestTest(unittest.TestCase):
             self.assertEqual(trade.decision_date, "2025-01-02")
             self.assertEqual(trade.trade_date, "2025-01-03")
             self.assertEqual(trade.quantity, 900)
-            self.assertEqual(trade.price, 10.01)
-            self.assertEqual(trade.fee, 5.0)
+            self.assertEqual(trade.price, 10.0)
+            self.assertEqual(trade.fee, 14.0)
+            self.assertEqual(trade.slippage_yuan, 9.0)
 
     def test_suspension_and_limit_up_block_buy(self) -> None:
         for suspended, limit_up in [(1, 11), (0, 10)]:
@@ -84,7 +116,8 @@ class HistoricalBacktestTest(unittest.TestCase):
             sell = result.trades[-1]
             self.assertEqual(sell.action, "sell")
             self.assertEqual(sell.reason, "HARD_STOP")
-            self.assertEqual(sell.price, 7.992)
+            self.assertEqual(sell.price, 8.0)
+            self.assertEqual(sell.slippage_yuan, 7.2)
 
     def test_same_bar_stop_wins_and_first_profit_takes_only_half(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
+
+import config as app_config
+from execution_contracts import FeeBreakdown, FeeSchedule
 
 
 DEFAULT_INPUTS = (
@@ -88,12 +92,35 @@ def load_signal_rows(path: Path) -> list[dict[str, Any]]:
 @dataclass
 class BacktestConfig:
     initial_cash: float = 100000.0
-    commission_rate: float = 0.0003
-    stamp_tax_rate: float = 0.001
-    min_commission: float = 5.0
+    commission_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.buy_commission_rate)
+    stamp_tax_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.stamp_tax_rate)
+    min_commission: float = float(app_config.SIMULATION_FEE_SCHEDULE.minimum_commission_yuan)
     max_position_pct: float = 20.0
     max_total_position_pct: float = 80.0
     lot_size: int = 100
+    fee_schedule: FeeSchedule | None = None
+
+    def resolved_fee_schedule(self) -> FeeSchedule:
+        if self.fee_schedule is not None:
+            return self.fee_schedule
+        base = app_config.SIMULATION_FEE_SCHEDULE
+        if (
+            self.commission_rate == float(base.buy_commission_rate)
+            and self.stamp_tax_rate == float(base.stamp_tax_rate)
+            and self.min_commission == float(base.minimum_commission_yuan)
+        ):
+            return base
+        no_costs = self.commission_rate == self.stamp_tax_rate == self.min_commission == 0
+        return FeeSchedule.simulation(
+            version=f"{base.version}-backtest-compat",
+            effective_from=base.effective_from,
+            commission_rate=self.commission_rate,
+            minimum_commission_yuan=self.min_commission,
+            stamp_tax_rate=self.stamp_tax_rate,
+            slippage_rate=0 if no_costs else base.buy_slippage_rate,
+            transfer_fee_rate=0 if no_costs else base.transfer_fee_rate,
+            other_fee_rate=0 if no_costs else base.other_fee_rate,
+        )
 
 
 @dataclass
@@ -120,11 +147,14 @@ class BacktestResult:
     max_drawdown_pct: float
     win_trades: int
     loss_trades: int
+    fee_schedule_version: str
+    fee_components: dict[str, float]
 
 
 class BacktestEngine:
     def __init__(self, config: BacktestConfig | None = None) -> None:
         self.config = config or BacktestConfig()
+        self.fee_schedule = self.config.resolved_fee_schedule()
         self.cash = float(self.config.initial_cash)
         self.positions: dict[str, Position] = {}
         self.trades: list[dict[str, Any]] = []
@@ -159,6 +189,8 @@ class BacktestEngine:
             max_drawdown_pct=self._max_drawdown_pct(),
             win_trades=sum(1 for value in self.realized_returns if value > 0),
             loss_trades=sum(1 for value in self.realized_returns if value < 0),
+            fee_schedule_version=self.fee_schedule.version,
+            fee_components=self._fee_totals(),
         )
 
     def _mark_price(self, row: dict[str, Any]) -> None:
@@ -201,13 +233,14 @@ class BacktestEngine:
         qty = int(budget // (price * self.config.lot_size)) * self.config.lot_size
         if qty <= 0:
             return
-        fee = self._buy_fee(qty * price)
+        fee = float(self.fee_schedule.estimate("buy", Decimal(str(price)), qty).total_yuan)
         if qty * price + fee > self.cash:
             qty = int((self.cash - fee) // (price * self.config.lot_size)) * self.config.lot_size
         if qty <= 0:
             return
         gross = qty * price
-        fee = self._buy_fee(gross)
+        breakdown = self.fee_schedule.estimate("buy", Decimal(str(price)), qty)
+        fee = float(breakdown.total_yuan)
         self.cash -= gross + fee
         self.positions[code] = Position(
             code=code,
@@ -219,7 +252,7 @@ class BacktestEngine:
             take_profit=_num(row.get("take_profit")),
             last_price=price,
         )
-        self.trades.append(self._trade_row(row, "buy", qty, price, fee, "buy_signal", 0.0))
+        self.trades.append(self._trade_row(row, "buy", qty, price, breakdown, "buy_signal", 0.0))
 
     def _sell(self, row: dict[str, Any], reason: str) -> None:
         code = _text(row.get("code"))
@@ -230,11 +263,12 @@ class BacktestEngine:
         if price <= 0 or _num(row.get("pct_chg")) <= -9.8:
             return
         gross = pos.qty * price
-        fee = self._sell_fee(gross)
+        breakdown = self.fee_schedule.estimate("sell", Decimal(str(price)), pos.qty)
+        fee = float(breakdown.total_yuan)
         self.cash += gross - fee
         pnl = (price - pos.avg_cost) * pos.qty - fee
         self.realized_returns.append(pnl)
-        self.trades.append(self._trade_row(row, "sell", pos.qty, price, fee, reason, pnl))
+        self.trades.append(self._trade_row(row, "sell", pos.qty, price, breakdown, reason, pnl))
         del self.positions[code]
 
     def _trade_row(
@@ -243,7 +277,7 @@ class BacktestEngine:
         action: str,
         qty: int,
         price: float,
-        fee: float,
+        breakdown: FeeBreakdown,
         reason: str,
         pnl: float,
     ) -> dict[str, Any]:
@@ -254,22 +288,28 @@ class BacktestEngine:
             "action": action,
             "qty": qty,
             "price": round(price, 4),
-            "fee": round(fee, 4),
+            "fee": float(breakdown.total_yuan),
+            "fee_schedule_version": breakdown.schedule_version,
+            "fee_components": {
+                key: float(value) for key, value in breakdown.components_dict().items()
+            },
             "reason": reason,
             "pnl": round(pnl, 4),
             "final_score": _num(row.get("final_score")),
         }
 
-    def _buy_fee(self, gross: float) -> float:
-        if gross <= 0:
-            return 0.0
-        return max(gross * self.config.commission_rate, self.config.min_commission)
-
-    def _sell_fee(self, gross: float) -> float:
-        if gross <= 0:
-            return 0.0
-        commission = max(gross * self.config.commission_rate, self.config.min_commission)
-        return commission + gross * self.config.stamp_tax_rate
+    def _fee_totals(self) -> dict[str, float]:
+        keys = (
+            "commission_yuan",
+            "stamp_tax_yuan",
+            "transfer_fee_yuan",
+            "other_fee_yuan",
+            "slippage_yuan",
+        )
+        return {
+            key: round(sum(float(row["fee_components"][key]) for row in self.trades), 2)
+            for key in keys
+        }
 
     def _record_equity(self, date: str) -> None:
         value = self._portfolio_value()
@@ -319,17 +359,27 @@ def build_report(result: BacktestResult) -> str:
         lines.append("- 暂无交易。")
     lines.append("")
     lines.append("> 第一版为信号级轻量回测，用于评估已生成信号的执行效果；完整历史重跑策略会在后续阶段补充。")
+    lines.insert(2, f"- Fee schedule: {result.fee_schedule_version}")
+    lines.insert(3, f"- Fee components: {json.dumps(result.fee_components, sort_keys=True)}")
     return "\n".join(lines) + "\n"
 
 
 def write_trades_csv(path: Path, trades: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["date", "code", "name", "action", "qty", "price", "fee", "reason", "pnl", "final_score"]
+    fieldnames = [
+        "date", "code", "name", "action", "qty", "price", "fee",
+        "fee_schedule_version", "fee_components", "reason", "pnl", "final_score",
+    ]
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for row in trades:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+            output = {key: row.get(key, "") for key in fieldnames}
+            if isinstance(output["fee_components"], dict):
+                output["fee_components"] = json.dumps(
+                    output["fee_components"], sort_keys=True, separators=(",", ":")
+                )
+            writer.writerow(output)
 
 
 def resolve_default_input() -> Path:
@@ -361,8 +411,14 @@ def main() -> None:
     parser.add_argument("--report", type=Path, default=Path("output/backtest_report.md"))
     parser.add_argument("--trades", type=Path, default=Path("output/backtest_trades.csv"))
     parser.add_argument("--cash", type=float, default=100000.0)
-    parser.add_argument("--commission-rate", type=float, default=0.0003)
-    parser.add_argument("--stamp-tax-rate", type=float, default=0.001)
+    parser.add_argument(
+        "--commission-rate", type=float,
+        default=float(app_config.SIMULATION_FEE_SCHEDULE.buy_commission_rate),
+    )
+    parser.add_argument(
+        "--stamp-tax-rate", type=float,
+        default=float(app_config.SIMULATION_FEE_SCHEDULE.stamp_tax_rate),
+    )
     args = parser.parse_args()
     result = run_backtest(
         args.input,
