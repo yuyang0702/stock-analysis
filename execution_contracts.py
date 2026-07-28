@@ -172,12 +172,12 @@ def client_order_id(
 ) -> str:
     return canonical_sha256(
         {
-            "account_scope_id": account_scope_id,
-            "adapter": adapter,
-            "logical_signal_id": logical_signal_id,
-            "pre_trade_result_id": pre_trade_result_id,
-            "exact_order": exact_order,
-            "submission_attempt_id": submission_attempt_id,
+            "account_scope_id": _text(account_scope_id, "account_scope_id"),
+            "adapter": _text(adapter, "adapter"),
+            "logical_signal_id": _text(logical_signal_id, "logical_signal_id"),
+            "pre_trade_result_id": _text(pre_trade_result_id, "pre_trade_result_id"),
+            "exact_order": _normalize_exact_order(exact_order),
+            "submission_attempt_id": _text(submission_attempt_id, "submission_attempt_id"),
         }
     )[:32]
 
@@ -220,6 +220,37 @@ def _sha256_text(value: object, name: str) -> str:
     except ValueError as error:
         raise ValueError(f"{name} must be a SHA-256 hex digest") from error
     return result
+
+
+_EXACT_ORDER_FIELDS = frozenset(
+    {
+        "code",
+        "side",
+        "order_qty",
+        "expected_current_qty",
+        "target_position_qty",
+        "limit_price",
+        "price_cap",
+        "stop_price",
+        "expires_at",
+    }
+)
+
+
+def _normalize_exact_order(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _EXACT_ORDER_FIELDS:
+        raise ValueError("exact_order fields do not match the normalized contract")
+    return {
+        "code": _text(value["code"], "code"),
+        "side": _side(value["side"]),
+        "order_qty": _qty(value["order_qty"], "order_qty", positive=True),
+        "expected_current_qty": _qty(value["expected_current_qty"], "expected_current_qty"),
+        "target_position_qty": _qty(value["target_position_qty"], "target_position_qty"),
+        "limit_price": _decimal(value["limit_price"], "limit_price", positive=True, optional=True),
+        "price_cap": _decimal(value["price_cap"], "price_cap", positive=True, optional=True),
+        "stop_price": _decimal(value["stop_price"], "stop_price", positive=True, optional=True),
+        "expires_at": _timestamp(value["expires_at"], "expires_at"),
+    }
 
 
 _OPEN_ORDER_FIELDS = frozenset(
@@ -396,9 +427,17 @@ class FeeBreakdown:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> FeeBreakdown:
         values = dict(value)
-        expected = values.pop("content_sha256", None)
-        values.pop("total_yuan", None)
+        expected_fields = {field.name for field in fields(cls)} | {
+            "total_yuan",
+            "content_sha256",
+        }
+        if set(values) != expected_fields:
+            raise ValueError("fee breakdown fields do not match the signed contract")
+        expected = _sha256_text(values.pop("content_sha256", None), "content_sha256")
+        supplied_total = _decimal(values.pop("total_yuan"), "total_yuan")
         result = cls(**values)
+        if supplied_total != result.total_yuan:
+            raise ValueError("total_yuan does not match fee breakdown components")
         _verify_hash(expected, result.content_sha256, "fee breakdown")
         return result
 
@@ -426,21 +465,35 @@ class RoundTripCost:
 
     @property
     def content_sha256(self) -> str:
-        return canonical_sha256(self.to_dict())
+        return canonical_sha256(self._content_dict())
 
-    def to_dict(self) -> dict[str, object]:
+    def _content_dict(self) -> dict[str, object]:
         return {
             "buy": self.buy.to_dict(),
             "sell": self.sell.to_dict(),
             "total_yuan": f"{self.total_yuan:.2f}",
         }
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            **self._content_dict(),
+            "content_sha256": self.content_sha256,
+        }
+
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> RoundTripCost:
-        return cls(
+        if set(value) != {"buy", "sell", "total_yuan", "content_sha256"}:
+            raise ValueError("round-trip cost fields do not match the signed contract")
+        expected = _sha256_text(value.get("content_sha256"), "content_sha256")
+        supplied_total = _decimal(value.get("total_yuan"), "total_yuan")
+        result = cls(
             buy=FeeBreakdown.from_dict(value["buy"]),
             sell=FeeBreakdown.from_dict(value["sell"]),
         )
+        if supplied_total != result.total_yuan:
+            raise ValueError("total_yuan does not match round-trip cost components")
+        _verify_hash(expected, result.content_sha256, "round-trip cost")
+        return result
 
 
 @dataclass(frozen=True)
@@ -530,7 +583,7 @@ class FeeSchedule:
         slippage_rate = self.buy_slippage_rate if normalized_side == "buy" else self.sell_slippage_rate
         slippage_raw = notional * slippage_rate
         raw_inputs = {
-            "schedule": self.to_dict(),
+            "schedule": self._content_dict(),
             "side": normalized_side,
             "price": normalized_price,
             "qty": normalized_qty,
@@ -560,27 +613,33 @@ class FeeSchedule:
         return RoundTripCost(self.estimate("buy", entry_price, qty), self.estimate("sell", exit_price, qty))
 
     def to_dict(self) -> dict[str, object]:
+        return {**self._content_dict(), "contract_sha256": self.contract_sha256}
+
+    def _content_dict(self) -> dict[str, object]:
         return _record_dict(self)
 
     @property
     def contract_sha256(self) -> str:
-        return canonical_sha256(self.to_dict())
+        return canonical_sha256(self._content_dict())
 
     def derive_variant(self, label: str, **changes: object) -> FeeSchedule:
         values = self.to_dict()
         values.update(changes)
         values.pop("version", None)
+        values.pop("contract_sha256", None)
         suffix = canonical_sha256(values)[:12]
         return FeeSchedule(version=f"{self.version}-{_text(label, 'label')}-{suffix}", **values)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> FeeSchedule:
         values = dict(value)
-        expected = values.pop("contract_sha256", None)
+        expected = _sha256_text(values.pop("contract_sha256", None), "contract_sha256")
         legacy_minimum = values.pop("minimum_commission_yuan", None)
         if legacy_minimum is not None:
-            values.setdefault("buy_minimum_commission_yuan", legacy_minimum)
-            values.setdefault("sell_minimum_commission_yuan", legacy_minimum)
+            if "buy_minimum_commission_yuan" in values or "sell_minimum_commission_yuan" in values:
+                raise ValueError("mixed legacy and current fee schedule schemas")
+            values["buy_minimum_commission_yuan"] = legacy_minimum
+            values["sell_minimum_commission_yuan"] = legacy_minimum
         result = cls(**values)
         _verify_hash(expected, result.contract_sha256, "fee schedule")
         return result
@@ -710,7 +769,9 @@ class InstrumentRules:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> InstrumentRules:
-        return cls(**dict(value))
+        values = dict(value)
+        values["rules_sha256"] = _sha256_text(values.get("rules_sha256"), "rules_sha256")
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -755,7 +816,9 @@ class QuoteSnapshot:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> QuoteSnapshot:
-        return cls(**dict(value))
+        values = dict(value)
+        values["quote_sha256"] = _sha256_text(values.get("quote_sha256"), "quote_sha256")
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -895,7 +958,7 @@ class BrokerSnapshot:
             normalized.pop("snapshot_sha256")
             snapshot_id = f"broker-{canonical_sha256(normalized)[:20]}"
             normalized["snapshot_id"] = snapshot_id
-            return cls.from_dict(normalized)
+            return cls(**normalized)
         return cls(snapshot_id=snapshot_id, generated_at=generated_at, **values)
 
     def to_dict(self) -> dict[str, object]:
@@ -904,6 +967,9 @@ class BrokerSnapshot:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> BrokerSnapshot:
         values = dict(value)
+        values["snapshot_sha256"] = _sha256_text(
+            values.get("snapshot_sha256"), "snapshot_sha256"
+        )
         values["positions"] = tuple(BrokerPosition.from_dict(item) for item in values.get("positions", ()))
         return cls(**values)
 
@@ -953,6 +1019,8 @@ class StrategyOrderCandidate:
         )
         for name in ("stop_price", "target_price"):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        if self.side == "buy" and not ZERO < self.stop_price < self.suggested_entry_price:
+            raise ValueError("buy stop_price must be positive and below suggested_entry_price")
         object.__setattr__(self, "signal_time", _timestamp(self.signal_time, "signal_time"))
         object.__setattr__(
             self, "frozen_valid_until", _timestamp(self.frozen_valid_until, "frozen_valid_until")
@@ -970,7 +1038,11 @@ class StrategyOrderCandidate:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> StrategyOrderCandidate:
-        return cls(**dict(value))
+        values = dict(value)
+        values["payload_sha256"] = _sha256_text(
+            values.get("payload_sha256"), "payload_sha256"
+        )
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -994,9 +1066,19 @@ class PreTradeResult:
     projected_open_risk_yuan: Decimal = ZERO
     per_trade_risk_yuan: Decimal = ZERO
     percentage_risk: Decimal = ZERO
+    approved_limit_price: Decimal | None = None
+    approved_price_cap: Decimal | None = None
+    submission_attempt_id: str = "not-applicable"
+    execution_fee: FeeBreakdown | None = None
     round_trip_cost: RoundTripCost | None = None
+    planned_stop_loss_yuan: Decimal | None = None
+    gap_loss_yuan: Decimal | None = None
+    fee_erosion_ratio: Decimal | None = None
+    cost_to_expected_edge_ratio: Decimal | None = None
     broker_snapshot_id: str = "not-applicable"
+    broker_snapshot_sha256: str = "not-applicable"
     quote_snapshot_id: str = "not-applicable"
+    quote_snapshot_sha256: str = "not-applicable"
     instrument_rules_sha256: str = "not-applicable"
     strategy_version: str = "not-applicable"
     result_sha256: str = ""
@@ -1010,6 +1092,7 @@ class PreTradeResult:
             "broker_snapshot_id",
             "quote_snapshot_id",
             "strategy_version",
+            "submission_attempt_id",
         ):
             object.__setattr__(self, name, _text(getattr(self, name), name))
         object.__setattr__(
@@ -1017,12 +1100,17 @@ class PreTradeResult:
             "fee_schedule_sha256",
             _sha256_text(self.fee_schedule_sha256, "fee_schedule_sha256"),
         )
-        rules_hash = _text(self.instrument_rules_sha256, "instrument_rules_sha256")
-        if rules_hash.lower() == "not-applicable":
-            rules_hash = "not-applicable"
-        else:
-            rules_hash = _sha256_text(rules_hash, "instrument_rules_sha256")
-        object.__setattr__(self, "instrument_rules_sha256", rules_hash)
+        for name in (
+            "broker_snapshot_sha256",
+            "quote_snapshot_sha256",
+            "instrument_rules_sha256",
+        ):
+            value = _text(getattr(self, name), name)
+            object.__setattr__(
+                self,
+                name,
+                "not-applicable" if value.lower() == "not-applicable" else _sha256_text(value, name),
+            )
         object.__setattr__(self, "allowed", _boolean(self.allowed, "allowed"))
         candidate = (
             self.candidate
@@ -1052,23 +1140,107 @@ class PreTradeResult:
             "percentage_risk",
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        for name in (
+            "planned_stop_loss_yuan",
+            "gap_loss_yuan",
+            "fee_erosion_ratio",
+            "cost_to_expected_edge_ratio",
+        ):
+            object.__setattr__(self, name, _decimal(getattr(self, name), name, optional=True))
+        for name in ("approved_limit_price", "approved_price_cap"):
+            object.__setattr__(
+                self,
+                name,
+                _decimal(getattr(self, name), name, positive=True, optional=True),
+            )
         object.__setattr__(self, "checked_at", _timestamp(self.checked_at, "checked_at"))
         object.__setattr__(self, "valid_until", _timestamp(self.valid_until, "valid_until"))
-        if datetime.fromisoformat(self.valid_until) < datetime.fromisoformat(self.checked_at):
+        checked_at = datetime.fromisoformat(self.checked_at)
+        valid_until = datetime.fromisoformat(self.valid_until)
+        signal_time = datetime.fromisoformat(candidate.signal_time)
+        frozen_valid_until = datetime.fromisoformat(candidate.frozen_valid_until)
+        if valid_until < checked_at:
             raise ValueError("valid_until must not precede checked_at")
+        if checked_at < signal_time:
+            raise ValueError("checked_at must not precede candidate signal_time")
+        if self.allowed and (checked_at > frozen_valid_until or valid_until > frozen_valid_until):
+            raise ValueError("allowed result must remain within candidate frozen_valid_until")
+        if not self.allowed and valid_until != checked_at:
+            raise ValueError("rejected result valid_until must equal checked_at")
+        execution_fee = self.execution_fee
+        if execution_fee is not None and not isinstance(execution_fee, FeeBreakdown):
+            raise ValueError("execution_fee must be a FeeBreakdown")
+        if execution_fee is not None and (
+            execution_fee.schedule_version != self.fee_schedule_version
+            or execution_fee.fee_schedule_sha256 != self.fee_schedule_sha256
+            or execution_fee.side != candidate.side
+            or execution_fee.qty != self.approved_qty
+        ):
+            raise ValueError("execution_fee side, fee schedule contract or quantity mismatch")
         if self.allowed:
             if self.broker_snapshot_id.lower() == "not-applicable":
                 raise ValueError("allowed result requires broker_snapshot_id")
+            if self.broker_snapshot_sha256 == "not-applicable":
+                raise ValueError("allowed result requires broker_snapshot_sha256")
             if self.quote_snapshot_id.lower() == "not-applicable":
                 raise ValueError("allowed result requires quote_snapshot_id")
+            if self.quote_snapshot_sha256 == "not-applicable":
+                raise ValueError("allowed result requires quote_snapshot_sha256")
             if self.instrument_rules_sha256 == "not-applicable":
                 raise ValueError("allowed result requires instrument_rules_sha256")
             if self.approved_qty <= 0:
                 raise ValueError("allowed result requires positive approved_qty")
+            if self.submission_attempt_id.lower() == "not-applicable":
+                raise ValueError("allowed result requires submission_attempt_id")
+            if execution_fee is None:
+                raise ValueError("allowed result requires execution_fee")
+            if self.approved_limit_price is None and self.approved_price_cap is None:
+                raise ValueError("allowed result requires approved price protection")
+            if candidate.side == "sell" and self.approved_limit_price is None:
+                raise ValueError("allowed sell result requires approved_limit_price")
+            if self.approved_limit_price is not None and self.approved_price_cap is not None:
+                if candidate.side == "buy" and self.approved_limit_price > self.approved_price_cap:
+                    raise ValueError("approved buy limit price must not exceed price cap")
+                if candidate.side == "sell" and self.approved_limit_price < self.approved_price_cap:
+                    raise ValueError("approved sell limit price must not be below price cap")
+            if self.approved_limit_price is not None and execution_fee.price != self.approved_limit_price:
+                raise ValueError("execution_fee price does not match approved_limit_price")
+            if self.approved_price_cap is not None:
+                if (
+                    candidate.side == "buy"
+                    and self.approved_limit_price is None
+                    and execution_fee.price != self.approved_price_cap
+                ):
+                    raise ValueError("execution_fee price must match cap-only approved_price_cap")
+                if candidate.side == "buy" and execution_fee.price > self.approved_price_cap:
+                    raise ValueError("execution_fee price exceeds approved_price_cap")
+                if candidate.side == "sell" and execution_fee.price < self.approved_price_cap:
+                    raise ValueError("execution_fee price is below approved_price_cap")
             if candidate.side == "buy" and self.target_position_qty <= 0:
                 raise ValueError("allowed buy result requires positive target_position_qty")
             if candidate.side == "buy" and self.round_trip_cost is None:
                 raise ValueError("allowed buy result requires round_trip_cost")
+            if candidate.side == "buy":
+                for name in (
+                    "planned_stop_loss_yuan",
+                    "gap_loss_yuan",
+                    "fee_erosion_ratio",
+                    "cost_to_expected_edge_ratio",
+                ):
+                    if getattr(self, name) is None:
+                        raise ValueError(f"allowed buy result requires {name}")
+                if self.planned_stop_loss_yuan <= ZERO:
+                    raise ValueError("planned_stop_loss_yuan must be positive for an allowed buy")
+                if self.gap_loss_yuan < self.planned_stop_loss_yuan:
+                    raise ValueError("gap_loss_yuan must not be below planned_stop_loss_yuan")
+                if candidate.stop_price >= execution_fee.price:
+                    raise ValueError("buy stop_price must be below the approved execution price")
+                if self.per_trade_risk_yuan != max(
+                    self.planned_stop_loss_yuan, self.gap_loss_yuan
+                ):
+                    raise ValueError(
+                        "per_trade_risk_yuan must equal the larger planned_stop_loss_yuan or gap_loss_yuan"
+                    )
         if self.round_trip_cost is not None:
             if not isinstance(self.round_trip_cost, RoundTripCost):
                 raise ValueError("round_trip_cost must be a RoundTripCost")
@@ -1078,21 +1250,43 @@ class PreTradeResult:
                 or self.round_trip_cost.buy.qty != self.approved_qty
             ):
                 raise ValueError("round_trip_cost fee schedule contract or quantity mismatch")
-        content = _record_dict(self)
-        content.pop("result_sha256")
-        actual = canonical_sha256(content)
+            applicable_fee = (
+                self.round_trip_cost.buy
+                if candidate.side == "buy"
+                else self.round_trip_cost.sell
+            )
+            if self.allowed and execution_fee != applicable_fee:
+                raise ValueError("execution_fee does not match the applicable round_trip_cost fee")
+            if candidate.side == "buy" and self.round_trip_cost.sell.price != candidate.stop_price:
+                raise ValueError("round_trip_cost sell price must equal candidate stop_price")
+        actual = canonical_sha256(self._content_dict())
         _verify_hash(supplied_hash, actual, "pre-trade result")
         object.__setattr__(self, "result_sha256", actual)
 
+    def _content_dict(self) -> dict[str, object]:
+        content = _record_dict(self)
+        content.pop("result_sha256")
+        if self.execution_fee is not None:
+            content["execution_fee"] = self.execution_fee.to_dict()
+        if self.round_trip_cost is not None:
+            content["round_trip_cost"] = self.round_trip_cost.to_dict()
+        return content
+
     def to_dict(self) -> dict[str, object]:
-        return _record_dict(self)
+        return {**self._content_dict(), "result_sha256": self.result_sha256}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> PreTradeResult:
         values = dict(value)
+        values["result_sha256"] = _sha256_text(
+            values.get("result_sha256"), "result_sha256"
+        )
         candidate = values.get("candidate")
         if isinstance(candidate, Mapping):
             values["candidate"] = StrategyOrderCandidate.from_dict(candidate)
+        execution_fee = values.get("execution_fee")
+        if isinstance(execution_fee, Mapping):
+            values["execution_fee"] = FeeBreakdown.from_dict(execution_fee)
         cost = values.get("round_trip_cost")
         if isinstance(cost, Mapping):
             values["round_trip_cost"] = RoundTripCost.from_dict(cost)
@@ -1103,6 +1297,8 @@ class PreTradeResult:
 class ExecutionIntent:
     client_order_id: str
     pre_trade_result_id: str
+    pre_trade_result: PreTradeResult
+    pre_trade_result_sha256: str
     submission_attempt_id: str
     account_scope_id: str
     adapter: str
@@ -1113,6 +1309,7 @@ class ExecutionIntent:
     parameter_version: str
     model_version: str
     fee_schedule_version: str
+    fee_schedule_sha256: str
     code: str
     side: str
     order_qty: int
@@ -1151,6 +1348,8 @@ class ExecutionIntent:
         ):
             object.__setattr__(self, name, _text(getattr(self, name), name))
         for name in (
+            "pre_trade_result_sha256",
+            "fee_schedule_sha256",
             "broker_snapshot_sha256",
             "quote_snapshot_sha256",
             "instrument_rules_sha256",
@@ -1164,17 +1363,120 @@ class ExecutionIntent:
             object.__setattr__(self, name, _decimal(getattr(self, name), name, positive=True, optional=True))
         object.__setattr__(self, "signal_time", _timestamp(self.signal_time, "signal_time"))
         object.__setattr__(self, "expires_at", _timestamp(self.expires_at, "expires_at"))
-        if datetime.fromisoformat(self.expires_at) < datetime.fromisoformat(self.signal_time):
+        signal_time = datetime.fromisoformat(self.signal_time)
+        expires_at = datetime.fromisoformat(self.expires_at)
+        if expires_at < signal_time:
             raise ValueError("expires_at must not precede signal_time")
-        content = _record_dict(self)
-        content.pop("intent_sha256")
-        actual = canonical_sha256(content)
+        if self.limit_price is None and self.price_cap is None:
+            raise ValueError("price protection requires limit_price or price_cap")
+        if self.side == "sell" and self.limit_price is None:
+            raise ValueError("sell price protection requires limit_price")
+        if self.side == "buy" and self.stop_price is None:
+            raise ValueError("buy requires stop_price")
+        if self.limit_price is not None and self.price_cap is not None:
+            if self.side == "buy" and self.limit_price > self.price_cap:
+                raise ValueError("buy limit_price must not exceed price_cap")
+            if self.side == "sell" and self.limit_price < self.price_cap:
+                raise ValueError("sell limit_price must not be below price_cap")
+        if self.side == "buy":
+            if self.target_position_qty != self.expected_current_qty + self.order_qty:
+                raise ValueError("buy target_position_qty must equal current quantity plus order_qty")
+        else:
+            if self.order_qty > self.expected_current_qty:
+                raise ValueError("sell order_qty cannot oversell expected_current_qty")
+            if self.target_position_qty != self.expected_current_qty - self.order_qty:
+                raise ValueError("sell target_position_qty must equal current quantity minus order_qty")
+        result = (
+            self.pre_trade_result
+            if isinstance(self.pre_trade_result, PreTradeResult)
+            else PreTradeResult.from_dict(self.pre_trade_result)
+        )
+        object.__setattr__(self, "pre_trade_result", result)
+        if not result.allowed:
+            raise ValueError("execution intent requires an allowed pre_trade_result")
+        for name, actual_value, expected_value in (
+            ("pre_trade_result_id", self.pre_trade_result_id, result.pre_trade_result_id),
+            ("pre_trade_result_sha256", self.pre_trade_result_sha256, result.result_sha256),
+            ("submission_attempt_id", self.submission_attempt_id, result.submission_attempt_id),
+            ("fee_schedule_version", self.fee_schedule_version, result.fee_schedule_version),
+            ("fee_schedule_sha256", self.fee_schedule_sha256, result.fee_schedule_sha256),
+            ("broker_snapshot_id", self.broker_snapshot_id, result.broker_snapshot_id),
+            ("broker_snapshot_sha256", self.broker_snapshot_sha256, result.broker_snapshot_sha256),
+            ("quote_snapshot_id", self.quote_snapshot_id, result.quote_snapshot_id),
+            ("quote_snapshot_sha256", self.quote_snapshot_sha256, result.quote_snapshot_sha256),
+            ("instrument_rules_sha256", self.instrument_rules_sha256, result.instrument_rules_sha256),
+            ("limit_price", self.limit_price, result.approved_limit_price),
+            ("price_cap", self.price_cap, result.approved_price_cap),
+            ("order_qty", self.order_qty, result.approved_qty),
+            ("target_position_qty", self.target_position_qty, result.target_position_qty),
+        ):
+            if actual_value != expected_value:
+                raise ValueError(f"{name} does not match pre_trade_result")
+        candidate = result.candidate
+        for name in (
+            "account_scope_id",
+            "logical_signal_id",
+            "source_signal_id",
+            "strategy_id",
+            "strategy_version",
+            "parameter_version",
+            "model_version",
+            "fee_schedule_version",
+            "code",
+            "side",
+            "signal_time",
+        ):
+            if getattr(self, name) != getattr(candidate, name):
+                raise ValueError(f"{name} does not match pre_trade_result candidate")
+        if self.stop_price is not None and self.stop_price != candidate.stop_price:
+            raise ValueError("stop_price does not match pre_trade_result candidate")
+        if expires_at < datetime.fromisoformat(result.checked_at):
+            raise ValueError("expires_at must not precede pre_trade_result checked_at")
+        if expires_at != datetime.fromisoformat(result.valid_until):
+            raise ValueError("expires_at must equal pre_trade_result valid_until")
+        if expires_at > datetime.fromisoformat(candidate.frozen_valid_until):
+            raise ValueError("expires_at exceeds candidate frozen_valid_until")
+        exact_order = {
+            "code": self.code,
+            "side": self.side,
+            "order_qty": self.order_qty,
+            "expected_current_qty": self.expected_current_qty,
+            "target_position_qty": self.target_position_qty,
+            "limit_price": self.limit_price,
+            "price_cap": self.price_cap,
+            "stop_price": self.stop_price,
+            "expires_at": self.expires_at,
+        }
+        expected_client_order_id = client_order_id(
+            self.account_scope_id,
+            self.adapter,
+            self.logical_signal_id,
+            self.pre_trade_result_id,
+            exact_order,
+            self.submission_attempt_id,
+        )
+        if self.client_order_id != expected_client_order_id:
+            raise ValueError("client_order_id does not match the canonical execution order")
+        actual = canonical_sha256(self._content_dict())
         _verify_hash(supplied_hash, actual, "execution intent")
         object.__setattr__(self, "intent_sha256", actual)
 
+    def _content_dict(self) -> dict[str, object]:
+        content = _record_dict(self)
+        content.pop("intent_sha256")
+        content["pre_trade_result"] = self.pre_trade_result.to_dict()
+        return content
+
     def to_dict(self) -> dict[str, object]:
-        return _record_dict(self)
+        return {**self._content_dict(), "intent_sha256": self.intent_sha256}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> ExecutionIntent:
-        return cls(**dict(value))
+        values = dict(value)
+        values["intent_sha256"] = _sha256_text(
+            values.get("intent_sha256"), "intent_sha256"
+        )
+        result = values.get("pre_trade_result")
+        if isinstance(result, Mapping):
+            values["pre_trade_result"] = PreTradeResult.from_dict(result)
+        return cls(**values)

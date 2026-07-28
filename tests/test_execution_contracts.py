@@ -60,38 +60,104 @@ FILL = {
 }
 
 
-def make_candidate(*, target_price: str = "11") -> StrategyOrderCandidate:
+def make_candidate(
+    *,
+    target_price: str = "11",
+    side: str = "buy",
+    stop_price: str = "9.5",
+    signal_time: str = "2026-07-28T09:55:00+08:00",
+    frozen_valid_until: str = "2026-07-28T10:05:00+08:00",
+) -> StrategyOrderCandidate:
     logical = logical_signal_id(
-        "scope-uuid", "2026-07-28", "main", "s1", "600000", "buy", "breakout"
+        "scope-uuid", "2026-07-28", "main", "s1", "600000", side, "breakout"
     )
     return StrategyOrderCandidate(
         candidate_id="candidate-1", logical_signal_id=logical,
         account_scope_id="scope-uuid", source_signal_id="signal-run-1",
         source_run_id="run-1", strategy_id="main", strategy_version="s1",
         parameter_version="p1", model_version="disabled",
-        fee_schedule_version="sim-v1", code="600000", side="buy",
-        setup_type="breakout", suggested_entry_price=D("10"), stop_price=D("9.5"),
-        target_price=D(target_price), signal_time="2026-07-28T09:55:00+08:00",
-        frozen_valid_until="2026-07-28T10:05:00+08:00",
+        fee_schedule_version="sim-v1", code="600000", side=side,
+        setup_type="breakout", suggested_entry_price=D("10"), stop_price=D(stop_price),
+        target_price=D(target_price), signal_time=signal_time,
+        frozen_valid_until=frozen_valid_until,
     )
 
 
-def intent_values(candidate: StrategyOrderCandidate) -> dict[str, object]:
-    return {
-        "client_order_id": "order-1", "pre_trade_result_id": "risk-1",
-        "submission_attempt_id": candidate.candidate_id, "account_scope_id": "scope-uuid",
-        "adapter": "joinquant", "logical_signal_id": candidate.logical_signal_id,
-        "source_signal_id": candidate.source_signal_id, "strategy_id": "main",
-        "strategy_version": "s1", "parameter_version": "p1", "model_version": "disabled",
-        "fee_schedule_version": "sim-v1", "code": "600000", "side": "buy",
-        "order_qty": 100, "expected_current_qty": 0, "target_position_qty": 100,
-        "limit_price": D("10"), "price_cap": D("10.10"), "stop_price": D("9.5"),
-        "signal_time": "2026-07-28T09:55:00+08:00",
-        "expires_at": "2026-07-28T10:01:00+08:00",
+def pre_trade_values(
+    candidate: StrategyOrderCandidate,
+    **changes: object,
+) -> dict[str, object]:
+    is_buy = candidate.side == "buy"
+    values: dict[str, object] = {
+        "pre_trade_result_id": "risk-1", "candidate_id": candidate.candidate_id,
+        "candidate": candidate, "allowed": True, "hard_blocks": (), "warnings": (),
+        "approved_qty": 100, "target_position_qty": 100 if is_buy else 0,
+        "fee_schedule_version": FEES.version,
+        "fee_schedule_sha256": FEES.contract_sha256, "strategy_version": "s1",
+        "checked_at": "2026-07-28T09:56:00+08:00",
+        "valid_until": "2026-07-28T10:01:00+08:00",
+        "approved_limit_price": D("10"),
+        "approved_price_cap": D("10.10") if is_buy else D("9.90"),
+        "submission_attempt_id": candidate.candidate_id,
+        "execution_fee": FEES.estimate(candidate.side, D("10"), 100),
+        "round_trip_cost": FEES.estimate_round_trip(D("10"), D("9.5"), 100) if is_buy else None,
+        "planned_stop_loss_yuan": D("80") if is_buy else None,
+        "gap_loss_yuan": D("100") if is_buy else None,
+        "fee_erosion_ratio": D("0.10") if is_buy else None,
+        "cost_to_expected_edge_ratio": D("0.20") if is_buy else None,
+        "per_trade_risk_yuan": D("100") if is_buy else D("0"),
         "broker_snapshot_id": "broker-1", "broker_snapshot_sha256": "a" * 64,
         "quote_snapshot_id": "quote-1", "quote_snapshot_sha256": "b" * 64,
         "instrument_rules_sha256": "c" * 64,
     }
+    values.update(changes)
+    return values
+
+
+def intent_values(
+    candidate: StrategyOrderCandidate,
+    result: PreTradeResult | None = None,
+) -> dict[str, object]:
+    is_buy = candidate.side == "buy"
+    result = result or PreTradeResult(**pre_trade_values(candidate))
+    current_qty = (
+        result.target_position_qty - result.approved_qty
+        if is_buy else result.target_position_qty + result.approved_qty
+    )
+    values: dict[str, object] = {
+        "pre_trade_result_id": result.pre_trade_result_id,
+        "pre_trade_result": result,
+        "pre_trade_result_sha256": result.result_sha256,
+        "submission_attempt_id": candidate.candidate_id, "account_scope_id": "scope-uuid",
+        "adapter": "joinquant", "logical_signal_id": candidate.logical_signal_id,
+        "source_signal_id": candidate.source_signal_id, "strategy_id": "main",
+        "strategy_version": "s1", "parameter_version": "p1", "model_version": "disabled",
+        "fee_schedule_version": "sim-v1", "fee_schedule_sha256": FEES.contract_sha256,
+        "code": "600000", "side": candidate.side,
+        "order_qty": result.approved_qty, "expected_current_qty": current_qty,
+        "target_position_qty": result.target_position_qty,
+        "limit_price": D("10"), "price_cap": D("10.10") if is_buy else D("9.90"),
+        "stop_price": D("9.5"),
+        "signal_time": "2026-07-28T09:55:00+08:00",
+        "expires_at": "2026-07-28T10:01:00+08:00",
+        "broker_snapshot_id": result.broker_snapshot_id,
+        "broker_snapshot_sha256": result.broker_snapshot_sha256,
+        "quote_snapshot_id": result.quote_snapshot_id,
+        "quote_snapshot_sha256": result.quote_snapshot_sha256,
+        "instrument_rules_sha256": result.instrument_rules_sha256,
+    }
+    exact_order = {
+        name: values[name]
+        for name in (
+            "code", "side", "order_qty", "expected_current_qty", "target_position_qty",
+            "limit_price", "price_cap", "stop_price", "expires_at",
+        )
+    }
+    values["client_order_id"] = client_order_id(
+        values["account_scope_id"], values["adapter"], values["logical_signal_id"],
+        values["pre_trade_result_id"], exact_order, values["submission_attempt_id"],
+    )
+    return values
 
 
 class ExecutionContractsTest(unittest.TestCase):
@@ -113,12 +179,10 @@ class ExecutionContractsTest(unittest.TestCase):
         self.assertEqual(fees.estimate("buy", D("10"), 100).commission_yuan, D("3.00"))
         self.assertEqual(fees.estimate("sell", D("10"), 100).commission_yuan, D("7.00"))
         self.assertEqual(len(fees.contract_sha256), 64)
-        self.assertNotEqual(
-            fees.contract_sha256,
-            FeeSchedule.from_dict(
-                {**fees.to_dict(), "sell_minimum_commission_yuan": "8"}
-            ).contract_sha256,
-        )
+        changed = fees.to_dict()
+        changed.pop("contract_sha256")
+        changed["sell_minimum_commission_yuan"] = "8"
+        self.assertNotEqual(fees.contract_sha256, FeeSchedule(**changed).contract_sha256)
 
     def test_round_trip_applies_each_minimum_commission_and_sell_tax(self) -> None:
         result = FEES.estimate_round_trip(D("10"), D("11"), 100)
@@ -130,6 +194,41 @@ class ExecutionContractsTest(unittest.TestCase):
         self.assertEqual(result.buy.slippage_yuan, D("1.00"))
         self.assertEqual(result.total_yuan, D("12.67"))
         self.assertEqual(len(result.content_sha256), 64)
+
+    def test_fee_input_identity_excludes_serialization_envelope(self) -> None:
+        result = FEES.estimate("buy", D("10"), 100)
+        schedule = FEES.to_dict()
+        schedule.pop("contract_sha256")
+        expected = canonical_sha256(
+            {
+                "schedule": schedule,
+                "side": "buy",
+                "price": D("10"),
+                "qty": 100,
+                "notional": D("1000"),
+                "commission": D("5"),
+                "stamp_tax": D("0"),
+                "transfer_fee": D("0.01"),
+                "other_fee": D("0"),
+                "slippage": D("1"),
+            }
+        )
+
+        self.assertEqual(result.input_sha256, expected)
+
+    def test_signed_fee_records_reject_changed_totals_and_extra_fields(self) -> None:
+        breakdown = FEES.estimate("buy", D("10"), 100)
+        round_trip = FEES.estimate_round_trip(D("10"), D("9.5"), 100)
+        for loader, payload in (
+            (type(breakdown).from_dict, breakdown.to_dict()),
+            (RoundTripCost.from_dict, round_trip.to_dict()),
+        ):
+            with self.subTest(loader=loader.__qualname__, field="total_yuan"):
+                with self.assertRaisesRegex(ValueError, "total_yuan"):
+                    loader({**payload, "total_yuan": "999.99"})
+            with self.subTest(loader=loader.__qualname__, field="extra"):
+                with self.assertRaisesRegex(ValueError, "fields"):
+                    loader({**payload, "unexpected": "value"})
 
     def test_fee_schedule_rejects_missing_invalid_or_non_finite_inputs(self) -> None:
         values = dict(FEES.to_dict())
@@ -148,26 +247,23 @@ class ExecutionContractsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             FEES.estimate("buy", D("10"), -100)
 
+    def test_fee_schedule_minimum_field_schema_is_unambiguous(self) -> None:
+        legacy = FEES.to_dict()
+        legacy["minimum_commission_yuan"] = legacy.pop("buy_minimum_commission_yuan")
+        legacy.pop("sell_minimum_commission_yuan")
+
+        self.assertEqual(FeeSchedule.from_dict(legacy), FEES)
+
+        with self.assertRaisesRegex(ValueError, "mixed"):
+            FeeSchedule.from_dict({**FEES.to_dict(), "minimum_commission_yuan": "999"})
+
     def test_fee_breakdown_and_pre_trade_cost_round_trip_keep_decimal_semantics(self) -> None:
         costs = FEES.estimate_round_trip(D("10"), D("9.5"), 100)
+        candidate = make_candidate()
         result = PreTradeResult(
-            pre_trade_result_id="risk-with-costs",
-            candidate_id="candidate-1",
-            candidate=make_candidate(),
-            allowed=True,
-            hard_blocks=(),
-            warnings=(),
-            approved_qty=100,
-            target_position_qty=100,
-            fee_schedule_version="sim-v1",
-            fee_schedule_sha256=FEES.contract_sha256,
-            strategy_version="s1",
-            checked_at="2026-07-28T09:56:00+08:00",
-            valid_until="2026-07-28T10:01:00+08:00",
-            round_trip_cost=costs,
-            broker_snapshot_id="broker-1",
-            quote_snapshot_id="quote-1",
-            instrument_rules_sha256="c" * 64,
+            **pre_trade_values(
+                candidate, pre_trade_result_id="risk-with-costs", round_trip_cost=costs
+            )
         )
 
         restored = PreTradeResult.from_dict(result.to_dict())
@@ -175,7 +271,7 @@ class ExecutionContractsTest(unittest.TestCase):
         self.assertEqual(restored.round_trip_cost.total_yuan, costs.total_yuan)
         tampered = costs.buy.to_dict()
         tampered["commission_yuan"] = "4.99"
-        with self.assertRaisesRegex(ValueError, "content hash conflict"):
+        with self.assertRaisesRegex(ValueError, "total_yuan|content hash conflict"):
             type(costs.buy).from_dict(tampered)
 
     def test_instrument_rules_validate_board_lots_price_ticks_and_odd_lot_sells(self) -> None:
@@ -225,7 +321,12 @@ class ExecutionContractsTest(unittest.TestCase):
         logical = logical_signal_id(
             "scope-uuid", "2026-07-28", "main", "s1", "000001", "buy", "breakout"
         )
-        exact_order = {"code": "000001", "side": "buy", "target_qty": 100, "limit_price": D("10")}
+        exact_order = {
+            "code": "000001", "side": "buy", "order_qty": 100,
+            "expected_current_qty": 0, "target_position_qty": 100,
+            "limit_price": D("10"), "price_cap": D("10.10"),
+            "stop_price": D("9.5"), "expires_at": "2026-07-28T10:01:00+08:00",
+        }
         first = client_order_id("scope", "joinquant", logical, "risk-1", exact_order, "candidate-1")
 
         self.assertEqual(
@@ -405,55 +506,21 @@ class ExecutionContractsTest(unittest.TestCase):
             signal_time="2026-07-28T09:55:00+08:00",
             frozen_valid_until="2026-07-28T10:05:00+08:00",
         )
-        result = PreTradeResult(
-            pre_trade_result_id="risk-1",
-            candidate_id=candidate.candidate_id,
-            candidate=candidate,
-            allowed=True,
-            hard_blocks=(),
-            warnings=(),
-            approved_qty=100,
-            target_position_qty=100,
-            fee_schedule_version="sim-v1",
-            fee_schedule_sha256=FEES.contract_sha256,
-            strategy_version="s1",
-            checked_at="2026-07-28T09:56:00+08:00",
-            valid_until="2026-07-28T10:01:00+08:00",
-            round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 100),
-            broker_snapshot_id="broker-1",
-            quote_snapshot_id="quote-1",
-            instrument_rules_sha256="c" * 64,
+        result = PreTradeResult(**pre_trade_values(candidate))
+        conflicting_result = PreTradeResult(
+            **pre_trade_values(
+                candidate,
+                approved_qty=200,
+                target_position_qty=200,
+                execution_fee=FEES.estimate("buy", D("10"), 200),
+                round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 200),
+                planned_stop_loss_yuan=D("160"),
+                gap_loss_yuan=D("200"),
+                per_trade_risk_yuan=D("200"),
+            )
         )
-        common = dict(
-            client_order_id="order-1",
-            pre_trade_result_id=result.pre_trade_result_id,
-            submission_attempt_id=candidate.candidate_id,
-            account_scope_id="scope-uuid",
-            adapter="joinquant",
-            logical_signal_id=logical,
-            source_signal_id=candidate.source_signal_id,
-            strategy_id="main",
-            strategy_version="s1",
-            parameter_version="p1",
-            model_version="disabled",
-            fee_schedule_version="sim-v1",
-            code="600000",
-            side="buy",
-            expected_current_qty=0,
-            target_position_qty=100,
-            limit_price=D("10"),
-            price_cap=D("10.10"),
-            stop_price=D("9.5"),
-            signal_time="2026-07-28T09:55:00+08:00",
-            expires_at="2026-07-28T10:01:00+08:00",
-            broker_snapshot_id="broker-1",
-            broker_snapshot_sha256="a" * 64,
-            quote_snapshot_id="quote-1",
-            quote_snapshot_sha256="b" * 64,
-            instrument_rules_sha256="c" * 64,
-        )
-        first = ExecutionIntent(order_qty=100, **common)
-        conflicting = ExecutionIntent(order_qty=200, **common)
+        first = ExecutionIntent(**intent_values(candidate, result))
+        conflicting = ExecutionIntent(**intent_values(candidate, conflicting_result))
 
         self.assertEqual(candidate.payload_sha256, StrategyOrderCandidate.from_dict(candidate.to_dict()).payload_sha256)
         self.assertEqual(result.result_sha256, PreTradeResult.from_dict(result.to_dict()).result_sha256)
@@ -464,17 +531,8 @@ class ExecutionContractsTest(unittest.TestCase):
     def test_pre_trade_result_binds_the_full_normalized_candidate_payload(self) -> None:
         first_candidate = make_candidate(target_price="11")
         second_candidate = make_candidate(target_price="12")
-        common = dict(
-            pre_trade_result_id="risk-1", candidate_id="candidate-1", allowed=True,
-            hard_blocks=(), warnings=(), approved_qty=100, target_position_qty=100,
-            fee_schedule_version="sim-v1", fee_schedule_sha256=FEES.contract_sha256,
-            strategy_version="s1",
-            checked_at="2026-07-28T09:56:00+08:00",
-            valid_until="2026-07-28T10:01:00+08:00",
-            round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 100),
-            broker_snapshot_id="broker-1", quote_snapshot_id="quote-1",
-            instrument_rules_sha256="c" * 64,
-        )
+        common = pre_trade_values(first_candidate)
+        common.pop("candidate")
 
         first = PreTradeResult(candidate=first_candidate, **common)
         second = PreTradeResult(candidate=second_candidate, **common)
@@ -517,16 +575,7 @@ class ExecutionContractsTest(unittest.TestCase):
 
         candidate = make_candidate()
         costs = FEES.estimate_round_trip(D("10"), D("9.5"), 100)
-        common = dict(
-            pre_trade_result_id="risk-1", candidate_id=candidate.candidate_id,
-            candidate=candidate, allowed=True, hard_blocks=(), warnings=(), approved_qty=100,
-            target_position_qty=100, fee_schedule_version=FEES.version,
-            fee_schedule_sha256=FEES.contract_sha256, strategy_version="s1",
-            checked_at="2026-07-28T09:56:00+08:00",
-            valid_until="2026-07-28T10:01:00+08:00", round_trip_cost=costs,
-            broker_snapshot_id="broker-1", quote_snapshot_id="quote-1",
-            instrument_rules_sha256="c" * 64,
-        )
+        common = pre_trade_values(candidate, round_trip_cost=costs)
         result = PreTradeResult(**common)
         self.assertEqual(result.fee_schedule_sha256, FEES.contract_sha256)
         with self.assertRaisesRegex(ValueError, "fee schedule contract"):
@@ -534,23 +583,16 @@ class ExecutionContractsTest(unittest.TestCase):
 
     def test_allowed_pre_trade_result_requires_evidence_but_rejected_may_omit_it(self) -> None:
         candidate = make_candidate()
-        common = dict(
-            pre_trade_result_id="risk-1", candidate_id=candidate.candidate_id,
-            candidate=candidate, allowed=True, hard_blocks=(), warnings=(), approved_qty=100,
-            target_position_qty=100, fee_schedule_version=FEES.version,
-            fee_schedule_sha256=FEES.contract_sha256, strategy_version="s1",
-            checked_at="2026-07-28T09:56:00+08:00",
-            valid_until="2026-07-28T10:01:00+08:00",
-            round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 100),
-            broker_snapshot_id="broker-1", quote_snapshot_id="quote-1",
-            instrument_rules_sha256="c" * 64,
-        )
+        common = pre_trade_values(candidate)
         PreTradeResult(**common)
         for field, value in (
             ("broker_snapshot_id", "not-applicable"),
+            ("broker_snapshot_sha256", "not-applicable"),
             ("quote_snapshot_id", "not-applicable"),
+            ("quote_snapshot_sha256", "not-applicable"),
             ("instrument_rules_sha256", "not-applicable"),
             ("instrument_rules_sha256", "x"),
+            ("submission_attempt_id", "not-applicable"),
             ("round_trip_cost", None),
             ("round_trip_cost", FEES.estimate_round_trip(D("10"), D("9.5"), 200)),
             ("approved_qty", 0),
@@ -563,12 +605,446 @@ class ExecutionContractsTest(unittest.TestCase):
         rejected = PreTradeResult(
             **{
                 **common, "allowed": False, "hard_blocks": ("NO_QUOTE",),
-                "approved_qty": 0, "target_position_qty": 0, "round_trip_cost": None,
-                "broker_snapshot_id": "not-applicable", "quote_snapshot_id": "not-applicable",
+                "approved_qty": 0, "target_position_qty": 0, "execution_fee": None,
+                "round_trip_cost": None, "valid_until": common["checked_at"],
+                "approved_limit_price": None, "approved_price_cap": None,
+                "submission_attempt_id": "not-applicable",
+                "broker_snapshot_id": "not-applicable",
+                "broker_snapshot_sha256": "not-applicable",
+                "quote_snapshot_id": "not-applicable",
+                "quote_snapshot_sha256": "not-applicable",
                 "instrument_rules_sha256": "not-applicable",
             }
         )
         self.assertFalse(rejected.allowed)
+
+    def test_pre_trade_result_freezes_side_specific_risk_and_fee_evidence(self) -> None:
+        for side in ("buy", "sell"):
+            with self.subTest(side=side):
+                candidate = make_candidate(side=side)
+                execution_fee = FEES.estimate(side, D("10"), 100)
+                values = dict(
+                    pre_trade_result_id=f"risk-{side}", candidate_id=candidate.candidate_id,
+                    candidate=candidate, allowed=True, hard_blocks=(), warnings=(),
+                    approved_qty=100, target_position_qty=100 if side == "buy" else 0,
+                    fee_schedule_version=FEES.version,
+                    fee_schedule_sha256=FEES.contract_sha256, strategy_version="s1",
+                    checked_at="2026-07-28T09:56:00+08:00",
+                    valid_until="2026-07-28T10:01:00+08:00",
+                    approved_limit_price=D("10"),
+                    approved_price_cap=D("10.10") if side == "buy" else D("9.90"),
+                    submission_attempt_id=candidate.candidate_id,
+                    execution_fee=execution_fee,
+                    round_trip_cost=(
+                        FEES.estimate_round_trip(D("10"), D("9.5"), 100)
+                        if side == "buy" else None
+                    ),
+                    planned_stop_loss_yuan=D("80") if side == "buy" else None,
+                    gap_loss_yuan=D("100") if side == "buy" else None,
+                    fee_erosion_ratio=D("0.10") if side == "buy" else None,
+                    cost_to_expected_edge_ratio=D("0.20") if side == "buy" else None,
+                    per_trade_risk_yuan=D("100") if side == "buy" else D("0"),
+                    broker_snapshot_id="broker-1", broker_snapshot_sha256="a" * 64,
+                    quote_snapshot_id="quote-1", quote_snapshot_sha256="b" * 64,
+                    instrument_rules_sha256="c" * 64,
+                )
+
+                result = PreTradeResult(**values)
+
+                self.assertEqual(result.execution_fee.side, side)
+                self.assertEqual(result.execution_fee.qty, 100)
+                self.assertEqual(
+                    PreTradeResult.from_dict(result.to_dict()).result_sha256,
+                    result.result_sha256,
+                )
+                required = ["execution_fee"]
+                if side == "buy":
+                    required += [
+                        "round_trip_cost", "planned_stop_loss_yuan", "gap_loss_yuan",
+                        "fee_erosion_ratio", "cost_to_expected_edge_ratio",
+                    ]
+                for field in required:
+                    with self.subTest(side=side, missing=field):
+                        with self.assertRaisesRegex(ValueError, field):
+                            PreTradeResult(**{**values, field: None})
+                with self.assertRaisesRegex(ValueError, "execution_fee"):
+                    PreTradeResult(
+                        **{
+                            **values,
+                            "execution_fee": FEES.estimate(
+                                "sell" if side == "buy" else "buy", D("10"), 100
+                            ),
+                        }
+                    )
+                if side == "buy":
+                    with self.assertRaisesRegex(ValueError, "per_trade_risk_yuan"):
+                        PreTradeResult(**{**values, "per_trade_risk_yuan": D("80")})
+
+    def test_buy_result_rejects_contradictory_fee_prices_and_non_positive_stop_risk(self) -> None:
+        with self.assertRaisesRegex(ValueError, "stop_price"):
+            make_candidate(stop_price="10")
+
+        candidate = make_candidate()
+        values = pre_trade_values(candidate)
+        with self.assertRaisesRegex(ValueError, "execution_fee|round_trip_cost"):
+            PreTradeResult(
+                **{
+                    **values,
+                    "round_trip_cost": FEES.estimate_round_trip(D("20"), D("9.5"), 100),
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "planned_stop_loss_yuan"):
+            PreTradeResult(
+                **{
+                    **values,
+                    "planned_stop_loss_yuan": D("0"),
+                    "gap_loss_yuan": D("0"),
+                    "per_trade_risk_yuan": D("0"),
+                }
+            )
+
+    def test_cap_only_buy_prices_fee_at_the_approved_cap(self) -> None:
+        candidate = make_candidate()
+        values = pre_trade_values(
+            candidate,
+            approved_limit_price=None,
+            approved_price_cap=D("100"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "approved_price_cap"):
+            PreTradeResult(**values)
+
+    def test_allowed_buy_requires_conservative_positive_gap_loss(self) -> None:
+        candidate = make_candidate()
+        for gap_loss in (D("0"), D("79.99")):
+            with self.subTest(gap_loss=gap_loss):
+                with self.assertRaisesRegex(ValueError, "gap_loss_yuan"):
+                    PreTradeResult(
+                        **pre_trade_values(
+                            candidate,
+                            gap_loss_yuan=gap_loss,
+                            per_trade_risk_yuan=D("80"),
+                        )
+                    )
+
+    def test_pre_trade_result_enforces_candidate_time_window(self) -> None:
+        candidate = make_candidate()
+        common = pre_trade_values(candidate, pre_trade_result_id="risk-time")
+        common.pop("checked_at")
+        common.pop("valid_until")
+
+        for checked_at, valid_until in (
+            (candidate.signal_time, candidate.signal_time),
+            (candidate.signal_time, candidate.frozen_valid_until),
+            (candidate.frozen_valid_until, candidate.frozen_valid_until),
+        ):
+            with self.subTest(boundary=(checked_at, valid_until)):
+                PreTradeResult(**common, checked_at=checked_at, valid_until=valid_until)
+
+        for checked_at, valid_until in (
+            ("2026-07-28T09:54:59+08:00", "2026-07-28T10:00:00+08:00"),
+            ("2026-07-28T10:05:01+08:00", "2026-07-28T10:05:01+08:00"),
+            ("2026-07-28T10:00:00+08:00", "2026-07-28T10:05:01+08:00"),
+        ):
+            with self.subTest(invalid_allowed=(checked_at, valid_until)):
+                with self.assertRaisesRegex(ValueError, "candidate|signal_time|frozen_valid_until"):
+                    PreTradeResult(**common, checked_at=checked_at, valid_until=valid_until)
+
+        rejected = {
+            **common, "allowed": False, "hard_blocks": ("STALE_SIGNAL",),
+            "approved_qty": 0, "target_position_qty": 0, "execution_fee": None,
+            "round_trip_cost": None, "approved_limit_price": None,
+            "approved_price_cap": None, "submission_attempt_id": "not-applicable",
+            "broker_snapshot_id": "not-applicable",
+            "broker_snapshot_sha256": "not-applicable",
+            "quote_snapshot_id": "not-applicable",
+            "quote_snapshot_sha256": "not-applicable",
+            "instrument_rules_sha256": "not-applicable",
+        }
+        PreTradeResult(
+            **rejected,
+            checked_at="2026-07-28T10:06:00+08:00",
+            valid_until="2026-07-28T10:06:00+08:00",
+        )
+        for checked_at, valid_until in (
+            ("2026-07-28T10:06:00+08:00", "2026-07-28T10:06:01+08:00"),
+            ("2026-07-28T09:54:59+08:00", "2026-07-28T09:54:59+08:00"),
+        ):
+            with self.subTest(invalid_rejected=(checked_at, valid_until)):
+                with self.assertRaisesRegex(ValueError, "checked_at|signal_time|valid_until"):
+                    PreTradeResult(**rejected, checked_at=checked_at, valid_until=valid_until)
+
+    def test_execution_intent_rejects_unsafe_price_stop_and_quantity_relationships(self) -> None:
+        buy = intent_values(make_candidate())
+        sell = intent_values(make_candidate(side="sell"))
+        cases = (
+            ("price protection", {**buy, "limit_price": None, "price_cap": None}),
+            ("stop_price", {**buy, "stop_price": None}),
+            ("buy target", {**buy, "expected_current_qty": 100, "target_position_qty": 150}),
+            ("oversell", {**sell, "order_qty": 200}),
+            ("sell target", {**sell, "order_qty": 50, "target_position_qty": 80}),
+            ("price protection", {**sell, "limit_price": None}),
+            ("buy limit", {**buy, "limit_price": D("10.20"), "price_cap": D("10.10")}),
+            ("sell limit", {**sell, "limit_price": D("9.80"), "price_cap": D("9.90")}),
+        )
+        for message, values in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    ExecutionIntent(**values)
+
+    def test_signed_from_dict_requires_present_well_formed_hashes(self) -> None:
+        candidate = make_candidate()
+        result = PreTradeResult(
+            **pre_trade_values(candidate, pre_trade_result_id="risk-signed")
+        )
+        quote = QuoteSnapshot.from_values(
+            code="600000", quote_time="2026-07-28T10:00:00+08:00",
+            last_price="10", bid_price=None, ask_price=None,
+            limit_up_price=None, limit_down_price=None,
+        )
+        broker = BrokerSnapshot.from_values(
+            account_scope_id="scope-uuid", trade_date="2026-07-28",
+            broker_time="2026-07-28T10:00:00+08:00", total_equity=50_000,
+            cash=20_000, available_cash=20_000, frozen_cash=0, positions=[],
+            open_orders=[], fills=[], adapter_version="sim-1", node_version="node-1",
+            session_id="session-1", capabilities_version="cap-1",
+        )
+        rules = InstrumentRules.a_share("600000")
+        intent = ExecutionIntent(**intent_values(candidate))
+        missing = object()
+        records = (
+            (type(FEES.estimate("buy", D("10"), 100)).from_dict,
+             FEES.estimate("buy", D("10"), 100).to_dict(), "content_sha256"),
+            (RoundTripCost.from_dict,
+             FEES.estimate_round_trip(D("10"), D("9.5"), 100).to_dict(),
+             "content_sha256"),
+            (FeeSchedule.from_dict, FEES.to_dict(), "contract_sha256"),
+            (InstrumentRules.from_dict, rules.to_dict(), "rules_sha256"),
+            (QuoteSnapshot.from_dict, quote.to_dict(), "quote_sha256"),
+            (BrokerSnapshot.from_dict, broker.to_dict(), "snapshot_sha256"),
+            (StrategyOrderCandidate.from_dict, candidate.to_dict(), "payload_sha256"),
+            (PreTradeResult.from_dict, result.to_dict(), "result_sha256"),
+            (ExecutionIntent.from_dict, intent.to_dict(), "intent_sha256"),
+        )
+        for loader, payload, hash_field in records:
+            for bad_hash in (missing, None, "", "a" * 63, "z" * 64, "d" * 64):
+                with self.subTest(loader=loader.__qualname__, hash=bad_hash):
+                    broken = dict(payload)
+                    if bad_hash is missing:
+                        broken.pop(hash_field)
+                    else:
+                        broken[hash_field] = bad_hash
+                    with self.assertRaises(ValueError):
+                        loader(broken)
+
+        tampered_fee = FEES.estimate("buy", D("10"), 100).to_dict()
+        tampered_fee.pop("content_sha256")
+        tampered_fee["commission_yuan"] = "0"
+        with self.assertRaises(ValueError):
+            type(FEES.estimate("buy", D("10"), 100)).from_dict(tampered_fee)
+        tampered_candidate = candidate.to_dict()
+        tampered_candidate.pop("payload_sha256")
+        tampered_candidate["target_price"] = "99"
+        with self.assertRaises(ValueError):
+            StrategyOrderCandidate.from_dict(tampered_candidate)
+
+    def test_pre_trade_result_binds_snapshot_content_hashes(self) -> None:
+        candidate = make_candidate()
+        values = pre_trade_values(candidate, pre_trade_result_id="risk-snapshots")
+
+        result = PreTradeResult(**values)
+
+        self.assertEqual(result.broker_snapshot_sha256, "a" * 64)
+        self.assertEqual(result.quote_snapshot_sha256, "b" * 64)
+        self.assertEqual(PreTradeResult.from_dict(result.to_dict()).result_sha256, result.result_sha256)
+        self.assertNotEqual(
+            result.result_sha256,
+            PreTradeResult(**{**values, "broker_snapshot_sha256": "d" * 64}).result_sha256,
+        )
+        for field, value in (
+            ("broker_snapshot_sha256", "not-applicable"),
+            ("quote_snapshot_sha256", "not-applicable"),
+            ("broker_snapshot_sha256", "x"),
+            ("quote_snapshot_sha256", "x"),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, field):
+                    PreTradeResult(**{**values, field: value})
+
+        rejected = PreTradeResult(
+            **{
+                **values, "allowed": False, "hard_blocks": ("NO_QUOTE",),
+                "approved_qty": 0, "target_position_qty": 0, "execution_fee": None,
+                "round_trip_cost": None, "valid_until": values["checked_at"],
+                "approved_limit_price": None, "approved_price_cap": None,
+                "submission_attempt_id": "not-applicable",
+                "broker_snapshot_id": "not-applicable",
+                "broker_snapshot_sha256": "not-applicable",
+                "quote_snapshot_id": "not-applicable",
+                "quote_snapshot_sha256": "not-applicable",
+                "instrument_rules_sha256": "not-applicable",
+            }
+        )
+        self.assertEqual(rejected.broker_snapshot_sha256, "not-applicable")
+
+    def test_execution_intent_binds_allowed_result_and_canonical_order_id(self) -> None:
+        candidate = make_candidate()
+        result = PreTradeResult(
+            **pre_trade_values(candidate, pre_trade_result_id="risk-chain")
+        )
+        exact_order = {
+            "code": candidate.code, "side": candidate.side, "order_qty": 100,
+            "expected_current_qty": 0, "target_position_qty": 100,
+            "limit_price": D("10"), "price_cap": D("10.10"),
+            "stop_price": D("9.5"), "expires_at": "2026-07-28T10:01:00+08:00",
+        }
+        order_id = client_order_id(
+            candidate.account_scope_id, "joinquant", candidate.logical_signal_id,
+            result.pre_trade_result_id, exact_order, candidate.candidate_id,
+        )
+        values = {
+            **intent_values(candidate, result), "client_order_id": order_id,
+            "pre_trade_result_id": result.pre_trade_result_id,
+            "pre_trade_result": result,
+            "pre_trade_result_sha256": result.result_sha256,
+            "fee_schedule_sha256": FEES.contract_sha256,
+        }
+
+        intent = ExecutionIntent(**values)
+
+        self.assertEqual(intent.pre_trade_result.result_sha256, result.result_sha256)
+        self.assertEqual(ExecutionIntent.from_dict(intent.to_dict()).intent_sha256, intent.intent_sha256)
+        for field, value in (
+            ("client_order_id", "arbitrary-order-id"),
+            ("pre_trade_result_id", "other-result"),
+            ("pre_trade_result_sha256", "d" * 64),
+            ("fee_schedule_version", "other-fees"),
+            ("fee_schedule_sha256", "d" * 64),
+            ("broker_snapshot_id", "other-broker"),
+            ("broker_snapshot_sha256", "d" * 64),
+            ("quote_snapshot_id", "other-quote"),
+            ("quote_snapshot_sha256", "d" * 64),
+            ("instrument_rules_sha256", "d" * 64),
+            ("account_scope_id", "other-scope"),
+            ("logical_signal_id", "other-logical"),
+            ("source_signal_id", "other-source"),
+            ("strategy_id", "other-strategy"),
+            ("strategy_version", "other-strategy-version"),
+            ("parameter_version", "other-parameters"),
+            ("model_version", "other-model"),
+            ("code", "000001"),
+            ("signal_time", "2026-07-28T09:56:00+08:00"),
+            ("stop_price", D("9.4")),
+            ("order_qty", 200),
+            ("target_position_qty", 200),
+            ("expires_at", "2026-07-28T10:02:00+08:00"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    ExecutionIntent(**{**values, field: value})
+
+        rejected_result = PreTradeResult(
+            **pre_trade_values(
+                candidate,
+                pre_trade_result_id="risk-rejected",
+                allowed=False,
+                hard_blocks=("NO_QUOTE",),
+                approved_qty=0,
+                target_position_qty=0,
+                execution_fee=None,
+                round_trip_cost=None,
+                approved_limit_price=None,
+                approved_price_cap=None,
+                submission_attempt_id="not-applicable",
+                valid_until="2026-07-28T09:56:00+08:00",
+                broker_snapshot_id="not-applicable",
+                broker_snapshot_sha256="not-applicable",
+                quote_snapshot_id="not-applicable",
+                quote_snapshot_sha256="not-applicable",
+                instrument_rules_sha256="not-applicable",
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "allowed pre_trade_result"):
+            ExecutionIntent(
+                **{
+                    **values,
+                    "pre_trade_result_id": rejected_result.pre_trade_result_id,
+                    "pre_trade_result": rejected_result,
+                    "pre_trade_result_sha256": rejected_result.result_sha256,
+                }
+            )
+
+        changed_order = {**exact_order, "limit_price": D("9.99")}
+        self.assertNotEqual(
+            order_id,
+            client_order_id(
+                candidate.account_scope_id, "joinquant", candidate.logical_signal_id,
+                result.pre_trade_result_id, changed_order, candidate.candidate_id,
+            ),
+        )
+        equivalent_order = {
+            **exact_order,
+            "limit_price": "10.00",
+            "price_cap": "10.100",
+            "expires_at": "2026-07-28T02:01:00Z",
+        }
+        self.assertEqual(
+            order_id,
+            client_order_id(
+                candidate.account_scope_id, "joinquant", candidate.logical_signal_id,
+                result.pre_trade_result_id, equivalent_order, candidate.candidate_id,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "exact_order"):
+            incomplete_order = dict(exact_order)
+            incomplete_order.pop("expires_at")
+            client_order_id(
+                candidate.account_scope_id, "joinquant", candidate.logical_signal_id,
+                result.pre_trade_result_id, incomplete_order, candidate.candidate_id,
+            )
+        self.assertNotEqual(
+            order_id,
+            client_order_id(
+                candidate.account_scope_id, "qmt", candidate.logical_signal_id,
+                result.pre_trade_result_id, exact_order, candidate.candidate_id,
+            ),
+        )
+        self.assertNotEqual(
+            order_id,
+            client_order_id(
+                candidate.account_scope_id, "joinquant", candidate.logical_signal_id,
+                result.pre_trade_result_id, exact_order, "attempt-2",
+            ),
+        )
+
+    def test_execution_intent_cannot_precede_approval_or_change_approved_price(self) -> None:
+        candidate = make_candidate()
+        result = PreTradeResult(**pre_trade_values(candidate))
+        values = intent_values(candidate, result)
+
+        for field_changes, message in (
+            ({"expires_at": "2026-07-28T09:55:30+08:00"}, "checked_at"),
+            ({"expires_at": "2026-07-28T10:00:00+08:00"}, "valid_until"),
+            ({"limit_price": D("11"), "price_cap": D("11.10")}, "limit_price|execution_fee"),
+            ({"submission_attempt_id": "attempt-2"}, "submission_attempt_id"),
+        ):
+            changed = {**values, **field_changes}
+            exact_order = {
+                name: changed[name]
+                for name in (
+                    "code", "side", "order_qty", "expected_current_qty",
+                    "target_position_qty", "limit_price", "price_cap", "stop_price",
+                    "expires_at",
+                )
+            }
+            changed["client_order_id"] = client_order_id(
+                changed["account_scope_id"], changed["adapter"],
+                changed["logical_signal_id"], changed["pre_trade_result_id"],
+                exact_order, changed["submission_attempt_id"],
+            )
+            with self.subTest(changes=field_changes):
+                with self.assertRaisesRegex(ValueError, message):
+                    ExecutionIntent(**changed)
 
     def test_execution_intent_rejects_malformed_digest_references(self) -> None:
         candidate = make_candidate()
