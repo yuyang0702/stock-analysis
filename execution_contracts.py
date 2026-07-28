@@ -7,12 +7,13 @@ import json
 import math
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from types import MappingProxyType
 from typing import Mapping
 
 
 CENT = Decimal("0.01")
+RATIO_QUANTUM = Decimal("0.00000001")
 ZERO = Decimal("0")
 
 
@@ -40,6 +41,15 @@ def _decimal(
 
 def _money(value: Decimal) -> Decimal:
     return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def _ratio(numerator: Decimal, denominator: Decimal, name: str) -> Decimal:
+    if denominator <= ZERO:
+        raise ValueError(f"{name} denominator must be positive")
+    with localcontext() as context:
+        context.prec = 50
+        context.rounding = ROUND_HALF_UP
+        return (numerator / denominator).quantize(RATIO_QUANTUM)
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -494,6 +504,32 @@ class RoundTripCost:
             raise ValueError("total_yuan does not match round-trip cost components")
         _verify_hash(expected, result.content_sha256, "round-trip cost")
         return result
+
+
+def scenario_loss_yuan(
+    entry_price: Decimal,
+    exit_price: Decimal,
+    qty: int,
+    round_trip_cost: RoundTripCost,
+) -> Decimal:
+    normalized_entry = _decimal(entry_price, "entry_price", positive=True)
+    normalized_exit = _decimal(exit_price, "exit_price", positive=True)
+    normalized_qty = _qty(qty, "qty", positive=True)
+    if normalized_exit >= normalized_entry:
+        raise ValueError("exit_price must be below entry_price for a loss scenario")
+    if not isinstance(round_trip_cost, RoundTripCost):
+        raise ValueError("round_trip_cost must be a RoundTripCost")
+    if round_trip_cost.buy.qty != normalized_qty:
+        raise ValueError("round_trip_cost quantity does not match qty")
+    if (
+        round_trip_cost.buy.price != normalized_entry
+        or round_trip_cost.sell.price != normalized_exit
+    ):
+        raise ValueError("round_trip_cost prices do not match the loss scenario")
+    return _money(
+        (normalized_entry - normalized_exit) * normalized_qty
+        + round_trip_cost.total_yuan
+    )
 
 
 @dataclass(frozen=True)
@@ -1071,7 +1107,10 @@ class PreTradeResult:
     submission_attempt_id: str = "not-applicable"
     execution_fee: FeeBreakdown | None = None
     round_trip_cost: RoundTripCost | None = None
+    target_round_trip_cost: RoundTripCost | None = None
     planned_stop_loss_yuan: Decimal | None = None
+    gap_price: Decimal | None = None
+    gap_round_trip_cost: RoundTripCost | None = None
     gap_loss_yuan: Decimal | None = None
     fee_erosion_ratio: Decimal | None = None
     cost_to_expected_edge_ratio: Decimal | None = None
@@ -1153,6 +1192,11 @@ class PreTradeResult:
                 name,
                 _decimal(getattr(self, name), name, positive=True, optional=True),
             )
+        object.__setattr__(
+            self,
+            "gap_price",
+            _decimal(self.gap_price, "gap_price", positive=True, optional=True),
+        )
         object.__setattr__(self, "checked_at", _timestamp(self.checked_at, "checked_at"))
         object.__setattr__(self, "valid_until", _timestamp(self.valid_until, "valid_until"))
         checked_at = datetime.fromisoformat(self.checked_at)
@@ -1223,24 +1267,15 @@ class PreTradeResult:
             if candidate.side == "buy":
                 for name in (
                     "planned_stop_loss_yuan",
+                    "target_round_trip_cost",
+                    "gap_price",
+                    "gap_round_trip_cost",
                     "gap_loss_yuan",
                     "fee_erosion_ratio",
                     "cost_to_expected_edge_ratio",
                 ):
                     if getattr(self, name) is None:
                         raise ValueError(f"allowed buy result requires {name}")
-                if self.planned_stop_loss_yuan <= ZERO:
-                    raise ValueError("planned_stop_loss_yuan must be positive for an allowed buy")
-                if self.gap_loss_yuan < self.planned_stop_loss_yuan:
-                    raise ValueError("gap_loss_yuan must not be below planned_stop_loss_yuan")
-                if candidate.stop_price >= execution_fee.price:
-                    raise ValueError("buy stop_price must be below the approved execution price")
-                if self.per_trade_risk_yuan != max(
-                    self.planned_stop_loss_yuan, self.gap_loss_yuan
-                ):
-                    raise ValueError(
-                        "per_trade_risk_yuan must equal the larger planned_stop_loss_yuan or gap_loss_yuan"
-                    )
         if self.round_trip_cost is not None:
             if not isinstance(self.round_trip_cost, RoundTripCost):
                 raise ValueError("round_trip_cost must be a RoundTripCost")
@@ -1259,6 +1294,77 @@ class PreTradeResult:
                 raise ValueError("execution_fee does not match the applicable round_trip_cost fee")
             if candidate.side == "buy" and self.round_trip_cost.sell.price != candidate.stop_price:
                 raise ValueError("round_trip_cost sell price must equal candidate stop_price")
+        if self.target_round_trip_cost is not None:
+            if not isinstance(self.target_round_trip_cost, RoundTripCost):
+                raise ValueError("target_round_trip_cost must be a RoundTripCost")
+            if (
+                self.target_round_trip_cost.buy.schedule_version != self.fee_schedule_version
+                or self.target_round_trip_cost.buy.fee_schedule_sha256 != self.fee_schedule_sha256
+                or self.target_round_trip_cost.buy.qty != self.approved_qty
+            ):
+                raise ValueError("target_round_trip_cost fee schedule contract or quantity mismatch")
+            if self.target_round_trip_cost.sell.price != candidate.target_price:
+                raise ValueError("target_round_trip_cost sell price must equal candidate target_price")
+        if self.gap_round_trip_cost is not None:
+            if not isinstance(self.gap_round_trip_cost, RoundTripCost):
+                raise ValueError("gap_round_trip_cost must be a RoundTripCost")
+            if (
+                self.gap_round_trip_cost.buy.schedule_version != self.fee_schedule_version
+                or self.gap_round_trip_cost.buy.fee_schedule_sha256 != self.fee_schedule_sha256
+                or self.gap_round_trip_cost.buy.qty != self.approved_qty
+            ):
+                raise ValueError("gap_round_trip_cost fee schedule contract or quantity mismatch")
+            if self.gap_price is None:
+                raise ValueError("gap_round_trip_cost requires gap_price")
+            if self.gap_round_trip_cost.sell.price != self.gap_price:
+                raise ValueError("gap_round_trip_cost sell price must equal gap_price")
+        if self.allowed and candidate.side == "buy":
+            if self.gap_price >= execution_fee.price:
+                raise ValueError("gap_price must be below the approved execution price")
+            if self.target_round_trip_cost.buy != execution_fee:
+                raise ValueError("target_round_trip_cost buy fee must match execution_fee")
+            if self.gap_round_trip_cost.buy != execution_fee:
+                raise ValueError("gap_round_trip_cost buy fee must match execution_fee")
+            planned_loss = scenario_loss_yuan(
+                execution_fee.price,
+                candidate.stop_price,
+                self.approved_qty,
+                self.round_trip_cost,
+            )
+            if self.planned_stop_loss_yuan != planned_loss:
+                raise ValueError("planned_stop_loss_yuan does not match frozen price and fee evidence")
+            gap_loss = scenario_loss_yuan(
+                execution_fee.price,
+                self.gap_price,
+                self.approved_qty,
+                self.gap_round_trip_cost,
+            )
+            if self.gap_loss_yuan != gap_loss:
+                raise ValueError("gap_loss_yuan does not match frozen price and fee evidence")
+            if self.per_trade_risk_yuan != max(planned_loss, gap_loss):
+                raise ValueError(
+                    "per_trade_risk_yuan must equal the larger planned_stop_loss_yuan or gap_loss_yuan"
+                )
+
+            expected_fee_erosion = _ratio(
+                self.target_round_trip_cost.total_yuan,
+                execution_fee.notional_yuan,
+                "fee_erosion_ratio",
+            )
+            expected_edge_yuan = (
+                candidate.target_price - execution_fee.price
+            ) * self.approved_qty
+            expected_cost_to_edge = _ratio(
+                self.target_round_trip_cost.total_yuan,
+                expected_edge_yuan,
+                "cost_to_expected_edge_ratio",
+            )
+            if self.fee_erosion_ratio != expected_fee_erosion:
+                raise ValueError("fee_erosion_ratio does not match frozen fee and notional evidence")
+            if self.cost_to_expected_edge_ratio != expected_cost_to_edge:
+                raise ValueError(
+                    "cost_to_expected_edge_ratio does not match frozen cost and expected edge evidence"
+                )
         actual = canonical_sha256(self._content_dict())
         _verify_hash(supplied_hash, actual, "pre-trade result")
         object.__setattr__(self, "result_sha256", actual)
@@ -1270,6 +1376,10 @@ class PreTradeResult:
             content["execution_fee"] = self.execution_fee.to_dict()
         if self.round_trip_cost is not None:
             content["round_trip_cost"] = self.round_trip_cost.to_dict()
+        if self.target_round_trip_cost is not None:
+            content["target_round_trip_cost"] = self.target_round_trip_cost.to_dict()
+        if self.gap_round_trip_cost is not None:
+            content["gap_round_trip_cost"] = self.gap_round_trip_cost.to_dict()
         return content
 
     def to_dict(self) -> dict[str, object]:
@@ -1278,6 +1388,8 @@ class PreTradeResult:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> PreTradeResult:
         values = dict(value)
+        if set(values) != {field.name for field in fields(cls)}:
+            raise ValueError("pre-trade result fields do not match the signed contract")
         values["result_sha256"] = _sha256_text(
             values.get("result_sha256"), "result_sha256"
         )
@@ -1290,6 +1402,12 @@ class PreTradeResult:
         cost = values.get("round_trip_cost")
         if isinstance(cost, Mapping):
             values["round_trip_cost"] = RoundTripCost.from_dict(cost)
+        target_cost = values.get("target_round_trip_cost")
+        if isinstance(target_cost, Mapping):
+            values["target_round_trip_cost"] = RoundTripCost.from_dict(target_cost)
+        gap_cost = values.get("gap_round_trip_cost")
+        if isinstance(gap_cost, Mapping):
+            values["gap_round_trip_cost"] = RoundTripCost.from_dict(gap_cost)
         return cls(**values)
 
 

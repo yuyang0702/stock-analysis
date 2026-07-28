@@ -2,6 +2,7 @@ import unittest
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
 
+import execution_contracts as contracts
 from execution_contracts import (
     BrokerPosition,
     BrokerSnapshot,
@@ -88,24 +89,57 @@ def pre_trade_values(
     **changes: object,
 ) -> dict[str, object]:
     is_buy = candidate.side == "buy"
+    entry_price = D("10")
+    approved_qty = 100
+    execution_fee = FEES.estimate(candidate.side, entry_price, approved_qty)
+    planned_cost = (
+        FEES.estimate_round_trip(entry_price, candidate.stop_price, approved_qty)
+        if is_buy else None
+    )
+    target_cost = (
+        FEES.estimate_round_trip(entry_price, candidate.target_price, approved_qty)
+        if is_buy else None
+    )
+    gap_price = D("9") if is_buy else None
+    gap_cost = (
+        FEES.estimate_round_trip(entry_price, gap_price, approved_qty)
+        if is_buy else None
+    )
+    planned_loss = (
+        (entry_price - candidate.stop_price) * approved_qty + planned_cost.total_yuan
+        if is_buy else None
+    )
+    gap_loss = (
+        (entry_price - gap_price) * approved_qty + gap_cost.total_yuan
+        if is_buy else None
+    )
     values: dict[str, object] = {
         "pre_trade_result_id": "risk-1", "candidate_id": candidate.candidate_id,
         "candidate": candidate, "allowed": True, "hard_blocks": (), "warnings": (),
-        "approved_qty": 100, "target_position_qty": 100 if is_buy else 0,
+        "approved_qty": approved_qty, "target_position_qty": approved_qty if is_buy else 0,
         "fee_schedule_version": FEES.version,
         "fee_schedule_sha256": FEES.contract_sha256, "strategy_version": "s1",
         "checked_at": "2026-07-28T09:56:00+08:00",
         "valid_until": "2026-07-28T10:01:00+08:00",
-        "approved_limit_price": D("10"),
+        "approved_limit_price": entry_price,
         "approved_price_cap": D("10.10") if is_buy else D("9.90"),
         "submission_attempt_id": candidate.candidate_id,
-        "execution_fee": FEES.estimate(candidate.side, D("10"), 100),
-        "round_trip_cost": FEES.estimate_round_trip(D("10"), D("9.5"), 100) if is_buy else None,
-        "planned_stop_loss_yuan": D("80") if is_buy else None,
-        "gap_loss_yuan": D("100") if is_buy else None,
-        "fee_erosion_ratio": D("0.10") if is_buy else None,
-        "cost_to_expected_edge_ratio": D("0.20") if is_buy else None,
-        "per_trade_risk_yuan": D("100") if is_buy else D("0"),
+        "execution_fee": execution_fee,
+        "round_trip_cost": planned_cost,
+        "target_round_trip_cost": target_cost,
+        "planned_stop_loss_yuan": planned_loss,
+        "gap_price": gap_price,
+        "gap_round_trip_cost": gap_cost,
+        "gap_loss_yuan": gap_loss,
+        "fee_erosion_ratio": (
+            target_cost.total_yuan / execution_fee.notional_yuan if is_buy else None
+        ),
+        "cost_to_expected_edge_ratio": (
+            target_cost.total_yuan
+            / ((candidate.target_price - entry_price) * approved_qty)
+            if is_buy else None
+        ),
+        "per_trade_risk_yuan": max(planned_loss, gap_loss) if is_buy else D("0"),
         "broker_snapshot_id": "broker-1", "broker_snapshot_sha256": "a" * 64,
         "quote_snapshot_id": "quote-1", "quote_snapshot_sha256": "b" * 64,
         "instrument_rules_sha256": "c" * 64,
@@ -514,9 +548,14 @@ class ExecutionContractsTest(unittest.TestCase):
                 target_position_qty=200,
                 execution_fee=FEES.estimate("buy", D("10"), 200),
                 round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 200),
-                planned_stop_loss_yuan=D("160"),
-                gap_loss_yuan=D("200"),
-                per_trade_risk_yuan=D("200"),
+                target_round_trip_cost=FEES.estimate_round_trip(D("10"), D("11"), 200),
+                planned_stop_loss_yuan=D("114.89"),
+                gap_price=D("9"),
+                gap_round_trip_cost=FEES.estimate_round_trip(D("10"), D("9"), 200),
+                gap_loss_yuan=D("214.74"),
+                fee_erosion_ratio=D("0.00767"),
+                cost_to_expected_edge_ratio=D("0.0767"),
+                per_trade_risk_yuan=D("214.74"),
             )
         )
         first = ExecutionIntent(**intent_values(candidate, result))
@@ -535,7 +574,15 @@ class ExecutionContractsTest(unittest.TestCase):
         common.pop("candidate")
 
         first = PreTradeResult(candidate=first_candidate, **common)
-        second = PreTradeResult(candidate=second_candidate, **common)
+        second = PreTradeResult(
+            candidate=second_candidate,
+            **{
+                **common,
+                "target_round_trip_cost": FEES.estimate_round_trip(D("10"), D("12"), 100),
+                "fee_erosion_ratio": D("0.01282"),
+                "cost_to_expected_edge_ratio": D("0.0641"),
+            },
+        )
 
         self.assertNotEqual(first.result_sha256, second.result_sha256)
         self.assertEqual(
@@ -606,7 +653,9 @@ class ExecutionContractsTest(unittest.TestCase):
             **{
                 **common, "allowed": False, "hard_blocks": ("NO_QUOTE",),
                 "approved_qty": 0, "target_position_qty": 0, "execution_fee": None,
-                "round_trip_cost": None, "valid_until": common["checked_at"],
+                "round_trip_cost": None, "target_round_trip_cost": None,
+                "gap_round_trip_cost": None,
+                "valid_until": common["checked_at"],
                 "approved_limit_price": None, "approved_price_cap": None,
                 "submission_attempt_id": "not-applicable",
                 "broker_snapshot_id": "not-applicable",
@@ -623,30 +672,10 @@ class ExecutionContractsTest(unittest.TestCase):
             with self.subTest(side=side):
                 candidate = make_candidate(side=side)
                 execution_fee = FEES.estimate(side, D("10"), 100)
-                values = dict(
-                    pre_trade_result_id=f"risk-{side}", candidate_id=candidate.candidate_id,
-                    candidate=candidate, allowed=True, hard_blocks=(), warnings=(),
-                    approved_qty=100, target_position_qty=100 if side == "buy" else 0,
-                    fee_schedule_version=FEES.version,
-                    fee_schedule_sha256=FEES.contract_sha256, strategy_version="s1",
-                    checked_at="2026-07-28T09:56:00+08:00",
-                    valid_until="2026-07-28T10:01:00+08:00",
-                    approved_limit_price=D("10"),
-                    approved_price_cap=D("10.10") if side == "buy" else D("9.90"),
-                    submission_attempt_id=candidate.candidate_id,
+                values = pre_trade_values(
+                    candidate,
+                    pre_trade_result_id=f"risk-{side}",
                     execution_fee=execution_fee,
-                    round_trip_cost=(
-                        FEES.estimate_round_trip(D("10"), D("9.5"), 100)
-                        if side == "buy" else None
-                    ),
-                    planned_stop_loss_yuan=D("80") if side == "buy" else None,
-                    gap_loss_yuan=D("100") if side == "buy" else None,
-                    fee_erosion_ratio=D("0.10") if side == "buy" else None,
-                    cost_to_expected_edge_ratio=D("0.20") if side == "buy" else None,
-                    per_trade_risk_yuan=D("100") if side == "buy" else D("0"),
-                    broker_snapshot_id="broker-1", broker_snapshot_sha256="a" * 64,
-                    quote_snapshot_id="quote-1", quote_snapshot_sha256="b" * 64,
-                    instrument_rules_sha256="c" * 64,
                 )
 
                 result = PreTradeResult(**values)
@@ -660,8 +689,9 @@ class ExecutionContractsTest(unittest.TestCase):
                 required = ["execution_fee"]
                 if side == "buy":
                     required += [
-                        "round_trip_cost", "planned_stop_loss_yuan", "gap_loss_yuan",
-                        "fee_erosion_ratio", "cost_to_expected_edge_ratio",
+                        "round_trip_cost", "target_round_trip_cost",
+                        "planned_stop_loss_yuan", "gap_price", "gap_round_trip_cost",
+                        "gap_loss_yuan", "fee_erosion_ratio", "cost_to_expected_edge_ratio",
                     ]
                 for field in required:
                     with self.subTest(side=side, missing=field):
@@ -714,8 +744,21 @@ class ExecutionContractsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "approved_price_cap"):
             PreTradeResult(**values)
 
-    def test_allowed_buy_requires_conservative_positive_gap_loss(self) -> None:
+    def test_allowed_buy_requires_reproducible_positive_gap_loss(self) -> None:
         candidate = make_candidate()
+        shallower_gap_cost = FEES.estimate_round_trip(D("10"), D("9.8"), 100)
+        PreTradeResult(
+            **pre_trade_values(
+                candidate,
+                gap_price=D("9.8"),
+                gap_round_trip_cost=shallower_gap_cost,
+                planned_stop_loss_yuan=D("62.45"),
+                gap_loss_yuan=D("32.49"),
+                fee_erosion_ratio=D("0.01267"),
+                cost_to_expected_edge_ratio=D("0.1267"),
+                per_trade_risk_yuan=D("62.45"),
+            )
+        )
         for gap_loss in (D("0"), D("79.99")):
             with self.subTest(gap_loss=gap_loss):
                 with self.assertRaisesRegex(ValueError, "gap_loss_yuan"):
@@ -726,6 +769,148 @@ class ExecutionContractsTest(unittest.TestCase):
                             per_trade_risk_yuan=D("80"),
                         )
                     )
+
+    def test_scenario_loss_yuan_recomputes_frozen_price_quantity_and_fees(self) -> None:
+        planned_cost = FEES.estimate_round_trip(D("10"), D("9.5"), 100)
+
+        self.assertEqual(
+            contracts.scenario_loss_yuan(D("10"), D("9.5"), 100, planned_cost),
+            D("62.45"),
+        )
+        with self.assertRaisesRegex(ValueError, "quantity|price"):
+            contracts.scenario_loss_yuan(D("10"), D("9.5"), 200, planned_cost)
+
+    def test_allowed_buy_freezes_target_cost_and_rejects_wrong_target_evidence(self) -> None:
+        candidate = make_candidate(target_price="10.7")
+        target_cost = FEES.estimate_round_trip(D("10"), candidate.target_price, 100)
+        values = pre_trade_values(
+            candidate,
+            target_round_trip_cost=target_cost,
+            fee_erosion_ratio=D("0.01263"),
+            cost_to_expected_edge_ratio=D("0.18042857"),
+        )
+
+        result = PreTradeResult(**values)
+
+        payload = result.to_dict()
+        self.assertEqual(
+            payload["target_round_trip_cost"]["content_sha256"],
+            target_cost.content_sha256,
+        )
+        self.assertEqual(
+            PreTradeResult.from_dict(payload).result_sha256,
+            result.result_sha256,
+        )
+        changed_payload = dict(payload)
+        changed_payload["target_round_trip_cost"] = FEES.estimate_round_trip(
+            D("10"), D("10.6"), 100
+        ).to_dict()
+        self.assertNotEqual(
+            result.result_sha256,
+            canonical_sha256(
+                {key: value for key, value in changed_payload.items() if key != "result_sha256"}
+            ),
+        )
+
+        missing = dict(payload)
+        missing.pop("target_round_trip_cost")
+        missing["result_sha256"] = canonical_sha256(
+            {key: value for key, value in missing.items() if key != "result_sha256"}
+        )
+        with self.assertRaisesRegex(ValueError, "fields|target_round_trip_cost"):
+            PreTradeResult.from_dict(missing)
+
+        wrong_contract = FEES.derive_variant(
+            "wrong-target-fees", sell_minimum_commission_yuan=D("6")
+        ).estimate_round_trip(D("10"), candidate.target_price, 100)
+        for cost in (
+            FEES.estimate_round_trip(D("10"), D("10.6"), 100),
+            wrong_contract,
+        ):
+            with self.subTest(cost=cost):
+                with self.assertRaisesRegex(ValueError, "target_round_trip_cost"):
+                    PreTradeResult(**{**values, "target_round_trip_cost": cost})
+                broken = {**payload, "target_round_trip_cost": cost.to_dict()}
+                broken["result_sha256"] = canonical_sha256(
+                    {key: value for key, value in broken.items() if key != "result_sha256"}
+                )
+                with self.assertRaisesRegex(ValueError, "target_round_trip_cost"):
+                    PreTradeResult.from_dict(broken)
+
+    def test_allowed_buy_rejects_understated_reproducible_risk_and_ratios(self) -> None:
+        candidate = make_candidate()
+        common = pre_trade_values(candidate)
+        cases = (
+            (
+                "planned_stop_loss_yuan",
+                {"planned_stop_loss_yuan": D("0.01")},
+            ),
+            (
+                "gap_loss_yuan",
+                {"gap_loss_yuan": D("80"), "per_trade_risk_yuan": D("80")},
+            ),
+            ("fee_erosion_ratio", {"fee_erosion_ratio": D("0")}),
+            (
+                "cost_to_expected_edge_ratio",
+                {"cost_to_expected_edge_ratio": D("0")},
+            ),
+        )
+
+        for message, changes in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    PreTradeResult(**{**common, **changes})
+
+    def test_pre_trade_gap_evidence_is_signed_and_from_dict_fails_closed(self) -> None:
+        candidate = make_candidate()
+        gap_cost = FEES.estimate_round_trip(D("10"), D("9"), 100)
+        result = PreTradeResult(
+            **pre_trade_values(
+                candidate,
+                gap_price=D("9"),
+                gap_round_trip_cost=gap_cost,
+                planned_stop_loss_yuan=D("62.45"),
+                gap_loss_yuan=D("112.37"),
+                fee_erosion_ratio=D("0.01267"),
+                cost_to_expected_edge_ratio=D("0.1267"),
+                per_trade_risk_yuan=D("112.37"),
+            )
+        )
+
+        payload = result.to_dict()
+        self.assertEqual(payload["gap_price"], "9")
+        self.assertEqual(payload["gap_round_trip_cost"]["content_sha256"], gap_cost.content_sha256)
+        self.assertEqual(
+            PreTradeResult.from_dict(payload).result_sha256,
+            result.result_sha256,
+        )
+        for field in ("gap_price", "gap_round_trip_cost"):
+            with self.subTest(missing=field):
+                broken = dict(payload)
+                broken.pop(field)
+                broken["result_sha256"] = canonical_sha256(
+                    {key: value for key, value in broken.items() if key != "result_sha256"}
+                )
+                with self.assertRaisesRegex(ValueError, "fields|gap"):
+                    PreTradeResult.from_dict(broken)
+
+        for field, value, related in (
+            ("planned_stop_loss_yuan", D("0.01"), {}),
+            (
+                "gap_loss_yuan",
+                D("62.45"),
+                {"per_trade_risk_yuan": D("62.45")},
+            ),
+            ("fee_erosion_ratio", D("0"), {}),
+            ("cost_to_expected_edge_ratio", D("0"), {}),
+        ):
+            with self.subTest(resigned_understatement=field):
+                understated = {**payload, field: value, **related}
+                understated["result_sha256"] = canonical_sha256(
+                    {key: value for key, value in understated.items() if key != "result_sha256"}
+                )
+                with self.assertRaisesRegex(ValueError, field):
+                    PreTradeResult.from_dict(understated)
 
     def test_pre_trade_result_enforces_candidate_time_window(self) -> None:
         candidate = make_candidate()
@@ -753,7 +938,8 @@ class ExecutionContractsTest(unittest.TestCase):
         rejected = {
             **common, "allowed": False, "hard_blocks": ("STALE_SIGNAL",),
             "approved_qty": 0, "target_position_qty": 0, "execution_fee": None,
-            "round_trip_cost": None, "approved_limit_price": None,
+            "round_trip_cost": None, "target_round_trip_cost": None,
+            "gap_round_trip_cost": None, "approved_limit_price": None,
             "approved_price_cap": None, "submission_attempt_id": "not-applicable",
             "broker_snapshot_id": "not-applicable",
             "broker_snapshot_sha256": "not-applicable",
@@ -875,7 +1061,8 @@ class ExecutionContractsTest(unittest.TestCase):
             **{
                 **values, "allowed": False, "hard_blocks": ("NO_QUOTE",),
                 "approved_qty": 0, "target_position_qty": 0, "execution_fee": None,
-                "round_trip_cost": None, "valid_until": values["checked_at"],
+                "round_trip_cost": None, "target_round_trip_cost": None,
+                "gap_round_trip_cost": None, "valid_until": values["checked_at"],
                 "approved_limit_price": None, "approved_price_cap": None,
                 "submission_attempt_id": "not-applicable",
                 "broker_snapshot_id": "not-applicable",
@@ -953,6 +1140,8 @@ class ExecutionContractsTest(unittest.TestCase):
                 target_position_qty=0,
                 execution_fee=None,
                 round_trip_cost=None,
+                target_round_trip_cost=None,
+                gap_round_trip_cost=None,
                 approved_limit_price=None,
                 approved_price_cap=None,
                 submission_attempt_id="not-applicable",
