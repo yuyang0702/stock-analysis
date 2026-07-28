@@ -325,6 +325,7 @@ def _normalize_fill(value: object) -> Mapping[str, object]:
 @dataclass(frozen=True)
 class FeeBreakdown:
     schedule_version: str
+    fee_schedule_sha256: str
     side: str
     price: Decimal
     qty: int
@@ -338,6 +339,11 @@ class FeeBreakdown:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schedule_version", _text(self.schedule_version, "schedule_version"))
+        object.__setattr__(
+            self,
+            "fee_schedule_sha256",
+            _sha256_text(self.fee_schedule_sha256, "fee_schedule_sha256"),
+        )
         object.__setattr__(self, "side", _side(self.side))
         object.__setattr__(self, "qty", _qty(self.qty, "qty"))
         object.__setattr__(self, "price", _decimal(self.price, "price", positive=self.qty > 0))
@@ -407,8 +413,12 @@ class RoundTripCost:
             raise ValueError("round-trip sides must be fee breakdowns")
         if self.buy.side != "buy" or self.sell.side != "sell":
             raise ValueError("round-trip sides must be buy then sell")
-        if self.buy.schedule_version != self.sell.schedule_version or self.buy.qty != self.sell.qty:
-            raise ValueError("round-trip fee schedule and quantity must match")
+        if (
+            self.buy.schedule_version != self.sell.schedule_version
+            or self.buy.fee_schedule_sha256 != self.sell.fee_schedule_sha256
+            or self.buy.qty != self.sell.qty
+        ):
+            raise ValueError("round-trip fee schedule contract and quantity must match")
 
     @property
     def total_yuan(self) -> Decimal:
@@ -533,6 +543,7 @@ class FeeSchedule:
         }
         return FeeBreakdown(
             schedule_version=self.version,
+            fee_schedule_sha256=self.contract_sha256,
             side=normalized_side,
             price=normalized_price,
             qty=normalized_qty,
@@ -598,6 +609,9 @@ class InstrumentRules:
         supplied_hash = self.rules_sha256
         for name in ("code", "exchange", "board", "security_type", "source"):
             object.__setattr__(self, name, _text(getattr(self, name), name))
+        if type(self.special_status) is not str:
+            raise ValueError("special_status must be text")
+        object.__setattr__(self, "special_status", _text(self.special_status, "special_status"))
         object.__setattr__(self, "buy_min_qty", _qty(self.buy_min_qty, "buy_min_qty", positive=True))
         object.__setattr__(self, "buy_qty_step", _qty(self.buy_qty_step, "buy_qty_step", positive=True))
         object.__setattr__(
@@ -970,6 +984,7 @@ class PreTradeResult:
     approved_qty: int
     target_position_qty: int
     fee_schedule_version: str
+    fee_schedule_sha256: str
     checked_at: str
     valid_until: str
     estimated_cash_yuan: Decimal = ZERO
@@ -994,10 +1009,21 @@ class PreTradeResult:
             "fee_schedule_version",
             "broker_snapshot_id",
             "quote_snapshot_id",
-            "instrument_rules_sha256",
             "strategy_version",
         ):
             object.__setattr__(self, name, _text(getattr(self, name), name))
+        object.__setattr__(
+            self,
+            "fee_schedule_sha256",
+            _sha256_text(self.fee_schedule_sha256, "fee_schedule_sha256"),
+        )
+        rules_hash = _text(self.instrument_rules_sha256, "instrument_rules_sha256")
+        if rules_hash.lower() == "not-applicable":
+            rules_hash = "not-applicable"
+        else:
+            rules_hash = _sha256_text(rules_hash, "instrument_rules_sha256")
+        object.__setattr__(self, "instrument_rules_sha256", rules_hash)
+        object.__setattr__(self, "allowed", _boolean(self.allowed, "allowed"))
         candidate = (
             self.candidate
             if isinstance(self.candidate, StrategyOrderCandidate)
@@ -1014,7 +1040,6 @@ class PreTradeResult:
         object.__setattr__(self, "warnings", tuple(_text(item, "warning") for item in self.warnings))
         if self.allowed and self.hard_blocks:
             raise ValueError("allowed result cannot contain hard blocks")
-        object.__setattr__(self, "allowed", _boolean(self.allowed, "allowed"))
         for name in ("approved_qty", "target_position_qty"):
             object.__setattr__(self, name, _qty(getattr(self, name), name))
         for name in (
@@ -1031,11 +1056,28 @@ class PreTradeResult:
         object.__setattr__(self, "valid_until", _timestamp(self.valid_until, "valid_until"))
         if datetime.fromisoformat(self.valid_until) < datetime.fromisoformat(self.checked_at):
             raise ValueError("valid_until must not precede checked_at")
+        if self.allowed:
+            if self.broker_snapshot_id.lower() == "not-applicable":
+                raise ValueError("allowed result requires broker_snapshot_id")
+            if self.quote_snapshot_id.lower() == "not-applicable":
+                raise ValueError("allowed result requires quote_snapshot_id")
+            if self.instrument_rules_sha256 == "not-applicable":
+                raise ValueError("allowed result requires instrument_rules_sha256")
+            if self.approved_qty <= 0:
+                raise ValueError("allowed result requires positive approved_qty")
+            if candidate.side == "buy" and self.target_position_qty <= 0:
+                raise ValueError("allowed buy result requires positive target_position_qty")
+            if candidate.side == "buy" and self.round_trip_cost is None:
+                raise ValueError("allowed buy result requires round_trip_cost")
         if self.round_trip_cost is not None:
             if not isinstance(self.round_trip_cost, RoundTripCost):
                 raise ValueError("round_trip_cost must be a RoundTripCost")
-            if self.round_trip_cost.buy.schedule_version != self.fee_schedule_version:
-                raise ValueError("round_trip_cost fee schedule version mismatch")
+            if (
+                self.round_trip_cost.buy.schedule_version != self.fee_schedule_version
+                or self.round_trip_cost.buy.fee_schedule_sha256 != self.fee_schedule_sha256
+                or self.round_trip_cost.buy.qty != self.approved_qty
+            ):
+                raise ValueError("round_trip_cost fee schedule contract or quantity mismatch")
         content = _record_dict(self)
         content.pop("result_sha256")
         actual = canonical_sha256(content)

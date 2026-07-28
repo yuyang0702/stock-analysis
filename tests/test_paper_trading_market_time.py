@@ -5,6 +5,7 @@ import unittest
 import pandas as pd
 
 import a_share_strategy
+from paper_trading import new_account
 
 
 class PaperTradingMarketTimeTest(unittest.TestCase):
@@ -44,7 +45,11 @@ class PaperTradingMarketTimeTest(unittest.TestCase):
         cfg = a_share_strategy.Config()
         rows = pd.DataFrame([{"code": "600000", "price": 10, "position_pct": 10, "final_score": 90}])
 
-        with patch("a_share_strategy.apply_paper_trades") as apply_mock:
+        with (
+            patch("a_share_strategy.load_account", return_value=new_account(10_000)),
+            patch("a_share_strategy.save_account") as save_mock,
+            patch("a_share_strategy.apply_paper_trades") as apply_mock,
+        ):
             md = a_share_strategy.run_paper_trading(
                 cfg,
                 rows,
@@ -53,6 +58,46 @@ class PaperTradingMarketTimeTest(unittest.TestCase):
 
         apply_mock.assert_not_called()
         self.assertIn("非A股交易时间", md)
+
+
+    def test_after_hours_report_stamps_current_fee_contract_before_return(self) -> None:
+        cfg = a_share_strategy.Config(
+            mode="after",
+            paper_trade_commission_rate=0.0007,
+            paper_trade_stamp_tax_rate=0.0008,
+            paper_trade_slippage_pct=0.0002,
+        )
+        account = new_account(10_000)
+        account.update(
+            {
+                "active_fee_schedule_version": "old-v1",
+                "active_fee_schedule_sha256": "a" * 64,
+                "active_fee_schedule": {
+                    "version": "old-v1", "contract_sha256": "a" * 64,
+                },
+                "fee_schedule_version": "old-v1",
+                "fee_schedule_sha256": "a" * 64,
+            }
+        )
+
+        with (
+            patch("a_share_strategy.load_account", return_value=account),
+            patch("a_share_strategy.save_account") as save_mock,
+            patch("a_share_strategy.apply_paper_trades") as apply_mock,
+        ):
+            markdown = a_share_strategy.run_paper_trading(
+                cfg, pd.DataFrame(), now=datetime(2026, 7, 7, 16, 0)
+            )
+
+        apply_mock.assert_not_called()
+        save_mock.assert_called_once()
+        save_mock.assert_called_once()
+        self.assertNotEqual(account["active_fee_schedule_sha256"], "a" * 64)
+        self.assertEqual(
+            account["active_fee_schedule"]["buy_commission_rate"], "0.0007"
+        )
+        self.assertIn(account["active_fee_schedule_version"], markdown)
+        self.assertIn(account["active_fee_schedule_sha256"], markdown)
 
 
 if __name__ == "__main__":

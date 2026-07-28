@@ -4,7 +4,12 @@ from decimal import Decimal
 import pandas as pd
 
 from execution_contracts import FeeSchedule
-from paper_trading import apply_paper_trades, new_account, summarize_account
+from paper_trading import (
+    apply_paper_trades,
+    build_paper_trade_markdown,
+    new_account,
+    summarize_account,
+)
 
 
 class PaperTradingTest(unittest.TestCase):
@@ -69,6 +74,38 @@ class PaperTradingTest(unittest.TestCase):
             {item["fee_schedule_version"] for item in summary["fee_components_by_schedule"].values()},
             {"paper-v1", "paper-v2"},
         )
+
+    def test_no_trade_schedule_switch_reports_active_contract_separately(self) -> None:
+        first = FeeSchedule.simulation(version="paper-v1", minimum_commission_yuan=3)
+        second = FeeSchedule.simulation(version="paper-v2", minimum_commission_yuan=7)
+        account = new_account(10_000)
+        apply_paper_trades(
+            account,
+            pd.DataFrame([{"code": "600000", "price": 10, "entry_price": 10,
+                           "stop_loss": 9, "take_profit": 11, "position_pct": 10,
+                           "final_score": 90}]),
+            trade_date="2026-07-07", fee_schedule=first,
+        )
+
+        events = apply_paper_trades(
+            account, pd.DataFrame(), trade_date="2026-07-08", fee_schedule=second
+        )
+        summary = summarize_account(account)
+        markdown = build_paper_trade_markdown(account, events)
+
+        self.assertEqual(events, [])
+        self.assertEqual(summary["active_fee_schedule_version"], "paper-v2")
+        self.assertEqual(summary["active_fee_schedule_sha256"], second.contract_sha256)
+        self.assertEqual(
+            summary["active_fee_schedule"]["buy_minimum_commission_yuan"], "7"
+        )
+        self.assertEqual(summary["historical_fee_schedule_versions"], ["paper-v1"])
+        self.assertEqual(
+            set(summary["historical_fee_components_by_schedule"]),
+            {first.contract_sha256},
+        )
+        self.assertIn(f"Active fee schedule: paper-v2 | SHA-256: {second.contract_sha256}", markdown)
+        self.assertIn("Historical fee totals:", markdown)
 
     def test_buys_100_share_lots_from_signal_position_pct(self) -> None:
         account = new_account(100_000)

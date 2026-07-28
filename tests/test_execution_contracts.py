@@ -10,6 +10,7 @@ from execution_contracts import (
     InstrumentRules,
     PreTradeResult,
     QuoteSnapshot,
+    RoundTripCost,
     StrategyOrderCandidate,
     canonical_json,
     canonical_sha256,
@@ -159,10 +160,14 @@ class ExecutionContractsTest(unittest.TestCase):
             approved_qty=100,
             target_position_qty=100,
             fee_schedule_version="sim-v1",
+            fee_schedule_sha256=FEES.contract_sha256,
             strategy_version="s1",
             checked_at="2026-07-28T09:56:00+08:00",
             valid_until="2026-07-28T10:01:00+08:00",
             round_trip_cost=costs,
+            broker_snapshot_id="broker-1",
+            quote_snapshot_id="quote-1",
+            instrument_rules_sha256="c" * 64,
         )
 
         restored = PreTradeResult.from_dict(result.to_dict())
@@ -190,6 +195,21 @@ class ExecutionContractsTest(unittest.TestCase):
         self.assertTrue(rules.is_fresh("2026-07-28T10:00:00+08:00"))
         self.assertFalse(rules.is_fresh("2026-07-28T15:00:01+08:00"))
         self.assertEqual(rules.rules_sha256, InstrumentRules.from_dict(rules.to_dict()).rules_sha256)
+
+    def test_instrument_rules_special_status_is_strict_immutable_text(self) -> None:
+        rules = InstrumentRules.a_share("600000", special_status=" normal ")
+
+        self.assertEqual(rules.special_status, "normal")
+        for value in ("", ["normal"], object()):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "special_status"):
+                    InstrumentRules.a_share("600000", special_status=value)
+
+        source = rules.to_dict()
+        restored = InstrumentRules.from_dict(source)
+        original = restored.to_dict()
+        source["special_status"] = "halted"
+        self.assertEqual(restored.to_dict(), original)
 
     def test_canonical_json_is_stable_and_rejects_non_finite_numbers(self) -> None:
         left = {"b": [D("1.00"), 2], "a": "text"}
@@ -395,9 +415,14 @@ class ExecutionContractsTest(unittest.TestCase):
             approved_qty=100,
             target_position_qty=100,
             fee_schedule_version="sim-v1",
+            fee_schedule_sha256=FEES.contract_sha256,
             strategy_version="s1",
             checked_at="2026-07-28T09:56:00+08:00",
             valid_until="2026-07-28T10:01:00+08:00",
+            round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 100),
+            broker_snapshot_id="broker-1",
+            quote_snapshot_id="quote-1",
+            instrument_rules_sha256="c" * 64,
         )
         common = dict(
             client_order_id="order-1",
@@ -442,9 +467,13 @@ class ExecutionContractsTest(unittest.TestCase):
         common = dict(
             pre_trade_result_id="risk-1", candidate_id="candidate-1", allowed=True,
             hard_blocks=(), warnings=(), approved_qty=100, target_position_qty=100,
-            fee_schedule_version="sim-v1", strategy_version="s1",
+            fee_schedule_version="sim-v1", fee_schedule_sha256=FEES.contract_sha256,
+            strategy_version="s1",
             checked_at="2026-07-28T09:56:00+08:00",
             valid_until="2026-07-28T10:01:00+08:00",
+            round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 100),
+            broker_snapshot_id="broker-1", quote_snapshot_id="quote-1",
+            instrument_rules_sha256="c" * 64,
         )
 
         first = PreTradeResult(candidate=first_candidate, **common)
@@ -463,14 +492,83 @@ class ExecutionContractsTest(unittest.TestCase):
         common = dict(
             pre_trade_result_id="risk-1", candidate_id=candidate.candidate_id,
             candidate=candidate, allowed=True, hard_blocks=(), warnings=(), approved_qty=100,
-            target_position_qty=100, fee_schedule_version="sim-v1", strategy_version="s1",
+            target_position_qty=100, fee_schedule_version="sim-v1",
+            fee_schedule_sha256=FEES.contract_sha256, strategy_version="s1",
             checked_at="2026-07-28T09:56:00+08:00",
             valid_until="2026-07-28T10:01:00+08:00",
+            round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 100),
+            broker_snapshot_id="broker-1", quote_snapshot_id="quote-1",
+            instrument_rules_sha256="c" * 64,
         )
         for field in ("fee_schedule_version", "strategy_version"):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(ValueError, field):
                     PreTradeResult(**{**common, field: "different"})
+
+    def test_round_trip_and_pre_trade_result_bind_one_fee_contract_hash(self) -> None:
+        first = FeeSchedule.simulation(version="same", minimum_commission_yuan=3)
+        second = FeeSchedule.simulation(version="same", minimum_commission_yuan=9)
+        buy = first.estimate("buy", D("10"), 100)
+        sell = second.estimate("sell", D("9.5"), 100)
+
+        self.assertEqual(buy.fee_schedule_sha256, first.contract_sha256)
+        with self.assertRaisesRegex(ValueError, "contract"):
+            RoundTripCost(buy, sell)
+
+        candidate = make_candidate()
+        costs = FEES.estimate_round_trip(D("10"), D("9.5"), 100)
+        common = dict(
+            pre_trade_result_id="risk-1", candidate_id=candidate.candidate_id,
+            candidate=candidate, allowed=True, hard_blocks=(), warnings=(), approved_qty=100,
+            target_position_qty=100, fee_schedule_version=FEES.version,
+            fee_schedule_sha256=FEES.contract_sha256, strategy_version="s1",
+            checked_at="2026-07-28T09:56:00+08:00",
+            valid_until="2026-07-28T10:01:00+08:00", round_trip_cost=costs,
+            broker_snapshot_id="broker-1", quote_snapshot_id="quote-1",
+            instrument_rules_sha256="c" * 64,
+        )
+        result = PreTradeResult(**common)
+        self.assertEqual(result.fee_schedule_sha256, FEES.contract_sha256)
+        with self.assertRaisesRegex(ValueError, "fee schedule contract"):
+            PreTradeResult(**{**common, "fee_schedule_sha256": "d" * 64})
+
+    def test_allowed_pre_trade_result_requires_evidence_but_rejected_may_omit_it(self) -> None:
+        candidate = make_candidate()
+        common = dict(
+            pre_trade_result_id="risk-1", candidate_id=candidate.candidate_id,
+            candidate=candidate, allowed=True, hard_blocks=(), warnings=(), approved_qty=100,
+            target_position_qty=100, fee_schedule_version=FEES.version,
+            fee_schedule_sha256=FEES.contract_sha256, strategy_version="s1",
+            checked_at="2026-07-28T09:56:00+08:00",
+            valid_until="2026-07-28T10:01:00+08:00",
+            round_trip_cost=FEES.estimate_round_trip(D("10"), D("9.5"), 100),
+            broker_snapshot_id="broker-1", quote_snapshot_id="quote-1",
+            instrument_rules_sha256="c" * 64,
+        )
+        PreTradeResult(**common)
+        for field, value in (
+            ("broker_snapshot_id", "not-applicable"),
+            ("quote_snapshot_id", "not-applicable"),
+            ("instrument_rules_sha256", "not-applicable"),
+            ("instrument_rules_sha256", "x"),
+            ("round_trip_cost", None),
+            ("round_trip_cost", FEES.estimate_round_trip(D("10"), D("9.5"), 200)),
+            ("approved_qty", 0),
+            ("target_position_qty", 0),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValueError):
+                    PreTradeResult(**{**common, field: value})
+
+        rejected = PreTradeResult(
+            **{
+                **common, "allowed": False, "hard_blocks": ("NO_QUOTE",),
+                "approved_qty": 0, "target_position_qty": 0, "round_trip_cost": None,
+                "broker_snapshot_id": "not-applicable", "quote_snapshot_id": "not-applicable",
+                "instrument_rules_sha256": "not-applicable",
+            }
+        )
+        self.assertFalse(rejected.allowed)
 
     def test_execution_intent_rejects_malformed_digest_references(self) -> None:
         candidate = make_candidate()

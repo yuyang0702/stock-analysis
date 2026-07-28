@@ -31,7 +31,13 @@ from exit_policy import (
     resolve_effective_stop,
 )
 from global_market_context import load_global_context
-from paper_trading import apply_paper_trades, build_paper_trade_markdown, load_account, save_account
+from paper_trading import (
+    apply_paper_trades,
+    build_paper_trade_markdown,
+    load_account,
+    record_active_fee_schedule,
+    save_account,
+)
 from risk_engine import RiskDecision, build_risk_decision, build_signal_lifecycle, classify_trade_mode
 from shadow_score import apply_shadow_scores
 from strategy_profile import build_strategy_profile
@@ -3253,6 +3259,13 @@ def run_paper_trading(
     now = now or datetime.now()
     account = load_account(app_config.PAPER_TRADE_FILE, cfg.paper_trade_cash)
     if not is_a_share_trading_time(now):
+        record_active_fee_schedule(
+            account,
+            commission_rate=cfg.paper_trade_commission_rate,
+            stamp_tax_rate=cfg.paper_trade_stamp_tax_rate,
+            slippage_pct=cfg.paper_trade_slippage_pct,
+        )
+        save_account(app_config.PAPER_TRADE_FILE, account)
         md = build_paper_trade_markdown(account, [])
         md += f"\n> 非A股交易时间，本地模拟盘本轮不执行买卖。当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
         print(md.replace("\n", " | "), flush=True)

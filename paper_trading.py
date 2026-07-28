@@ -115,6 +115,25 @@ def _fee_schedule(
     )
 
 
+def record_active_fee_schedule(
+    account: dict[str, Any],
+    *,
+    commission_rate: float,
+    stamp_tax_rate: float,
+    slippage_pct: float,
+    fee_schedule: FeeSchedule | None = None,
+) -> FeeSchedule:
+    fees = _fee_schedule(fee_schedule, commission_rate, stamp_tax_rate, slippage_pct)
+    account["active_fee_schedule_version"] = fees.version
+    account["active_fee_schedule_sha256"] = fees.contract_sha256
+    account["active_fee_schedule"] = {
+        **fees.to_dict(), "contract_sha256": fees.contract_sha256,
+    }
+    account["fee_schedule_version"] = fees.version
+    account["fee_schedule_sha256"] = fees.contract_sha256
+    return fees
+
+
 def _fee_fields(value: FeeBreakdown) -> dict[str, float]:
     return {key: float(amount) for key, amount in value.components_dict().items()}
 
@@ -215,7 +234,13 @@ def apply_paper_trades(
     fee_schedule: FeeSchedule | None = None,
 ) -> list[dict[str, Any]]:
     trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
-    fees = _fee_schedule(fee_schedule, commission_rate, stamp_tax_rate, slippage_pct)
+    fees = record_active_fee_schedule(
+        account,
+        commission_rate=commission_rate,
+        stamp_tax_rate=stamp_tax_rate,
+        slippage_pct=slippage_pct,
+        fee_schedule=fee_schedule,
+    )
     rows_by_code = _row_map(rows)
     positions = account.setdefault("positions", {})
     events: list[dict[str, Any]] = []
@@ -316,8 +341,6 @@ def apply_paper_trades(
         events.append(event)
 
     account.setdefault("equity_curve", []).append({"date": trade_date, "equity": _equity(account)})
-    account["fee_schedule_version"] = fees.version
-    account["fee_schedule_sha256"] = fees.contract_sha256
     account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return events
 
@@ -386,6 +409,26 @@ def summarize_account(account: dict[str, Any]) -> dict[str, Any]:
         if fee_groups
         else _txt(account.get("fee_schedule_sha256")) or "not-applicable"
     )
+    active_version = (
+        _txt(account.get("active_fee_schedule_version"))
+        or _txt(account.get("fee_schedule_version"))
+        or "not-applicable"
+    )
+    active_hash = (
+        _txt(account.get("active_fee_schedule_sha256"))
+        or _txt(account.get("fee_schedule_sha256"))
+        or "not-applicable"
+    )
+    active_schedule = account.get("active_fee_schedule")
+    if not isinstance(active_schedule, dict):
+        active_schedule = {
+            "version": active_version,
+            "contract_sha256": active_hash,
+        }
+    historical_components = {
+        key: round(sum(_num(trade.get("fee_components", {}).get(key)) for trade in trades), 2)
+        for key in fee_keys
+    }
     return {
         "cash": round(_num(account.get("cash")), 2),
         "equity": _equity(account),
@@ -400,10 +443,14 @@ def summarize_account(account: dict[str, Any]) -> dict[str, Any]:
         "fee_schedule_versions": versions,
         "fee_schedule_sha256": summary_hash,
         "fee_components_by_schedule": ordered_fee_groups,
-        "fee_components": {
-            key: round(sum(_num(trade.get("fee_components", {}).get(key)) for trade in trades), 2)
-            for key in fee_keys
-        },
+        "fee_components": historical_components,
+        "active_fee_schedule_version": active_version,
+        "active_fee_schedule_sha256": active_hash,
+        "active_fee_schedule": dict(active_schedule),
+        "historical_fee_schedule_versions": versions,
+        "historical_fee_schedule_sha256": summary_hash,
+        "historical_fee_components_by_schedule": ordered_fee_groups,
+        "historical_fee_components": historical_components,
     }
 
 
@@ -431,5 +478,32 @@ def build_paper_trade_markdown(account: dict[str, Any], events: list[dict[str, A
             )
     else:
         lines.append("> 本轮无模拟成交，T+1、冷却或价格条件未满足。")
-    lines.insert(2, f"> Fee schedule: {summary['fee_schedule_version']}")
+    active = summary["active_fee_schedule"]
+    historical = summary["historical_fee_components"]
+    lines.insert(
+        2,
+        f"> Active fee schedule: {summary['active_fee_schedule_version']} | "
+        f"SHA-256: {summary['active_fee_schedule_sha256']}",
+    )
+    lines.insert(
+        3,
+        "> Active fee contract: "
+        f"commission B/S {active.get('buy_commission_rate', 'n/a')}/"
+        f"{active.get('sell_commission_rate', 'n/a')} | minimum B/S "
+        f"{active.get('buy_minimum_commission_yuan', 'n/a')}/"
+        f"{active.get('sell_minimum_commission_yuan', 'n/a')} | stamp "
+        f"{active.get('stamp_tax_rate', 'n/a')} | transfer "
+        f"{active.get('transfer_fee_rate', 'n/a')} | other "
+        f"{active.get('other_fee_rate', 'n/a')} | slippage B/S "
+        f"{active.get('buy_slippage_rate', 'n/a')}/{active.get('sell_slippage_rate', 'n/a')}",
+    )
+    lines.insert(
+        4,
+        "> Historical fee totals: "
+        f"commission {historical['commission_yuan']:.2f} | stamp "
+        f"{historical['stamp_tax_yuan']:.2f} | transfer "
+        f"{historical['transfer_fee_yuan']:.2f} | other "
+        f"{historical['other_fee_yuan']:.2f} | slippage "
+        f"{historical['slippage_yuan']:.2f}",
+    )
     return "\n".join(lines)
