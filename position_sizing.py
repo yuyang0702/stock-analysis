@@ -95,6 +95,7 @@ class SizingDecision:
     allowed: bool
     reasons: tuple[str, ...]
     target_qty: int
+    evaluated_qty: int
     position_value_yuan: Decimal
     buy_cash_required_yuan: Decimal
     buy_fee: FeeBreakdown | None
@@ -116,6 +117,169 @@ class SizingDecision:
     economic_trade_allowed: bool
     fee_schedule_version: str
     fee_schedule_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.allowed) is not bool or type(self.economic_trade_allowed) is not bool:
+            raise ValueError("decision statuses must be boolean")
+        if type(self.fee_schedule_version) is not str or type(self.fee_schedule_sha256) is not str:
+            raise ValueError("fee schedule identity must be text")
+        if type(self.reasons) is not tuple or any(type(reason) is not str for reason in self.reasons):
+            raise ValueError("reasons must be an ordered tuple of strings")
+        ordered = tuple(reason for reason in REASON_ORDER if reason in self.reasons)
+        if self.reasons != ordered or len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("reasons must be unique and use the fixed rejection order")
+        for name in ("target_qty", "evaluated_qty"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        decimal_names = (
+            "position_value_yuan", "buy_cash_required_yuan", "percentage_risk_yuan",
+            "risk_cap_yuan", "effective_per_trade_risk_yuan",
+            "remaining_open_risk_yuan", "planned_stop_loss_yuan", "gap_loss_yuan",
+            "worst_case_loss_yuan", "rule_target_price", "gross_edge_yuan",
+            "expected_net_pnl_yuan", "fee_erosion_ratio",
+            "cost_to_expected_edge_ratio",
+        )
+        for name in decimal_names:
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite():
+                raise ValueError(f"{name} must be a finite Decimal")
+        for name in (
+            "position_value_yuan", "buy_cash_required_yuan", "percentage_risk_yuan",
+            "risk_cap_yuan", "effective_per_trade_risk_yuan",
+            "remaining_open_risk_yuan", "planned_stop_loss_yuan", "gap_loss_yuan",
+            "worst_case_loss_yuan", "fee_erosion_ratio", "cost_to_expected_edge_ratio",
+        ):
+            if getattr(self, name) < ZERO:
+                raise ValueError(f"{name} must be non-negative")
+        if self.effective_per_trade_risk_yuan != min(
+            self.percentage_risk_yuan, self.risk_cap_yuan
+        ):
+            raise ValueError("effective_per_trade_risk_yuan does not match its limits")
+        if self.allowed:
+            if self.reasons or self.target_qty <= 0 or self.target_qty != self.evaluated_qty:
+                raise ValueError("allowed decision quantity and reasons are inconsistent")
+            if not self.economic_trade_allowed:
+                raise ValueError("allowed decision must pass economics")
+        elif self.target_qty != 0 or not self.reasons:
+            raise ValueError("rejected decision must have zero target and ordered reasons")
+
+        if self.evaluated_qty == 0:
+            if "FEE_SCHEDULE_REQUIRED" not in self.reasons:
+                raise ValueError("zero evaluated quantity is only valid without a fee schedule")
+            if self.economic_trade_allowed or self.fee_schedule_version or self.fee_schedule_sha256:
+                raise ValueError("missing-fee rejection cannot claim fee or economic evidence")
+            if any(
+                value is not None
+                for value in (
+                    self.buy_fee, self.planned_stop_cost, self.gap_cost, self.target_cost,
+                )
+            ):
+                raise ValueError("missing-fee rejection cannot carry fee evidence")
+            for name in (
+                "position_value_yuan", "buy_cash_required_yuan", "planned_stop_loss_yuan",
+                "gap_loss_yuan", "worst_case_loss_yuan", "gross_edge_yuan",
+                "expected_net_pnl_yuan", "fee_erosion_ratio",
+                "cost_to_expected_edge_ratio",
+            ):
+                if getattr(self, name) != ZERO:
+                    raise ValueError(f"{name} must be zero without an evaluated quantity")
+            return
+
+        if "FEE_SCHEDULE_REQUIRED" in self.reasons:
+            raise ValueError("evaluated evidence cannot report a missing fee schedule")
+        if not isinstance(self.buy_fee, FeeBreakdown):
+            raise ValueError("evaluated evidence requires a buy fee")
+        if (
+            self.buy_fee.qty != self.evaluated_qty
+            or self.position_value_yuan != self.buy_fee.price * self.evaluated_qty
+            or self.buy_cash_required_yuan
+            != self.position_value_yuan + self.buy_fee.total_yuan
+        ):
+            raise ValueError("buy quantity, value and cash evidence are inconsistent")
+        if (
+            self.fee_schedule_version != self.buy_fee.schedule_version
+            or self.fee_schedule_sha256 != self.buy_fee.fee_schedule_sha256
+        ):
+            raise ValueError("fee schedule identity does not match buy evidence")
+
+        def validate_cost(cost: RoundTripCost | None, name: str) -> RoundTripCost:
+            if not isinstance(cost, RoundTripCost):
+                raise ValueError(f"{name} must be a RoundTripCost")
+            if cost.buy != self.buy_fee or cost.buy.qty != self.evaluated_qty:
+                raise ValueError(f"{name} does not match evaluated buy evidence")
+            if (
+                cost.buy.schedule_version != self.fee_schedule_version
+                or cost.buy.fee_schedule_sha256 != self.fee_schedule_sha256
+            ):
+                raise ValueError(f"{name} uses a different fee schedule")
+            return cost
+
+        invalid_stop = "INVALID_STOP_DISTANCE" in self.reasons
+        if invalid_stop:
+            if self.planned_stop_cost is not None or self.gap_cost is not None:
+                raise ValueError("invalid stop rejection cannot carry loss-scenario costs")
+            if any(
+                amount != ZERO
+                for amount in (
+                    self.planned_stop_loss_yuan,
+                    self.gap_loss_yuan,
+                    self.worst_case_loss_yuan,
+                )
+            ):
+                raise ValueError("invalid stop rejection cannot carry scenario losses")
+        else:
+            planned = validate_cost(self.planned_stop_cost, "planned_stop_cost")
+            gap = validate_cost(self.gap_cost, "gap_cost")
+            planned_loss = scenario_loss_yuan(
+                self.buy_fee.price, planned.sell.price, self.evaluated_qty, planned
+            )
+            gap_loss = scenario_loss_yuan(
+                self.buy_fee.price, gap.sell.price, self.evaluated_qty, gap
+            )
+            if (
+                self.planned_stop_loss_yuan != planned_loss
+                or self.gap_loss_yuan != gap_loss
+                or self.worst_case_loss_yuan != max(planned_loss, gap_loss)
+            ):
+                raise ValueError("loss-scenario evidence is not reproducible")
+            if (
+                ("PER_TRADE_RISK_EXCEEDED" in self.reasons)
+                != (self.worst_case_loss_yuan > self.effective_per_trade_risk_yuan)
+                or ("PORTFOLIO_OPEN_RISK_EXCEEDED" in self.reasons)
+                != (self.worst_case_loss_yuan > self.remaining_open_risk_yuan)
+            ):
+                raise ValueError("risk rejection reasons do not match scenario loss")
+
+        entry_price = self.buy_fee.price
+        if self.gross_edge_yuan != (self.rule_target_price - entry_price) * self.evaluated_qty:
+            raise ValueError("gross edge does not match evaluated quantity and target")
+        if self.rule_target_price > ZERO:
+            target = validate_cost(self.target_cost, "target_cost")
+            if target.sell.price != self.rule_target_price:
+                raise ValueError("target cost price does not match rule target")
+            if self.expected_net_pnl_yuan != self.gross_edge_yuan - target.total_yuan:
+                raise ValueError("expected net PnL is not reproducible")
+            if self.fee_erosion_ratio != _ratio(target.total_yuan, self.position_value_yuan):
+                raise ValueError("fee erosion ratio is not reproducible")
+            if self.cost_to_expected_edge_ratio != _ratio(
+                target.total_yuan, self.gross_edge_yuan
+            ):
+                raise ValueError("cost-to-edge ratio is not reproducible")
+        elif (
+            self.target_cost is not None
+            or self.expected_net_pnl_yuan != ZERO
+            or self.fee_erosion_ratio != ZERO
+            or self.cost_to_expected_edge_ratio != ZERO
+        ):
+            raise ValueError("non-positive target cannot carry target-cost economics")
+        if self.economic_trade_allowed:
+            if self.gross_edge_yuan <= ZERO or self.expected_net_pnl_yuan <= ZERO:
+                raise ValueError("economic approval requires positive edge and net PnL")
+            if "ECONOMIC_EDGE_INSUFFICIENT" in self.reasons:
+                raise ValueError("economic approval conflicts with rejection reason")
+        elif "ECONOMIC_EDGE_INSUFFICIENT" not in self.reasons:
+            raise ValueError("failed economics requires its stable rejection reason")
 
 
 @dataclass(frozen=True)
@@ -146,7 +310,7 @@ def _empty_decision(
     target_price: Decimal,
 ) -> SizingDecision:
     return SizingDecision(
-        False, reasons, 0, ZERO, ZERO, None, percentage_risk, policy.risk_cap_yuan,
+        False, reasons, 0, 0, ZERO, ZERO, None, percentage_risk, policy.risk_cap_yuan,
         min(percentage_risk, policy.risk_cap_yuan), capacity.remaining_open_risk_yuan,
         None, None, None, ZERO, ZERO, ZERO, target_price, ZERO, ZERO,
         ZERO.quantize(RATIO_QUANTUM), ZERO.quantize(RATIO_QUANTUM), False, "", "",
@@ -166,6 +330,7 @@ def _decision(
         allowed=allowed,
         reasons=() if allowed else reasons,
         target_qty=evidence.qty if allowed else 0,
+        evaluated_qty=evidence.qty,
         position_value_yuan=evidence.position_value,
         buy_cash_required_yuan=evidence.cash_required,
         buy_fee=evidence.buy_fee,
@@ -218,6 +383,10 @@ def allocate_buy_quantity(
     percentage_risk = _money(equity_amount * policy.risk_pct)
     effective_risk = min(percentage_risk, policy.risk_cap_yuan)
     target_price = entry * (Decimal("1") + policy.expected_gross_return)
+    minimum_valid_qty = (
+        (rules.buy_min_qty + rules.buy_qty_step - 1) // rules.buy_qty_step
+        * rules.buy_qty_step
+    )
     max_aligned = capacity.max_qty // rules.buy_qty_step * rules.buy_qty_step
 
     try:
@@ -231,11 +400,11 @@ def allocate_buy_quantity(
     base = {
         "FEE_SCHEDULE_REQUIRED": fees is None,
         "INVALID_STOP_DISTANCE": not loss_prices_valid,
-        "NO_BOARD_LOT": max_aligned < rules.buy_min_qty,
+        "NO_BOARD_LOT": max_aligned < minimum_valid_qty,
     }
     if fees is not None and not isinstance(fees, FeeSchedule):
         raise ValueError("fees must be FeeSchedule or None")
-    entry_rule_errors = rules.validate_order("buy", rules.buy_min_qty, entry)
+    entry_rule_errors = rules.validate_order("buy", minimum_valid_qty, entry)
     if entry_rule_errors:
         raise ValueError(f"entry order violates instrument rules: {', '.join(entry_rule_errors)}")
     if fees is None:
@@ -243,6 +412,9 @@ def allocate_buy_quantity(
         return _empty_decision(reasons, policy, capacity, percentage_risk, target_price)
 
     def evidence(qty: int) -> _Evidence:
+        entry_errors = rules.validate_order("buy", qty, entry)
+        if entry_errors:
+            raise ValueError(f"entry order violates instrument rules: {', '.join(entry_errors)}")
         position_value = entry * qty
         buy_fee = fees.estimate("buy", entry, qty)
         cash_required = position_value + buy_fee.total_yuan
@@ -289,13 +461,13 @@ def allocate_buy_quantity(
         }
 
     if not any(base.values()):
-        for qty in range(max_aligned, rules.buy_min_qty - 1, -rules.buy_qty_step):
+        for qty in range(max_aligned, minimum_valid_qty - 1, -rules.buy_qty_step):
             item = evidence(qty)
             current = failures(item)
             if not any(current.values()):
                 return _decision(True, (), item, policy, capacity, percentage_risk, fees)
 
-    audited = evidence(rules.buy_min_qty)
+    audited = evidence(minimum_valid_qty)
     rejected = failures(audited)
     reasons = tuple(reason for reason in REASON_ORDER if rejected.get(reason, False))
     return _decision(False, reasons, audited, policy, capacity, percentage_risk, fees)
