@@ -102,7 +102,7 @@ class SignalWatchlistTest(unittest.TestCase):
                 row,
                 kind="强势",
                 mode="intraday",
-                pushed_at=datetime(2026, 7, 6, 10, 30),
+                pushed_at=datetime.now().replace(microsecond=0),
             )
 
             data = strat.load_signal_watchlist(path)
