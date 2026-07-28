@@ -4,6 +4,9 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
+from backtest_engine import BacktestConfig, BacktestEngine
 from execution_contracts import FeeSchedule
 
 from historical_backtest import (
@@ -20,6 +23,7 @@ from historical_backtest import (
 )
 from historical_data import HistoricalStore
 from historical_strategy import Candidate
+from paper_trading import apply_paper_trades, new_account, summarize_account
 
 
 class HistoricalBacktestTest(unittest.TestCase):
@@ -27,7 +31,8 @@ class HistoricalBacktestTest(unittest.TestCase):
         fees = FeeSchedule(
             version="test-v1", effective_from="2026-01-01",
             buy_commission_rate=Decimal("0.0003"), sell_commission_rate=Decimal("0.0003"),
-            minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
+            buy_minimum_commission_yuan=Decimal("5"),
+            sell_minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
             transfer_fee_rate=Decimal("0.00001"), other_fee_rate=Decimal("0"),
             buy_slippage_rate=Decimal("0.001"), sell_slippage_rate=Decimal("0.001"),
         )
@@ -41,6 +46,7 @@ class HistoricalBacktestTest(unittest.TestCase):
                 result = run_historical_backtest(store, "d1", "2025-01-02", "2025-01-03", config)
 
         self.assertEqual(result.metadata["fee_schedule_version"], "test-v1")
+        self.assertEqual(result.metadata["fee_schedule_sha256"], fees.contract_sha256)
         self.assertEqual(result.trades[0].price, 10.0)
         self.assertEqual(result.trades[0].fee, 6.01)
         self.assertEqual(result.trades[0].fee_components, {
@@ -69,8 +75,108 @@ class HistoricalBacktestTest(unittest.TestCase):
                 )
         return store
 
-    def _candidate(self, stop: float = 9.0) -> Candidate:
-        return Candidate("600000", 90, 10, 10, stop, 12, 0.3, "short", "NORMAL", "bank", "value", {"proxy_only": True})
+    def _candidate(
+        self, stop: float = 9.0, *, take_profit: float = 12.0, position_pct: float = 10.0
+    ) -> Candidate:
+        return Candidate(
+            "600000", 90, position_pct, 10, stop, take_profit, 0.3,
+            "short", "NORMAL", "bank", "value", {"proxy_only": True},
+        )
+
+    def test_partial_exits_allocate_all_entry_cost_exactly_once(self) -> None:
+        fees = FeeSchedule.simulation(
+            version="partial-v1", transfer_fee_rate=0, other_fee_rate=0
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(
+                Path(tmp),
+                [
+                    ("2025-01-02", 10, 10.1, 9.9, 10, 0, 11, 9),
+                    ("2025-01-03", 10, 10.2, 9.9, 10, 0, 11, 9),
+                    ("2025-01-06", 11, 11.2, 10.5, 11, 0, 12, 9),
+                    ("2025-01-07", 8.8, 9, 8.5, 8.8, 0, 9.6, 8),
+                ],
+            )
+            candidate = self._candidate(take_profit=11, position_pct=20)
+            with patch(
+                "historical_backtest.generate_daily_candidates",
+                side_effect=[[candidate], [], [], []],
+            ):
+                result = run_historical_backtest(
+                    store, "d1", "2025-01-02", "2025-01-07",
+                    HistoricalBacktestConfig(initial_cash=10_000, fee_schedule=fees),
+                )
+
+        buy = next(trade for trade in result.trades if trade.action == "buy")
+        sells = [trade for trade in result.trades if trade.action == "sell"]
+        self.assertEqual([trade.quantity for trade in sells], [100, 100])
+        self.assertEqual(
+            round(sum(trade.entry_fee_allocated_yuan for trade in sells), 2), buy.fee
+        )
+
+    def test_three_engines_share_one_lot_and_round_trip_net_pnl(self) -> None:
+        fees = FeeSchedule.simulation(
+            version="engine-equality-v1", transfer_fee_rate=0, other_fee_rate=0
+        )
+        signal = BacktestEngine(
+            BacktestConfig(initial_cash=10_000, fee_schedule=fees)
+        ).run(
+            [
+                {"date": "2025-01-03", "code": "600000", "action": "buy", "price": 10,
+                 "entry_price": 10, "position_pct": 10},
+                {"date": "2025-01-06", "code": "600000", "action": "sell", "price": 10.1},
+            ]
+        )
+
+        account = new_account(10_000)
+        apply_paper_trades(
+            account,
+            pd.DataFrame([{"code": "600000", "price": 10, "entry_price": 10,
+                           "stop_loss": 9, "take_profit": 10.1, "position_pct": 10,
+                           "final_score": 90}]),
+            trade_date="2025-01-03", fee_schedule=fees,
+        )
+        paper_sell = apply_paper_trades(
+            account,
+            pd.DataFrame([{"code": "600000", "price": 10.1,
+                           "stop_loss": 9, "take_profit": 10.1}]),
+            trade_date="2025-01-06", fee_schedule=fees,
+        )[0]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(
+                Path(tmp),
+                [
+                    ("2025-01-02", 10, 10, 9.9, 10, 0, 11, 9),
+                    ("2025-01-03", 10, 10, 9.9, 10, 0, 11, 9),
+                    ("2025-01-06", 10.1, 10.1, 10, 10.1, 0, 11, 9),
+                ],
+            )
+            candidate = self._candidate(take_profit=10.1)
+            with patch(
+                "historical_backtest.generate_daily_candidates",
+                side_effect=[[candidate], [], []],
+            ):
+                historical = run_historical_backtest(
+                    store, "d1", "2025-01-02", "2025-01-06",
+                    HistoricalBacktestConfig(initial_cash=10_000, fee_schedule=fees),
+                )
+
+        quantities = [
+            signal.trades[0]["qty"],
+            account["trades"][0]["qty"],
+            historical.trades[0].quantity,
+        ]
+        pnls = [
+            signal.trades[-1]["pnl"],
+            paper_sell["pnl"],
+            historical.trades[-1].pnl,
+        ]
+        self.assertEqual(quantities, [100, 100, 100])
+        self.assertEqual(pnls, [-2.52, -2.52, -2.52])
+        metrics = compute_metrics(historical.equity, historical.trades)
+        self.assertEqual(metrics.win_rate, 0)
+        self.assertEqual(metrics.profit_factor, 0)
 
     def test_close_decision_executes_next_open_with_lot_slippage_and_fee(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,10 +190,10 @@ class HistoricalBacktestTest(unittest.TestCase):
             trade = result.trades[0]
             self.assertEqual(trade.decision_date, "2025-01-02")
             self.assertEqual(trade.trade_date, "2025-01-03")
-            self.assertEqual(trade.quantity, 900)
+            self.assertEqual(trade.quantity, 1000)
             self.assertEqual(trade.price, 10.0)
-            self.assertEqual(trade.fee, 14.0)
-            self.assertEqual(trade.slippage_yuan, 9.0)
+            self.assertEqual(trade.fee, 15.0)
+            self.assertEqual(trade.slippage_yuan, 10.0)
 
     def test_suspension_and_limit_up_block_buy(self) -> None:
         for suspended, limit_up in [(1, 11), (0, 10)]:
@@ -117,7 +223,7 @@ class HistoricalBacktestTest(unittest.TestCase):
             self.assertEqual(sell.action, "sell")
             self.assertEqual(sell.reason, "HARD_STOP")
             self.assertEqual(sell.price, 8.0)
-            self.assertEqual(sell.slippage_yuan, 7.2)
+            self.assertEqual(sell.slippage_yuan, 8.0)
 
     def test_same_bar_stop_wins_and_first_profit_takes_only_half(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -204,6 +310,42 @@ class HistoricalBacktestTest(unittest.TestCase):
         self.assertEqual(comparison["status"], "COMPARISON_CONTRACT_MISMATCH")
         self.assertIn("dataset_hash", comparison["mismatches"])
 
+    def test_comparison_rejects_different_fee_contract_hashes(self) -> None:
+        common = {"dataset_hash": "a", "window": "w"}
+        baseline = HistoricalBacktestResult(
+            metadata={**common, "fee_schedule_sha256": "a" * 64}
+        )
+        candidate = HistoricalBacktestResult(
+            metadata={**common, "fee_schedule_sha256": "b" * 64}
+        )
+
+        comparison = compare_results(baseline, candidate)
+
+        self.assertEqual(comparison["status"], "COMPARISON_CONTRACT_MISMATCH")
+        self.assertIn("fee_schedule_sha256", comparison["mismatches"])
+
+        version_only = compare_results(
+            HistoricalBacktestResult(metadata={**common, "fee_schedule_version": "v1"}),
+            HistoricalBacktestResult(metadata={**common, "fee_schedule_version": "v2"}),
+        )
+        self.assertEqual(version_only["status"], "COMPARISON_CONTRACT_MISMATCH")
+        self.assertIn("fee_schedule_version", version_only["mismatches"])
+
+        for fee_hash in (None, "x"):
+            with self.subTest(fee_hash=fee_hash):
+                metadata = {
+                    **common, "fee_schedule_version": "v1",
+                    "fee_schedule_sha256": fee_hash,
+                }
+                invalid = compare_results(
+                    HistoricalBacktestResult(metadata=metadata),
+                    HistoricalBacktestResult(metadata=metadata),
+                )
+                self.assertEqual(
+                    invalid["status"], "COMPARISON_CONTRACT_MISMATCH"
+                )
+                self.assertIn("fee_schedule_sha256", invalid["mismatches"])
+
     def test_group_metrics_is_bounded_and_sensitivity_changes_execution_only(self) -> None:
         trades = [
             HistoricalTrade("2025-01-01", "2025-01-02", f"{i:06d}", "sell", 100, 10, 0, "X", i - 2, strategy_mode="short", market_regime="NORMAL", score=80 + i, industry=str(i), theme="unknown")
@@ -220,6 +362,9 @@ class HistoricalBacktestTest(unittest.TestCase):
         matrix = sensitivity_matrix(factory, HistoricalBacktestConfig())
         self.assertEqual(set(matrix), {"zero_slippage", "base", "double_slippage", "double_fees"})
         self.assertTrue(all(item.mode == HistoricalBacktestConfig().mode for item in seen))
+        schedules = [item.resolved_fee_schedule() for item in seen]
+        self.assertEqual(len({item.version for item in schedules}), 4)
+        self.assertEqual(len({item.contract_sha256 for item in schedules}), 4)
 
     def test_short_time_stop_decides_at_close_and_sells_next_open(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

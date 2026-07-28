@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, fields, is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from types import MappingProxyType
 from typing import Mapping
@@ -16,7 +16,14 @@ CENT = Decimal("0.01")
 ZERO = Decimal("0")
 
 
-def _decimal(value: object, name: str, *, positive: bool = False, optional: bool = False) -> Decimal | None:
+def _decimal(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    optional: bool = False,
+    signed: bool = False,
+) -> Decimal | None:
     if value is None and optional:
         return None
     if isinstance(value, bool):
@@ -25,8 +32,8 @@ def _decimal(value: object, name: str, *, positive: bool = False, optional: bool
         result = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError) as error:
         raise ValueError(f"{name} must be a finite decimal") from error
-    if not result.is_finite() or result < 0 or (positive and result <= 0):
-        qualifier = "positive" if positive else "non-negative"
+    if not result.is_finite() or (not signed and result < 0) or (positive and result <= 0):
+        qualifier = "positive" if positive else "finite" if signed else "non-negative"
         raise ValueError(f"{name} must be a finite {qualifier} decimal")
     return result
 
@@ -68,7 +75,7 @@ def _timestamp(value: object, name: str) -> str:
         raise ValueError(f"{name} must be an ISO-8601 timestamp") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"{name} must include a timezone")
-    return result
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _qty(value: object, name: str, *, positive: bool = False) -> int:
@@ -215,6 +222,106 @@ def _sha256_text(value: object, name: str) -> str:
     return result
 
 
+_OPEN_ORDER_FIELDS = frozenset(
+    {
+        "client_order_id",
+        "broker_order_id",
+        "stock_code",
+        "side",
+        "target_qty",
+        "filled_qty",
+        "status",
+        "updated_at",
+    }
+)
+_OPEN_ORDER_STATUSES = frozenset(
+    {"submit_unknown", "submitted", "partially_filled", "pending_cancel"}
+)
+_FILL_FIELDS = frozenset(
+    {
+        "broker_fill_id",
+        "client_order_id",
+        "broker_order_id",
+        "stock_code",
+        "side",
+        "qty",
+        "price",
+        "commission_yuan",
+        "stamp_tax_yuan",
+        "transfer_fee_yuan",
+        "other_fee_yuan",
+        "fee_data_status",
+        "filled_at",
+    }
+)
+
+
+def _record_mapping(value: object, name: str) -> dict[str, object]:
+    if isinstance(value, Mapping):
+        payload = value
+    elif callable(getattr(value, "to_dict", None)):
+        payload = value.to_dict()
+    else:
+        raise ValueError(f"{name} must be a normalized mapping")
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name}.to_dict() must return a mapping")
+    return dict(payload)
+
+
+def _normalize_open_order(value: object) -> Mapping[str, object]:
+    payload = _record_mapping(value, "open order")
+    if set(payload) != _OPEN_ORDER_FIELDS:
+        raise ValueError("open order fields do not match the normalized contract")
+    target_qty = _qty(payload["target_qty"], "target_qty", positive=True)
+    filled_qty = _qty(payload["filled_qty"], "filled_qty")
+    if filled_qty >= target_qty:
+        raise ValueError("open order filled_qty must be below target_qty")
+    status = _text(payload["status"], "status").lower()
+    if status not in _OPEN_ORDER_STATUSES:
+        raise ValueError("open order status is not normalized")
+    broker_order_id = payload["broker_order_id"]
+    if broker_order_id is not None or status != "submit_unknown":
+        broker_order_id = _text(broker_order_id, "broker_order_id")
+    return _freeze(
+        {
+            "client_order_id": _text(payload["client_order_id"], "client_order_id"),
+            "broker_order_id": broker_order_id,
+            "stock_code": _text(payload["stock_code"], "stock_code"),
+            "side": _side(payload["side"]),
+            "target_qty": target_qty,
+            "filled_qty": filled_qty,
+            "status": status,
+            "updated_at": _timestamp(payload["updated_at"], "updated_at"),
+        }
+    )
+
+
+def _normalize_fill(value: object) -> Mapping[str, object]:
+    payload = _record_mapping(value, "fill")
+    if set(payload) != _FILL_FIELDS:
+        raise ValueError("fill fields do not match the normalized contract")
+    fee_status = _text(payload["fee_data_status"], "fee_data_status").lower()
+    if fee_status not in {"reported", "unknown"}:
+        raise ValueError("fill fee_data_status is not normalized")
+    return _freeze(
+        {
+            "broker_fill_id": _text(payload["broker_fill_id"], "broker_fill_id"),
+            "client_order_id": _text(payload["client_order_id"], "client_order_id"),
+            "broker_order_id": _text(payload["broker_order_id"], "broker_order_id"),
+            "stock_code": _text(payload["stock_code"], "stock_code"),
+            "side": _side(payload["side"]),
+            "qty": _qty(payload["qty"], "qty", positive=True),
+            "price": _decimal(payload["price"], "price", positive=True),
+            "commission_yuan": _decimal(payload["commission_yuan"], "commission_yuan"),
+            "stamp_tax_yuan": _decimal(payload["stamp_tax_yuan"], "stamp_tax_yuan"),
+            "transfer_fee_yuan": _decimal(payload["transfer_fee_yuan"], "transfer_fee_yuan"),
+            "other_fee_yuan": _decimal(payload["other_fee_yuan"], "other_fee_yuan"),
+            "fee_data_status": fee_status,
+            "filled_at": _timestamp(payload["filled_at"], "filled_at"),
+        }
+    )
+
+
 @dataclass(frozen=True)
 class FeeBreakdown:
     schedule_version: str
@@ -332,7 +439,8 @@ class FeeSchedule:
     effective_from: str
     buy_commission_rate: Decimal
     sell_commission_rate: Decimal
-    minimum_commission_yuan: Decimal
+    buy_minimum_commission_yuan: Decimal
+    sell_minimum_commission_yuan: Decimal
     stamp_tax_rate: Decimal
     transfer_fee_rate: Decimal
     other_fee_rate: Decimal
@@ -345,7 +453,8 @@ class FeeSchedule:
         for name in (
             "buy_commission_rate",
             "sell_commission_rate",
-            "minimum_commission_yuan",
+            "buy_minimum_commission_yuan",
+            "sell_minimum_commission_yuan",
             "stamp_tax_rate",
             "transfer_fee_rate",
             "other_fee_rate",
@@ -362,6 +471,8 @@ class FeeSchedule:
         effective_from: str = "2026-01-01",
         commission_rate: object = "0.0003",
         minimum_commission_yuan: object = "5",
+        buy_minimum_commission_yuan: object | None = None,
+        sell_minimum_commission_yuan: object | None = None,
         stamp_tax_rate: object = "0.0005",
         slippage_rate: object = "0.001",
         transfer_fee_rate: object = "0",
@@ -372,7 +483,16 @@ class FeeSchedule:
             effective_from=effective_from,
             buy_commission_rate=commission_rate,
             sell_commission_rate=commission_rate,
-            minimum_commission_yuan=minimum_commission_yuan,
+            buy_minimum_commission_yuan=(
+                minimum_commission_yuan
+                if buy_minimum_commission_yuan is None
+                else buy_minimum_commission_yuan
+            ),
+            sell_minimum_commission_yuan=(
+                minimum_commission_yuan
+                if sell_minimum_commission_yuan is None
+                else sell_minimum_commission_yuan
+            ),
             stamp_tax_rate=stamp_tax_rate,
             transfer_fee_rate=transfer_fee_rate,
             other_fee_rate=other_fee_rate,
@@ -388,7 +508,12 @@ class FeeSchedule:
         commission_rate = (
             self.buy_commission_rate if normalized_side == "buy" else self.sell_commission_rate
         )
-        commission_raw = max(self.minimum_commission_yuan, notional * commission_rate) if qty else ZERO
+        minimum_commission = (
+            self.buy_minimum_commission_yuan
+            if normalized_side == "buy"
+            else self.sell_minimum_commission_yuan
+        )
+        commission_raw = max(minimum_commission, notional * commission_rate) if qty else ZERO
         stamp_raw = notional * self.stamp_tax_rate if normalized_side == "sell" else ZERO
         transfer_raw = notional * self.transfer_fee_rate
         other_raw = notional * self.other_fee_rate
@@ -426,9 +551,28 @@ class FeeSchedule:
     def to_dict(self) -> dict[str, object]:
         return _record_dict(self)
 
+    @property
+    def contract_sha256(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    def derive_variant(self, label: str, **changes: object) -> FeeSchedule:
+        values = self.to_dict()
+        values.update(changes)
+        values.pop("version", None)
+        suffix = canonical_sha256(values)[:12]
+        return FeeSchedule(version=f"{self.version}-{_text(label, 'label')}-{suffix}", **values)
+
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> FeeSchedule:
-        return cls(**dict(value))
+        values = dict(value)
+        expected = values.pop("contract_sha256", None)
+        legacy_minimum = values.pop("minimum_commission_yuan", None)
+        if legacy_minimum is not None:
+            values.setdefault("buy_minimum_commission_yuan", legacy_minimum)
+            values.setdefault("sell_minimum_commission_yuan", legacy_minimum)
+        result = cls(**values)
+        _verify_hash(expected, result.contract_sha256, "fee schedule")
+        return result
 
 
 @dataclass(frozen=True)
@@ -586,7 +730,10 @@ class QuoteSnapshot:
     @classmethod
     def from_values(cls, *, snapshot_id: str | None = None, **values: object) -> QuoteSnapshot:
         if snapshot_id is None:
-            snapshot_id = f"quote-{canonical_sha256(values)[:20]}"
+            normalized = cls(snapshot_id="generated", **values).to_dict()
+            normalized.pop("snapshot_id")
+            normalized.pop("quote_sha256")
+            snapshot_id = f"quote-{canonical_sha256(normalized)[:20]}"
         return cls(snapshot_id=snapshot_id, **values)
 
     def to_dict(self) -> dict[str, object]:
@@ -672,9 +819,13 @@ class BrokerSnapshot:
             "cash",
             "available_cash",
             "frozen_cash",
-            "account_drawdown_pct",
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        object.__setattr__(
+            self,
+            "account_drawdown_pct",
+            _decimal(self.account_drawdown_pct, "account_drawdown_pct", signed=True),
+        )
         intraday = self.intraday_pnl if isinstance(self.intraday_pnl, Decimal) else Decimal(str(self.intraday_pnl))
         if not intraday.is_finite():
             raise ValueError("intraday_pnl must be finite")
@@ -687,9 +838,26 @@ class BrokerSnapshot:
         )
         if len({item.code for item in positions}) != len(positions):
             raise ValueError("duplicate broker position code")
+        positions = tuple(sorted(positions, key=lambda item: item.code))
         object.__setattr__(self, "positions", positions)
-        object.__setattr__(self, "open_orders", tuple(_freeze(item) for item in self.open_orders))
-        object.__setattr__(self, "fills", tuple(_freeze(item) for item in self.fills))
+        open_orders = tuple(
+            sorted(
+                (_normalize_open_order(item) for item in self.open_orders),
+                key=lambda item: (item["client_order_id"], item["broker_order_id"] or ""),
+            )
+        )
+        fills = tuple(
+            sorted(
+                (_normalize_fill(item) for item in self.fills),
+                key=lambda item: item["broker_fill_id"],
+            )
+        )
+        if len({item["client_order_id"] for item in open_orders}) != len(open_orders):
+            raise ValueError("duplicate broker open-order client_order_id")
+        if len({item["broker_fill_id"] for item in fills}) != len(fills):
+            raise ValueError("duplicate broker fill ID")
+        object.__setattr__(self, "open_orders", open_orders)
+        object.__setattr__(self, "fills", fills)
         content = _record_dict(self)
         content.pop("snapshot_sha256")
         actual = canonical_sha256(content)
@@ -706,7 +874,14 @@ class BrokerSnapshot:
     ) -> BrokerSnapshot:
         generated_at = generated_at or str(values["broker_time"])
         if snapshot_id is None:
-            snapshot_id = f"broker-{canonical_sha256({**values, 'generated_at': generated_at})[:20]}"
+            normalized = cls(
+                snapshot_id="generated", generated_at=generated_at, **values
+            ).to_dict()
+            normalized.pop("snapshot_id")
+            normalized.pop("snapshot_sha256")
+            snapshot_id = f"broker-{canonical_sha256(normalized)[:20]}"
+            normalized["snapshot_id"] = snapshot_id
+            return cls.from_dict(normalized)
         return cls(snapshot_id=snapshot_id, generated_at=generated_at, **values)
 
     def to_dict(self) -> dict[str, object]:
@@ -788,6 +963,7 @@ class StrategyOrderCandidate:
 class PreTradeResult:
     pre_trade_result_id: str
     candidate_id: str
+    candidate: StrategyOrderCandidate
     allowed: bool
     hard_blocks: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -822,6 +998,18 @@ class PreTradeResult:
             "strategy_version",
         ):
             object.__setattr__(self, name, _text(getattr(self, name), name))
+        candidate = (
+            self.candidate
+            if isinstance(self.candidate, StrategyOrderCandidate)
+            else StrategyOrderCandidate.from_dict(self.candidate)
+        )
+        if candidate.candidate_id != self.candidate_id:
+            raise ValueError("candidate_id does not match normalized candidate")
+        if candidate.fee_schedule_version != self.fee_schedule_version:
+            raise ValueError("fee_schedule_version does not match normalized candidate")
+        if candidate.strategy_version != self.strategy_version:
+            raise ValueError("strategy_version does not match normalized candidate")
+        object.__setattr__(self, "candidate", candidate)
         object.__setattr__(self, "hard_blocks", tuple(_text(item, "hard block") for item in self.hard_blocks))
         object.__setattr__(self, "warnings", tuple(_text(item, "warning") for item in self.warnings))
         if self.allowed and self.hard_blocks:
@@ -860,14 +1048,13 @@ class PreTradeResult:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> PreTradeResult:
         values = dict(value)
+        candidate = values.get("candidate")
+        if isinstance(candidate, Mapping):
+            values["candidate"] = StrategyOrderCandidate.from_dict(candidate)
         cost = values.get("round_trip_cost")
         if isinstance(cost, Mapping):
-            values["round_trip_cost"] = _round_trip_from_dict(cost)
+            values["round_trip_cost"] = RoundTripCost.from_dict(cost)
         return cls(**values)
-
-
-def _round_trip_from_dict(value: Mapping[str, object]) -> RoundTripCost:
-    return RoundTripCost.from_dict(value)
 
 
 @dataclass(frozen=True)
@@ -918,12 +1105,15 @@ class ExecutionIntent:
             "fee_schedule_version",
             "code",
             "broker_snapshot_id",
-            "broker_snapshot_sha256",
             "quote_snapshot_id",
+        ):
+            object.__setattr__(self, name, _text(getattr(self, name), name))
+        for name in (
+            "broker_snapshot_sha256",
             "quote_snapshot_sha256",
             "instrument_rules_sha256",
         ):
-            object.__setattr__(self, name, _text(getattr(self, name), name))
+            object.__setattr__(self, name, _sha256_text(getattr(self, name), name))
         object.__setattr__(self, "side", _side(self.side))
         object.__setattr__(self, "order_qty", _qty(self.order_qty, "order_qty", positive=True))
         for name in ("expected_current_qty", "target_position_qty"):

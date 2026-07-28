@@ -96,13 +96,20 @@ def _fee_schedule(
     ):
         return base
     no_costs = commission_rate == stamp_tax_rate == slippage_pct == 0
-    return FeeSchedule.simulation(
-        version=f"{base.version}-paper-compat",
-        effective_from=base.effective_from,
-        commission_rate=commission_rate,
-        minimum_commission_yuan=0 if no_costs or commission_rate == 0 else base.minimum_commission_yuan,
+    minimums = (
+        (0, 0)
+        if no_costs or commission_rate == 0
+        else (base.buy_minimum_commission_yuan, base.sell_minimum_commission_yuan)
+    )
+    return base.derive_variant(
+        "paper-compat",
+        buy_commission_rate=commission_rate,
+        sell_commission_rate=commission_rate,
+        buy_minimum_commission_yuan=minimums[0],
+        sell_minimum_commission_yuan=minimums[1],
         stamp_tax_rate=stamp_tax_rate,
-        slippage_rate=slippage_pct,
+        buy_slippage_rate=slippage_pct,
+        sell_slippage_rate=slippage_pct,
         transfer_fee_rate=0 if no_costs else base.transfer_fee_rate,
         other_fee_rate=0 if no_costs else base.other_fee_rate,
     )
@@ -247,6 +254,7 @@ def apply_paper_trades(
             "amount": proceeds,
             "fees": fee_total,
             "fee_schedule_version": fees.version,
+            "fee_schedule_sha256": fees.contract_sha256,
             "fee_components": _fee_fields(breakdown),
             "pnl": pnl,
             "reason": reason,
@@ -299,6 +307,7 @@ def apply_paper_trades(
             "amount": cost,
             "fees": fee_total,
             "fee_schedule_version": fees.version,
+            "fee_schedule_sha256": fees.contract_sha256,
             "fee_components": _fee_fields(breakdown),
             "reason": "signal",
             "signal_type": signal_type,
@@ -308,6 +317,7 @@ def apply_paper_trades(
 
     account.setdefault("equity_curve", []).append({"date": trade_date, "equity": _equity(account)})
     account["fee_schedule_version"] = fees.version
+    account["fee_schedule_sha256"] = fees.contract_sha256
     account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return events
 
@@ -335,12 +345,47 @@ def summarize_account(account: dict[str, Any]) -> dict[str, Any]:
         "other_fee_yuan",
         "slippage_yuan",
     )
+    fee_groups: dict[str, dict[str, Any]] = {}
+    for trade in trades:
+        version = _txt(trade.get("fee_schedule_version")) or "not-applicable"
+        schedule_hash = _txt(trade.get("fee_schedule_sha256"))
+        key = schedule_hash or f"legacy:{version}"
+        group = fee_groups.setdefault(
+            key,
+            {
+                "fee_schedule_version": version,
+                "fee_schedule_sha256": schedule_hash or "not-applicable",
+                "fee_components": {name: 0.0 for name in fee_keys},
+            },
+        )
+        for name in fee_keys:
+            group["fee_components"][name] = round(
+                group["fee_components"][name]
+                + _num(trade.get("fee_components", {}).get(name)),
+                2,
+            )
     for trade in sells:
         key = _txt(trade.get("signal_type")) or "signal"
         item = signal_stats.setdefault(key, {"closed": 0, "wins": 0, "pnl": 0.0})
         item["closed"] += 1
         item["wins"] += 1 if _num(trade.get("pnl")) > 0 else 0
         item["pnl"] = round(item["pnl"] + _num(trade.get("pnl")), 2)
+    ordered_fee_groups = {key: fee_groups[key] for key in sorted(fee_groups)}
+    versions = sorted({item["fee_schedule_version"] for item in fee_groups.values()})
+    summary_version = (
+        "mixed"
+        if len(fee_groups) > 1
+        else versions[0]
+        if versions
+        else _txt(account.get("fee_schedule_version")) or "not-applicable"
+    )
+    summary_hash = (
+        "mixed"
+        if len(fee_groups) > 1
+        else next(iter(fee_groups.values()))["fee_schedule_sha256"]
+        if fee_groups
+        else _txt(account.get("fee_schedule_sha256")) or "not-applicable"
+    )
     return {
         "cash": round(_num(account.get("cash")), 2),
         "equity": _equity(account),
@@ -351,7 +396,10 @@ def summarize_account(account: dict[str, Any]) -> dict[str, Any]:
         "win_rate": round(len(wins) / len(sells) * 100, 2) if sells else 0.0,
         "max_drawdown_pct": _max_drawdown_pct(account.get("equity_curve", [])),
         "signal_stats": signal_stats,
-        "fee_schedule_version": _txt(account.get("fee_schedule_version")) or "not-applicable",
+        "fee_schedule_version": summary_version,
+        "fee_schedule_versions": versions,
+        "fee_schedule_sha256": summary_hash,
+        "fee_components_by_schedule": ordered_fee_groups,
         "fee_components": {
             key: round(sum(_num(trade.get("fee_components", {}).get(key)) for trade in trades), 2)
             for key in fee_keys

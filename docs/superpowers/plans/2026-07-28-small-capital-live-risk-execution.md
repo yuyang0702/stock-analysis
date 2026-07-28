@@ -71,7 +71,8 @@ def test_round_trip_applies_each_minimum_commission_and_sell_tax(self):
     fees = FeeSchedule(
         version="sim-v1", effective_from="2026-01-01",
         buy_commission_rate=Decimal("0.0003"), sell_commission_rate=Decimal("0.0003"),
-        minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
+        buy_minimum_commission_yuan=Decimal("5"),
+        sell_minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
         transfer_fee_rate=Decimal("0.00001"), other_fee_rate=Decimal("0"),
         buy_slippage_rate=Decimal("0.001"), sell_slippage_rate=Decimal("0.001"),
     )
@@ -112,7 +113,8 @@ class FeeSchedule:
     effective_from: str
     buy_commission_rate: Decimal
     sell_commission_rate: Decimal
-    minimum_commission_yuan: Decimal
+    buy_minimum_commission_yuan: Decimal
+    sell_minimum_commission_yuan: Decimal
     stamp_tax_rate: Decimal
     transfer_fee_rate: Decimal
     other_fee_rate: Decimal
@@ -120,7 +122,7 @@ class FeeSchedule:
     sell_slippage_rate: Decimal
 ```
 
-For an order, compute `notional = price * qty`, commission as `max(minimum_commission_yuan, notional * side_commission_rate)` when quantity is positive, stamp tax on sells only, and transfer/other fees on their configured sides. Slippage is a separate cash component using the side-specific rate; every component is rounded once to Fen and the unrounded inputs remain in the result hash. Round-trip cost calls the buy calculation at entry and the sell calculation independently at the planned stop/gap/target price, so minimum commission applies on both sides.
+For an order, compute `notional = price * qty`, commission as `max(side_minimum_commission_yuan, notional * side_commission_rate)` when quantity is positive, stamp tax on sells only, and transfer/other fees on their configured sides. Slippage is a separate cash component using the side-specific rate; every component is rounded once to Fen and the unrounded inputs remain in the result hash. Round-trip cost calls the buy calculation at entry and the sell calculation independently at the planned stop/gap/target price, so each side's explicit minimum commission applies independently.
 
 Use canonical JSON identities exactly:
 

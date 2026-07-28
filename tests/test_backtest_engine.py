@@ -9,11 +9,19 @@ from execution_contracts import FeeSchedule
 
 
 class BacktestEngineTest(unittest.TestCase):
+    def test_legacy_fee_inputs_derive_unique_audit_contracts(self) -> None:
+        first = BacktestConfig(commission_rate=0.0004).resolved_fee_schedule()
+        second = BacktestConfig(commission_rate=0.0005).resolved_fee_schedule()
+
+        self.assertNotEqual(first.version, second.version)
+        self.assertNotEqual(first.contract_sha256, second.contract_sha256)
+
     def test_reports_versioned_fee_components(self) -> None:
         fees = FeeSchedule(
             version="test-v1", effective_from="2026-01-01",
             buy_commission_rate=Decimal("0.0003"), sell_commission_rate=Decimal("0.0003"),
-            minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
+            buy_minimum_commission_yuan=Decimal("5"),
+            sell_minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
             transfer_fee_rate=Decimal("0.00001"), other_fee_rate=Decimal("0"),
             buy_slippage_rate=Decimal("0.001"), sell_slippage_rate=Decimal("0.001"),
         )
@@ -25,6 +33,7 @@ class BacktestEngineTest(unittest.TestCase):
         )
 
         self.assertEqual(result.fee_schedule_version, "test-v1")
+        self.assertEqual(result.fee_schedule_sha256, fees.contract_sha256)
         self.assertEqual(result.trades[0]["price"], 10.0)
         self.assertEqual(result.trades[0]["fee"], 6.01)
         self.assertEqual(result.cash, 8_993.99)
@@ -35,6 +44,32 @@ class BacktestEngineTest(unittest.TestCase):
             "other_fee_yuan": 0.0,
             "slippage_yuan": 1.0,
         })
+
+    def test_gross_winning_round_trip_is_classified_by_full_net_cost(self) -> None:
+        fees = FeeSchedule.simulation(
+            version="cross-zero-v1",
+            transfer_fee_rate=0,
+            other_fee_rate=0,
+        )
+        result = BacktestEngine(
+            BacktestConfig(initial_cash=10_000, fee_schedule=fees)
+        ).run(
+            [
+                {
+                    "date": "2026-01-02", "code": "600000", "action": "buy",
+                    "price": 10, "entry_price": 10, "position_pct": 10,
+                },
+                {
+                    "date": "2026-01-03", "code": "600000", "action": "sell",
+                    "price": 10.1,
+                },
+            ]
+        )
+
+        self.assertEqual(result.trades[-1]["pnl"], -2.52)
+        self.assertEqual(result.win_trades, 0)
+        self.assertEqual(result.loss_trades, 1)
+        self.assertEqual(result.cash, 9_997.48)
 
     def test_buys_from_signal_position_and_marks_to_market(self) -> None:
         engine = BacktestEngine(

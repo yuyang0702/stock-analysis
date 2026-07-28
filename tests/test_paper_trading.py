@@ -12,7 +12,8 @@ class PaperTradingTest(unittest.TestCase):
         fees = FeeSchedule(
             version="test-v1", effective_from="2026-01-01",
             buy_commission_rate=Decimal("0.0003"), sell_commission_rate=Decimal("0.0003"),
-            minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
+            buy_minimum_commission_yuan=Decimal("5"),
+            sell_minimum_commission_yuan=Decimal("5"), stamp_tax_rate=Decimal("0.0005"),
             transfer_fee_rate=Decimal("0.00001"), other_fee_rate=Decimal("0"),
             buy_slippage_rate=Decimal("0.001"), sell_slippage_rate=Decimal("0.001"),
         )
@@ -29,6 +30,7 @@ class PaperTradingTest(unittest.TestCase):
         )
 
         self.assertEqual(events[0]["fee_schedule_version"], "test-v1")
+        self.assertEqual(events[0]["fee_schedule_sha256"], fees.contract_sha256)
         self.assertEqual(events[0]["price"], 10.0)
         self.assertEqual(events[0]["fees"], 6.01)
         self.assertEqual(account["cash"], 8_993.99)
@@ -39,6 +41,34 @@ class PaperTradingTest(unittest.TestCase):
             "other_fee_yuan": 0.0,
             "slippage_yuan": 1.0,
         })
+
+    def test_summary_groups_history_spanning_multiple_fee_contracts(self) -> None:
+        first = FeeSchedule.simulation(version="paper-v1", minimum_commission_yuan=3)
+        second = FeeSchedule.simulation(version="paper-v2", minimum_commission_yuan=7)
+        account = new_account(10_000)
+        apply_paper_trades(
+            account,
+            pd.DataFrame([{"code": "600000", "price": 10, "entry_price": 10,
+                           "stop_loss": 9, "take_profit": 11, "position_pct": 10,
+                           "final_score": 90}]),
+            trade_date="2026-07-07", fee_schedule=first,
+        )
+        apply_paper_trades(
+            account,
+            pd.DataFrame([{"code": "600000", "price": 11,
+                           "stop_loss": 9, "take_profit": 11}]),
+            trade_date="2026-07-08", fee_schedule=second,
+        )
+
+        summary = summarize_account(account)
+
+        self.assertEqual(summary["fee_schedule_version"], "mixed")
+        self.assertEqual(summary["fee_schedule_sha256"], "mixed")
+        self.assertEqual(summary["fee_schedule_versions"], ["paper-v1", "paper-v2"])
+        self.assertEqual(
+            {item["fee_schedule_version"] for item in summary["fee_components_by_schedule"].values()},
+            {"paper-v1", "paper-v2"},
+        )
 
     def test_buys_100_share_lots_from_signal_position_pct(self) -> None:
         account = new_account(100_000)

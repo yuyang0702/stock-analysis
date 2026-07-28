@@ -17,7 +17,8 @@ class ConfigEnvTest(unittest.TestCase):
                 self.assertEqual(fees.version, "simulation-only-v1")
                 self.assertEqual(fees.buy_commission_rate, Decimal("0.0003"))
                 self.assertEqual(fees.sell_commission_rate, Decimal("0.0003"))
-                self.assertEqual(fees.minimum_commission_yuan, Decimal("5"))
+                self.assertEqual(fees.buy_minimum_commission_yuan, Decimal("5"))
+                self.assertEqual(fees.sell_minimum_commission_yuan, Decimal("5"))
                 self.assertEqual(fees.stamp_tax_rate, Decimal("0.0005"))
                 self.assertEqual(fees.buy_slippage_rate, Decimal("0.001"))
                 self.assertEqual(fees.sell_slippage_rate, Decimal("0.001"))
@@ -30,7 +31,8 @@ class ConfigEnvTest(unittest.TestCase):
             "FEE_SCHEDULE_EFFECTIVE_FROM": "2026-07-01",
             "FEE_BUY_COMMISSION_RATE": "0.00021",
             "FEE_SELL_COMMISSION_RATE": "0.00022",
-            "FEE_MINIMUM_COMMISSION_YUAN": "6",
+            "FEE_BUY_MINIMUM_COMMISSION_YUAN": "6",
+            "FEE_SELL_MINIMUM_COMMISSION_YUAN": "7",
             "FEE_STAMP_TAX_RATE": "0.0005",
             "FEE_TRANSFER_FEE_RATE": "0.00001",
             "FEE_OTHER_FEE_RATE": "0.00002",
@@ -45,9 +47,22 @@ class ConfigEnvTest(unittest.TestCase):
                 self.assertEqual(fees.effective_from, "2026-07-01")
                 self.assertEqual(fees.buy_commission_rate, Decimal("0.00021"))
                 self.assertEqual(fees.sell_commission_rate, Decimal("0.00022"))
-                self.assertEqual(fees.minimum_commission_yuan, Decimal("6"))
+                self.assertEqual(fees.buy_minimum_commission_yuan, Decimal("6"))
+                self.assertEqual(fees.sell_minimum_commission_yuan, Decimal("7"))
                 self.assertEqual(fees.other_fee_rate, Decimal("0.00002"))
                 self.assertEqual(fees.sell_slippage_rate, Decimal("0.0009"))
+        finally:
+            importlib.reload(config)
+
+    def test_legacy_minimum_commission_env_fills_both_explicit_sides(self) -> None:
+        try:
+            with patch.dict(
+                os.environ, {"FEE_MINIMUM_COMMISSION_YUAN": "4"}, clear=True
+            ):
+                fees = importlib.reload(config).SIMULATION_FEE_SCHEDULE
+
+                self.assertEqual(fees.buy_minimum_commission_yuan, Decimal("4"))
+                self.assertEqual(fees.sell_minimum_commission_yuan, Decimal("4"))
         finally:
             importlib.reload(config)
 

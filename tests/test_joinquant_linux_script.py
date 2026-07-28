@@ -54,6 +54,7 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
 
         self.assertIn('set_env "JOINQUANT_ENABLE" "1"', text)
         self.assertIn('set_env "PAPER_TRADE_ENABLE" "0"', text)
+        self.assertIn('set_env "PAPER_TRADE_STAMP_TAX_RATE" "0.0005"', text)
         self.assertIn('set_env "JOINQUANT_DRY_RUN" "false"', text)
         self.assertIn("ledger-check", text)
         self.assertIn('set_env "RISK_MODE" "observe"', text)

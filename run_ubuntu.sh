@@ -302,7 +302,7 @@ write_env_file() {
   set_env "PAPER_TRADE_ENABLE" "0"
   set_env "PAPER_TRADE_CASH" "${cash}"
   set_env "PAPER_TRADE_COMMISSION_RATE" "0.0003"
-  set_env "PAPER_TRADE_STAMP_TAX_RATE" "0.001"
+  set_env "PAPER_TRADE_STAMP_TAX_RATE" "0.0005"
   set_env "PAPER_TRADE_SLIPPAGE_PCT" "0.001"
   set_env "PAPER_TRADE_COOLDOWN_DAYS" "3"
   set_env "PAPER_TRADE_MAX_POSITIONS" "5"

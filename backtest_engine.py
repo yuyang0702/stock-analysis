@@ -94,7 +94,9 @@ class BacktestConfig:
     initial_cash: float = 100000.0
     commission_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.buy_commission_rate)
     stamp_tax_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.stamp_tax_rate)
-    min_commission: float = float(app_config.SIMULATION_FEE_SCHEDULE.minimum_commission_yuan)
+    min_commission: float = float(
+        app_config.SIMULATION_FEE_SCHEDULE.buy_minimum_commission_yuan
+    )
     max_position_pct: float = 20.0
     max_total_position_pct: float = 80.0
     lot_size: int = 100
@@ -107,17 +109,19 @@ class BacktestConfig:
         if (
             self.commission_rate == float(base.buy_commission_rate)
             and self.stamp_tax_rate == float(base.stamp_tax_rate)
-            and self.min_commission == float(base.minimum_commission_yuan)
+            and self.min_commission == float(base.buy_minimum_commission_yuan)
         ):
             return base
         no_costs = self.commission_rate == self.stamp_tax_rate == self.min_commission == 0
-        return FeeSchedule.simulation(
-            version=f"{base.version}-backtest-compat",
-            effective_from=base.effective_from,
-            commission_rate=self.commission_rate,
-            minimum_commission_yuan=self.min_commission,
+        return base.derive_variant(
+            "backtest-compat",
+            buy_commission_rate=self.commission_rate,
+            sell_commission_rate=self.commission_rate,
+            buy_minimum_commission_yuan=self.min_commission,
+            sell_minimum_commission_yuan=self.min_commission,
             stamp_tax_rate=self.stamp_tax_rate,
-            slippage_rate=0 if no_costs else base.buy_slippage_rate,
+            buy_slippage_rate=0 if no_costs else base.buy_slippage_rate,
+            sell_slippage_rate=0 if no_costs else base.sell_slippage_rate,
             transfer_fee_rate=0 if no_costs else base.transfer_fee_rate,
             other_fee_rate=0 if no_costs else base.other_fee_rate,
         )
@@ -129,6 +133,7 @@ class Position:
     name: str
     qty: int
     avg_cost: float
+    entry_fee_remaining_yuan: float
     buy_date: str
     stop_loss: float = 0.0
     take_profit: float = 0.0
@@ -148,6 +153,7 @@ class BacktestResult:
     win_trades: int
     loss_trades: int
     fee_schedule_version: str
+    fee_schedule_sha256: str
     fee_components: dict[str, float]
 
 
@@ -190,6 +196,7 @@ class BacktestEngine:
             win_trades=sum(1 for value in self.realized_returns if value > 0),
             loss_trades=sum(1 for value in self.realized_returns if value < 0),
             fee_schedule_version=self.fee_schedule.version,
+            fee_schedule_sha256=self.fee_schedule.contract_sha256,
             fee_components=self._fee_totals(),
         )
 
@@ -247,6 +254,7 @@ class BacktestEngine:
             name=_text(row.get("name")),
             qty=qty,
             avg_cost=price,
+            entry_fee_remaining_yuan=fee,
             buy_date=_date_text(row),
             stop_loss=_num(row.get("stop_loss")),
             take_profit=_num(row.get("take_profit")),
@@ -266,9 +274,12 @@ class BacktestEngine:
         breakdown = self.fee_schedule.estimate("sell", Decimal(str(price)), pos.qty)
         fee = float(breakdown.total_yuan)
         self.cash += gross - fee
-        pnl = (price - pos.avg_cost) * pos.qty - fee
+        entry_fee = pos.entry_fee_remaining_yuan
+        pnl = (price - pos.avg_cost) * pos.qty - fee - entry_fee
         self.realized_returns.append(pnl)
-        self.trades.append(self._trade_row(row, "sell", pos.qty, price, breakdown, reason, pnl))
+        self.trades.append(
+            self._trade_row(row, "sell", pos.qty, price, breakdown, reason, pnl, entry_fee)
+        )
         del self.positions[code]
 
     def _trade_row(
@@ -280,6 +291,7 @@ class BacktestEngine:
         breakdown: FeeBreakdown,
         reason: str,
         pnl: float,
+        entry_fee_allocated_yuan: float = 0.0,
     ) -> dict[str, Any]:
         return {
             "date": _date_text(row),
@@ -295,6 +307,7 @@ class BacktestEngine:
             },
             "reason": reason,
             "pnl": round(pnl, 4),
+            "entry_fee_allocated_yuan": round(entry_fee_allocated_yuan, 2),
             "final_score": _num(row.get("final_score")),
         }
 
@@ -360,7 +373,8 @@ def build_report(result: BacktestResult) -> str:
     lines.append("")
     lines.append("> 第一版为信号级轻量回测，用于评估已生成信号的执行效果；完整历史重跑策略会在后续阶段补充。")
     lines.insert(2, f"- Fee schedule: {result.fee_schedule_version}")
-    lines.insert(3, f"- Fee components: {json.dumps(result.fee_components, sort_keys=True)}")
+    lines.insert(3, f"- Fee contract SHA-256: {result.fee_schedule_sha256}")
+    lines.insert(4, f"- Fee components: {json.dumps(result.fee_components, sort_keys=True)}")
     return "\n".join(lines) + "\n"
 
 
@@ -368,7 +382,8 @@ def write_trades_csv(path: Path, trades: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "date", "code", "name", "action", "qty", "price", "fee",
-        "fee_schedule_version", "fee_components", "reason", "pnl", "final_score",
+        "fee_schedule_version", "fee_components", "reason", "pnl",
+        "entry_fee_allocated_yuan", "final_score",
     ]
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)

@@ -26,7 +26,9 @@ from historical_strategy import Candidate, generate_daily_candidates
 class HistoricalBacktestConfig:
     initial_cash: float = 100_000.0
     commission_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.buy_commission_rate)
-    minimum_commission: float = float(app_config.SIMULATION_FEE_SCHEDULE.minimum_commission_yuan)
+    minimum_commission: float = float(
+        app_config.SIMULATION_FEE_SCHEDULE.buy_minimum_commission_yuan
+    )
     stamp_tax_rate: float = float(app_config.SIMULATION_FEE_SCHEDULE.stamp_tax_rate)
     slippage_bps: float = float(app_config.SIMULATION_FEE_SCHEDULE.buy_slippage_rate * 10_000)
     max_positions: int = 8
@@ -41,7 +43,7 @@ class HistoricalBacktestConfig:
         base = app_config.SIMULATION_FEE_SCHEDULE
         if (
             self.commission_rate == float(base.buy_commission_rate)
-            and self.minimum_commission == float(base.minimum_commission_yuan)
+            and self.minimum_commission == float(base.buy_minimum_commission_yuan)
             and self.stamp_tax_rate == float(base.stamp_tax_rate)
             and self.slippage_bps == float(base.buy_slippage_rate * 10_000)
         ):
@@ -49,13 +51,15 @@ class HistoricalBacktestConfig:
         no_costs = (
             self.commission_rate == self.minimum_commission == self.stamp_tax_rate == self.slippage_bps == 0
         )
-        return FeeSchedule.simulation(
-            version=f"{base.version}-historical-compat",
-            effective_from=base.effective_from,
-            commission_rate=self.commission_rate,
-            minimum_commission_yuan=self.minimum_commission,
+        return base.derive_variant(
+            "historical-compat",
+            buy_commission_rate=self.commission_rate,
+            sell_commission_rate=self.commission_rate,
+            buy_minimum_commission_yuan=self.minimum_commission,
+            sell_minimum_commission_yuan=self.minimum_commission,
             stamp_tax_rate=self.stamp_tax_rate,
-            slippage_rate=self.slippage_bps / 10_000,
+            buy_slippage_rate=self.slippage_bps / 10_000,
+            sell_slippage_rate=self.slippage_bps / 10_000,
             transfer_fee_rate=0 if no_costs else base.transfer_fee_rate,
             other_fee_rate=0 if no_costs else base.other_fee_rate,
         )
@@ -76,6 +80,7 @@ class HistoricalPosition:
     theme: str
     buy_date: str
     highest_price: float
+    entry_fee_remaining_yuan: float = 0.0
     take_profit_stage: int = 0
     last_adjust_factor: float = 1.0
     holding_trade_days: int = 0
@@ -118,6 +123,7 @@ class HistoricalTrade:
     transfer_fee_yuan: float = 0.0
     other_fee_yuan: float = 0.0
     slippage_yuan: float = 0.0
+    entry_fee_allocated_yuan: float = 0.0
 
     @property
     def fee_components(self) -> dict[str, float]:
@@ -223,15 +229,18 @@ def run_historical_backtest(
             value = price * quantity
             breakdown = fees.estimate("sell", Decimal(str(price)), quantity)
             fee = float(breakdown.total_yuan)
+            entry_fee = _allocate_entry_fee(position, quantity)
             cash += value - fee
-            pnl = round((price - position.entry_price) * quantity - fee, 2)
+            pnl = round((price - position.entry_price) * quantity - fee - entry_fee, 2)
             result.trades.append(
                 HistoricalTrade(
                     order.decision_date, trade_date, order.code, "sell", quantity, price, fee,
                     order.reason, pnl, holding_days=position.holding_trade_days,
                     strategy_mode=position.mode, market_regime=position.market_regime,
                     industry=position.industry, theme=position.theme,
-                    fee_schedule_version=fees.version, **_fee_fields(breakdown),
+                    fee_schedule_version=fees.version,
+                    entry_fee_allocated_yuan=entry_fee,
+                    **_fee_fields(breakdown),
                 )
             )
             position.quantity -= quantity
@@ -262,7 +271,7 @@ def run_historical_backtest(
                 continue
             breakdown = fees.estimate("buy", Decimal(str(price)), quantity)
             fee = float(breakdown.total_yuan)
-            while quantity > 0 and price * quantity + fee > min(cash, target):
+            while quantity > 0 and price * quantity + fee > cash:
                 quantity -= 100
                 breakdown = fees.estimate("buy", Decimal(str(price)), quantity)
                 fee = float(breakdown.total_yuan)
@@ -284,6 +293,7 @@ def run_historical_backtest(
                 theme=candidate.theme,
                 buy_date=trade_date,
                 highest_price=float(row["high"]),
+                entry_fee_remaining_yuan=fee,
                 last_adjust_factor=float(row["adjust_factor"]),
             )
             result.trades.append(
@@ -323,14 +333,17 @@ def run_historical_backtest(
             value = price * quantity
             breakdown = fees.estimate("sell", Decimal(str(price)), quantity)
             fee = float(breakdown.total_yuan)
+            entry_fee = _allocate_entry_fee(position, quantity)
             cash += value - fee
-            pnl = round((price - position.entry_price) * quantity - fee, 2)
+            pnl = round((price - position.entry_price) * quantity - fee - entry_fee, 2)
             result.trades.append(
                 HistoricalTrade(
                     trade_date, trade_date, code, "sell", quantity, price, fee, reason, pnl,
                     holding_days=position.holding_trade_days, strategy_mode=position.mode,
                     market_regime=position.market_regime, industry=position.industry, theme=position.theme,
-                    fee_schedule_version=fees.version, **_fee_fields(breakdown),
+                    fee_schedule_version=fees.version,
+                    entry_fee_allocated_yuan=entry_fee,
+                    **_fee_fields(breakdown),
                 )
             )
             if quantity >= position.quantity:
@@ -382,6 +395,7 @@ def run_historical_backtest(
     result.metadata.update(
         {
             "fee_schedule_version": fees.version,
+            "fee_schedule_sha256": fees.contract_sha256,
             "fee_components": {
                 key: round(sum(trade.fee_components[key] for trade in result.trades), 2)
                 for key in (
@@ -399,6 +413,19 @@ def run_historical_backtest(
 
 def _fee_fields(value: FeeBreakdown) -> dict[str, float]:
     return {key: float(amount) for key, amount in value.components_dict().items()}
+
+
+def _allocate_entry_fee(position: HistoricalPosition, quantity: int) -> float:
+    if quantity >= position.quantity:
+        allocated = position.entry_fee_remaining_yuan
+    else:
+        allocated = round(
+            position.entry_fee_remaining_yuan * quantity / position.quantity, 2
+        )
+    position.entry_fee_remaining_yuan = round(
+        position.entry_fee_remaining_yuan - allocated, 2
+    )
+    return allocated
 
 
 def _account_value(cash: float, positions: dict[str, HistoricalPosition], rows: dict[str, dict]) -> float:
@@ -497,8 +524,21 @@ def compare_results(
         "capital",
         "strategy_version",
         "parameter_family_count",
+        "fee_schedule_version",
+        "fee_schedule_sha256",
     )
     mismatches = [key for key in contract_keys if baseline.metadata.get(key) != candidate.metadata.get(key)]
+    fee_hashes = (
+        baseline.metadata.get("fee_schedule_sha256"),
+        candidate.metadata.get("fee_schedule_sha256"),
+    )
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in value)
+        for value in fee_hashes
+    ) and "fee_schedule_sha256" not in mismatches:
+        mismatches.append("fee_schedule_sha256")
     if mismatches:
         return {"status": "COMPARISON_CONTRACT_MISMATCH", "mismatches": mismatches}
     left = compute_metrics(baseline.equity, baseline.trades)
@@ -543,24 +583,29 @@ def sensitivity_matrix(
     variants = {
         "zero_slippage": replace(
             base_config,
-            fee_schedule=replace(fees, buy_slippage_rate=Decimal("0"), sell_slippage_rate=Decimal("0")),
+            fee_schedule=fees.derive_variant(
+                "zero-slippage",
+                buy_slippage_rate=Decimal("0"),
+                sell_slippage_rate=Decimal("0"),
+            ),
         ),
         "base": base_config,
         "double_slippage": replace(
             base_config,
-            fee_schedule=replace(
-                fees,
+            fee_schedule=fees.derive_variant(
+                "double-slippage",
                 buy_slippage_rate=fees.buy_slippage_rate * 2,
                 sell_slippage_rate=fees.sell_slippage_rate * 2,
             ),
         ),
         "double_fees": replace(
             base_config,
-            fee_schedule=replace(
-                fees,
+            fee_schedule=fees.derive_variant(
+                "double-fees",
                 buy_commission_rate=fees.buy_commission_rate * 2,
                 sell_commission_rate=fees.sell_commission_rate * 2,
-                minimum_commission_yuan=fees.minimum_commission_yuan * 2,
+                buy_minimum_commission_yuan=fees.buy_minimum_commission_yuan * 2,
+                sell_minimum_commission_yuan=fees.sell_minimum_commission_yuan * 2,
                 stamp_tax_rate=fees.stamp_tax_rate * 2,
                 transfer_fee_rate=fees.transfer_fee_rate * 2,
                 other_fee_rate=fees.other_fee_rate * 2,
