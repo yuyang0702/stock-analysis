@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
 
 from gap_reentry import (
     GapReentryInput, estimated_limit_up_price, evaluate_gap_reentry,
+    evaluate_minimum_lot_risk,
     minimum_lot_position,
 )
 
@@ -34,6 +36,35 @@ def case(**overrides: object) -> GapReentryInput:
 
 
 class GapReentryTest(unittest.TestCase):
+    def test_gap_one_lot_checks_trade_and_portfolio_budgets_separately(self) -> None:
+        result = evaluate_minimum_lot_risk(
+            per_trade_risk_yuan=Decimal("80"),
+            remaining_open_risk_yuan=Decimal("200"),
+            lot_loss_yuan=Decimal("100"),
+        )
+
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.reasons, ("PER_TRADE_RISK_EXCEEDED",))
+
+        portfolio = evaluate_minimum_lot_risk(
+            per_trade_risk_yuan=Decimal("200"),
+            remaining_open_risk_yuan=Decimal("80"),
+            lot_loss_yuan=Decimal("100"),
+        )
+        both = evaluate_minimum_lot_risk(
+            per_trade_risk_yuan=Decimal("80"),
+            remaining_open_risk_yuan=Decimal("80"),
+            lot_loss_yuan=Decimal("100"),
+        )
+        self.assertEqual(portfolio.reasons, ("PORTFOLIO_OPEN_RISK_EXCEEDED",))
+        self.assertEqual(
+            both.reasons,
+            ("PER_TRADE_RISK_EXCEEDED", "PORTFOLIO_OPEN_RISK_EXCEEDED"),
+        )
+
+        with self.assertRaises(ValueError):
+            evaluate_minimum_lot_risk(Decimal("NaN"), Decimal("80"), Decimal("100"))
+
     def test_limit_price_uses_board_rules(self) -> None:
         self.assertEqual(estimated_limit_up_price("600000", 10), 11.0)
         self.assertEqual(estimated_limit_up_price("300001", 10), 12.0)

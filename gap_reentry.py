@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time
+from decimal import Decimal, InvalidOperation
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,43 @@ class MinimumLotDecision:
     qty: int = 0
     position_pct: float = 0.0
     risk_pct: float = 0.0
+
+
+@dataclass(frozen=True)
+class MinimumLotRiskDecision:
+    allowed: bool
+    reasons: tuple[str, ...]
+
+
+def _risk_amount(value: object, name: str) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite non-negative Decimal")
+    try:
+        amount = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite non-negative Decimal") from error
+    if not amount.is_finite() or amount < 0:
+        raise ValueError(f"{name} must be a finite non-negative Decimal")
+    return amount
+
+
+def evaluate_minimum_lot_risk(
+    per_trade_risk_yuan: Decimal,
+    remaining_open_risk_yuan: Decimal,
+    lot_loss_yuan: Decimal,
+) -> MinimumLotRiskDecision:
+    per_trade = _risk_amount(per_trade_risk_yuan, "per_trade_risk_yuan")
+    remaining = _risk_amount(remaining_open_risk_yuan, "remaining_open_risk_yuan")
+    loss = _risk_amount(lot_loss_yuan, "lot_loss_yuan")
+    reasons = tuple(
+        reason
+        for exceeded, reason in (
+            (loss > per_trade, "PER_TRADE_RISK_EXCEEDED"),
+            (loss > remaining, "PORTFOLIO_OPEN_RISK_EXCEEDED"),
+        )
+        if exceeded
+    )
+    return MinimumLotRiskDecision(not reasons, reasons)
 
 
 def reentry_cap_price(entry: float, stop: float) -> float:
