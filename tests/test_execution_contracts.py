@@ -843,6 +843,8 @@ class ExecutionContractsTest(unittest.TestCase):
         buy_values = pre_trade_values(buy)
         with self.assertRaisesRegex(ValueError, "approved_price_cap"):
             PreTradeResult(**{**buy_values, "approved_price_cap": D("10.09")})
+        with self.assertRaisesRegex(ValueError, "target_position_qty"):
+            PreTradeResult(**{**buy_values, "target_position_qty": 50})
         changed_gap = D("9.01")
         changed_gap_cost = FEES.estimate_round_trip(D("10"), changed_gap, 100)
         changed_gap_loss = (D("10") - changed_gap) * 100 + changed_gap_cost.total_yuan
@@ -940,6 +942,8 @@ class ExecutionContractsTest(unittest.TestCase):
         self.assertFalse(rejected.allowed)
         self.assertEqual(rejected.fee_schedule_sha256, "not-applicable")
         self.assertIsNone(rejected.round_trip_cost)
+        with self.assertRaisesRegex(ValueError, "hard_blocks"):
+            PreTradeResult(**{**values, "hard_blocks": ()})
         for field, value in (
             ("execution_fee", FEES.estimate("buy", D("10"), 100)),
             (

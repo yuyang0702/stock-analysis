@@ -1318,6 +1318,8 @@ class PreTradeResult:
         object.__setattr__(self, "warnings", tuple(_text(item, "warning") for item in self.warnings))
         if self.allowed and self.hard_blocks:
             raise ValueError("allowed result cannot contain hard blocks")
+        if not self.allowed and not self.hard_blocks:
+            raise ValueError("rejected result requires hard_blocks")
         for name in ("approved_qty", "target_position_qty"):
             object.__setattr__(self, name, _qty(getattr(self, name), name))
         for name in (
@@ -1470,6 +1472,13 @@ class PreTradeResult:
                     raise ValueError("execution_fee price is below approved_price_cap")
             if candidate.side == "buy" and self.target_position_qty <= 0:
                 raise ValueError("allowed buy result requires positive target_position_qty")
+            if (
+                candidate.side == "buy"
+                and self.target_position_qty < self.approved_qty
+            ):
+                raise ValueError(
+                    "buy target_position_qty cannot be below approved_qty"
+                )
             if candidate.side == "buy" and self.round_trip_cost is None:
                 raise ValueError("allowed buy result requires round_trip_cost")
             if candidate.side == "buy":
