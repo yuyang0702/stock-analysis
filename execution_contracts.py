@@ -1439,6 +1439,13 @@ class PreTradeResult:
                 and self.approved_price_cap != candidate.sell_price_floor
             ):
                 raise ValueError("approved_price_cap does not match sell candidate")
+            if (
+                candidate.side == "sell"
+                and self.target_position_qty < candidate.requested_target_position_qty
+            ):
+                raise ValueError(
+                    "target_position_qty cannot sell below requested_target_position_qty"
+                )
             if self.approved_limit_price is not None and self.approved_price_cap is not None:
                 if candidate.side == "buy" and self.approved_limit_price > self.approved_price_cap:
                     raise ValueError("approved buy limit price must not exceed price cap")

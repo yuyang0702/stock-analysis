@@ -867,6 +867,12 @@ class ExecutionContractsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, field):
                     PreTradeResult(**{**sell_values, field: value})
 
+        partial = make_candidate(side="sell", requested_target_position_qty=0)
+        PreTradeResult(**pre_trade_values(partial, target_position_qty=1))
+        no_oversell = make_candidate(side="sell", requested_target_position_qty=50)
+        with self.assertRaisesRegex(ValueError, "target_position_qty"):
+            PreTradeResult(**pre_trade_values(no_oversell, target_position_qty=0))
+
     def test_sell_result_rejects_buy_only_risk_and_economic_evidence(self) -> None:
         candidate = make_candidate(side="sell")
         values = pre_trade_values(candidate)
