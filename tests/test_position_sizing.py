@@ -264,7 +264,7 @@ class PositionSizingTest(unittest.TestCase):
             "remaining_open_risk_yuan", "planned_stop_loss_yuan", "gap_loss_yuan",
             "worst_case_loss_yuan", "rule_target_price", "gross_edge_yuan",
             "expected_net_pnl_yuan", "fee_erosion_ratio",
-            "cost_to_expected_edge_ratio",
+            "cost_to_expected_edge_ratio", "max_cost_edge_ratio",
         )
         bad_changes = (
             {"allowed": "yes"},
@@ -349,6 +349,40 @@ class PositionSizingTest(unittest.TestCase):
             replace(result, position_value_yuan=D("0"))
         with self.assertRaises(ValueError):
             replace(result, reasons=())
+
+    def test_economic_rejection_cannot_be_flipped_above_frozen_ratio_limit(self) -> None:
+        result = allocate(
+            risk_cap_yuan=D("1000"), capacity=CapacityBudget(100, D("1000")),
+            expected_gross_return=D("0.02"), max_cost_edge_ratio=D("0.35"),
+        )
+
+        self.assertGreater(result.expected_net_pnl_yuan, D("0"))
+        self.assertGreater(result.cost_to_expected_edge_ratio, D("0.35"))
+        with self.assertRaises(ValueError):
+            replace(
+                result,
+                allowed=True,
+                reasons=(),
+                target_qty=result.evaluated_qty,
+                economic_trade_allowed=True,
+            )
+
+    def test_invalid_stop_rejection_cannot_claim_scenario_risk_reasons(self) -> None:
+        result = allocate(
+            stop_price=D("10"), expected_gross_return=D("0.10"),
+            max_cost_edge_ratio=D("0.5"),
+        )
+
+        with self.assertRaises(ValueError):
+            replace(
+                result,
+                reasons=("INVALID_STOP_DISTANCE", "PER_TRADE_RISK_EXCEEDED"),
+            )
+        with self.assertRaises(ValueError):
+            replace(
+                result,
+                reasons=("INVALID_STOP_DISTANCE", "PORTFOLIO_OPEN_RISK_EXCEEDED"),
+            )
 
 
 if __name__ == "__main__":

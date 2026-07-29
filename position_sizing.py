@@ -114,6 +114,7 @@ class SizingDecision:
     expected_net_pnl_yuan: Decimal
     fee_erosion_ratio: Decimal
     cost_to_expected_edge_ratio: Decimal
+    max_cost_edge_ratio: Decimal
     economic_trade_allowed: bool
     fee_schedule_version: str
     fee_schedule_sha256: str
@@ -138,7 +139,7 @@ class SizingDecision:
             "remaining_open_risk_yuan", "planned_stop_loss_yuan", "gap_loss_yuan",
             "worst_case_loss_yuan", "rule_target_price", "gross_edge_yuan",
             "expected_net_pnl_yuan", "fee_erosion_ratio",
-            "cost_to_expected_edge_ratio",
+            "cost_to_expected_edge_ratio", "max_cost_edge_ratio",
         )
         for name in decimal_names:
             value = getattr(self, name)
@@ -149,6 +150,7 @@ class SizingDecision:
             "risk_cap_yuan", "effective_per_trade_risk_yuan",
             "remaining_open_risk_yuan", "planned_stop_loss_yuan", "gap_loss_yuan",
             "worst_case_loss_yuan", "fee_erosion_ratio", "cost_to_expected_edge_ratio",
+            "max_cost_edge_ratio",
         ):
             if getattr(self, name) < ZERO:
                 raise ValueError(f"{name} must be non-negative")
@@ -217,6 +219,14 @@ class SizingDecision:
 
         invalid_stop = "INVALID_STOP_DISTANCE" in self.reasons
         if invalid_stop:
+            if any(
+                reason in self.reasons
+                for reason in (
+                    "PER_TRADE_RISK_EXCEEDED",
+                    "PORTFOLIO_OPEN_RISK_EXCEEDED",
+                )
+            ):
+                raise ValueError("invalid stop rejection cannot claim scenario risk reasons")
             if self.planned_stop_cost is not None or self.gap_cost is not None:
                 raise ValueError("invalid stop rejection cannot carry loss-scenario costs")
             if any(
@@ -274,7 +284,11 @@ class SizingDecision:
         ):
             raise ValueError("non-positive target cannot carry target-cost economics")
         if self.economic_trade_allowed:
-            if self.gross_edge_yuan <= ZERO or self.expected_net_pnl_yuan <= ZERO:
+            if (
+                self.gross_edge_yuan <= ZERO
+                or self.expected_net_pnl_yuan <= ZERO
+                or self.cost_to_expected_edge_ratio > self.max_cost_edge_ratio
+            ):
                 raise ValueError("economic approval requires positive edge and net PnL")
             if "ECONOMIC_EDGE_INSUFFICIENT" in self.reasons:
                 raise ValueError("economic approval conflicts with rejection reason")
@@ -313,7 +327,8 @@ def _empty_decision(
         False, reasons, 0, 0, ZERO, ZERO, None, percentage_risk, policy.risk_cap_yuan,
         min(percentage_risk, policy.risk_cap_yuan), capacity.remaining_open_risk_yuan,
         None, None, None, ZERO, ZERO, ZERO, target_price, ZERO, ZERO,
-        ZERO.quantize(RATIO_QUANTUM), ZERO.quantize(RATIO_QUANTUM), False, "", "",
+        ZERO.quantize(RATIO_QUANTUM), ZERO.quantize(RATIO_QUANTUM),
+        policy.max_cost_edge_ratio, False, "", "",
     )
 
 
@@ -349,6 +364,7 @@ def _decision(
         expected_net_pnl_yuan=evidence.net_pnl,
         fee_erosion_ratio=evidence.fee_erosion_ratio,
         cost_to_expected_edge_ratio=evidence.cost_edge_ratio,
+        max_cost_edge_ratio=policy.max_cost_edge_ratio,
         economic_trade_allowed=evidence.economic_allowed,
         fee_schedule_version=fees.version,
         fee_schedule_sha256=fees.contract_sha256,
