@@ -1,5 +1,5 @@
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 
 import execution_contracts as contracts
@@ -68,6 +68,16 @@ def make_candidate(
     stop_price: str = "9.5",
     signal_time: str = "2026-07-28T09:55:00+08:00",
     frozen_valid_until: str = "2026-07-28T10:05:00+08:00",
+    industry: object = "technology",
+    theme: object = "artificial-intelligence",
+    buy_gap_price: Decimal | None = None,
+    buy_price_cap: Decimal | None = None,
+    requested_target_position_qty: object = None,
+    exit_owner_id: object = None,
+    exit_action: object = None,
+    exit_priority: object = None,
+    sell_limit_price: Decimal | None = None,
+    sell_price_floor: Decimal | None = None,
 ) -> StrategyOrderCandidate:
     logical = logical_signal_id(
         "scope-uuid", "2026-07-28", "main", "s1", "600000", side, "breakout"
@@ -81,6 +91,21 @@ def make_candidate(
         setup_type="breakout", suggested_entry_price=D("10"), stop_price=D(stop_price),
         target_price=D(target_price), signal_time=signal_time,
         frozen_valid_until=frozen_valid_until,
+        industry=industry, theme=theme,
+        uncategorized=not (str(industry or "").strip() and str(theme or "").strip()),
+        buy_gap_price=D("9") if side == "buy" and buy_gap_price is None else buy_gap_price,
+        buy_price_cap=D("10") if side == "buy" and buy_price_cap is None else buy_price_cap,
+        requested_target_position_qty=(
+            0 if side == "sell" and requested_target_position_qty is None
+            else requested_target_position_qty
+        ),
+        exit_owner_id="cycle-1" if side == "sell" and exit_owner_id is None else exit_owner_id,
+        exit_action="hard_stop" if side == "sell" and exit_action is None else exit_action,
+        exit_priority=100 if side == "sell" and exit_priority is None else exit_priority,
+        sell_limit_price=(
+            D("9.40") if side == "sell" and sell_limit_price is None else sell_limit_price
+        ),
+        sell_price_floor=sell_price_floor,
     )
 
 
@@ -517,29 +542,7 @@ class ExecutionContractsTest(unittest.TestCase):
             )
 
     def test_candidate_result_and_intent_hashes_expose_content_conflicts(self) -> None:
-        logical = logical_signal_id(
-            "scope-uuid", "2026-07-28", "main", "s1", "600000", "buy", "breakout"
-        )
-        candidate = StrategyOrderCandidate(
-            candidate_id="candidate-1",
-            logical_signal_id=logical,
-            account_scope_id="scope-uuid",
-            source_signal_id="signal-run-1",
-            source_run_id="run-1",
-            strategy_id="main",
-            strategy_version="s1",
-            parameter_version="p1",
-            model_version="disabled",
-            fee_schedule_version="sim-v1",
-            code="600000",
-            side="buy",
-            setup_type="breakout",
-            suggested_entry_price=D("10"),
-            stop_price=D("9.5"),
-            target_price=D("11"),
-            signal_time="2026-07-28T09:55:00+08:00",
-            frozen_valid_until="2026-07-28T10:05:00+08:00",
-        )
+        candidate = make_candidate()
         result = PreTradeResult(**pre_trade_values(candidate))
         conflicting_result = PreTradeResult(
             **pre_trade_values(
@@ -566,6 +569,45 @@ class ExecutionContractsTest(unittest.TestCase):
         self.assertNotEqual(first.intent_sha256, conflicting.intent_sha256)
         with self.assertRaises(FrozenInstanceError):
             first.order_qty = 200
+
+    def test_candidate_freezes_admission_facts(self) -> None:
+        buy = make_candidate(industry="", theme="")
+
+        self.assertEqual(buy.industry, "__UNCATEGORIZED__")
+        self.assertEqual(buy.theme, "__UNCATEGORIZED__")
+        self.assertTrue(buy.uncategorized)
+        self.assertEqual(StrategyOrderCandidate.from_dict(buy.to_dict()), buy)
+
+        changed = replace(buy, buy_price_cap=D("10.01"), payload_sha256="")
+        self.assertNotEqual(changed.payload_sha256, buy.payload_sha256)
+        tampered = {**buy.to_dict(), "buy_price_cap": "10.01"}
+        with self.assertRaisesRegex(ValueError, "conflict"):
+            StrategyOrderCandidate.from_dict(tampered)
+
+        sell = make_candidate(
+            side="sell",
+            requested_target_position_qty=0,
+            exit_owner_id="cycle-1",
+            exit_action="hard_stop",
+            exit_priority=100,
+            sell_limit_price=D("9.40"),
+            sell_price_floor=D("9.30"),
+        )
+        self.assertEqual(StrategyOrderCandidate.from_dict(sell.to_dict()), sell)
+
+        invalid = (
+            (buy, {"buy_gap_price": None}, "buy_gap_price"),
+            (buy, {"sell_limit_price": D("9")}, "side-inapplicable"),
+            (buy, {"uncategorized": False}, "uncategorized"),
+            (sell, {"exit_owner_id": None}, "exit_owner_id"),
+            (sell, {"exit_priority": True}, "exit_priority"),
+            (sell, {"sell_price_floor": D("9.50")}, "sell_price_floor"),
+            (sell, {"buy_price_cap": D("10")}, "side-inapplicable"),
+        )
+        for original, changes, message in invalid:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, message):
+                    replace(original, **changes, payload_sha256="")
 
     def test_pre_trade_result_binds_the_full_normalized_candidate_payload(self) -> None:
         first_candidate = make_candidate(target_price="11")

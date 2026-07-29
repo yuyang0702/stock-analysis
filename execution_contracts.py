@@ -15,6 +15,7 @@ from typing import Mapping
 CENT = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.00000001")
 ZERO = Decimal("0")
+UNCATEGORIZED = "__UNCATEGORIZED__"
 
 
 def _decimal(
@@ -64,6 +65,22 @@ def _text(value: object, name: str) -> str:
     if not result:
         raise ValueError(f"{name} is required")
     return result
+
+
+def _classification(value: object, name: str) -> str:
+    if value is None:
+        return UNCATEGORIZED
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be text")
+    return value.strip() or UNCATEGORIZED
+
+
+def _optional_text(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be text")
+    return _text(value, name)
 
 
 def _date_text(value: object, name: str) -> str:
@@ -1030,6 +1047,17 @@ class StrategyOrderCandidate:
     target_price: Decimal
     signal_time: str
     frozen_valid_until: str
+    industry: str
+    theme: str
+    uncategorized: bool
+    buy_gap_price: Decimal | None
+    buy_price_cap: Decimal | None
+    requested_target_position_qty: int | None
+    exit_owner_id: str | None
+    exit_action: str | None
+    exit_priority: int | None
+    sell_limit_price: Decimal | None
+    sell_price_floor: Decimal | None
     payload_sha256: str = ""
 
     def __post_init__(self) -> None:
@@ -1050,13 +1078,87 @@ class StrategyOrderCandidate:
         ):
             object.__setattr__(self, name, _text(getattr(self, name), name))
         object.__setattr__(self, "side", _side(self.side))
+        object.__setattr__(self, "industry", _classification(self.industry, "industry"))
+        object.__setattr__(self, "theme", _classification(self.theme, "theme"))
+        object.__setattr__(self, "uncategorized", _boolean(self.uncategorized, "uncategorized"))
+        expected_uncategorized = UNCATEGORIZED in {self.industry, self.theme}
+        if self.uncategorized != expected_uncategorized:
+            raise ValueError("uncategorized must match normalized industry/theme")
         object.__setattr__(
             self, "suggested_entry_price", _decimal(self.suggested_entry_price, "suggested_entry_price", positive=True)
         )
         for name in ("stop_price", "target_price"):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        for name in (
+            "buy_gap_price",
+            "buy_price_cap",
+            "sell_limit_price",
+            "sell_price_floor",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _decimal(getattr(self, name), name, positive=True, optional=True),
+            )
+        if self.requested_target_position_qty is not None:
+            object.__setattr__(
+                self,
+                "requested_target_position_qty",
+                _qty(self.requested_target_position_qty, "requested_target_position_qty"),
+            )
+        object.__setattr__(
+            self, "exit_owner_id", _optional_text(self.exit_owner_id, "exit_owner_id")
+        )
+        object.__setattr__(
+            self, "exit_action", _optional_text(self.exit_action, "exit_action")
+        )
+        if self.exit_priority is not None:
+            object.__setattr__(
+                self, "exit_priority", _qty(self.exit_priority, "exit_priority")
+            )
         if self.side == "buy" and not ZERO < self.stop_price < self.suggested_entry_price:
             raise ValueError("buy stop_price must be positive and below suggested_entry_price")
+        if self.side == "buy":
+            if self.buy_gap_price is None:
+                raise ValueError("buy_gap_price is required for a buy candidate")
+            if self.buy_price_cap is None:
+                raise ValueError("buy_price_cap is required for a buy candidate")
+            if not self.stop_price < self.buy_price_cap:
+                raise ValueError("buy stop_price must be below buy_price_cap")
+            if not self.buy_gap_price < self.buy_price_cap:
+                raise ValueError("buy_gap_price must be below buy_price_cap")
+            if not self.target_price > self.buy_price_cap:
+                raise ValueError("buy target_price must be above buy_price_cap")
+            if any(
+                value is not None
+                for value in (
+                    self.requested_target_position_qty,
+                    self.exit_owner_id,
+                    self.exit_action,
+                    self.exit_priority,
+                    self.sell_limit_price,
+                    self.sell_price_floor,
+                )
+            ):
+                raise ValueError("buy candidate contains side-inapplicable sell fields")
+        else:
+            if self.buy_gap_price is not None or self.buy_price_cap is not None:
+                raise ValueError("sell candidate contains side-inapplicable buy fields")
+            if self.requested_target_position_qty is None:
+                raise ValueError("requested_target_position_qty is required for a sell candidate")
+            if self.exit_owner_id is None:
+                raise ValueError("exit_owner_id is required for a sell candidate")
+            if self.exit_action is None:
+                raise ValueError("exit_action is required for a sell candidate")
+            if self.exit_priority is None:
+                raise ValueError("exit_priority is required for a sell candidate")
+            if self.sell_limit_price is None:
+                raise ValueError("sell_limit_price is required for a sell candidate")
+            if (
+                self.sell_price_floor is not None
+                and self.sell_price_floor > self.sell_limit_price
+            ):
+                raise ValueError("sell_price_floor must not exceed sell_limit_price")
         object.__setattr__(self, "signal_time", _timestamp(self.signal_time, "signal_time"))
         object.__setattr__(
             self, "frozen_valid_until", _timestamp(self.frozen_valid_until, "frozen_valid_until")
