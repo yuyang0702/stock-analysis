@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from contextlib import closing
 from decimal import Decimal
 import sqlite3
 import unittest
@@ -44,11 +45,19 @@ class TradingStoreTest(unittest.TestCase):
         broker_time: str = "2026-07-29T10:00:00+08:00",
         generated_at: str = "2026-07-29T10:00:01+08:00",
         qty: int = 100,
+        open_orders: tuple[dict[str, object], ...] | None = None,
     ) -> BrokerSnapshot:
+        if open_orders is None:
+            open_orders = ({
+                "client_order_id": "open-1", "broker_order_id": "jq-1",
+                "stock_code": "600001", "side": "buy", "target_qty": 100,
+                "filled_qty": 0, "status": "submitted",
+                "updated_at": broker_time,
+            },)
         return BrokerSnapshot.from_values(
             snapshot_id=snapshot_id,
             account_scope_id=scope,
-            trade_date="2026-07-29",
+            trade_date=broker_time[:10],
             broker_time=broker_time,
             generated_at=generated_at,
             total_equity=Decimal("10000"),
@@ -62,17 +71,80 @@ class TradingStoreTest(unittest.TestCase):
                     last_price="10", market_value=str(qty * 10),
                 ),
             ),
-            open_orders=({
-                "client_order_id": "open-1", "broker_order_id": "jq-1",
-                "stock_code": "600001", "side": "buy", "target_qty": 100,
-                "filled_qty": 0, "status": "submitted",
-                "updated_at": broker_time,
-            },),
+            open_orders=open_orders,
             fills=(),
             adapter_version="legacy-joinquant-v1-adapter",
             node_version="legacy-joinquant-v1-node",
             session_id="legacy-joinquant-v1-session",
             capabilities_version="legacy-joinquant-v1-capabilities",
+        )
+
+    @staticmethod
+    def _insert_matched_reconciliation(
+        conn: sqlite3.Connection,
+        reconciliation_id: str,
+        account_scope_id: str,
+        *,
+        broker_time: str,
+        generated_at: str,
+        finished_at: str,
+    ) -> None:
+        current = conn.execute(
+            """SELECT snapshot_id, snapshot_sha256, broker_time, generated_at
+               FROM broker_snapshot_current WHERE account_scope_id=?""",
+            (account_scope_id,),
+        ).fetchone()
+        if current is not None:
+            snapshot_id = str(current["snapshot_id"])
+            snapshot_sha256 = str(current["snapshot_sha256"])
+            broker_time = str(current["broker_time"])
+            generated_at = str(current["generated_at"])
+        else:
+            snapshot_id = f"snapshot-{reconciliation_id}"
+            snapshot_sha256 = "a" * 64
+        conn.execute(
+            """INSERT INTO reconciliation_runs(
+               reconciliation_id, mode, started_at, finished_at, result,
+               severity, difference_count, control_action, summary_json,
+               account_scope_id, broker_snapshot_id, broker_snapshot_sha256,
+               snapshot_broker_time, snapshot_generated_at
+               ) VALUES(?, 'full', ?, ?, 'matched', 'INFO', 0, '', '{}',
+                        ?, ?, ?, ?, ?)""",
+            (
+                reconciliation_id, broker_time, finished_at,
+                account_scope_id, snapshot_id, snapshot_sha256,
+                broker_time, generated_at,
+            ),
+        )
+
+    @staticmethod
+    def _reserve_intent(
+        store: TradingStore,
+        conn: sqlite3.Connection,
+        candidate: object,
+        result: PreTradeResult,
+        intent: ExecutionIntent,
+        reservation_id: str,
+    ) -> None:
+        conn.execute(
+            """INSERT OR IGNORE INTO account_scopes(
+               account_scope_id, adapter, scope_alias, created_at
+               ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+            (candidate.account_scope_id,),
+        )
+        store.insert_strategy_order_candidate(conn, candidate)
+        store.insert_pre_trade_result(conn, result)
+        store.insert_execution_intent(conn, intent)
+        store.reserve_capacity(
+            conn, account_scope_id=candidate.account_scope_id,
+            reservation_id=reservation_id,
+            client_order_id=intent.client_order_id,
+            stock_code=candidate.code, side=candidate.side,
+            target_qty=intent.order_qty,
+            cash_yuan="1006.01", position_value_yuan="1000",
+            open_risk_yuan="112.37", industry=candidate.industry,
+            theme=candidate.theme, uncategorized=candidate.uncategorized,
+            created_at="2026-07-28T10:00:00+08:00",
         )
 
     def test_schema_v11_is_idempotent_and_has_scoped_execution_chain(self) -> None:
@@ -114,6 +186,34 @@ class TradingStoreTest(unittest.TestCase):
                     }),
                     1,
                 )
+                for table in (
+                    "broker_position_current", "broker_order_current",
+                ):
+                    parent_tables = {
+                        row[2]
+                        for row in conn.execute(
+                            f"PRAGMA foreign_key_list({table})"
+                        )
+                    }
+                    self.assertEqual(
+                        parent_tables,
+                        {"account_scopes", "broker_snapshot_current"},
+                    )
+                for table, chain_parent in (
+                    ("pre_trade_results", "strategy_order_candidates"),
+                    ("execution_intents", "pre_trade_results"),
+                    ("capacity_reservations", "execution_intents"),
+                ):
+                    parent_tables = {
+                        row[2]
+                        for row in conn.execute(
+                            f"PRAGMA foreign_key_list({table})"
+                        )
+                    }
+                    self.assertEqual(
+                        parent_tables,
+                        {"account_scopes", chain_parent},
+                    )
 
     def test_schema_v11_health_rejects_forbidden_global_unique_key(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -126,7 +226,149 @@ class TradingStoreTest(unittest.TestCase):
                 )
             health = store.health()
             self.assertFalse(health.ok)
-            self.assertIn("unique keys", health.error)
+            self.assertIn("unique", health.error)
+
+    def test_schema_health_rejects_extra_legacy_unique_index(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute(
+                    """CREATE UNIQUE INDEX forbidden_order_stock
+                       ON orders(stock_code)"""
+                )
+            health = store.health()
+            self.assertFalse(health.ok)
+            self.assertEqual(health.schema_version, 11)
+            self.assertIn("unique", health.error)
+
+    def test_schema_health_rejects_duplicate_unique_signature(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute(
+                    """CREATE UNIQUE INDEX duplicate_order_id_unique
+                       ON orders(order_id)"""
+                )
+            health = store.health()
+            self.assertFalse(health.ok)
+            self.assertIn("unique", health.error)
+
+    def test_schema_health_rejects_broadened_partial_unique_predicate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute("DROP INDEX idx_position_cycles_active_code")
+                conn.execute(
+                    """CREATE UNIQUE INDEX idx_position_cycles_active_code
+                       ON position_cycles(stock_code)
+                       WHERE status = 'active' OR 1=1"""
+                )
+            health = store.health()
+            self.assertFalse(health.ok)
+            self.assertIn("idx_position_cycles_active_code", health.error)
+
+    def test_schema_health_rejects_index_collation_or_direction_change(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute("DROP INDEX idx_position_cycles_active_code")
+                conn.execute(
+                    """CREATE UNIQUE INDEX idx_position_cycles_active_code
+                       ON position_cycles(stock_code COLLATE NOCASE DESC)
+                       WHERE status='active'"""
+                )
+            health = store.health()
+            self.assertFalse(health.ok)
+            self.assertIn("idx_position_cycles_active_code", health.error)
+
+    def test_schema_health_rejects_primary_key_collation_or_direction_change(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute("DROP TABLE system_state")
+                conn.execute(
+                    """CREATE TABLE system_state(
+                       key TEXT COLLATE NOCASE,
+                       value TEXT NOT NULL,
+                       updated_at TEXT NOT NULL,
+                       reason TEXT NOT NULL DEFAULT '',
+                       PRIMARY KEY(key DESC)
+                       )"""
+                )
+            health = store.health()
+            self.assertFalse(health.ok)
+            self.assertIn("primary key index", health.error)
+
+    def test_schema_v11_health_and_initialize_reject_missing_legacy_table(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute("DROP TABLE orders")
+            self.assertFalse(store.health().ok)
+            self.assertIn("orders", store.health().error)
+            with self.assertRaisesRegex(RuntimeError, "orders"):
+                store.initialize()
+
+    def test_schema_v11_health_rejects_missing_legacy_column(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute(
+                    "ALTER TABLE daily_equity DROP COLUMN fee_data_status"
+                )
+            health = store.health()
+            self.assertFalse(health.ok)
+            self.assertIn("fee_data_status", health.error)
+
+    def test_malformed_schema_v10_is_not_repaired_or_upgraded(self) -> None:
+        corruptions = (
+            ("missing table", "DROP TABLE orders", "orders"),
+            (
+                "missing column",
+                "ALTER TABLE daily_equity DROP COLUMN fee_data_status",
+                "fee_data_status",
+            ),
+        )
+        for label, corruption, expected in corruptions:
+            with self.subTest(label=label), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "trading.db"
+                store = TradingStore(path)
+                store.initialize()
+                with store.connect() as conn:
+                    for table in (
+                        "capacity_reservations", "execution_intents",
+                        "pre_trade_results", "strategy_order_candidates",
+                        "broker_position_current", "broker_order_current",
+                        "broker_snapshot_current", "account_scopes",
+                    ):
+                        conn.execute(f"DROP TABLE {table}")
+                    conn.execute(
+                        "DELETE FROM schema_migrations WHERE version=11"
+                    )
+                    conn.execute(corruption)
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    store.initialize()
+                conn = sqlite3.connect(path)
+                try:
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0],
+                        10,
+                    )
+                    self.assertIsNone(conn.execute(
+                        """SELECT 1 FROM sqlite_master
+                           WHERE type='table' AND name='account_scopes'"""
+                    ).fetchone())
+                finally:
+                    conn.close()
 
     def test_schema_v11_refuses_newer_database_without_mutation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -296,6 +538,38 @@ class TradingStoreTest(unittest.TestCase):
                     "first",
                 )
 
+    def test_current_snapshot_requires_caller_owned_transaction(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                store.replace_current_broker_snapshot(
+                    conn, self._broker_snapshot(scope, "first"),
+                )
+            newer = self._broker_snapshot(
+                scope, "newer",
+                broker_time="2026-07-29T10:01:00+08:00",
+                generated_at="2026-07-29T10:01:01+08:00",
+            )
+            with store.connect() as conn:
+                with self.assertRaisesRegex(ValueError, "BEGIN IMMEDIATE"):
+                    store.replace_current_broker_snapshot(conn, newer)
+            with store.connect() as conn:
+                conn.execute("BEGIN")
+                with self.assertRaisesRegex(ValueError, "BEGIN IMMEDIATE"):
+                    store.replace_current_broker_snapshot(conn, newer)
+                conn.rollback()
+            with store.connect() as conn:
+                self.assertEqual(
+                    store.load_current_broker_snapshot(
+                        conn, scope,
+                    ).snapshot_id,
+                    "first",
+                )
+
     def test_immutable_chain_and_reservation_are_scoped_and_idempotent(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
@@ -319,7 +593,7 @@ class TradingStoreTest(unittest.TestCase):
                 later_result = PreTradeResult(**pre_trade_values(
                     candidate, pre_trade_result_id="risk-2",
                     checked_at="2026-07-28T09:57:00+08:00",
-                    valid_until="2026-07-28T10:02:00+08:00",
+                    valid_until="2026-07-28T10:01:00+08:00",
                 ))
                 self.assertEqual(
                     store.insert_pre_trade_result(conn, later_result), "risk-2",
@@ -328,48 +602,1281 @@ class TradingStoreTest(unittest.TestCase):
                     conn, account_scope_id=candidate.account_scope_id,
                     reservation_id="reservation-1", client_order_id=intent.client_order_id,
                     stock_code="600000", side="buy", target_qty=100,
-                    cash_yuan="1006", position_value_yuan="1000",
-                    open_risk_yuan="60", industry="technology",
+                    cash_yuan="1006.01", position_value_yuan="1000",
+                    open_risk_yuan="112.37", industry="technology",
                     theme="artificial-intelligence", uncategorized=False,
-                    created_at="2026-07-29T10:00:00+08:00",
+                    created_at="2026-07-28T10:00:00+08:00",
                 )
                 self.assertEqual(reservation_id, "reservation-1")
                 totals = store.aggregate_active_reservations(
                     conn, candidate.account_scope_id,
                 )
-                self.assertEqual(totals["cash_yuan"], Decimal("1006"))
+                self.assertEqual(totals["cash_yuan"], Decimal("1006.01"))
                 self.assertEqual(totals["target_qty"], 100)
+                active = store.list_active_reservations(
+                    conn, candidate.account_scope_id,
+                )
+                self.assertEqual(len(active), 1)
+                self.assertEqual(
+                    active[0]["account_scope_id"],
+                    candidate.account_scope_id,
+                )
+                self.assertEqual(active[0]["reservation_id"], "reservation-1")
+                self.assertEqual(active[0]["client_order_id"], intent.client_order_id)
+                self.assertEqual(active[0]["intent_status"], "READY")
+                self.assertEqual(active[0]["original_target_qty"], 100)
+                self.assertEqual(
+                    active[0]["remaining_cash_yuan"], Decimal("1006.01"),
+                )
+                self.assertNotIn("stock_code", active[0])
+                self.assertNotIn("status", active[0])
+                self.assertTrue(store.compare_and_set_execution_intent_status(
+                    conn,
+                    candidate.account_scope_id,
+                    intent.client_order_id,
+                    expected_status="READY",
+                    new_status="SUBMITTING",
+                    transitioned_at="2026-07-28T10:00:01+08:00",
+                ))
+                self.assertEqual(
+                    store.list_active_reservations(
+                        conn, candidate.account_scope_id,
+                    )[0]["intent_status"],
+                    "SUBMITTING",
+                )
+                other_scope = store.get_or_create_account_scope(
+                    conn, "qmt", "paper",
+                )
+                self.assertEqual(
+                    store.list_active_reservations(conn, other_scope),
+                    [],
+                )
+                later_intent = ExecutionIntent(**intent_values(
+                    candidate, later_result,
+                ))
+                store.insert_execution_intent(conn, later_intent)
+                store.reserve_capacity(
+                    conn, account_scope_id=candidate.account_scope_id,
+                    reservation_id="reservation-0",
+                    client_order_id=later_intent.client_order_id,
+                    stock_code="600000", side="buy", target_qty=100,
+                    cash_yuan="1006.01", position_value_yuan="1000",
+                    open_risk_yuan="112.37", industry="technology",
+                    theme="artificial-intelligence", uncategorized=False,
+                    created_at="2026-07-28T10:00:00+08:00",
+                )
+                self.assertEqual(
+                    [
+                        row["reservation_id"]
+                        for row in store.list_active_reservations(
+                            conn, candidate.account_scope_id,
+                        )
+                    ],
+                    ["reservation-0", "reservation-1"],
+                )
+                self.assertTrue(store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id,
+                    later_intent.client_order_id,
+                    expected_status="READY", new_status="EXPIRED",
+                    transitioned_at="2026-07-28T10:01:00+08:00",
+                ))
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "expired-empty",
+                        broker_time="2026-07-28T10:01:01+08:00",
+                        generated_at="2026-07-28T10:01:02+08:00",
+                        open_orders=(),
+                    ),
+                )
+                self.assertTrue(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id, "reservation-0",
+                    released_at="2026-07-28T10:01:03+08:00",
+                    reason="test cleanup",
+                ))
+                self.assertTrue(store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="SUBMITTING", new_status="SUBMITTED",
+                    transitioned_at="2026-07-28T10:00:02+08:00",
+                ))
+                self.assertTrue(store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="SUBMITTED", new_status="PARTIALLY_FILLED",
+                    transitioned_at="2026-07-28T10:01:00+08:00",
+                ))
+                conn.execute(
+                    """INSERT INTO orders(
+                       client_order_id, stock_code, action, target_qty,
+                       requested_qty, filled_qty, average_fill_price, status,
+                       submit_count, reason, updated_at, raw_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        intent.client_order_id, candidate.code, "buy", 100,
+                        100, 50, 10, "partial", 1, "",
+                        "2026-07-28T10:01:00+08:00", "{}",
+                    ),
+                )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "partial-50",
+                        broker_time="2026-07-28T10:01:04+08:00",
+                        generated_at="2026-07-28T10:01:05+08:00",
+                        open_orders=({
+                            "client_order_id": intent.client_order_id,
+                            "broker_order_id": "jq-partial-1",
+                            "stock_code": candidate.code, "side": "buy",
+                            "target_qty": 100, "filled_qty": 50,
+                            "status": "partially_filled",
+                            "updated_at": "2026-07-28T10:01:00+08:00",
+                        },),
+                    ),
+                )
                 self.assertTrue(store.adjust_capacity_reservation(
                     conn, candidate.account_scope_id, "reservation-1",
-                    remaining_target_qty=50, remaining_cash_yuan="503",
-                    remaining_position_value_yuan="500",
-                    remaining_open_risk_yuan="30",
+                    cumulative_filled_qty=50,
                 ))
                 adjusted = store.aggregate_active_reservations(
                     conn, candidate.account_scope_id,
                 )
-                self.assertEqual(adjusted["cash_yuan"], Decimal("503"))
+                self.assertEqual(adjusted["cash_yuan"], Decimal("503.01"))
                 self.assertEqual(adjusted["target_qty"], 50)
-                with self.assertRaisesRegex(ValueError, "cannot increase"):
+                self.assertEqual(
+                    store.reserve_capacity(
+                        conn, account_scope_id=candidate.account_scope_id,
+                        reservation_id="reservation-1",
+                        client_order_id=intent.client_order_id,
+                        stock_code="600000", side="buy", target_qty=100,
+                        cash_yuan="1006.01", position_value_yuan="1000",
+                        open_risk_yuan="112.37", industry="technology",
+                        theme="artificial-intelligence",
+                        uncategorized=False,
+                        created_at="2026-07-28T10:00:00+08:00",
+                    ),
+                    "reservation-1",
+                )
+                replayed = conn.execute(
+                    """SELECT remaining_target_qty, remaining_cash_yuan, status
+                       FROM capacity_reservations
+                       WHERE reservation_id='reservation-1'"""
+                ).fetchone()
+                self.assertEqual(
+                    tuple(replayed), (50, "503.01", "active"),
+                )
+                conn.execute(
+                    """UPDATE orders SET filled_qty=25
+                       WHERE client_order_id=?""",
+                    (intent.client_order_id,),
+                )
+                with self.assertRaisesRegex(ValueError, "partial-fill evidence"):
                     store.adjust_capacity_reservation(
                         conn, candidate.account_scope_id, "reservation-1",
-                        remaining_target_qty=75, remaining_cash_yuan="750",
-                        remaining_position_value_yuan="750",
-                        remaining_open_risk_yuan="45",
+                        cumulative_filled_qty=25,
                     )
+                conn.execute(
+                    """UPDATE orders SET filled_qty=100, status='filled'
+                       WHERE client_order_id=?""",
+                    (intent.client_order_id,),
+                )
+                self.assertTrue(store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="PARTIALLY_FILLED", new_status="FILLED",
+                    transitioned_at="2026-07-28T10:02:00+08:00",
+                ))
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "filled-empty",
+                        broker_time="2026-07-28T10:02:01+08:00",
+                        generated_at="2026-07-28T10:02:02+08:00",
+                        open_orders=(),
+                    ),
+                )
+                self._insert_matched_reconciliation(
+                    conn, "matched-idempotent", candidate.account_scope_id,
+                    broker_time="2026-07-28T10:02:01+08:00",
+                    generated_at="2026-07-28T10:02:02+08:00",
+                    finished_at="2026-07-28T10:02:03+08:00",
+                )
                 self.assertTrue(store.release_capacity_reservation(
                     conn, candidate.account_scope_id, "reservation-1",
-                    released_at="2026-07-29T10:01:00+08:00", reason="expired",
+                    released_at="2026-07-28T10:02:04+08:00", reason="filled",
+                    reconciliation_id="matched-idempotent",
                 ))
                 self.assertFalse(store.release_capacity_reservation(
                     conn, candidate.account_scope_id, "reservation-1",
-                    released_at="2026-07-29T10:02:00+08:00", reason="overwrite",
+                    released_at="2026-07-28T10:03:00+08:00", reason="overwrite",
                 ))
+                self.assertEqual(
+                    store.reserve_capacity(
+                        conn, account_scope_id=candidate.account_scope_id,
+                        reservation_id="reservation-1",
+                        client_order_id=intent.client_order_id,
+                        stock_code="600000", side="buy", target_qty=100,
+                        cash_yuan="1006.01", position_value_yuan="1000",
+                        open_risk_yuan="112.37", industry="technology",
+                        theme="artificial-intelligence",
+                        uncategorized=False,
+                        created_at="2026-07-28T10:00:00+08:00",
+                    ),
+                    "reservation-1",
+                )
                 row = conn.execute(
-                    """SELECT target_qty, remaining_target_qty, release_reason
-                       FROM capacity_reservations"""
+                    """SELECT target_qty, remaining_target_qty, release_reason,
+                              status
+                       FROM capacity_reservations
+                       WHERE reservation_id='reservation-1'"""
                 ).fetchone()
-                self.assertEqual((row[0], row[1], row[2]), (100, 50, "expired"))
+                self.assertEqual(
+                    tuple(row), (100, 50, "filled", "released"),
+                )
+
+    def test_execution_intent_and_capacity_inputs_fail_closed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, candidate)
+                store.insert_pre_trade_result(conn, result)
+                with self.assertRaisesRegex(ValueError, "READY"):
+                    store.insert_execution_intent(
+                        conn, intent, status="SUBMITTED",
+                    )
+                store.insert_execution_intent(conn, intent)
+                base = {
+                    "account_scope_id": candidate.account_scope_id,
+                    "reservation_id": "invalid-reservation",
+                    "client_order_id": intent.client_order_id,
+                    "stock_code": "600000", "side": "buy",
+                    "target_qty": 100, "cash_yuan": "1006.01",
+                    "position_value_yuan": "1000",
+                    "open_risk_yuan": "112.37",
+                    "industry": "technology",
+                    "theme": "artificial-intelligence",
+                    "uncategorized": False,
+                    "created_at": "2026-07-28T10:00:00+08:00",
+                }
+                invalid_cases = (
+                    {"target_qty": True},
+                    {"target_qty": -1},
+                    {"target_qty": 1.5},
+                    {"target_qty": float("inf")},
+                    {"side": "hold"},
+                    {"side": "sell"},
+                    {"uncategorized": 1},
+                    {"reservation_id": ""},
+                    {"stock_code": ""},
+                    {"industry": "", "uncategorized": False},
+                    {"industry": "__UNCATEGORIZED__", "uncategorized": False},
+                    {"uncategorized": True},
+                    {"created_at": ""},
+                    {"created_at": "2026-07-28T10:00:00"},
+                    {"stock_code": "000001"},
+                    {"target_qty": 50},
+                    {"cash_yuan": "1006"},
+                    {"position_value_yuan": "999"},
+                    {"open_risk_yuan": "112"},
+                )
+                for index, changes in enumerate(invalid_cases):
+                    conn.execute(f"SAVEPOINT invalid_{index}")
+                    try:
+                        with self.assertRaises(ValueError):
+                            store.reserve_capacity(conn, **{**base, **changes})
+                    finally:
+                        conn.execute(f"ROLLBACK TO invalid_{index}")
+                        conn.execute(f"RELEASE invalid_{index}")
+                store.reserve_capacity(conn, **{
+                    **base, "reservation_id": "valid-reservation",
+                })
+                for invalid_qty in (True, -1, 1.5, float("nan")):
+                    with self.assertRaises(ValueError):
+                        store.adjust_capacity_reservation(
+                            conn, candidate.account_scope_id,
+                            "valid-reservation",
+                            cumulative_filled_qty=invalid_qty,
+                        )
+
+    def test_sell_reservation_matches_intent_without_consuming_buy_capacity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate(side="sell")
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, candidate)
+                store.insert_pre_trade_result(conn, result)
+                store.insert_execution_intent(conn, intent)
+                reservation = {
+                    "account_scope_id": candidate.account_scope_id,
+                    "reservation_id": "sell-reservation",
+                    "client_order_id": intent.client_order_id,
+                    "stock_code": candidate.code, "side": "sell",
+                    "target_qty": intent.order_qty,
+                    "cash_yuan": "0", "position_value_yuan": "0",
+                    "open_risk_yuan": "0",
+                    "industry": candidate.industry,
+                    "theme": candidate.theme,
+                    "uncategorized": candidate.uncategorized,
+                    "created_at": "2026-07-28T10:00:00+08:00",
+                }
+                self.assertEqual(
+                    store.reserve_capacity(conn, **reservation),
+                    "sell-reservation",
+                )
+                for field in (
+                    "cash_yuan", "position_value_yuan", "open_risk_yuan",
+                ):
+                    with self.assertRaisesRegex(ValueError, "sell"):
+                        store.reserve_capacity(
+                            conn,
+                            **{
+                                **reservation,
+                                "reservation_id": f"invalid-{field}",
+                                field: "1",
+                            },
+                        )
+
+    def test_execution_intent_cas_enforces_the_frozen_state_graph(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, candidate)
+                store.insert_pre_trade_result(conn, result)
+                store.insert_execution_intent(conn, intent)
+                for expected, new in (
+                    ("", "SUBMITTING"),
+                    ("READY", ""),
+                    ("UNKNOWN", "SUBMITTING"),
+                    ("READY", "UNKNOWN"),
+                    ("READY", "FILLED"),
+                ):
+                    with self.assertRaises(ValueError):
+                        store.compare_and_set_execution_intent_status(
+                            conn, candidate.account_scope_id,
+                            intent.client_order_id,
+                            expected_status=expected, new_status=new,
+                            transitioned_at="2026-07-28T10:00:00+08:00",
+                        )
+                with self.assertRaisesRegex(ValueError, "expired"):
+                    store.compare_and_set_execution_intent_status(
+                        conn, candidate.account_scope_id,
+                        intent.client_order_id,
+                        expected_status="READY", new_status="SUBMITTING",
+                        transitioned_at="2026-07-28T10:01:00+08:00",
+                    )
+                self.assertTrue(store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="READY", new_status="SUBMITTING",
+                    transitioned_at="2026-07-28T10:00:00+08:00",
+                ))
+                self.assertTrue(store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="SUBMITTING", new_status="SUBMIT_UNKNOWN",
+                    transitioned_at="2026-07-28T10:00:01+08:00",
+                ))
+                with self.assertRaises(ValueError):
+                    store.compare_and_set_execution_intent_status(
+                        conn, candidate.account_scope_id,
+                        intent.client_order_id,
+                        expected_status="SUBMIT_UNKNOWN", new_status="READY",
+                        transitioned_at="2026-07-28T10:00:02+08:00",
+                    )
+                for recovered_status in (
+                    "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "CANCELLED",
+                    "REJECTED", "NOT_SUBMITTED",
+                ):
+                    conn.execute(
+                        """UPDATE execution_intents SET status='SUBMIT_UNKNOWN'
+                           WHERE account_scope_id=? AND client_order_id=?""",
+                        (candidate.account_scope_id, intent.client_order_id),
+                    )
+                    self.assertTrue(
+                        store.compare_and_set_execution_intent_status(
+                            conn, candidate.account_scope_id,
+                            intent.client_order_id,
+                            expected_status="SUBMIT_UNKNOWN",
+                            new_status=recovered_status,
+                            transitioned_at="2026-07-28T10:00:02+08:00",
+                        )
+                    )
+
+    def test_reservation_release_requires_aware_time_and_reason(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, candidate)
+                store.insert_pre_trade_result(conn, result)
+                store.insert_execution_intent(conn, intent)
+                store.reserve_capacity(
+                    conn, account_scope_id=candidate.account_scope_id,
+                    reservation_id="release-reservation",
+                    client_order_id=intent.client_order_id,
+                    stock_code=candidate.code, side="buy",
+                    target_qty=intent.order_qty,
+                    cash_yuan="1006.01", position_value_yuan="1000",
+                    open_risk_yuan="112.37",
+                    industry=candidate.industry, theme=candidate.theme,
+                    uncategorized=candidate.uncategorized,
+                    created_at="2026-07-28T10:00:00+08:00",
+                )
+                with self.assertRaises(ValueError):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "release-reservation",
+                        released_at="2026-07-28T10:01:00",
+                        reason="expired",
+                    )
+                with self.assertRaises(ValueError):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "release-reservation",
+                        released_at="2026-07-28T10:01:00+08:00",
+                        reason="",
+                    )
+
+    def test_reservation_lifecycle_requires_authoritative_execution_evidence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, candidate)
+                store.insert_pre_trade_result(conn, result)
+                store.insert_execution_intent(conn, intent)
+                store.reserve_capacity(
+                    conn, account_scope_id=candidate.account_scope_id,
+                    reservation_id="evidence-reservation",
+                    client_order_id=intent.client_order_id,
+                    stock_code=candidate.code, side="buy",
+                    target_qty=intent.order_qty,
+                    cash_yuan="1006.01", position_value_yuan="1000",
+                    open_risk_yuan="112.37",
+                    industry=candidate.industry, theme=candidate.theme,
+                    uncategorized=candidate.uncategorized,
+                    created_at="2026-07-28T10:00:00+08:00",
+                )
+                with self.assertRaisesRegex(ValueError, "before expiry"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation",
+                        released_at="2026-07-28T10:00:00+08:00",
+                        reason="not expired",
+                    )
+                with self.assertRaisesRegex(ValueError, "EXPIRED"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation",
+                        released_at="2026-07-28T10:01:00+08:00",
+                        reason="expired without intent transition",
+                    )
+                store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="READY", new_status="SUBMITTING",
+                    transitioned_at="2026-07-28T10:00:00+08:00",
+                )
+                with self.assertRaisesRegex(ValueError, "PARTIALLY_FILLED"):
+                    store.adjust_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation", cumulative_filled_qty=50,
+                    )
+                with self.assertRaisesRegex(ValueError, "cannot be released"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation",
+                        released_at="2026-07-28T10:01:00+08:00",
+                        reason="unsafe early release",
+                    )
+                store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="SUBMITTING", new_status="SUBMITTED",
+                    transitioned_at="2026-07-28T10:00:01+08:00",
+                )
+                store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="SUBMITTED", new_status="PARTIALLY_FILLED",
+                    transitioned_at="2026-07-28T10:01:00+08:00",
+                )
+                conn.execute(
+                    """INSERT INTO orders(
+                       client_order_id, stock_code, action, target_qty,
+                       requested_qty, filled_qty, average_fill_price, status,
+                       submit_count, reason, updated_at, raw_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        intent.client_order_id, candidate.code, "buy", 100,
+                        100, 50, 10, "partial", 1, "",
+                        "2026-07-28T10:01:00+08:00", "{}",
+                    ),
+                )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "evidence-partial-50",
+                        broker_time="2026-07-28T10:01:01+08:00",
+                        generated_at="2026-07-28T10:01:02+08:00",
+                        open_orders=({
+                            "client_order_id": intent.client_order_id,
+                            "broker_order_id": "jq-evidence-partial",
+                            "stock_code": candidate.code, "side": "buy",
+                            "target_qty": 100, "filled_qty": 50,
+                            "status": "partially_filled",
+                            "updated_at": "2026-07-28T10:01:00+08:00",
+                        },),
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "partial-fill evidence"):
+                    store.adjust_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation", cumulative_filled_qty=40,
+                    )
+                self.assertTrue(store.adjust_capacity_reservation(
+                    conn, candidate.account_scope_id,
+                    "evidence-reservation", cumulative_filled_qty=50,
+                ))
+                remaining = conn.execute(
+                    """SELECT remaining_target_qty, remaining_cash_yuan,
+                              remaining_position_value_yuan,
+                              remaining_open_risk_yuan
+                       FROM capacity_reservations
+                       WHERE reservation_id='evidence-reservation'"""
+                ).fetchone()
+                self.assertEqual(
+                    tuple(remaining), (50, "503.01", "500", "56.19"),
+                )
+                conn.execute(
+                    """UPDATE orders SET filled_qty=100, status='filled',
+                       updated_at='2026-07-28T10:02:00+08:00'
+                       WHERE client_order_id=?""",
+                    (intent.client_order_id,),
+                )
+                store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="PARTIALLY_FILLED", new_status="FILLED",
+                    transitioned_at="2026-07-28T10:02:00+08:00",
+                )
+                conn.execute(
+                    "UPDATE orders SET status='cancelled' WHERE client_order_id=?",
+                    (intent.client_order_id,),
+                )
+                with self.assertRaisesRegex(ValueError, "reconciliation_id"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation",
+                        released_at="2026-07-28T10:02:01+08:00",
+                        reason="missing reconciliation",
+                    )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "terminal-empty",
+                        broker_time="2026-07-28T10:02:01+08:00",
+                        generated_at="2026-07-28T10:02:02+08:00",
+                        open_orders=(),
+                    ),
+                )
+                self._insert_matched_reconciliation(
+                    conn, "matched-wrong-status", candidate.account_scope_id,
+                    broker_time="2026-07-28T10:02:01+08:00",
+                    generated_at="2026-07-28T10:02:02+08:00",
+                    finished_at="2026-07-28T10:02:03+08:00",
+                )
+                with self.assertRaisesRegex(ValueError, "FILLED.*order"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation",
+                        released_at="2026-07-28T10:02:04+08:00",
+                        reason="wrong terminal order",
+                        reconciliation_id="matched-wrong-status",
+                    )
+                conn.execute(
+                    """UPDATE orders SET status='filled',
+                       updated_at='2026-07-28T10:02:05+08:00'
+                       WHERE client_order_id=?""",
+                    (intent.client_order_id,),
+                )
+                self._insert_matched_reconciliation(
+                    conn, "matched-stale", candidate.account_scope_id,
+                    broker_time="2026-07-28T10:02:03+08:00",
+                    generated_at="2026-07-28T10:02:04+08:00",
+                    finished_at="2026-07-28T10:02:05+08:00",
+                )
+                with self.assertRaisesRegex(ValueError, "predates"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "evidence-reservation",
+                        released_at="2026-07-28T10:02:06+08:00",
+                        reason="stale reconciliation",
+                        reconciliation_id="matched-stale",
+                    )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "terminal-release",
+                        broker_time="2026-07-28T10:02:06+08:00",
+                        generated_at="2026-07-28T10:02:07+08:00",
+                        open_orders=(),
+                    ),
+                )
+                self._insert_matched_reconciliation(
+                    conn, "matched-release", candidate.account_scope_id,
+                    broker_time="2026-07-28T10:02:06+08:00",
+                    generated_at="2026-07-28T10:02:07+08:00",
+                    finished_at="2026-07-28T10:02:08+08:00",
+                )
+                self.assertTrue(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id,
+                    "evidence-reservation",
+                    released_at="2026-07-28T10:02:09+08:00",
+                    reason="terminal order reconciled",
+                    reconciliation_id="matched-release",
+                ))
+
+    def test_terminal_release_requires_fresh_scoped_snapshot_evidence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                self._reserve_intent(
+                    store, conn, candidate, result, intent,
+                    "scoped-release",
+                )
+                for expected, new, transitioned_at in (
+                    ("READY", "SUBMITTING", "2026-07-28T10:00:00+08:00"),
+                    ("SUBMITTING", "SUBMITTED", "2026-07-28T10:00:01+08:00"),
+                    ("SUBMITTED", "FILLED", "2026-07-28T10:00:02+08:00"),
+                ):
+                    store.compare_and_set_execution_intent_status(
+                        conn, candidate.account_scope_id,
+                        intent.client_order_id, expected_status=expected,
+                        new_status=new, transitioned_at=transitioned_at,
+                    )
+                conn.execute(
+                    """INSERT INTO orders(
+                       client_order_id, stock_code, action, target_qty,
+                       requested_qty, filled_qty, average_fill_price, status,
+                       submit_count, reason, updated_at, raw_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        intent.client_order_id, candidate.code, "buy", 500,
+                        100, 100, 10, "filled", 1, "",
+                        "2026-07-28T10:00:02+08:00", "{}",
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, started_at, finished_at,
+                       result, severity, difference_count, control_action,
+                       summary_json
+                       ) VALUES('legacy-null','full',?,?,?,?,0,'','{}')""",
+                    (
+                        "2026-07-28T10:00:03+08:00",
+                        "2026-07-28T10:00:04+08:00", "matched", "INFO",
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "snapshot evidence"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id, "scoped-release",
+                        released_at="2026-07-28T10:00:10+08:00",
+                        reason="legacy evidence", reconciliation_id="legacy-null",
+                    )
+
+                other_scope = store.get_or_create_account_scope(
+                    conn, "qmt", "paper",
+                )
+                self._insert_matched_reconciliation(
+                    conn, "cross-scope", other_scope,
+                    broker_time="2026-07-28T10:00:03+08:00",
+                    generated_at="2026-07-28T10:00:04+08:00",
+                    finished_at="2026-07-28T10:00:05+08:00",
+                )
+                with self.assertRaisesRegex(ValueError, "account scope"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id, "scoped-release",
+                        released_at="2026-07-28T10:00:10+08:00",
+                        reason="cross scope", reconciliation_id="cross-scope",
+                    )
+
+                self._insert_matched_reconciliation(
+                    conn, "prior-day", candidate.account_scope_id,
+                    broker_time="2026-07-27T15:00:00+08:00",
+                    generated_at="2026-07-27T15:00:01+08:00",
+                    finished_at="2026-07-28T10:00:05+08:00",
+                )
+                with self.assertRaisesRegex(ValueError, "predates"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id, "scoped-release",
+                        released_at="2026-07-28T10:00:10+08:00",
+                        reason="stale snapshot", reconciliation_id="prior-day",
+                    )
+
+                self._insert_matched_reconciliation(
+                    conn, "fresh-match", candidate.account_scope_id,
+                    broker_time="2026-07-28T10:00:03+08:00",
+                    generated_at="2026-07-28T10:00:04+08:00",
+                    finished_at="2026-07-28T10:00:05+08:00",
+                )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "current-order",
+                        broker_time="2026-07-28T10:00:06+08:00",
+                        generated_at="2026-07-28T10:00:07+08:00",
+                        open_orders=({
+                            "client_order_id": intent.client_order_id,
+                            "broker_order_id": "jq-still-open",
+                            "stock_code": candidate.code, "side": "buy",
+                            "target_qty": 100, "filled_qty": 0,
+                            "status": "submitted",
+                            "updated_at": "2026-07-28T10:00:06+08:00",
+                        },),
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "current broker order"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id, "scoped-release",
+                        released_at="2026-07-28T10:00:08+08:00",
+                        reason="broker order still open",
+                        reconciliation_id="fresh-match",
+                    )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "newer-current",
+                        broker_time="2026-07-28T10:00:08+08:00",
+                        generated_at="2026-07-28T10:00:09+08:00",
+                        open_orders=(),
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "does not describe current broker snapshot",
+                ):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id, "scoped-release",
+                        released_at="2026-07-28T10:00:10+08:00",
+                        reason="stale matched snapshot",
+                        reconciliation_id="fresh-match",
+                    )
+                self._insert_matched_reconciliation(
+                    conn, "newer-match", candidate.account_scope_id,
+                    broker_time="2026-07-28T10:00:08+08:00",
+                    generated_at="2026-07-28T10:00:09+08:00",
+                    finished_at="2026-07-28T10:00:09+08:00",
+                )
+                self.assertTrue(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id, "scoped-release",
+                    released_at="2026-07-28T10:00:10+08:00",
+                    reason="fresh scoped evidence",
+                    reconciliation_id="newer-match",
+                ))
+
+    def test_expired_release_requires_post_expiry_snapshot_without_order(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                self._reserve_intent(
+                    store, conn, candidate, result, intent,
+                    "expired-release",
+                )
+                store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="READY", new_status="EXPIRED",
+                    transitioned_at="2026-07-28T10:01:00+08:00",
+                )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "expired-has-order",
+                        broker_time="2026-07-28T10:01:01+08:00",
+                        generated_at="2026-07-28T10:01:02+08:00",
+                        open_orders=({
+                            "client_order_id": intent.client_order_id,
+                            "broker_order_id": "jq-expired",
+                            "stock_code": candidate.code, "side": "buy",
+                            "target_qty": 100, "filled_qty": 0,
+                            "status": "submitted",
+                            "updated_at": "2026-07-28T10:01:01+08:00",
+                        },),
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "current broker order"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id, "expired-release",
+                        released_at="2026-07-28T10:01:03+08:00",
+                        reason="order still exists",
+                    )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "expired-empty-later",
+                        broker_time="2026-07-28T10:01:03+08:00",
+                        generated_at="2026-07-28T10:01:04+08:00",
+                        open_orders=(),
+                    ),
+                )
+                self.assertTrue(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id, "expired-release",
+                    released_at="2026-07-28T10:01:05+08:00",
+                    reason="post-expiry absence confirmed",
+                ))
+
+    def test_partial_adjustment_binds_broker_order_and_fill_identity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                self._reserve_intent(
+                    store, conn, candidate, result, intent,
+                    "identity-adjust",
+                )
+                for expected, new, transitioned_at in (
+                    ("READY", "SUBMITTING", "2026-07-28T10:00:00+08:00"),
+                    ("SUBMITTING", "SUBMITTED", "2026-07-28T10:00:01+08:00"),
+                    (
+                        "SUBMITTED", "PARTIALLY_FILLED",
+                        "2026-07-28T10:00:02+08:00",
+                    ),
+                ):
+                    store.compare_and_set_execution_intent_status(
+                        conn, candidate.account_scope_id,
+                        intent.client_order_id, expected_status=expected,
+                        new_status=new, transitioned_at=transitioned_at,
+                    )
+                conn.execute(
+                    """INSERT INTO orders(
+                       client_order_id, order_id, stock_code, action,
+                       target_qty, requested_qty, filled_qty,
+                       average_fill_price, status, submit_count, reason,
+                       updated_at, raw_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        intent.client_order_id, "jq-partial", candidate.code,
+                        "buy", 100, 100, 50, 10, "partial", 1, "",
+                        "2026-07-28T10:00:02+08:00", "{}",
+                    ),
+                )
+
+                def replace_order(snapshot_id: str, **changes: object) -> None:
+                    order = {
+                        "client_order_id": intent.client_order_id,
+                        "broker_order_id": "jq-partial",
+                        "stock_code": candidate.code, "side": "buy",
+                        "target_qty": 100, "filled_qty": 50,
+                        "status": "partially_filled",
+                        "updated_at": "2026-07-28T10:00:02+08:00",
+                        **changes,
+                    }
+                    sequence = int(snapshot_id.rsplit("-", 1)[1])
+                    store.replace_current_broker_snapshot(
+                        conn,
+                        self._broker_snapshot(
+                            candidate.account_scope_id, snapshot_id,
+                            broker_time=(
+                                f"2026-07-28T10:00:{sequence:02d}+08:00"
+                            ),
+                            generated_at=(
+                                f"2026-07-28T10:00:{sequence + 1:02d}+08:00"
+                            ),
+                            open_orders=(order,),
+                        ),
+                    )
+
+                for snapshot_id, changes in (
+                    ("identity-10", {"stock_code": "000001"}),
+                    ("identity-12", {"side": "sell"}),
+                    ("identity-14", {"target_qty": 200}),
+                ):
+                    replace_order(snapshot_id, **changes)
+                    with self.assertRaisesRegex(ValueError, "broker order"):
+                        store.adjust_capacity_reservation(
+                            conn, candidate.account_scope_id,
+                            "identity-adjust", cumulative_filled_qty=50,
+                        )
+                replace_order("identity-16")
+                conn.execute(
+                    """UPDATE orders SET stock_code='000001'
+                       WHERE client_order_id=?""",
+                    (intent.client_order_id,),
+                )
+                with self.assertRaisesRegex(ValueError, "legacy order"):
+                    store.adjust_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "identity-adjust", cumulative_filled_qty=50,
+                    )
+                conn.execute(
+                    """UPDATE orders SET stock_code=?
+                       WHERE client_order_id=?""",
+                    (candidate.code, intent.client_order_id),
+                )
+                conn.execute(
+                    """INSERT INTO fills(
+                       fill_id, client_order_id, order_id, stock_code, action,
+                       qty, price, filled_at, raw_json
+                       ) VALUES('wrong-fill', NULL, 'jq-partial', '000001',
+                                'buy', 50, 10,
+                                '2026-07-28T10:00:02+08:00', '{}')""",
+                )
+                with self.assertRaisesRegex(ValueError, "fill identity"):
+                    store.adjust_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "identity-adjust", cumulative_filled_qty=50,
+                    )
+                conn.execute("DELETE FROM fills WHERE fill_id='wrong-fill'")
+                self.assertTrue(store.adjust_capacity_reservation(
+                    conn, candidate.account_scope_id,
+                    "identity-adjust", cumulative_filled_qty=50,
+                ))
+
+    def test_new_reservation_must_share_the_intent_creation_transaction(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, candidate)
+                store.insert_pre_trade_result(conn, result)
+                store.insert_execution_intent(conn, intent)
+            with store.transaction() as conn:
+                with self.assertRaisesRegex(ValueError, "same transaction"):
+                    store.reserve_capacity(
+                        conn, account_scope_id=candidate.account_scope_id,
+                        reservation_id="late-reservation",
+                        client_order_id=intent.client_order_id,
+                        stock_code=candidate.code, side="buy",
+                        target_qty=intent.order_qty,
+                        cash_yuan="1006.01", position_value_yuan="1000",
+                        open_risk_yuan="112.37",
+                        industry=candidate.industry, theme=candidate.theme,
+                        uncategorized=candidate.uncategorized,
+                        created_at="2026-07-28T10:00:00+08:00",
+                    )
+
+    def test_manual_transaction_boundary_invalidates_new_intent_marker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, candidate)
+                store.insert_pre_trade_result(conn, result)
+                store.insert_execution_intent(conn, intent)
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                with self.assertRaisesRegex(ValueError, "same transaction"):
+                    store.reserve_capacity(
+                        conn, account_scope_id=candidate.account_scope_id,
+                        reservation_id="committed-reservation",
+                        client_order_id=intent.client_order_id,
+                        stock_code=candidate.code, side="buy",
+                        target_qty=intent.order_qty,
+                        cash_yuan="1006.01", position_value_yuan="1000",
+                        open_risk_yuan="112.37",
+                        industry=candidate.industry, theme=candidate.theme,
+                        uncategorized=candidate.uncategorized,
+                        created_at="2026-07-28T10:00:00+08:00",
+                    )
+
+    def test_terminal_release_binds_transition_and_order_identity(self) -> None:
+        for case in ("old_reconciliation", "wrong_order"):
+            with self.subTest(case=case), TemporaryDirectory() as tmp:
+                store = TradingStore(Path(tmp) / "trading.db")
+                store.initialize()
+                candidate = make_candidate()
+                result = PreTradeResult(**pre_trade_values(candidate))
+                intent = ExecutionIntent(**intent_values(candidate, result))
+                with store.transaction() as conn:
+                    conn.execute(
+                        """INSERT INTO account_scopes(
+                           account_scope_id, adapter, scope_alias, created_at
+                           ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                        (candidate.account_scope_id,),
+                    )
+                    store.insert_strategy_order_candidate(conn, candidate)
+                    store.insert_pre_trade_result(conn, result)
+                    store.insert_execution_intent(conn, intent)
+                    store.reserve_capacity(
+                        conn, account_scope_id=candidate.account_scope_id,
+                        reservation_id="release-binding",
+                        client_order_id=intent.client_order_id,
+                        stock_code=candidate.code, side="buy",
+                        target_qty=intent.order_qty,
+                        cash_yuan="1006.01", position_value_yuan="1000",
+                        open_risk_yuan="112.37",
+                        industry=candidate.industry, theme=candidate.theme,
+                        uncategorized=candidate.uncategorized,
+                        created_at="2026-07-28T10:00:00+08:00",
+                    )
+                    store.compare_and_set_execution_intent_status(
+                        conn, candidate.account_scope_id,
+                        intent.client_order_id,
+                        expected_status="READY", new_status="SUBMITTING",
+                        transitioned_at="2026-07-28T10:00:00+08:00",
+                    )
+                    if case == "old_reconciliation":
+                        self._insert_matched_reconciliation(
+                            conn, "old-match", candidate.account_scope_id,
+                            broker_time="2026-07-28T10:00:20+08:00",
+                            generated_at="2026-07-28T10:00:25+08:00",
+                            finished_at="2026-07-28T10:00:30+08:00",
+                        )
+                        store.compare_and_set_execution_intent_status(
+                            conn, candidate.account_scope_id,
+                            intent.client_order_id,
+                            expected_status="SUBMITTING",
+                            new_status="NOT_SUBMITTED",
+                            transitioned_at="2026-07-28T10:01:00+08:00",
+                        )
+                        error = "predates"
+                        reconciliation_id = "old-match"
+                    else:
+                        store.compare_and_set_execution_intent_status(
+                            conn, candidate.account_scope_id,
+                            intent.client_order_id,
+                            expected_status="SUBMITTING", new_status="SUBMITTED",
+                            transitioned_at="2026-07-28T10:01:00+08:00",
+                        )
+                        store.compare_and_set_execution_intent_status(
+                            conn, candidate.account_scope_id,
+                            intent.client_order_id,
+                            expected_status="SUBMITTED", new_status="FILLED",
+                            transitioned_at="2026-07-28T10:01:01+08:00",
+                        )
+                        conn.execute(
+                            """INSERT INTO orders(
+                               client_order_id, stock_code, action, target_qty,
+                               requested_qty, filled_qty, average_fill_price,
+                               status, submit_count, reason, updated_at, raw_json
+                               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                intent.client_order_id, "000001", "sell", 1,
+                                1, 1, 10, "filled", 1, "",
+                                "2026-07-28T10:01:00+08:00", "{}",
+                            ),
+                        )
+                        self._insert_matched_reconciliation(
+                            conn, "wrong-order-match",
+                            candidate.account_scope_id,
+                            broker_time="2026-07-28T10:01:10+08:00",
+                            generated_at="2026-07-28T10:01:15+08:00",
+                            finished_at="2026-07-28T10:01:20+08:00",
+                        )
+                        error = "execution intent"
+                        reconciliation_id = "wrong-order-match"
+                    with self.assertRaisesRegex(ValueError, error):
+                        store.release_capacity_reservation(
+                            conn, candidate.account_scope_id,
+                            "release-binding",
+                            released_at="2026-07-28T10:02:00+08:00",
+                            reason="must remain reserved",
+                            reconciliation_id=reconciliation_id,
+                        )
+                    self.assertEqual(conn.execute(
+                        """SELECT status FROM capacity_reservations
+                           WHERE reservation_id='release-binding'"""
+                    ).fetchone()[0], "active")
+
+    def test_order_status_only_advances_and_late_full_fill_wins(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+
+            def order(
+                client_id: str,
+                status: str,
+                filled_qty: int,
+                updated_at: str,
+            ) -> dict:
+                return {
+                    "client_order_id": client_id,
+                    "signal_id": None,
+                    "order_id": client_id,
+                    "stock_code": "600000",
+                    "action": "buy",
+                    "target_qty": 100,
+                    "requested_qty": 100,
+                    "filled_qty": filled_qty,
+                    "average_fill_price": 10 if filled_qty else 0,
+                    "status": status,
+                    "submit_count": 1,
+                    "reason": "",
+                    "first_submitted_at": updated_at,
+                    "updated_at": updated_at,
+                    "completed_at": (
+                        updated_at
+                        if status in {
+                            "filled", "cancelled", "failed", "skipped",
+                        }
+                        else None
+                    ),
+                    "raw_json": "{}",
+                }
+
+            with store.transaction() as conn:
+                store.upsert_order(
+                    conn, order("monotonic", "submitted", 0, "2026-07-29 10:00:00"),
+                )
+                store.upsert_order(
+                    conn, order("monotonic", "partial", 50, "2026-07-29 10:01:00"),
+                )
+                store.upsert_order(
+                    conn, order("monotonic", "submitted", 0, "2026-07-29 10:00:30"),
+                )
+                for terminal in ("failed", "skipped"):
+                    store.upsert_order(
+                        conn, order(terminal, terminal, 0, "2026-07-29 10:00:00"),
+                    )
+                    store.upsert_order(
+                        conn, order(terminal, "submitted", 0, "2026-07-29 10:01:00"),
+                    )
+                store.upsert_order(
+                    conn, order("late-fill", "cancelled", 50, "2026-07-29 10:00:00"),
+                )
+                store.upsert_order(
+                    conn, order("late-fill", "filled", 100, "2026-07-29 10:01:00"),
+                )
+                store.upsert_order(
+                    conn, order("impossible-fill", "rejected", 0, "2026-07-29 10:00:00"),
+                )
+                with self.assertRaisesRegex(ValueError, "terminal order"):
+                    store.upsert_order(
+                        conn, order(
+                            "impossible-fill", "filled", 100,
+                            "2026-07-29 10:01:00",
+                        ),
+                    )
+                for terminal in (
+                    "rejected", "risk_rejected", "failed", "skipped",
+                ):
+                    with self.subTest(terminal=terminal), self.assertRaisesRegex(
+                        ValueError, "terminal order",
+                    ):
+                        store.upsert_order(
+                            conn,
+                            order(
+                                f"incoming-{terminal}", terminal, 50,
+                                "2026-07-29 10:01:00",
+                            ),
+                        )
+                store.upsert_order(conn, {
+                    **order(
+                        "stale-metadata", "filled", 100,
+                        "2026-07-29T10:00:00+08:00",
+                    ),
+                    "average_fill_price": 10,
+                    "reason": "confirmed",
+                    "raw_json": '{"version":"current"}',
+                })
+                store.upsert_order(conn, {
+                    **order(
+                        "stale-metadata", "submitted", 50,
+                        "2026-07-29T02:01:00Z",
+                    ),
+                    "average_fill_price": 9,
+                    "reason": "stale",
+                    "raw_json": '{"version":"stale"}',
+                })
+
+            with store.connect() as conn:
+                self.assertEqual(
+                    tuple(conn.execute(
+                        """SELECT filled_qty, status FROM orders
+                           WHERE client_order_id='monotonic'"""
+                    ).fetchone()),
+                    (50, "partial"),
+                )
+                for terminal in ("failed", "skipped"):
+                    self.assertEqual(conn.execute(
+                        "SELECT status FROM orders WHERE client_order_id=?",
+                        (terminal,),
+                    ).fetchone()[0], terminal)
+                self.assertEqual(
+                    tuple(conn.execute(
+                        """SELECT filled_qty, status FROM orders
+                           WHERE client_order_id='late-fill'"""
+                    ).fetchone()),
+                    (100, "filled"),
+                )
+                self.assertEqual(
+                    tuple(conn.execute(
+                        """SELECT filled_qty, average_fill_price, status,
+                                  reason, updated_at, raw_json
+                           FROM orders WHERE client_order_id='stale-metadata'"""
+                    ).fetchone()),
+                    (
+                        100, 10, "filled", "confirmed",
+                        "2026-07-29T10:00:00+08:00",
+                        '{"version":"current"}',
+                    ),
+                )
 
     def test_immutable_chain_rejects_changed_embedded_evidence(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -409,6 +1916,91 @@ class TradingStoreTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "adapter"):
                     store.get_or_create_account_scope(conn, "other", "primary")
 
+    def test_first_joinquant_scope_adopts_legacy_execution_issues(self) -> None:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = Path(tmp) / "trading.db"
+            store = TradingStore(path)
+            with patch.object(
+                TradingStore, "_migrate_schema_v11", return_value=None,
+            ):
+                store.initialize()
+            with store.transaction() as conn:
+                store.upsert_execution_issue(conn, {
+                    "issue_key": "order:legacy-order",
+                    "object_type": "order",
+                    "object_id": "legacy-order",
+                    "state": "ORDER_MISSING_PLATFORM",
+                    "severity": "ERROR",
+                    "stage_started_at": "2026-07-28 10:00:00",
+                    "seen_at": "2026-07-28 10:00:00",
+                    "details": {},
+                })
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                row = conn.execute(
+                    """SELECT issue_key, state, recovered_at
+                       FROM execution_issue_state"""
+                ).fetchone()
+
+        self.assertEqual(
+            row["issue_key"],
+            f"scope:{scope}:order:legacy-order",
+        )
+        self.assertEqual(row["state"], "ORDER_MISSING_PLATFORM")
+        self.assertIsNone(row["recovered_at"])
+
+    def test_legacy_issue_collision_merges_without_blocking_scope_lookup(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                store.upsert_execution_issue(conn, {
+                    "issue_key": f"scope:{scope}:ledger:sqlite",
+                    "object_type": "ledger",
+                    "object_id": "sqlite",
+                    "state": "RECOVERABLE_WARNING",
+                    "severity": "WARNING",
+                    "stage_started_at": "2026-07-28 10:01:00",
+                    "seen_at": "2026-07-28 10:01:00",
+                    "details": {"source": "scoped"},
+                })
+                store.recover_execution_issue(
+                    conn, f"scope:{scope}:ledger:sqlite",
+                    "2026-07-28 10:02:00",
+                )
+                store.upsert_execution_issue(conn, {
+                    "issue_key": "ledger:sqlite",
+                    "object_type": "ledger",
+                    "object_id": "sqlite",
+                    "state": "LEDGER_INTEGRITY_FAILURE",
+                    "severity": "CRITICAL",
+                    "stage_started_at": "2026-07-28 10:03:00",
+                    "seen_at": "2026-07-28 10:03:00",
+                    "details": {"source": "legacy"},
+                })
+                self.assertEqual(
+                    store.get_or_create_account_scope(
+                        conn, "joinquant", "primary",
+                    ),
+                    scope,
+                )
+                rows = conn.execute(
+                    """SELECT issue_key, state, severity, recovered_at
+                       FROM execution_issue_state"""
+                ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["issue_key"], f"scope:{scope}:ledger:sqlite")
+        self.assertEqual(rows[0]["state"], "LEDGER_INTEGRITY_FAILURE")
+        self.assertEqual(rows[0]["severity"], "CRITICAL")
+        self.assertIsNone(rows[0]["recovered_at"])
+
     def test_schema_v10_marks_historical_fee_and_pnl_evidence_unknown(self) -> None:
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = Path(tmp) / "trading.db"
@@ -416,7 +2008,7 @@ class TradingStoreTest(unittest.TestCase):
                 SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5,
                 SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
             )
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn, conn:
                 for version, schema in enumerate(schemas, 1):
                     conn.executescript(schema)
                     conn.execute(
@@ -454,6 +2046,74 @@ class TradingStoreTest(unittest.TestCase):
             self.assertEqual(fill["fee_data_status"], "unknown")
             self.assertEqual(equity["fee_data_status"], "unknown")
             self.assertEqual(equity["realized_pnl_status"], "unknown")
+
+    def test_v10_reconciliation_is_preserved_but_cannot_release_capacity(self) -> None:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = Path(tmp) / "trading.db"
+            store = TradingStore(path)
+            with patch.object(
+                TradingStore, "_migrate_schema_v11", return_value=None,
+            ):
+                store.initialize()
+            with store.connect() as conn:
+                conn.execute(
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, started_at, finished_at,
+                       result, severity, difference_count, control_action,
+                       summary_json
+                       ) VALUES('legacy-v10','full',
+                       '2026-07-28T10:00:03+08:00',
+                       '2026-07-28T10:00:04+08:00',
+                       'matched','INFO',0,'','{}')"""
+                )
+            store.initialize()
+
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                legacy = conn.execute(
+                    """SELECT account_scope_id, broker_snapshot_id,
+                              broker_snapshot_sha256, snapshot_broker_time,
+                              snapshot_generated_at
+                       FROM reconciliation_runs
+                       WHERE reconciliation_id='legacy-v10'"""
+                ).fetchone()
+                self.assertEqual(tuple(legacy), (None, None, None, None, None))
+                self._reserve_intent(
+                    store, conn, candidate, result, intent,
+                    "legacy-v10-release",
+                )
+                for expected, new, transitioned_at in (
+                    ("READY", "SUBMITTING", "2026-07-28T10:00:00+08:00"),
+                    ("SUBMITTING", "SUBMITTED", "2026-07-28T10:00:01+08:00"),
+                    ("SUBMITTED", "FILLED", "2026-07-28T10:00:02+08:00"),
+                ):
+                    store.compare_and_set_execution_intent_status(
+                        conn, candidate.account_scope_id,
+                        intent.client_order_id, expected_status=expected,
+                        new_status=new, transitioned_at=transitioned_at,
+                    )
+                conn.execute(
+                    """INSERT INTO orders(
+                       client_order_id, stock_code, action, target_qty,
+                       requested_qty, filled_qty, average_fill_price, status,
+                       submit_count, reason, updated_at, raw_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        intent.client_order_id, candidate.code, "buy", 100,
+                        100, 100, 10, "filled", 1, "",
+                        "2026-07-28T10:00:02+08:00", "{}",
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "snapshot evidence"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "legacy-v10-release",
+                        released_at="2026-07-28T10:00:05+08:00",
+                        reason="legacy reconciliation must not release",
+                        reconciliation_id="legacy-v10",
+                    )
 
     def test_finishes_strategy_run_with_bounded_terminal_evidence(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -679,7 +2339,7 @@ class TradingStoreTest(unittest.TestCase):
     def test_initialize_migrates_version_five_without_losing_rows(self) -> None:
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = Path(tmp) / "trading.db"
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn, conn:
                 for version, schema in enumerate((SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5), 1):
                     conn.executescript(schema)
                     conn.execute(
@@ -711,12 +2371,22 @@ class TradingStoreTest(unittest.TestCase):
                         (snapshot_id, trade_date, trade_date + " 15:00:00", trade_date + " 15:00:01", snapshot_id),
                     )
                 conn.execute(
-                    """INSERT INTO reconciliation_runs VALUES
-                       ('matched-old', 'incremental', 'old', '2025-01-01 15:00:01', '2025-01-01 15:00:02', 'matched', 'INFO', 0, '', '{}')"""
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, snapshot_id, started_at,
+                       finished_at, result, severity, difference_count,
+                       control_action, summary_json
+                       ) VALUES('matched-old', 'incremental', 'old',
+                       '2025-01-01 15:00:01', '2025-01-01 15:00:02',
+                       'matched', 'INFO', 0, '', '{}')"""
                 )
                 conn.execute(
-                    """INSERT INTO reconciliation_runs VALUES
-                       ('error-old', 'full', 'old', '2025-01-01 15:00:01', '2025-01-01 15:00:02', 'mismatch', 'ERROR', 1, 'stop_buy', '{}')"""
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, snapshot_id, started_at,
+                       finished_at, result, severity, difference_count,
+                       control_action, summary_json
+                       ) VALUES('error-old', 'full', 'old',
+                       '2025-01-01 15:00:01', '2025-01-01 15:00:02',
+                       'mismatch', 'ERROR', 1, 'stop_buy', '{}')"""
                 )
                 conn.execute(
                     """INSERT INTO reconciliation_items(

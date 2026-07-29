@@ -49,9 +49,18 @@ class OrderLedgerTest(unittest.TestCase):
             base = {"id": "sig-1", "order_id": "o-1", "code": "600000", "jq_code": "600000.XSHG",
                     "action": "buy", "amount": 100, "datetime": "2026-07-14 10:00:00"}
             partial = normalize_order({**base, "filled": 40, "status": "partial"}, trade_date="2026-07-14", strategy_version="v1")
+            stale = normalize_order({
+                **base, "filled": 0, "status": "submitted",
+                "datetime": "2026-07-14 09:59:00",
+            }, trade_date="2026-07-14", strategy_version="v1")
             filled = normalize_order({**base, "filled": 100, "status": "filled"}, trade_date="2026-07-14", strategy_version="v1")
             with store.transaction() as conn:
                 store.upsert_order(conn, partial)
+                store.upsert_order(conn, stale)
+                current = conn.execute(
+                    "SELECT status, filled_qty FROM orders"
+                ).fetchone()
+                self.assertEqual(tuple(current), ("partial", 40))
                 store.upsert_order(conn, filled)
                 row = conn.execute("SELECT status, filled_qty FROM orders").fetchone()
             self.assertEqual((row[0], row[1]), ("filled", 100))

@@ -10,7 +10,11 @@ from typing import Any
 from flask import Flask, abort, g, jsonify, request
 
 import config as app_config
-from joinquant_sync import ingest_snapshot_payload
+from joinquant_sync import (
+    ingest_snapshot_payload,
+    is_joinquant_event_only_payload,
+    sanitize_joinquant_payload,
+)
 from notifier import WeComNotifier
 from reconciliation import (
     ReconciliationDifference, ReconciliationResult, notify_reconciliation,
@@ -103,9 +107,18 @@ def build_execution_markdown(
     lines = [
         "#### 【JoinQuant 模拟盘】执行回报",
         f"> 账户快照：{payload.get('generated_at') or payload.get('received_at') or '-'}",
-        f"> 总资产：{_num(payload.get('total_value')):.2f} | 现金：{_num(payload.get('cash')):.2f} | 持仓：{len(positions)}",
-        f"> 本次新增成交：{len(executions)}",
     ]
+    if all(
+        payload.get(name) not in (None, "")
+        for name in ("cash", "available_cash", "total_value")
+    ):
+        lines.append(
+            f"> 总资产：{_num(payload.get('total_value')):.2f} | "
+            f"现金：{_num(payload.get('cash')):.2f} | 持仓：{len(positions)}"
+        )
+    else:
+        lines.append("> 事件包未提供账户快照，仅展示执行事实")
+    lines.append(f"> 本次新增成交：{len(executions)}")
     for item in executions:
         action = "买入" if item.get("action") == "buy" else "卖出"
         lines.append(
@@ -195,7 +208,10 @@ def create_app(
     @app.post("/joinquant/account_snapshot")
     def account_snapshot():
         _check_token(expected_token)
-        payload = _validate_snapshot(request.get_json(silent=True))
+        payload = sanitize_joinquant_payload(
+            _validate_snapshot(request.get_json(silent=True))
+        )
+        event_only = is_joinquant_event_only_payload(payload)
         try:
             ledger_result = ingest_snapshot_payload(
                 payload, ledger_store, str(payload.get("received_at")), mode="incremental"
@@ -205,6 +221,11 @@ def create_app(
                 event_path, "account_snapshot", 503,
                 error_type=type(exc).__name__, error=str(exc)[:160],
             )
+            if event_only:
+                return jsonify({
+                    "ok": False,
+                    "error": "execution_event_unavailable",
+                }), 503
             failure = ReconciliationResult(
                 hashlib.sha256(f"ledger:{type(exc).__name__}".encode("utf-8")).hexdigest()[:32],
                 "mismatch", "CRITICAL", [ReconciliationDifference(
@@ -215,13 +236,23 @@ def create_app(
             try:
                 ledger_store.initialize()
                 with ledger_store.transaction() as conn:
+                    account_scope_id = ledger_store.get_or_create_account_scope(
+                        conn, "joinquant", "primary",
+                    )
+                    failure.reconciliation_id = hashlib.sha256(
+                        (
+                            f"ledger:{type(exc).__name__}:"
+                            f"{account_scope_id}"
+                        ).encode("utf-8")
+                    ).hexdigest()[:32]
                     conn.execute(
                         """INSERT OR IGNORE INTO reconciliation_runs(
                            reconciliation_id, mode, snapshot_id, started_at, finished_at, result,
-                           severity, difference_count, control_action, summary_json
+                           severity, difference_count, control_action, summary_json,
+                           account_scope_id
                            ) VALUES (?, 'incremental', NULL, datetime('now'), datetime('now'),
-                           'mismatch', 'CRITICAL', 1, '', '{}')""",
-                        (failure.reconciliation_id,),
+                           'mismatch', 'CRITICAL', 1, '', '{}', ?)""",
+                        (failure.reconciliation_id, account_scope_id),
                     )
                     if conn.execute(
                         "SELECT 1 FROM reconciliation_items WHERE reconciliation_id=? LIMIT 1",
@@ -257,17 +288,20 @@ def create_app(
                 now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
             return jsonify({"ok": False, "error": "ledger_unavailable"}), 503
-        _write_json(account_path, payload)
-        history_path = account_path.parent / "account_snapshot_history.jsonl"
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        with history_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
-        try:
-            from ml_dataset import update_order_labels
+        if not ledger_result.get("event_only"):
+            _write_json(account_path, payload)
+            history_path = account_path.parent / "account_snapshot_history.jsonl"
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            with history_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(payload, ensure_ascii=False, default=str) + "\n"
+                )
+            try:
+                from ml_dataset import update_order_labels
 
-            update_order_labels(app_config.ML_SIGNAL_SAMPLE_FILE, payload)
-        except Exception as exc:
-            print(f"ML order label update skipped: {exc}", flush=True)
+                update_order_labels(app_config.ML_SIGNAL_SAMPLE_FILE, payload)
+            except Exception as exc:
+                print(f"ML order label update skipped: {exc}", flush=True)
         new_executions = list(ledger_result.get("new_executions") or [])
         if new_executions:
             _notify_execution(payload, new_executions)

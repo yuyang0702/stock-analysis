@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from trading_store import canonical_json
@@ -22,6 +23,32 @@ def _float(value: Any) -> float:
         return float(value or 0)
     except Exception:
         return 0.0
+
+
+def _quantity_alias(
+    event: dict[str, object], keys: tuple[str, ...], name: str,
+) -> int:
+    values: list[int] = []
+    for key in keys:
+        value = event.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be a non-negative integer")
+        try:
+            number = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"{key} must be a non-negative integer") from exc
+        if (
+            not number.is_finite()
+            or number < 0
+            or number != number.to_integral_value()
+        ):
+            raise ValueError(f"{key} must be a non-negative integer")
+        values.append(int(number))
+    if len(set(values)) > 1:
+        raise ValueError(f"{name} fields conflict")
+    return values[0] if values else 0
 
 
 def _reported_number(event: dict[str, object], key: str) -> bool:
@@ -49,13 +76,14 @@ def client_order_id(event: dict[str, object], trade_date: str, strategy_version:
 
 
 def fill_id(trade: dict[str, object]) -> str:
+    qty = _quantity_alias(trade, ("amount", "qty"), "fill quantity")
     explicit = _text(trade.get("trade_id") or trade.get("fill_id") or trade.get("id"))
     if explicit:
         return explicit
     raw = "|".join((
         _text(trade.get("order_id")), _text(trade.get("code") or trade.get("jq_code"))[:6],
         _text(trade.get("action")).lower(), _text(trade.get("datetime") or trade.get("filled_at")),
-        str(_int(trade.get("amount") or trade.get("qty"))), str(_float(trade.get("price"))),
+        str(qty), str(_float(trade.get("price"))),
     ))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -63,11 +91,44 @@ def fill_id(trade: dict[str, object]) -> str:
 def normalize_order(
     event: dict[str, object], *, trade_date: str, strategy_version: str
 ) -> dict[str, object]:
+    requested_qty = _quantity_alias(
+        event, ("amount", "requested_qty"), "requested quantity",
+    )
+    filled_qty = _quantity_alias(
+        event, ("filled", "filled_qty"), "filled quantity",
+    )
+    target_qty = (
+        _quantity_alias(event, ("target_qty",), "target quantity")
+        if event.get("target_qty") not in (None, "")
+        else None
+    )
     signal_id = _text(event.get("id") or event.get("signal_id"))
     if signal_id.startswith("jq-order-"):
         signal_id = ""
     status = _text(event.get("status")).split(".")[-1].lower() or "unknown"
-    status = {"held": "submitted", "canceled": "cancelled", "partial_filled": "partial"}.get(status, status)
+    status = {
+        "held": "submitted",
+        "canceled": "cancelled",
+        "partial_filled": "partial",
+        "partially_filled": "partial",
+    }.get(status, status)
+    allowed_qty = requested_qty if requested_qty > 0 else int(target_qty or 0)
+    terminal = {
+        "filled", "cancelled", "rejected", "risk_rejected", "failed", "skipped",
+    }
+    if filled_qty > allowed_qty:
+        raise ValueError("order filled quantity exceeds order quantity")
+    if status == "filled" and (
+        allowed_qty <= 0 or filled_qty != allowed_qty
+    ):
+        raise ValueError("filled order quantity is incomplete")
+    if status not in terminal and allowed_qty > 0:
+        if filled_qty == allowed_qty:
+            status = "filled"
+        elif filled_qty > 0:
+            status = "partial"
+        elif status == "partial":
+            status = "submitted"
     updated_at = _text(event.get("datetime") or event.get("updated_at"))
     return {
         "client_order_id": client_order_id(event, trade_date, strategy_version),
@@ -75,16 +136,16 @@ def normalize_order(
         "order_id": _text(event.get("order_id")) or None,
         "stock_code": _text(event.get("code") or event.get("jq_code"))[:6],
         "action": _text(event.get("action")).lower(),
-        "target_qty": event.get("target_qty"),
-        "requested_qty": _int(event.get("amount") or event.get("requested_qty")),
-        "filled_qty": _int(event.get("filled") or event.get("filled_qty")),
+        "target_qty": target_qty,
+        "requested_qty": requested_qty,
+        "filled_qty": filled_qty,
         "average_fill_price": _float(event.get("avg_price") or event.get("price")),
         "status": status,
         "submit_count": max(1, _int(event.get("submit_count"))),
         "reason": _text(event.get("reason")),
         "first_submitted_at": updated_at or None,
         "updated_at": updated_at,
-        "completed_at": updated_at if status in {"filled", "cancelled", "rejected", "risk_rejected"} else None,
+        "completed_at": updated_at if status in terminal else None,
         "raw_json": canonical_json(event),
     }
 
@@ -92,6 +153,7 @@ def normalize_order(
 def normalize_fill(
     trade: dict[str, object], *, orders: dict[str, dict[str, object]]
 ) -> dict[str, object]:
+    qty = _quantity_alias(trade, ("amount", "qty"), "fill quantity")
     order_id = _text(trade.get("order_id"))
     order = orders.get(order_id, {})
     fee_fields = ("commission", "stamp_tax", "other_fee")
@@ -103,7 +165,7 @@ def normalize_fill(
         "signal_id": order.get("signal_id") or _text(trade.get("signal_id")) or None,
         "stock_code": _text(trade.get("code") or trade.get("jq_code"))[:6],
         "action": _text(trade.get("action")).lower(),
-        "qty": _int(trade.get("amount") or trade.get("qty")),
+        "qty": qty,
         "price": _float(trade.get("price")),
         "commission": _float(trade.get("commission")),
         "stamp_tax": _float(trade.get("stamp_tax")),

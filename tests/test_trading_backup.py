@@ -40,6 +40,24 @@ class TradingBackupTest(unittest.TestCase):
             }.issubset(facts["table_counts"]))
             conn = sqlite3.connect(path)
             try:
+                reconciliation_columns = {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(reconciliation_runs)"
+                    )
+                }
+                self.assertTrue({
+                    "account_scope_id", "broker_snapshot_id",
+                    "broker_snapshot_sha256", "snapshot_broker_time",
+                    "snapshot_generated_at",
+                }.issubset(reconciliation_columns))
+                self.assertIn(
+                    "account_scopes",
+                    {
+                        row[2] for row in conn.execute(
+                            "PRAGMA foreign_key_list(reconciliation_runs)"
+                        )
+                    },
+                )
                 conn.execute("DROP TABLE capacity_reservations")
                 conn.commit()
             finally:
@@ -50,9 +68,10 @@ class TradingBackupTest(unittest.TestCase):
     def test_schema_v10_backup_contract_remains_supported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "trading.db"
-            self.make_store(path)
-            with TradingStore(path).connect() as conn:
-                conn.execute("DELETE FROM schema_migrations WHERE version=11")
+            with patch.object(
+                TradingStore, "_migrate_schema_v11", return_value=None,
+            ):
+                TradingStore(path).initialize()
             facts = trading_backup.database_facts(path)
             self.assertEqual(facts["schema_version"], 10)
             self.assertEqual(set(facts["table_counts"]), set(trading_backup.SCHEMA_10_TABLES))
@@ -66,6 +85,38 @@ class TradingBackupTest(unittest.TestCase):
                     "ALTER TABLE position_cycles DROP COLUMN trailing_stop_active_from"
                 )
             with self.assertRaisesRegex(RuntimeError, "trailing_stop_active_from"):
+                trading_backup.database_facts(path)
+
+    def test_schema_v11_backup_rejects_missing_legacy_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            with TradingStore(path).connect() as conn:
+                conn.execute("DROP TABLE orders")
+            with self.assertRaisesRegex(RuntimeError, "orders"):
+                trading_backup.database_facts(path)
+
+    def test_schema_v11_backup_rejects_missing_legacy_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            with TradingStore(path).connect() as conn:
+                conn.execute(
+                    "ALTER TABLE daily_equity DROP COLUMN fee_data_status"
+                )
+            with self.assertRaisesRegex(RuntimeError, "fee_data_status"):
+                trading_backup.database_facts(path)
+
+    def test_schema_v11_backup_rejects_extra_legacy_unique_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            with TradingStore(path).connect() as conn:
+                conn.execute(
+                    """CREATE UNIQUE INDEX forbidden_order_stock
+                       ON orders(stock_code)"""
+                )
+            with self.assertRaisesRegex(RuntimeError, "unique"):
                 trading_backup.database_facts(path)
 
     def test_schema_v7_backup_counts_current_execution_issue_state(self) -> None:

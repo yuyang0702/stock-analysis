@@ -6,9 +6,12 @@ from datetime import datetime
 from typing import Any
 
 import config as app_config
+from execution_contracts import BrokerSnapshot
 from execution_state import classify_exit_execution
-from order_ledger import fill_id
-from trading_store import TradingStore, canonical_json
+from order_ledger import fill_id, normalize_order
+from trading_store import (
+    TradingStore, canonical_json, order_allowed_quantity,
+)
 
 
 @dataclass
@@ -68,9 +71,42 @@ def _difference(
 
 def reconcile_snapshot(
     store: TradingStore, conn: Any, payload: dict[str, Any], *, snapshot_id: str,
-    mode: str, now: str,
+    broker_snapshot: BrokerSnapshot, mode: str, now: str,
 ) -> ReconciliationResult:
-    del store
+    broker_snapshot = BrokerSnapshot.from_dict(broker_snapshot.to_dict())
+    stable_payload = dict(payload)
+    stable_payload.pop("received_at", None)
+    payload_snapshot_id = hashlib.sha256(
+        canonical_json(stable_payload).encode("utf-8")
+    ).hexdigest()[:32]
+    if broker_snapshot.snapshot_id != f"joinquant-{payload_snapshot_id}":
+        raise ValueError(
+            "reconciliation broker snapshot is not bound to payload"
+        )
+    current = store.load_current_broker_snapshot(
+        conn, broker_snapshot.account_scope_id,
+    )
+    if current is None or (
+        current.snapshot_id != broker_snapshot.snapshot_id
+        or current.snapshot_sha256 != broker_snapshot.snapshot_sha256
+        or current.broker_time != broker_snapshot.broker_time
+        or current.generated_at != broker_snapshot.generated_at
+    ):
+        raise ValueError(
+            "reconciliation broker snapshot does not match current evidence"
+        )
+    raw_id = canonical_json({
+        "account_scope_id": broker_snapshot.account_scope_id,
+        "broker_snapshot_id": broker_snapshot.snapshot_id,
+        "broker_snapshot_sha256": broker_snapshot.snapshot_sha256,
+        "mode": mode,
+    })
+    reconciliation_id = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:32]
+    existing = conn.execute(
+        "SELECT * FROM reconciliation_runs WHERE reconciliation_id=?",
+        (reconciliation_id,),
+    ).fetchone()
+    observation_now = str(existing["started_at"]) if existing is not None else now
     differences: list[ReconciliationDifference] = []
     account = conn.execute(
         "SELECT trade_date, cash, available_cash, total_value FROM account_snapshots WHERE snapshot_id=?",
@@ -141,6 +177,12 @@ def reconcile_snapshot(
         _text(item.get("order_id")): item for item in payload.get("orders", [])
         if isinstance(item, dict) and _text(item.get("order_id"))
     }
+    trade_date = _text(payload.get("trade_date"))
+    strategy_version = _text(
+        payload.get("strategy_template_version")
+        or payload.get("template_version")
+        or payload.get("strategy_version")
+    )
     platform_fill_qty: dict[str, int] = {}
     for trade in payload.get("trades", []):
         if isinstance(trade, dict):
@@ -155,17 +197,57 @@ def reconcile_snapshot(
             differences.append(_difference(
                 "order", order_id, "ORDER_MISSING_LOCAL", "missing", "present", 0, "ERROR",
             ))
-        elif platform is None and str(local["status"]) not in {"filled", "cancelled", "rejected", "risk_rejected"}:
+        elif platform is None and str(local["status"]) not in {
+            "filled", "cancelled", "rejected", "failed", "skipped", "risk_rejected",
+        }:
             differences.append(_difference(
                 "order", order_id, "ORDER_MISSING_PLATFORM", "present", "missing", 0, "ERROR",
             ))
         if platform is not None:
-            reported = _qty(platform.get("filled") or platform.get("filled_qty"))
+            normalized = normalize_order(
+                platform, trade_date=trade_date,
+                strategy_version=strategy_version,
+            )
+            reported = int(normalized["filled_qty"])
             summed = platform_fill_qty.get(order_id, 0)
             if reported != summed:
                 differences.append(_difference(
                     "order", order_id, "ORDER_FILL_QTY_MISMATCH", reported, summed, 0, "ERROR",
                 ))
+            if local is not None:
+                comparisons = (
+                    (
+                        "ORDER_CODE_MISMATCH", str(local["stock_code"]),
+                        str(normalized["stock_code"]),
+                    ),
+                    (
+                        "ORDER_SIDE_MISMATCH", str(local["action"]).lower(),
+                        str(normalized["action"]).lower(),
+                    ),
+                    (
+                        "ORDER_QTY_MISMATCH",
+                        order_allowed_quantity(
+                            local["requested_qty"], local["target_qty"],
+                        ),
+                        order_allowed_quantity(
+                            normalized["requested_qty"], normalized["target_qty"],
+                        ),
+                    ),
+                    (
+                        "ORDER_FILLED_QTY_MISMATCH", int(local["filled_qty"]),
+                        reported,
+                    ),
+                    (
+                        "ORDER_STATUS_MISMATCH", str(local["status"]).lower(),
+                        str(normalized["status"]).lower(),
+                    ),
+                )
+                for reason_code, local_value, platform_value in comparisons:
+                    if local_value != platform_value:
+                        differences.append(_difference(
+                            "order", order_id, reason_code,
+                            local_value, platform_value, 0, "ERROR",
+                        ))
 
     local_fills = {
         str(row["fill_id"]): row for row in conn.execute(
@@ -213,7 +295,7 @@ def reconcile_snapshot(
         code = str(intent["stock_code"])
         execution = classify_exit_execution(
             dict(intent), execution_orders, quantities.get(code, 0),
-            now, set(app_config.A_SHARE_HOLIDAYS_DEFAULT),
+            observation_now, set(app_config.A_SHARE_HOLIDAYS_DEFAULT),
         )
         if not execution["complete"]:
             differences.append(_difference(
@@ -227,23 +309,70 @@ def reconcile_snapshot(
 
     severity = max((item.severity for item in differences), key=lambda item: _SEVERITY[item], default="INFO")
     result_text = "matched" if not differences else "mismatch"
-    raw_id = canonical_json({"snapshot_id": snapshot_id, "mode": mode})
-    reconciliation_id = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:32]
     result = ReconciliationResult(
         reconciliation_id, result_text, severity, differences, "", snapshot_id,
     )
+    difference_records = [
+        {
+            "category": item.category,
+            "object_id": item.object_id,
+            "reason_code": item.reason_code,
+            "local_value": item.local_value,
+            "platform_value": item.platform_value,
+            "tolerance": item.tolerance,
+            "severity": item.severity,
+            "details": item.details,
+        }
+        for item in differences
+    ]
+    differences_json = canonical_json(sorted(
+        difference_records, key=canonical_json,
+    ))
+    summary_json = canonical_json({
+        "counts": {
+            item.reason_code: sum(
+                1 for candidate in differences
+                if candidate.reason_code == item.reason_code
+            )
+            for item in differences
+        },
+        "differences_sha256": hashlib.sha256(
+            differences_json.encode("utf-8")
+        ).hexdigest(),
+    })
+    evidence = (
+        mode, snapshot_id, broker_snapshot.account_scope_id,
+        broker_snapshot.snapshot_id, broker_snapshot.snapshot_sha256,
+        broker_snapshot.broker_time, broker_snapshot.generated_at,
+        result_text, severity, len(differences), summary_json,
+    )
+    if existing is not None:
+        columns = (
+            "mode", "snapshot_id", "account_scope_id", "broker_snapshot_id",
+            "broker_snapshot_sha256", "snapshot_broker_time",
+            "snapshot_generated_at", "result", "severity",
+            "difference_count", "summary_json",
+        )
+        if tuple(existing[column] for column in columns) != evidence:
+            raise ValueError("immutable reconciliation evidence conflict")
+        result.control_action = str(existing["control_action"] or "")
+        return result
     conn.execute(
-        """INSERT OR REPLACE INTO reconciliation_runs(
-           reconciliation_id, mode, snapshot_id, started_at, finished_at, result, severity,
-           difference_count, control_action, summary_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO reconciliation_runs(
+           reconciliation_id, mode, snapshot_id, started_at, finished_at,
+           result, severity, difference_count, control_action, summary_json,
+           account_scope_id, broker_snapshot_id, broker_snapshot_sha256,
+           snapshot_broker_time, snapshot_generated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            reconciliation_id, mode, snapshot_id, now, now, result_text, severity, len(differences), "",
-            canonical_json({"counts": {item.reason_code: sum(
-                1 for candidate in differences if candidate.reason_code == item.reason_code
-            ) for item in differences}}),
+            reconciliation_id, mode, snapshot_id, observation_now,
+            observation_now, result_text,
+            severity, len(differences), "", summary_json,
+            broker_snapshot.account_scope_id, broker_snapshot.snapshot_id,
+            broker_snapshot.snapshot_sha256, broker_snapshot.broker_time,
+            broker_snapshot.generated_at,
         ),
     )
-    conn.execute("DELETE FROM reconciliation_items WHERE reconciliation_id=?", (reconciliation_id,))
     for item in differences:
         conn.execute(
             """INSERT INTO reconciliation_items(
@@ -261,11 +390,22 @@ def reconcile_snapshot(
 def persist_issue_transitions(
     store: TradingStore, conn: Any, result: ReconciliationResult, now: str
 ) -> list[dict[str, Any]]:
+    scope_row = conn.execute(
+        """SELECT account_scope_id FROM reconciliation_runs
+           WHERE reconciliation_id=?""",
+        (result.reconciliation_id,),
+    ).fetchone()
+    account_scope_id = (
+        str(scope_row["account_scope_id"] or "").strip()
+        if scope_row is not None
+        else ""
+    )
+    scope_prefix = f"scope:{account_scope_id}:" if account_scope_id else ""
     transitions: list[dict[str, Any]] = []
     active_keys: set[str] = set()
     by_key: dict[str, ReconciliationDifference] = {}
     for item in result.differences:
-        key = f"{item.category}:{item.object_id}"
+        key = f"{scope_prefix}{item.category}:{item.object_id}"
         current = by_key.get(key)
         if current is None or (
             _SEVERITY.get(item.severity, 0), item.reason_code
@@ -307,10 +447,19 @@ def persist_issue_transitions(
             ).total_seconds() >= 1800:
                 changed["transition"] = "REMINDER"
                 transitions.append(changed)
-    rows = conn.execute(
-        """SELECT issue_key, state FROM execution_issue_state
-           WHERE recovered_at IS NULL"""
-    ).fetchall()
+    if scope_prefix:
+        rows = conn.execute(
+            """SELECT issue_key, state FROM execution_issue_state
+               WHERE recovered_at IS NULL
+                 AND substr(issue_key, 1, ?) = ?""",
+            (len(scope_prefix), scope_prefix),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT issue_key, state FROM execution_issue_state
+               WHERE recovered_at IS NULL
+                 AND issue_key NOT LIKE 'scope:%'"""
+        ).fetchall()
     for row in rows:
         key, state = str(row[0]), str(row[1])
         if key in active_keys or state in _STICKY_ISSUES:

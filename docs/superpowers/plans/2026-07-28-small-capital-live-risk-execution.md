@@ -8,7 +8,9 @@
 
 **Tech Stack:** Python 3.11+, dataclasses, Decimal, sqlite3, pandas, existing unittest suite and JoinQuant template.
 
-**Status:** `planned / not implemented / not deployed / not observed / not validated`.
+**Status:** `implementation in progress`; the standalone components in Tasks 1-3 are `implemented / not deployed / not observed / not validated`, but the end-to-end Batch A capability is not implemented until Tasks 4-8 are complete.
+
+**Local evidence (2026-07-29):** Task 1 contracts, the Task 2 exact-sizing standalone component and the Task 3 schema/current-state/reconciliation component are included on this feature branch; the latest Task 2 hardening is commit `a4848b0`. Tasks 4-6 still have to connect these components to the production buy path, so ordinary buys do not yet use the new exact allocator. None of this is deployment, trading-session observation or strategy validation evidence.
 
 ## Global Constraints
 
@@ -64,7 +66,7 @@
 - Produces `QuoteSnapshot`, `BrokerPosition`, `BrokerSnapshot`, `StrategyOrderCandidate`, `PreTradeResult` and `ExecutionIntent` frozen records.
 - Produces `canonical_json(value) -> str`, `canonical_sha256(value) -> str`, `logical_signal_id(...) -> str` and `client_order_id(account_scope_id, adapter, logical_signal_id, pre_trade_result_id, exact_order, submission_attempt_id) -> str`.
 
-- [ ] **Step 1: Write failing fee and contract tests**
+- [x] **Step 1: Write failing fee and contract tests**
 
 ```python
 def test_round_trip_applies_each_minimum_commission_and_sell_tax(self):
@@ -98,13 +100,13 @@ def test_client_order_id_is_idempotent_but_new_attempt_is_distinct(self):
 
 Also test non-finite/negative fields, missing versions, effective dates, price ticks, zero-share sells, odd-lot sell allowance, rule freshness/hash and canonical content conflicts.
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 2: Run RED** *(historical RED execution is not reconstructible from Git; current GREEN evidence is recorded below)*
 
 Run: `python -m unittest tests.test_execution_contracts tests.test_backtest_engine tests.test_historical_backtest tests.test_paper_trading tests.test_config_env -v`
 
 Expected: `execution_contracts` is missing and fee totals differ across engines.
 
-- [ ] **Step 3: Implement Decimal-based contracts and one configured schedule**
+- [x] **Step 3: Implement Decimal-based contracts and one configured schedule**
 
 ```python
 @dataclass(frozen=True)
@@ -150,13 +152,13 @@ Centralize the simulation default currently represented by historical backtest v
 
 Replace engine-local calculations with adapters around `FeeSchedule`; keep old constructor fields as deprecated compatibility inputs only when they can be converted to a complete explicit schedule. Report the schedule version and component fees in every result.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `python -m unittest tests.test_execution_contracts tests.test_backtest_engine tests.test_historical_backtest tests.test_paper_trading tests.test_config_env -v`
 
 Expected: identical explicit schedule/price/quantity inputs produce identical fee components in all three engines.
 
-- [ ] **Step 5: Commit only after separate authorization**
+- [x] **Step 5: Commit only after separate authorization**
 
 ```bash
 git add execution_contracts.py config.py backtest_engine.py historical_backtest.py paper_trading.py tests/test_execution_contracts.py tests/test_config_env.py tests/test_backtest_engine.py tests/test_historical_backtest.py tests/test_paper_trading.py
@@ -178,7 +180,7 @@ git commit -m "feat: add versioned execution fee contracts"
 - Consumes an explicit per-trade Yuan cap and a separate remaining portfolio open-risk budget.
 - Produces stable reasons including `NO_BOARD_LOT`, `INVALID_STOP_DISTANCE`, `PER_TRADE_RISK_EXCEEDED`, `PORTFOLIO_OPEN_RISK_EXCEEDED`, `CASH_CAPACITY_EXCEEDED`, `ECONOMIC_EDGE_INSUFFICIENT` and `FEE_SCHEDULE_REQUIRED`.
 
-- [ ] **Step 1: Write failing discrete-search and gap-budget tests**
+- [x] **Step 1: Write failing discrete-search and gap-budget tests**
 
 ```python
 def test_allocator_searches_down_by_lot_with_minimum_fee(self):
@@ -201,13 +203,13 @@ def test_gap_one_lot_checks_trade_and_portfolio_budgets_separately(self):
 
 Cover 100/200-share steps, low/high prices, invalid stops, non-finite values, full buy/sell minimum fees, sell tax, both slippages, planned stop versus gap loss, slots/industry/theme/cash caps and an edge swallowed by fees.
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 2: Run RED** *(historical RED execution is not reconstructible from Git; current GREEN evidence is recorded below)*
 
 Run: `python -m unittest tests.test_position_sizing tests.test_gap_reentry -v`
 
 Expected: allocator is absent and current gap one-lot logic conflates the two budgets.
 
-- [ ] **Step 3: Implement descending integer-step search**
+- [x] **Step 3: Implement descending integer-step search**
 
 ```python
 for qty in range(max_qty_aligned, rules.buy_min_qty - 1, -rules.buy_qty_step):
@@ -221,13 +223,15 @@ return SizingDecision.rejected(reasons)
 
 Calculate percentage risk and Yuan cap independently, then use their minimum. Record planned-stop and gap loss separately. The economic layer can only reduce quantity or reject; it cannot exceed the rule/capacity upper bound. With ML disabled/L0/L1, expected edge comes only from frozen rule targets.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `python -m unittest tests.test_position_sizing tests.test_gap_reentry -v`
 
 Expected: all matrix cases return an exact, auditable lot or a stable rejection; no closed-form fee approximation remains.
 
-- [ ] **Step 5: Commit only after separate authorization**
+Local GREEN evidence (2026-07-29): Task 2 core `40/40`, exporter/notification/exit compatibility `85/85`, and the broader Task 1-2 regression set `208/208` passed. Independent specification, quality and adversarial reviews reported no remaining P0/P1/P2. This proves only the standalone component; Tasks 4-6 still own unified pre-trade and production-path integration.
+
+- [x] **Step 5: Commit only after separate authorization**
 
 ```bash
 git add position_sizing.py gap_reentry.py tests/test_position_sizing.py tests/test_gap_reentry.py
@@ -240,10 +244,19 @@ git commit -m "feat: allocate exact small-capital order quantities"
 
 - Modify: `trading_store.py`
 - Modify: `joinquant_sync.py`
+- Modify: `joinquant_signal_server.py`
+- Modify: `order_ledger.py`
+- Modify: `reconciliation.py`
 - Modify: `trading_backup.py`
+- Modify: `trading_control.py`
 - Modify: `tests/test_trading_store.py`
 - Modify: `tests/test_joinquant_sync.py`
+- Modify: `tests/test_joinquant_export_runtime.py`
+- Modify: `tests/test_joinquant_signal_server.py`
+- Modify: `tests/test_order_ledger.py`
+- Modify: `tests/test_reconciliation.py`
 - Modify: `tests/test_trading_backup.py`
+- Modify: `tests/test_trading_control.py`
 
 **Interfaces:**
 
@@ -251,8 +264,11 @@ git commit -m "feat: allocate exact small-capital order quantities"
 - Produces `load_current_broker_snapshot(conn, account_scope_id) -> BrokerSnapshot | None`.
 - Produces immutable candidate/result/intent inserts and active reservation aggregation/release methods.
 - Adds `position_cycles.profit_protection_activated_at` and `position_cycles.trailing_stop_active_from`.
+- Binds every imported broker snapshot to the complete normalized raw payload and replaces its current child rows atomically.
+- Scopes execution issues, reconciliation recovery and automatic control recovery to one random account scope; legacy primary-account issues are adopted without exposing account credentials.
+- Releases capacity only from fresh, full, zero-difference reconciliation evidence that matches the exact current broker snapshot and confirms no open broker order.
 
-- [ ] **Step 1: Write failing migration, replacement and rollback tests**
+- [x] **Step 1: Write failing migration, replacement and rollback tests**
 
 ```python
 def test_snapshot_replacement_is_atomic_and_account_scoped(self):
@@ -270,13 +286,13 @@ def test_empty_database_and_schema_10_upgrade_reach_11_idempotently(self):
 
 Also test snapshot hashes/newness, current positions/open orders, no account credential fields, candidate/result conflicts, reservation uniqueness, backup manifests and isolated restore counts.
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 2: Run RED** *(historical RED execution is not reconstructible from Git; current GREEN evidence is recorded below)*
 
 Run: `python -m unittest tests.test_trading_store tests.test_joinquant_sync tests.test_trading_backup -v`
 
 Expected: schema is 10 and the current-state/reservation tables do not exist.
 
-- [ ] **Step 3: Add schema 11 tables and idempotent migration**
+- [x] **Step 3: Add schema 11 tables and idempotent migration**
 
 ```sql
 CREATE TABLE account_scopes(
@@ -331,17 +347,19 @@ CREATE TABLE capacity_reservations(
 
 At first adapter registration, generate and persist a random UUID account scope; never derive it from an account number, Token, webhook, URL or rotating secret. Private QMT configuration may later map its raw account to this UUID without storing the raw account in Linux facts. Use normalized child current-state tables for capacity queries and bounded JSON only for audit reconstruction. `joinquant_sync` replaces all current child rows in the same transaction as the snapshot header, while existing account/order/fill history remains unchanged. Extend backup manifests and restore checks before incrementing `schema_migrations` to 11.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
-Run: `python -m unittest tests.test_trading_store tests.test_joinquant_sync tests.test_trading_backup -v`
+Run: `python -m unittest tests.test_trading_store tests.test_joinquant_sync tests.test_order_ledger tests.test_trading_backup tests.test_reconciliation tests.test_trading_control tests.test_joinquant_signal_server -v`
 
 Expected: empty and v10 databases reach schema 11, failed replacement rolls back, and backup/restore table counts match.
 
-- [ ] **Step 5: Commit only after separate authorization**
+Local GREEN evidence (2026-07-29): the focused Task 3 suite passed `188/188`; independent specification, quality and adversarial reviews reported no remaining P0/P1/P2, with the quality review running an expanded `192/192` compatibility set. `py_compile` and `git diff --check` passed. The complete Windows suite ran 635 tests: 632 passed and only the three deliberate `run_ubuntu.sh ledger-check` cases errored because `bash.exe` is unavailable on Windows; they remain mandatory Linux pre-deployment checks. This is implementation evidence only, not deployment, trading-session observation or strategy validation.
+
+- [x] **Step 5: Commit only after separate authorization**
 
 ```bash
-git add trading_store.py joinquant_sync.py trading_backup.py tests/test_trading_store.py tests/test_joinquant_sync.py tests/test_trading_backup.py
-git commit -m "feat: persist broker state and execution reservations"
+git add trading_store.py joinquant_sync.py joinquant_signal_server.py order_ledger.py reconciliation.py trading_backup.py trading_control.py tests/test_trading_store.py tests/test_joinquant_sync.py tests/test_joinquant_export_runtime.py tests/test_joinquant_signal_server.py tests/test_order_ledger.py tests/test_reconciliation.py tests/test_trading_backup.py tests/test_trading_control.py docs/superpowers/plans/2026-07-28-small-capital-live-risk-execution.md
+git commit -m "fix: harden broker state reconciliation"
 ```
 
 ### Task 4: Implement pure unified pre-trade checks

@@ -86,6 +86,9 @@ class JoinQuantExportRuntimeTest(unittest.TestCase):
             )
 
             with patch("joinquant_exporter.app_config.JOINQUANT_SIGNAL_FILE", output_path), patch(
+                "a_share_strategy.app_config.TRADING_DB_FILE",
+                Path(tmp) / "trading.db",
+            ), patch(
                 "a_share_strategy.is_a_share_trading_time", return_value=False
             ):
                 result = a_share_strategy.run_joinquant_export(a_share_strategy.Config(), rows)

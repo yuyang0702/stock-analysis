@@ -47,6 +47,16 @@ def _set_control(
 def apply_reconciliation_control(
     store: TradingStore, conn: object, result: ReconciliationResult, *, operator: str = "system"
 ) -> list[str]:
+    persisted = conn.execute(
+        """SELECT control_action FROM reconciliation_runs
+           WHERE reconciliation_id=?""",
+        (result.reconciliation_id,),
+    ).fetchone()
+    persisted_action = (
+        str(persisted["control_action"] or "")
+        if persisted is not None
+        else result.control_action
+    )
     actions: list[str] = []
     reason = f"reconciliation {result.reconciliation_id} {result.severity}"
     stop_event_id = None
@@ -62,7 +72,8 @@ def apply_reconciliation_control(
             "SELECT value, updated_at FROM system_state WHERE key='buy_enabled'"
         ).fetchone()
         stopped = conn.execute(
-            "SELECT finished_at FROM reconciliation_runs WHERE reconciliation_id=?",
+            """SELECT finished_at, account_scope_id
+               FROM reconciliation_runs WHERE reconciliation_id=?""",
             (result.reconciliation_id,),
         ).fetchone()
         store.set_system_state(
@@ -73,6 +84,7 @@ def apply_reconciliation_control(
                 "expected_value": str(row["value"]),
                 "expected_updated_at": str(row["updated_at"]),
                 "stopped_at": str(stopped[0]) if stopped else str(row["updated_at"]),
+                "account_scope_id": str(stopped[1] or "") if stopped else "",
             }, ensure_ascii=False, sort_keys=True),
             "reconciliation-owned stop-buy",
         )
@@ -87,11 +99,14 @@ def apply_reconciliation_control(
         operator=operator, reconciliation_id=result.reconciliation_id,
     ):
         actions.append("kill_switch_on")
-    result.control_action = ",".join(actions)
-    conn.execute(
-        "UPDATE reconciliation_runs SET control_action=? WHERE reconciliation_id=?",
-        (result.control_action, result.reconciliation_id),
-    )
+    if actions:
+        result.control_action = ",".join(actions)
+        conn.execute(
+            "UPDATE reconciliation_runs SET control_action=? WHERE reconciliation_id=?",
+            (result.control_action, result.reconciliation_id),
+        )
+    else:
+        result.control_action = persisted_action
     return actions
 
 
@@ -228,17 +243,22 @@ def auto_resume_eligibility(
     if _current(conn, "kill_switch", "0") == "1":
         reasons.append("KILL_SWITCH_ACTIVE")
     stopped_at = str(owner.get("stopped_at") or "")
+    account_scope_id = str(owner.get("account_scope_id") or "")
+    if not account_scope_id:
+        reasons.append("RECONCILIATION_SCOPE_REQUIRED")
     runs = conn.execute(
         """SELECT result, snapshot_id FROM reconciliation_runs
-           WHERE finished_at>? ORDER BY finished_at DESC LIMIT 2""",
-        (stopped_at,),
-    ).fetchall() if stopped_at else []
+           WHERE account_scope_id=? AND finished_at>?
+           ORDER BY finished_at DESC LIMIT 2""",
+        (account_scope_id, stopped_at),
+    ).fetchall() if stopped_at and account_scope_id else []
     if len(runs) < 2 or any(str(row[0]) != "matched" for row in runs) or len({str(row[1]) for row in runs if row[1]}) < 2:
         reasons.append("TWO_DISTINCT_POST_STOP_MATCHES_REQUIRED")
     snapshot = conn.execute(
         """SELECT generated_at, template_version FROM account_snapshots
-           ORDER BY generated_at DESC LIMIT 1"""
-    ).fetchone()
+           WHERE snapshot_id=?""",
+        (runs[0][1],),
+    ).fetchone() if runs and runs[0][1] else None
     if snapshot is None:
         reasons.append("ACCOUNT_SNAPSHOT_REQUIRED")
     else:
@@ -264,6 +284,17 @@ def apply_automatic_buy_recovery(
         store, conn, now=now, required_template=required_template
     )
     if not ok:
+        return None
+    result_scope = conn.execute(
+        """SELECT account_scope_id FROM reconciliation_runs
+           WHERE reconciliation_id=?""",
+        (result.reconciliation_id,),
+    ).fetchone()
+    if (
+        result_scope is None
+        or str(result_scope[0] or "")
+        != str(owner.get("account_scope_id") or "")
+    ):
         return None
     cursor = conn.execute(
         """UPDATE system_state SET value='1', updated_at=?, reason=?

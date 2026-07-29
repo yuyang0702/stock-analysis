@@ -7,9 +7,10 @@ import re
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
+from types import MappingProxyType
 from typing import Iterator
 
 from execution_contracts import (
@@ -35,6 +36,11 @@ class FillConflictError(RuntimeError):
 def canonical_json(value: str | dict) -> str:
     parsed = json.loads(value) if isinstance(value, str) else value
     return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def order_allowed_quantity(requested_qty: object, target_qty: object) -> int:
+    requested = int(requested_qty or 0)
+    return requested if requested > 0 else int(target_qty or 0)
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -366,6 +372,109 @@ SCHEMA_V10 = """
 -- Evidence-status columns are added idempotently in initialize().
 """
 
+SCHEMA_V10_REQUIRED_COLUMNS = MappingProxyType({
+    "schema_migrations": frozenset({"version", "applied_at"}),
+    "strategy_runs": frozenset({
+        "run_id", "trade_date", "started_at", "finished_at", "git_commit",
+        "strategy_version", "parameters_version", "data_status", "result",
+        "error_message", "created_at", "updated_at",
+    }),
+    "signals": frozenset({
+        "signal_id", "run_id", "trade_date", "stock_code", "jq_code",
+        "action", "target_position", "signal_price", "stop_loss",
+        "take_profit", "final_score", "strategy_mode", "generated_at",
+        "expires_at", "raw_json", "created_at", "validated_at",
+        "published_at",
+    }),
+    "risk_decisions": frozenset({
+        "decision_id", "signal_id", "risk_mode", "allowed",
+        "hard_block_code", "shadow_codes", "cash", "total_assets",
+        "position_value", "current_single_exposure",
+        "projected_single_exposure", "current_portfolio_exposure",
+        "projected_portfolio_exposure", "current_industry_exposure",
+        "projected_industry_exposure", "daily_profit_loss",
+        "account_drawdown", "turnover_rate", "snapshot_at", "raw_json",
+        "decided_at",
+    }),
+    "system_state": frozenset({"key", "value", "updated_at", "reason"}),
+    "position_cycles": frozenset({
+        "position_cycle_id", "stock_code", "entry_signal_id", "opened_at",
+        "closed_at", "status", "mode", "initial_qty", "current_qty",
+        "entry_price", "initial_stop_price", "initial_r", "atr14",
+        "market_state", "highest_price", "take_profit_stage",
+        "last_snapshot_at", "created_at", "updated_at", "manual_stop_price",
+    }),
+    "order_events": frozenset({
+        "event_key", "signal_id", "order_id", "stock_code", "action",
+        "target_qty", "requested_qty", "filled_qty", "status", "reason",
+        "event_at", "snapshot_at", "raw_json",
+    }),
+    "exit_intents": frozenset({
+        "signal_id", "stock_code", "target_qty", "reason", "status",
+        "remaining_qty", "created_at", "updated_at", "validated_at",
+        "published_at",
+    }),
+    "trade_cooldowns": frozenset({
+        "stock_code", "reason", "until_date", "updated_at",
+    }),
+    "orders": frozenset({
+        "client_order_id", "signal_id", "order_id", "stock_code", "action",
+        "target_qty", "requested_qty", "filled_qty", "average_fill_price",
+        "status", "submit_count", "reason", "first_submitted_at",
+        "updated_at", "completed_at", "raw_json",
+    }),
+    "fills": frozenset({
+        "fill_id", "client_order_id", "order_id", "signal_id", "stock_code",
+        "action", "qty", "price", "commission", "stamp_tax", "other_fee",
+        "filled_at", "raw_json", "fee_data_status",
+    }),
+    "account_snapshots": frozenset({
+        "snapshot_id", "trade_date", "generated_at", "received_at", "cash",
+        "available_cash", "total_value", "position_market_value",
+        "daily_turnover_pct", "daily_pnl_pct", "account_drawdown_pct",
+        "template_version", "state_hash", "retained_details", "raw_json",
+    }),
+    "position_snapshots": frozenset({
+        "snapshot_id", "stock_code", "qty", "closeable_qty", "locked_qty",
+        "today_qty", "avg_cost", "price", "market_value", "pnl",
+    }),
+    "daily_equity": frozenset({
+        "trade_date", "opening_equity", "closing_equity", "cash",
+        "position_market_value", "realized_pnl", "unrealized_pnl", "fees",
+        "net_deposit", "max_drawdown_pct", "first_snapshot_at",
+        "last_snapshot_at", "fee_data_status", "realized_pnl_status",
+    }),
+    "reconciliation_runs": frozenset({
+        "reconciliation_id", "mode", "snapshot_id", "started_at",
+        "finished_at", "result", "severity", "difference_count",
+        "control_action", "summary_json",
+    }),
+    "reconciliation_items": frozenset({
+        "item_id", "reconciliation_id", "category", "object_id",
+        "reason_code", "local_value", "platform_value", "tolerance",
+        "severity", "details_json",
+    }),
+    "control_events": frozenset({
+        "event_id", "action", "operator", "old_value", "new_value",
+        "reason", "reconciliation_id", "created_at",
+    }),
+    "execution_issue_state": frozenset({
+        "issue_key", "object_type", "object_id", "state", "severity",
+        "first_seen_at", "stage_started_at", "last_seen_at",
+        "last_transition_at", "last_notified_at", "recovered_at",
+        "signal_id", "order_id", "reconciliation_id", "details_json",
+    }),
+    "gap_reentry_opportunities": frozenset({
+        "opportunity_id", "trade_date", "stock_code", "parent_signal_id",
+        "new_signal_id", "state", "reason", "original_entry_price",
+        "original_stop_price", "original_risk_r", "reentry_cap_price",
+        "first_open_at", "first_open_price", "first_batch_id",
+        "confirmation_count", "attempt_count", "planned_entry_price",
+        "planned_stop_price", "planned_take_profit", "planned_qty",
+        "order_status", "created_at", "updated_at",
+    }),
+})
+
 SCHEMA_V11_TABLES = {
     "account_scopes": {
         "account_scope_id", "adapter", "scope_alias", "created_at",
@@ -395,7 +504,7 @@ SCHEMA_V11_TABLES = {
     "execution_intents": {
         "account_scope_id", "client_order_id", "pre_trade_result_id",
         "intent_sha256", "submission_attempt_id", "payload_json", "status",
-        "expires_at",
+        "expires_at", "status_updated_at",
     },
     "capacity_reservations": {
         "account_scope_id", "reservation_id", "client_order_id", "stock_code",
@@ -407,21 +516,421 @@ SCHEMA_V11_TABLES = {
     },
 }
 
+SCHEMA_V11_REQUIRED_COLUMNS = MappingProxyType({
+    **SCHEMA_V10_REQUIRED_COLUMNS,
+    **{
+        table: frozenset(columns)
+        for table, columns in SCHEMA_V11_TABLES.items()
+    },
+    "position_cycles": (
+        SCHEMA_V10_REQUIRED_COLUMNS["position_cycles"]
+        | frozenset({
+            "profit_protection_activated_at", "trailing_stop_active_from",
+        })
+    ),
+    "reconciliation_runs": (
+        SCHEMA_V10_REQUIRED_COLUMNS["reconciliation_runs"]
+        | frozenset({
+            "account_scope_id", "broker_snapshot_id",
+            "broker_snapshot_sha256", "snapshot_broker_time",
+            "snapshot_generated_at",
+        })
+    ),
+})
+
+SCHEMA_REQUIRED_COLUMNS_BY_VERSION = MappingProxyType({
+    10: SCHEMA_V10_REQUIRED_COLUMNS,
+    11: SCHEMA_V11_REQUIRED_COLUMNS,
+})
+
+SCHEMA_V10_PRIMARY_KEYS = MappingProxyType({
+    "schema_migrations": ("version",),
+    "strategy_runs": ("run_id",),
+    "signals": ("signal_id",),
+    "risk_decisions": ("decision_id",),
+    "system_state": ("key",),
+    "position_cycles": ("position_cycle_id",),
+    "order_events": ("event_key",),
+    "exit_intents": ("signal_id",),
+    "trade_cooldowns": ("stock_code",),
+    "orders": ("client_order_id",),
+    "fills": ("fill_id",),
+    "account_snapshots": ("snapshot_id",),
+    "position_snapshots": ("snapshot_id", "stock_code"),
+    "daily_equity": ("trade_date",),
+    "reconciliation_runs": ("reconciliation_id",),
+    "reconciliation_items": ("item_id",),
+    "control_events": ("event_id",),
+    "execution_issue_state": ("issue_key",),
+    "gap_reentry_opportunities": ("opportunity_id",),
+})
+
+SCHEMA_V10_UNIQUE_KEYS = MappingProxyType({
+    "orders": frozenset({("order_id",)}),
+    "gap_reentry_opportunities": frozenset({
+        ("trade_date", "stock_code", "opportunity_id"),
+    }),
+})
+
+SCHEMA_V10_NAMED_INDEXES = MappingProxyType({
+    "idx_strategy_runs_trade_date": (
+        "strategy_runs", ("trade_date",), False, None,
+    ),
+    "idx_signals_action": ("signals", ("action",), False, None),
+    "idx_signals_run_id": ("signals", ("run_id",), False, None),
+    "idx_risk_decisions_signal_id": (
+        "risk_decisions", ("signal_id",), False, None,
+    ),
+    "idx_position_cycles_active_code": (
+        "position_cycles", ("stock_code",), True, "status = 'active'",
+    ),
+    "idx_position_cycles_status": (
+        "position_cycles", ("status",), False, None,
+    ),
+    "idx_order_events_signal": (
+        "order_events", ("signal_id",), False, None,
+    ),
+    "idx_order_events_status": (
+        "order_events", ("status",), False, None,
+    ),
+    "idx_exit_intents_active_code": (
+        "exit_intents", ("stock_code",), True, "status = 'active'",
+    ),
+    "idx_orders_signal": ("orders", ("signal_id",), False, None),
+    "idx_orders_status": ("orders", ("status",), False, None),
+    "idx_fills_order": ("fills", ("order_id",), False, None),
+    "idx_fills_signal": ("fills", ("signal_id",), False, None),
+    "idx_fills_time": ("fills", ("filled_at",), False, None),
+    "idx_account_snapshots_trade_date": (
+        "account_snapshots", ("trade_date", "generated_at"), False, None,
+    ),
+    "idx_reconciliation_runs_time": (
+        "reconciliation_runs", ("started_at",), False, None,
+    ),
+    "idx_reconciliation_runs_result": (
+        "reconciliation_runs", ("result", "severity"), False, None,
+    ),
+    "idx_reconciliation_items_reason": (
+        "reconciliation_items", ("reason_code", "severity"), False, None,
+    ),
+    "idx_execution_issue_state_active": (
+        "execution_issue_state",
+        ("recovered_at", "severity", "last_seen_at"),
+        False,
+        None,
+    ),
+    "idx_gap_reentry_trade_state": (
+        "gap_reentry_opportunities", ("trade_date", "state"), False, None,
+    ),
+    "idx_gap_reentry_code_date": (
+        "gap_reentry_opportunities", ("stock_code", "trade_date"), False, None,
+    ),
+})
+
+SCHEMA_V10_FOREIGN_KEYS = MappingProxyType({
+    "signals": frozenset({
+        (("run_id", "strategy_runs", "run_id", "NO ACTION"),),
+    }),
+    "risk_decisions": frozenset({
+        (("signal_id", "signals", "signal_id", "NO ACTION"),),
+    }),
+    "orders": frozenset({
+        (("signal_id", "signals", "signal_id", "NO ACTION"),),
+    }),
+    "fills": frozenset({
+        (("signal_id", "signals", "signal_id", "NO ACTION"),),
+        (("client_order_id", "orders", "client_order_id", "SET NULL"),),
+    }),
+    "position_snapshots": frozenset({
+        (("snapshot_id", "account_snapshots", "snapshot_id", "CASCADE"),),
+    }),
+    "reconciliation_runs": frozenset({
+        (("snapshot_id", "account_snapshots", "snapshot_id", "SET NULL"),),
+    }),
+    "reconciliation_items": frozenset({
+        ((
+            "reconciliation_id", "reconciliation_runs",
+            "reconciliation_id", "CASCADE",
+        ),),
+    }),
+    "control_events": frozenset({
+        ((
+            "reconciliation_id", "reconciliation_runs",
+            "reconciliation_id", "SET NULL",
+        ),),
+    }),
+})
+
+
+def required_schema_columns(version: int) -> MappingProxyType:
+    try:
+        return SCHEMA_REQUIRED_COLUMNS_BY_VERSION[int(version)]
+    except KeyError as exc:
+        raise RuntimeError(f"unsupported schema version: {version}") from exc
+
+
+def _normalize_index_predicate(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*([=<>!]+)\s*", r"\1", text)
+    return text
+
+
+def _index_predicate(conn: sqlite3.Connection, index_name: str) -> str | None:
+    row = conn.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type='index' AND name=?""",
+        (index_name,),
+    ).fetchone()
+    match = re.search(
+        r"\bwhere\b(.*)$",
+        str(row[0] or "") if row is not None else "",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _normalize_index_predicate(match.group(1)) if match else None
+
+
+def _index_key_signature(
+    conn: sqlite3.Connection,
+    index_name: str,
+) -> tuple[tuple[str, bool, str], ...]:
+    return tuple(
+        (
+            str(row[2]),
+            bool(row[3]),
+            str(row[4] or "BINARY").upper(),
+        )
+        for row in sorted(
+            (
+                row
+                for row in conn.execute(
+                    f'PRAGMA index_xinfo("{index_name}")'
+                )
+                if int(row[5]) == 1
+            ),
+            key=lambda row: int(row[0]),
+        )
+    )
+
+
+def _unique_index_signatures(
+    conn: sqlite3.Connection,
+    table: str,
+) -> tuple[
+    tuple[tuple[tuple[str, bool, str], ...], bool, str | None], ...
+]:
+    signatures = []
+    for index in conn.execute(f"PRAGMA index_list({table})"):
+        if not int(index[2]) or str(index[3]) == "pk":
+            continue
+        index_name = str(index[1])
+        partial = bool(index[4])
+        signatures.append((
+            _index_key_signature(conn, index_name),
+            partial,
+            _index_predicate(conn, index_name) if partial else None,
+        ))
+    return tuple(sorted(signatures, key=repr))
+
+
+def _primary_key_index_signature(
+    conn: sqlite3.Connection,
+    table: str,
+    table_info: list[sqlite3.Row],
+) -> tuple[tuple[str, bool, str], ...]:
+    indexes = [
+        row for row in conn.execute(f"PRAGMA index_list({table})")
+        if str(row[3]) == "pk"
+    ]
+    if indexes:
+        if len(indexes) != 1:
+            return ()
+        return _index_key_signature(conn, str(indexes[0][1]))
+    primary_columns = [row for row in table_info if int(row[5]) > 0]
+    if (
+        len(primary_columns) == 1
+        and str(primary_columns[0][2]).strip().upper() == "INTEGER"
+    ):
+        return ((str(primary_columns[0][1]), False, "BINARY"),)
+    return ()
+
+
+def _expected_unique_index_signatures(
+    table: str,
+    table_unique_keys: object,
+    named_indexes: object,
+) -> tuple[
+    tuple[tuple[tuple[str, bool, str], ...], bool, str | None], ...
+]:
+    signatures = [
+        (
+            tuple((str(column), False, "BINARY") for column in columns),
+            False,
+            None,
+        )
+        for columns in table_unique_keys.get(table, ())
+    ]
+    for _, (
+        index_table, columns, unique, where,
+    ) in named_indexes.items():
+        if index_table == table and unique:
+            signatures.append((
+                tuple(
+                    (str(column), False, "BINARY")
+                    for column in columns
+                ),
+                where is not None,
+                _normalize_index_predicate(where),
+            ))
+    return tuple(sorted(signatures, key=repr))
+
+
+def validate_schema_contract(conn: sqlite3.Connection, version: int) -> None:
+    required = required_schema_columns(version)
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    missing_tables = set(required) - tables
+    if missing_tables:
+        raise RuntimeError(
+            f"schema {version} missing required tables: {sorted(missing_tables)}"
+        )
+    for table, required_columns in required.items():
+        table_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        actual_columns = {str(row[1]) for row in table_info}
+        missing_columns = required_columns - actual_columns
+        if missing_columns:
+            raise RuntimeError(
+                f"schema {version} table {table} missing columns: "
+                f"{sorted(missing_columns)}"
+            )
+        if table in SCHEMA_V10_PRIMARY_KEYS:
+            actual_primary_key = tuple(
+                str(row[1])
+                for row in sorted(
+                    (row for row in table_info if int(row[5]) > 0),
+                    key=lambda row: int(row[5]),
+                )
+            )
+            if actual_primary_key != SCHEMA_V10_PRIMARY_KEYS[table]:
+                raise RuntimeError(
+                    f"schema {version} table {table} has invalid primary key"
+                )
+            expected_primary_index = tuple(
+                (column, False, "BINARY")
+                for column in SCHEMA_V10_PRIMARY_KEYS[table]
+            )
+            if _primary_key_index_signature(
+                conn, table, table_info,
+            ) != expected_primary_index:
+                raise RuntimeError(
+                    f"schema {version} table {table} has invalid primary key index"
+                )
+            actual_unique_indexes = _unique_index_signatures(conn, table)
+            expected_unique_indexes = _expected_unique_index_signatures(
+                table,
+                SCHEMA_V10_UNIQUE_KEYS,
+                SCHEMA_V10_NAMED_INDEXES,
+            )
+            if actual_unique_indexes != expected_unique_indexes:
+                expected_names = sorted(
+                    name
+                    for name, (
+                        index_table, _, unique, _,
+                    ) in SCHEMA_V10_NAMED_INDEXES.items()
+                    if index_table == table and unique
+                )
+                raise RuntimeError(
+                    f"schema {version} table {table} has invalid unique "
+                    f"indexes: {expected_names}"
+                )
+            grouped: dict[int, list[sqlite3.Row]] = {}
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
+                grouped.setdefault(int(row[0]), []).append(row)
+            actual_foreign_keys = {
+                tuple(
+                    (
+                        str(row[3]), str(row[2]), str(row[4]), str(row[6]),
+                    )
+                    for row in sorted(rows, key=lambda item: int(item[1]))
+                )
+                for rows in grouped.values()
+            }
+            expected_foreign_keys = SCHEMA_V10_FOREIGN_KEYS.get(
+                table, frozenset(),
+            )
+            if version >= 11 and table == "reconciliation_runs":
+                expected_foreign_keys = expected_foreign_keys | frozenset({
+                    ((
+                        "account_scope_id", "account_scopes",
+                        "account_scope_id", "NO ACTION",
+                    ),),
+                })
+            if actual_foreign_keys != expected_foreign_keys:
+                raise RuntimeError(
+                    f"schema {version} table {table} has invalid foreign keys"
+                )
+    for index_name, (
+        expected_table, expected_columns, expected_unique, expected_where,
+    ) in SCHEMA_V10_NAMED_INDEXES.items():
+        index_row = conn.execute(
+            """SELECT tbl_name, sql FROM sqlite_master
+               WHERE type='index' AND name=?""",
+            (index_name,),
+        ).fetchone()
+        actual_columns = _index_key_signature(conn, index_name)
+        expected_key = tuple(
+            (str(column), False, "BINARY")
+            for column in expected_columns
+        )
+        table_index = None
+        if index_row is not None:
+            table_index = next(
+                (
+                    row for row in conn.execute(
+                        f"PRAGMA index_list({expected_table})"
+                    )
+                    if str(row[1]) == index_name
+                ),
+                None,
+            )
+        actual_where = _index_predicate(conn, index_name)
+        normalized_expected_where = _normalize_index_predicate(expected_where)
+        if (
+            index_row is None
+            or str(index_row[0]) != expected_table
+            or actual_columns != expected_key
+            or table_index is None
+            or bool(table_index[2]) != expected_unique
+            or bool(table_index[4]) != (expected_where is not None)
+            or actual_where != normalized_expected_where
+        ):
+            raise RuntimeError(
+                f"schema {version} index {index_name} is invalid"
+            )
+
 SCHEMA_V11_NAMED_INDEXES = {
     "idx_candidates_scope_signal": (
-        "strategy_order_candidates", ("account_scope_id", "logical_signal_id"),
+        "strategy_order_candidates",
+        ("account_scope_id", "logical_signal_id"),
+        False,
+        None,
     ),
     "idx_execution_intents_scope_status": (
-        "execution_intents", ("account_scope_id", "status"),
+        "execution_intents", ("account_scope_id", "status"), False, None,
     ),
     "idx_reservations_scope_status": (
-        "capacity_reservations", ("account_scope_id", "status"),
+        "capacity_reservations", ("account_scope_id", "status"), False, None,
     ),
     "idx_broker_orders_scope_status": (
-        "broker_order_current", ("account_scope_id", "status"),
+        "broker_order_current", ("account_scope_id", "status"), False, None,
     ),
 }
-SCHEMA_V11_INDEXES = frozenset(SCHEMA_V11_NAMED_INDEXES)
 
 SCHEMA_V11_PRIMARY_KEYS = {
     "account_scopes": ("account_scope_id",),
@@ -439,6 +948,69 @@ SCHEMA_V11_UNIQUE_KEYS = {
     "execution_intents": {("account_scope_id", "pre_trade_result_id")},
     "capacity_reservations": {("account_scope_id", "client_order_id")},
 }
+
+SCHEMA_V11_FOREIGN_KEYS = MappingProxyType({
+    "account_scopes": frozenset(),
+    "broker_snapshot_current": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+    }),
+    "broker_position_current": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+        ((
+            "account_scope_id", "broker_snapshot_current",
+            "account_scope_id", "CASCADE",
+        ),),
+    }),
+    "broker_order_current": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+        ((
+            "account_scope_id", "broker_snapshot_current",
+            "account_scope_id", "CASCADE",
+        ),),
+    }),
+    "strategy_order_candidates": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+    }),
+    "pre_trade_results": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+        (
+            (
+                "account_scope_id", "strategy_order_candidates",
+                "account_scope_id", "NO ACTION",
+            ),
+            (
+                "candidate_id", "strategy_order_candidates",
+                "candidate_id", "NO ACTION",
+            ),
+        ),
+    }),
+    "execution_intents": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+        (
+            (
+                "account_scope_id", "pre_trade_results",
+                "account_scope_id", "NO ACTION",
+            ),
+            (
+                "pre_trade_result_id", "pre_trade_results",
+                "pre_trade_result_id", "NO ACTION",
+            ),
+        ),
+    }),
+    "capacity_reservations": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+        (
+            (
+                "account_scope_id", "execution_intents",
+                "account_scope_id", "NO ACTION",
+            ),
+            (
+                "client_order_id", "execution_intents",
+                "client_order_id", "NO ACTION",
+            ),
+        ),
+    }),
+})
 
 SCHEMA_V11_STATEMENTS = (
     """CREATE TABLE account_scopes(
@@ -470,6 +1042,8 @@ SCHEMA_V11_STATEMENTS = (
        market_value TEXT NOT NULL,
        PRIMARY KEY(account_scope_id, stock_code),
        FOREIGN KEY(account_scope_id)
+           REFERENCES account_scopes(account_scope_id),
+       FOREIGN KEY(account_scope_id)
            REFERENCES broker_snapshot_current(account_scope_id) ON DELETE CASCADE
        )""",
     """CREATE TABLE broker_order_current(
@@ -484,6 +1058,8 @@ SCHEMA_V11_STATEMENTS = (
        updated_at TEXT NOT NULL,
        content_sha256 TEXT NOT NULL,
        PRIMARY KEY(account_scope_id, client_order_id),
+       FOREIGN KEY(account_scope_id)
+           REFERENCES account_scopes(account_scope_id),
        FOREIGN KEY(account_scope_id)
            REFERENCES broker_snapshot_current(account_scope_id) ON DELETE CASCADE
        )""",
@@ -507,6 +1083,8 @@ SCHEMA_V11_STATEMENTS = (
        checked_at TEXT NOT NULL,
        valid_until TEXT NOT NULL,
        PRIMARY KEY(account_scope_id, pre_trade_result_id),
+       FOREIGN KEY(account_scope_id)
+           REFERENCES account_scopes(account_scope_id),
        FOREIGN KEY(account_scope_id, candidate_id)
            REFERENCES strategy_order_candidates(account_scope_id, candidate_id)
        )""",
@@ -519,8 +1097,11 @@ SCHEMA_V11_STATEMENTS = (
        payload_json TEXT NOT NULL,
        status TEXT NOT NULL,
        expires_at TEXT NOT NULL,
+       status_updated_at TEXT NOT NULL,
        PRIMARY KEY(account_scope_id, client_order_id),
        UNIQUE(account_scope_id, pre_trade_result_id),
+       FOREIGN KEY(account_scope_id)
+           REFERENCES account_scopes(account_scope_id),
        FOREIGN KEY(account_scope_id, pre_trade_result_id)
            REFERENCES pre_trade_results(account_scope_id, pre_trade_result_id)
        )""",
@@ -547,6 +1128,8 @@ SCHEMA_V11_STATEMENTS = (
        release_reason TEXT,
        PRIMARY KEY(account_scope_id, reservation_id),
        UNIQUE(account_scope_id, client_order_id),
+       FOREIGN KEY(account_scope_id)
+           REFERENCES account_scopes(account_scope_id),
        FOREIGN KEY(account_scope_id, client_order_id)
            REFERENCES execution_intents(account_scope_id, client_order_id)
        )""",
@@ -601,6 +1184,14 @@ class SignalRecord:
 
 
 class _ClosingConnection(sqlite3.Connection):
+    def commit(self) -> None:
+        self._trading_store_new_intents = None
+        super().commit()
+
+    def rollback(self) -> None:
+        self._trading_store_new_intents = None
+        super().rollback()
+
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
         try:
             return super().__exit__(exc_type, exc_value, traceback)
@@ -640,6 +1231,10 @@ class TradingStore:
                     )
                 if current_version == SCHEMA_VERSION:
                     self._validate_schema_v11(conn)
+                    return
+                if current_version == 10:
+                    validate_schema_contract(conn, 10)
+                    self._migrate_schema_v11(conn)
                     return
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA_V1)
@@ -696,6 +1291,7 @@ class TradingStore:
             conn.executescript(SCHEMA_V10)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (10, datetime('now'))")
             conn.commit()
+            validate_schema_contract(conn, 10)
             self._migrate_schema_v11(conn)
 
     def _migrate_schema_v11(self, conn: sqlite3.Connection) -> None:
@@ -715,6 +1311,25 @@ class TradingStore:
         try:
             for statement in SCHEMA_V11_STATEMENTS:
                 conn.execute(statement)
+            reconciliation_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(reconciliation_runs)")
+            }
+            reconciliation_additions = {
+                "account_scope_id": (
+                    "TEXT REFERENCES account_scopes(account_scope_id)"
+                ),
+                "broker_snapshot_id": "TEXT",
+                "broker_snapshot_sha256": "TEXT",
+                "snapshot_broker_time": "TEXT",
+                "snapshot_generated_at": "TEXT",
+            }
+            for column, declaration in reconciliation_additions.items():
+                if column not in reconciliation_columns:
+                    conn.execute(
+                        f"ALTER TABLE reconciliation_runs "
+                        f"ADD COLUMN {column} {declaration}"
+                    )
             cycle_columns = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(position_cycles)")
             }
@@ -739,14 +1354,9 @@ class TradingStore:
 
     @staticmethod
     def _validate_schema_v11(conn: sqlite3.Connection) -> None:
-        for table, required_columns in SCHEMA_V11_TABLES.items():
+        validate_schema_contract(conn, 11)
+        for table in SCHEMA_V11_TABLES:
             table_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
-            columns = {str(row[1]) for row in table_info}
-            missing = required_columns - columns
-            if missing:
-                raise RuntimeError(
-                    f"schema 11 table {table} missing columns: {sorted(missing)}"
-                )
             primary_key = tuple(
                 str(row[1])
                 for row in sorted(
@@ -758,17 +1368,19 @@ class TradingStore:
                 raise RuntimeError(
                     f"schema 11 table {table} has invalid primary key: {primary_key}"
                 )
-        cycle_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(position_cycles)")
-        }
-        missing_cycle = {
-            "profit_protection_activated_at", "trailing_stop_active_from",
-        } - cycle_columns
-        if missing_cycle:
-            raise RuntimeError(
-                f"schema 11 position_cycles missing columns: {sorted(missing_cycle)}"
+            expected_primary_index = tuple(
+                (column, False, "BINARY")
+                for column in SCHEMA_V11_PRIMARY_KEYS[table]
             )
-        for index_name, (expected_table, expected_columns) in (
+            if _primary_key_index_signature(
+                conn, table, table_info,
+            ) != expected_primary_index:
+                raise RuntimeError(
+                    f"schema 11 table {table} has invalid primary key index"
+                )
+        for index_name, (
+            expected_table, expected_columns, expected_unique, expected_where,
+        ) in (
             SCHEMA_V11_NAMED_INDEXES.items()
         ):
             index_row = conn.execute(
@@ -776,91 +1388,59 @@ class TradingStore:
                    WHERE type='index' AND name=?""",
                 (index_name,),
             ).fetchone()
-            actual_columns = tuple(
-                str(row[2])
-                for row in sorted(
-                    conn.execute(
-                        f'PRAGMA index_info("{index_name}")'
-                    ).fetchall(),
-                    key=lambda row: int(row[0]),
-                )
+            actual_columns = _index_key_signature(conn, index_name)
+            expected_key = tuple(
+                (str(column), False, "BINARY")
+                for column in expected_columns
+            )
+            table_index = next(
+                (
+                    row
+                    for row in conn.execute(
+                        f"PRAGMA index_list({expected_table})"
+                    )
+                    if str(row[1]) == index_name
+                ),
+                None,
             )
             if (
                 index_row is None
                 or str(index_row[0]) != expected_table
-                or actual_columns != expected_columns
+                or actual_columns != expected_key
+                or table_index is None
+                or bool(table_index[2]) != expected_unique
+                or bool(table_index[4]) != (expected_where is not None)
+                or _index_predicate(
+                    conn, index_name,
+                ) != _normalize_index_predicate(expected_where)
             ):
                 raise RuntimeError(
-                    f"schema 11 index {index_name} has invalid table or columns"
+                    f"schema 11 index {index_name} is invalid"
                 )
-        for table, primary_key in SCHEMA_V11_PRIMARY_KEYS.items():
-            unique_sets = set()
-            for index in conn.execute(f"PRAGMA index_list({table})"):
-                if not int(index[2]):
-                    continue
-                unique_sets.add(tuple(
-                    str(row[2])
-                    for row in sorted(
-                        conn.execute(f'PRAGMA index_info("{index[1]}")').fetchall(),
-                        key=lambda row: int(row[0]),
-                    )
-                ))
-            expected_unique = {primary_key} | SCHEMA_V11_UNIQUE_KEYS.get(
-                table, set()
+        for table in SCHEMA_V11_PRIMARY_KEYS:
+            actual_unique = _unique_index_signatures(conn, table)
+            expected_unique = _expected_unique_index_signatures(
+                table,
+                SCHEMA_V11_UNIQUE_KEYS,
+                SCHEMA_V11_NAMED_INDEXES,
             )
-            if unique_sets != expected_unique:
+            if actual_unique != expected_unique:
                 raise RuntimeError(
-                    f"schema 11 table {table} has invalid unique keys: "
-                    f"{sorted(unique_sets)}"
+                    f"schema 11 table {table} has invalid unique indexes"
                 )
-        required_foreign_keys = {
-            "broker_snapshot_current": {("account_scope_id", "account_scopes", "account_scope_id")},
-            "broker_position_current": {
-                ("account_scope_id", "broker_snapshot_current", "account_scope_id"),
-            },
-            "broker_order_current": {
-                ("account_scope_id", "broker_snapshot_current", "account_scope_id"),
-            },
-            "strategy_order_candidates": {
-                ("account_scope_id", "account_scopes", "account_scope_id"),
-            },
-            "pre_trade_results": {
-                ("account_scope_id", "strategy_order_candidates", "account_scope_id"),
-                ("candidate_id", "strategy_order_candidates", "candidate_id"),
-            },
-            "execution_intents": {
-                ("account_scope_id", "pre_trade_results", "account_scope_id"),
-                ("pre_trade_result_id", "pre_trade_results", "pre_trade_result_id"),
-            },
-            "capacity_reservations": {
-                ("account_scope_id", "execution_intents", "account_scope_id"),
-                ("client_order_id", "execution_intents", "client_order_id"),
-            },
-        }
-        for table, required in required_foreign_keys.items():
+        for table, expected_groups in SCHEMA_V11_FOREIGN_KEYS.items():
             grouped: dict[int, list[sqlite3.Row]] = {}
             for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
                 grouped.setdefault(int(row[0]), []).append(row)
             actual_groups = {
                 tuple(
-                    (str(row[3]), str(row[2]), str(row[4]))
+                    (
+                        str(row[3]), str(row[2]), str(row[4]), str(row[6]),
+                    )
                     for row in sorted(rows, key=lambda item: int(item[1]))
                 )
                 for rows in grouped.values()
             }
-            expected_groups: set[tuple[tuple[str, str, str], ...]] = set()
-            if table in {
-                "pre_trade_results", "execution_intents",
-                "capacity_reservations",
-            }:
-                expected_groups.add(tuple(sorted(
-                    required,
-                    key=lambda item: (
-                        0 if item[0] == "account_scope_id" else 1
-                    ),
-                )))
-            else:
-                expected_groups = {(item,) for item in required}
             if actual_groups != expected_groups:
                 raise RuntimeError(
                     f"schema 11 table {table} has invalid foreign keys"
@@ -869,7 +1449,31 @@ class TradingStore:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self.connect() as conn:
+            conn._trading_store_transaction_generation = 0
+
+            def track_transaction_boundary(statement: str) -> None:
+                text = statement.lstrip()
+                while text.startswith(("--", "/*")):
+                    if text.startswith("--"):
+                        text = text.partition("\n")[2].lstrip()
+                    else:
+                        _, marker, text = text.partition("*/")
+                        if not marker:
+                            return
+                        text = text.lstrip()
+                words = text.upper().split(None, 2)
+                if not words or words[:2] in (["ROLLBACK", "TO"],):
+                    return
+                if words[0] in {"BEGIN", "COMMIT", "END", "ROLLBACK"}:
+                    conn._trading_store_transaction_generation += 1
+
+            conn.set_trace_callback(track_transaction_boundary)
             conn.execute("BEGIN IMMEDIATE")
+            conn._trading_store_transaction_owner = id(self)
+            conn._trading_store_owner_generation = (
+                conn._trading_store_transaction_generation
+            )
+            conn._trading_store_new_intents = set()
             try:
                 yield conn
             except Exception:
@@ -877,8 +1481,13 @@ class TradingStore:
                 raise
             else:
                 conn.commit()
+            finally:
+                conn._trading_store_new_intents = None
+                conn._trading_store_transaction_owner = None
+                conn._trading_store_owner_generation = None
 
     def health(self) -> StoreHealth:
+        version = 0
         try:
             with self.connect() as conn:
                 version = int(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0)
@@ -887,7 +1496,7 @@ class TradingStore:
                     self._validate_schema_v11(conn)
             return StoreHealth(ok=version == SCHEMA_VERSION, schema_version=version)
         except Exception as exc:
-            return StoreHealth(ok=False, schema_version=0, error=str(exc))
+            return StoreHealth(ok=False, schema_version=version, error=str(exc))
 
     @staticmethod
     def _money(value: object, name: str) -> Decimal:
@@ -898,6 +1507,62 @@ class TradingStore:
         if not amount.is_finite() or amount < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
         return amount
+
+    @staticmethod
+    def _decimal_text(value: Decimal) -> str:
+        text = format(value, "f").rstrip("0").rstrip(".")
+        return text or "0"
+
+    @staticmethod
+    def _quantity(
+        value: object,
+        name: str,
+        *,
+        positive: bool,
+    ) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+        try:
+            quantity = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if not quantity.is_finite() or quantity != quantity.to_integral_value():
+            raise ValueError(f"{name} must be a finite integer")
+        if quantity < 0 or (positive and quantity == 0):
+            qualifier = "positive" if positive else "nonnegative"
+            raise ValueError(f"{name} must be {qualifier}")
+        return int(quantity)
+
+    @staticmethod
+    def _required_text(value: object, name: str) -> str:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} is required")
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError(f"{name} is required")
+        return text
+
+    @staticmethod
+    def _aware_timestamp(value: object, name: str) -> str:
+        text = TradingStore._required_text(value, name)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a valid timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{name} must include a timezone")
+        return parsed.isoformat()
+
+    @staticmethod
+    def _timestamp_instant(value: object, name: str) -> datetime:
+        text = TradingStore._required_text(value, name)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a valid timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+        return parsed.astimezone(timezone.utc)
 
     def get_or_create_account_scope(
         self,
@@ -917,7 +1582,10 @@ class TradingStore:
             (adapter, scope_alias),
         ).fetchone()
         if row:
-            return str(row[0])
+            account_scope_id = str(row[0])
+            if adapter == "joinquant" and scope_alias == "primary":
+                self._adopt_legacy_execution_issues(conn, account_scope_id)
+            return account_scope_id
         account_scope_id = str(uuid.uuid4())
         try:
             conn.execute(
@@ -934,8 +1602,79 @@ class TradingStore:
             ).fetchone()
             if not row:
                 raise
-            return str(row[0])
+            account_scope_id = str(row[0])
+        if adapter == "joinquant" and scope_alias == "primary":
+            self._adopt_legacy_execution_issues(conn, account_scope_id)
         return account_scope_id
+
+    @staticmethod
+    def _adopt_legacy_execution_issues(
+        conn: sqlite3.Connection, account_scope_id: str,
+    ) -> None:
+        prefix = f"scope:{account_scope_id}:"
+        severity_rank = {
+            "INFO": 0, "WARNING": 1, "ERROR": 2, "CRITICAL": 3,
+        }
+        legacy_rows = conn.execute(
+            """SELECT * FROM execution_issue_state
+               WHERE issue_key NOT LIKE 'scope:%'"""
+        ).fetchall()
+        for legacy in legacy_rows:
+            scoped_key = prefix + str(legacy["issue_key"])
+            scoped = conn.execute(
+                """SELECT * FROM execution_issue_state WHERE issue_key=?""",
+                (scoped_key,),
+            ).fetchone()
+            if scoped is None:
+                conn.execute(
+                    """UPDATE execution_issue_state SET issue_key=?
+                       WHERE issue_key=?""",
+                    (scoped_key, legacy["issue_key"]),
+                )
+                continue
+            winner = max(
+                (scoped, legacy),
+                key=lambda row: (
+                    row["recovered_at"] is None,
+                    severity_rank.get(str(row["severity"]), -1),
+                    str(row["last_seen_at"]),
+                ),
+            )
+            first_seen = min(
+                str(scoped["first_seen_at"]), str(legacy["first_seen_at"]),
+            )
+            stage_started = min(
+                str(scoped["stage_started_at"]),
+                str(legacy["stage_started_at"]),
+            )
+            last_seen = max(
+                str(scoped["last_seen_at"]), str(legacy["last_seen_at"]),
+            )
+            notified = max(
+                str(scoped["last_notified_at"] or ""),
+                str(legacy["last_notified_at"] or ""),
+            )
+            conn.execute(
+                """UPDATE execution_issue_state SET
+                   object_type=?, object_id=?, state=?, severity=?,
+                   first_seen_at=?, stage_started_at=?, last_seen_at=?,
+                   last_transition_at=?, last_notified_at=?, recovered_at=?,
+                   signal_id=?, order_id=?, reconciliation_id=?, details_json=?
+                   WHERE issue_key=?""",
+                (
+                    winner["object_type"], winner["object_id"],
+                    winner["state"], winner["severity"], first_seen,
+                    stage_started, last_seen, winner["last_transition_at"],
+                    notified or None, winner["recovered_at"],
+                    winner["signal_id"], winner["order_id"],
+                    winner["reconciliation_id"], winner["details_json"],
+                    scoped_key,
+                ),
+            )
+            conn.execute(
+                """DELETE FROM execution_issue_state WHERE issue_key=?""",
+                (legacy["issue_key"],),
+            )
 
     def replace_current_broker_snapshot(
         self,
@@ -948,6 +1687,15 @@ class TradingStore:
         payload_json = contract_canonical_json(normalized.to_dict())
         if len(payload_json.encode("utf-8")) > 1024 * 1024:
             raise ValueError("broker snapshot canonical payload exceeds 1 MiB")
+        if (
+            not conn.in_transaction
+            or getattr(
+                conn, "_trading_store_transaction_owner", None,
+            ) != id(self)
+        ):
+            raise ValueError(
+                "broker snapshot replacement requires store-owned BEGIN IMMEDIATE"
+            )
         scope = normalized.account_scope_id
         if not conn.execute(
             "SELECT 1 FROM account_scopes WHERE account_scope_id=?", (scope,)
@@ -1137,6 +1885,8 @@ class TradingStore:
         *,
         status: str = "READY",
     ) -> str:
+        if status != "READY":
+            raise ValueError("execution intent initial status must be READY")
         record = ExecutionIntent.from_dict(
             intent.to_dict() if isinstance(intent, ExecutionIntent) else intent
         )
@@ -1152,8 +1902,13 @@ class TradingStore:
             or str(result_row[0]) != record.pre_trade_result_sha256
         ):
             raise ValueError("execution intent pre-trade evidence is not persisted")
+        existed = conn.execute(
+            """SELECT 1 FROM execution_intents
+               WHERE account_scope_id=? AND client_order_id=?""",
+            (record.account_scope_id, record.client_order_id),
+        ).fetchone() is not None
         payload = contract_canonical_json(record.to_dict())
-        return self._insert_immutable_fact(
+        identity = self._insert_immutable_fact(
             conn,
             table="execution_intents",
             scope=record.account_scope_id,
@@ -1164,14 +1919,29 @@ class TradingStore:
             statement="""INSERT INTO execution_intents(
                 account_scope_id, client_order_id, pre_trade_result_id,
                 intent_sha256, submission_attempt_id, payload_json, status,
-                expires_at
-                ) VALUES(?,?,?,?,?,?,?,?)""",
+                expires_at, status_updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
             parameters=(
                 record.account_scope_id, record.client_order_id,
                 record.pre_trade_result_id, record.intent_sha256,
                 record.submission_attempt_id, payload, str(status), record.expires_at,
+                record.pre_trade_result.checked_at,
             ),
         )
+        if (
+            not existed
+            and getattr(
+                conn, "_trading_store_transaction_owner", None,
+            ) == id(self)
+            and isinstance(
+                getattr(conn, "_trading_store_new_intents", None), set,
+            )
+        ):
+            conn._trading_store_new_intents.add((
+                record.account_scope_id,
+                record.client_order_id,
+            ))
+        return identity
 
     def compare_and_set_execution_intent_status(
         self,
@@ -1181,11 +1951,85 @@ class TradingStore:
         *,
         expected_status: str,
         new_status: str,
+        transitioned_at: str,
     ) -> bool:
+        account_scope_id = self._required_text(
+            account_scope_id, "account_scope_id",
+        )
+        client_order_id = self._required_text(
+            client_order_id, "client_order_id",
+        )
+        expected_status = self._required_text(
+            expected_status, "expected_status",
+        ).upper()
+        new_status = self._required_text(new_status, "new_status").upper()
+        transitioned_at = self._aware_timestamp(
+            transitioned_at, "transitioned_at",
+        )
+        transitions = {
+            "READY": {"SUBMITTING", "EXPIRED"},
+            "SUBMITTING": {
+                "SUBMITTED", "REJECTED", "NOT_SUBMITTED", "SUBMIT_UNKNOWN",
+            },
+            "SUBMITTED": {
+                "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED",
+            },
+            "PARTIALLY_FILLED": {
+                "PARTIALLY_FILLED", "FILLED", "CANCELLED",
+            },
+            "EXPIRED": set(),
+            "NOT_SUBMITTED": set(),
+            "REJECTED": set(),
+            "CANCELLED": set(),
+            "FILLED": set(),
+            "SUBMIT_UNKNOWN": {
+                "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "CANCELLED",
+                "REJECTED", "NOT_SUBMITTED",
+            },
+        }
+        if expected_status not in transitions or new_status not in transitions:
+            raise ValueError("unknown execution intent status")
+        if new_status not in transitions[expected_status]:
+            raise ValueError(
+                "invalid execution intent status transition"
+            )
+        current = conn.execute(
+            """SELECT status, status_updated_at, expires_at FROM execution_intents
+               WHERE account_scope_id=? AND client_order_id=?""",
+            (account_scope_id, client_order_id),
+        ).fetchone()
+        if current is not None and str(current["status"]).upper() == expected_status:
+            if self._timestamp_instant(
+                transitioned_at, "transitioned_at",
+            ) < self._timestamp_instant(
+                current["status_updated_at"], "status_updated_at",
+            ):
+                raise ValueError("execution intent transition time cannot regress")
+            expires_at = self._timestamp_instant(
+                current["expires_at"], "expires_at",
+            )
+            transition_instant = self._timestamp_instant(
+                transitioned_at, "transitioned_at",
+            )
+            if (
+                expected_status == "READY"
+                and new_status == "SUBMITTING"
+                and transition_instant >= expires_at
+            ):
+                raise ValueError("expired execution intent cannot be submitted")
+            if (
+                expected_status == "READY"
+                and new_status == "EXPIRED"
+                and transition_instant < expires_at
+            ):
+                raise ValueError("execution intent cannot expire before expires_at")
         cursor = conn.execute(
-            """UPDATE execution_intents SET status=?
+            """UPDATE execution_intents SET status=?, status_updated_at=?
                WHERE account_scope_id=? AND client_order_id=? AND status=?""",
-            (new_status, account_scope_id, client_order_id, expected_status),
+            (
+                new_status, transitioned_at, account_scope_id,
+                client_order_id, expected_status,
+            ),
         )
         return cursor.rowcount == 1
 
@@ -1207,17 +2051,101 @@ class TradingStore:
         uncategorized: bool,
         created_at: str,
     ) -> str:
-        if int(target_qty) <= 0:
-            raise ValueError("target_qty must be positive")
+        account_scope_id = self._required_text(
+            account_scope_id, "account_scope_id",
+        )
+        reservation_id = self._required_text(reservation_id, "reservation_id")
+        client_order_id = self._required_text(
+            client_order_id, "client_order_id",
+        )
+        stock_code = self._required_text(stock_code, "stock_code")
+        side = self._required_text(side, "side").lower()
+        if side not in {"buy", "sell"}:
+            raise ValueError("side must be buy or sell")
+        target_qty = self._quantity(target_qty, "target_qty", positive=True)
+        if not isinstance(uncategorized, bool):
+            raise ValueError("uncategorized must be a bool")
+        industry = self._required_text(industry, "industry")
+        theme = self._required_text(theme, "theme")
+        expected_uncategorized = "__UNCATEGORIZED__" in {industry, theme}
+        if uncategorized != expected_uncategorized:
+            raise ValueError(
+                "uncategorized must match normalized industry/theme"
+            )
+        created_at = self._aware_timestamp(created_at, "created_at")
         cash = self._money(cash_yuan, "cash_yuan")
         position_value = self._money(position_value_yuan, "position_value_yuan")
         open_risk = self._money(open_risk_yuan, "open_risk_yuan")
+        evidence = conn.execute(
+            """SELECT i.payload_json, i.intent_sha256, i.status,
+                      i.expires_at, i.status_updated_at,
+                      p.result_sha256, c.payload_sha256
+               FROM execution_intents AS i
+               JOIN pre_trade_results AS p
+                 ON p.account_scope_id=i.account_scope_id
+                AND p.pre_trade_result_id=i.pre_trade_result_id
+               JOIN strategy_order_candidates AS c
+                 ON c.account_scope_id=p.account_scope_id
+                AND c.candidate_id=p.candidate_id
+               WHERE i.account_scope_id=? AND i.client_order_id=?""",
+            (account_scope_id, client_order_id),
+        ).fetchone()
+        if evidence is None:
+            raise ValueError("capacity reservation requires execution intent")
+        try:
+            intent = ExecutionIntent.from_dict(
+                json.loads(str(evidence["payload_json"]))
+            )
+        except Exception as exc:
+            raise ValueError(
+                "capacity reservation execution intent evidence is invalid"
+            ) from exc
+        result = intent.pre_trade_result
+        candidate = result.candidate
+        if (
+            intent.intent_sha256 != str(evidence["intent_sha256"])
+            or result.result_sha256 != str(evidence["result_sha256"])
+            or candidate.payload_sha256 != str(evidence["payload_sha256"])
+        ):
+            raise ValueError(
+                "capacity reservation signed evidence does not match ledger"
+            )
+        if (
+            intent.account_scope_id != account_scope_id
+            or intent.client_order_id != client_order_id
+            or intent.code != stock_code
+            or intent.side != side
+            or intent.order_qty != target_qty
+        ):
+            raise ValueError(
+                "capacity reservation does not match execution intent"
+            )
+        if (
+            candidate.industry != industry
+            or candidate.theme != theme
+            or candidate.uncategorized != uncategorized
+        ):
+            raise ValueError(
+                "capacity reservation classification does not match candidate"
+            )
+        if side == "buy":
+            fee = result.execution_fee
+            if fee is None or (
+                position_value != fee.notional_yuan
+                or cash != fee.notional_yuan + fee.total_yuan
+                or open_risk != result.per_trade_risk_yuan
+            ):
+                raise ValueError(
+                    "buy reservation amounts do not match signed evidence"
+                )
+        elif any(value != 0 for value in (cash, position_value, open_risk)):
+            raise ValueError("sell reservation amounts must be zero")
         values = (
-            account_scope_id, reservation_id, client_order_id, str(stock_code),
-            str(side).lower(), int(target_qty), str(cash), str(position_value),
-            str(open_risk), int(target_qty), str(cash), str(position_value),
-            str(open_risk), str(industry), str(theme), int(bool(uncategorized)),
-            "active", str(created_at),
+            account_scope_id, reservation_id, client_order_id, stock_code,
+            side, target_qty, str(cash), str(position_value),
+            str(open_risk), target_qty, str(cash), str(position_value),
+            str(open_risk), industry, theme, int(uncategorized),
+            "active", created_at,
         )
         existing = conn.execute(
             """SELECT * FROM capacity_reservations
@@ -1228,14 +2156,41 @@ class TradingStore:
             columns = (
                 "account_scope_id", "reservation_id", "client_order_id",
                 "stock_code", "side", "target_qty", "cash_yuan",
-                "position_value_yuan", "open_risk_yuan", "remaining_target_qty",
-                "remaining_cash_yuan", "remaining_position_value_yuan",
-                "remaining_open_risk_yuan", "industry", "theme", "uncategorized",
-                "status", "created_at",
+                "position_value_yuan", "open_risk_yuan", "industry", "theme",
+                "uncategorized", "created_at",
             )
-            if tuple(existing[name] for name in columns) == values:
+            original_values = (
+                account_scope_id, reservation_id, client_order_id, stock_code,
+                side, target_qty, str(cash), str(position_value),
+                str(open_risk), industry, theme, int(uncategorized), created_at,
+            )
+            if tuple(existing[name] for name in columns) == original_values:
                 return reservation_id
             raise ValueError("capacity reservation immutable ID conflict")
+        if str(evidence["status"]).upper() != "READY":
+            raise ValueError("capacity reservation requires READY execution intent")
+        created_instant = self._timestamp_instant(created_at, "created_at")
+        if created_instant < self._timestamp_instant(
+            evidence["status_updated_at"], "status_updated_at",
+        ) or created_instant > self._timestamp_instant(
+            evidence["expires_at"], "expires_at",
+        ):
+            raise ValueError(
+                "capacity reservation creation time is outside intent validity"
+            )
+        new_intents = getattr(conn, "_trading_store_new_intents", None)
+        if (
+            not conn.in_transaction
+            or getattr(conn, "_trading_store_transaction_owner", None) != id(self)
+            or getattr(conn, "_trading_store_owner_generation", None)
+            != getattr(conn, "_trading_store_transaction_generation", None)
+            or not new_intents
+            or (account_scope_id, client_order_id) not in new_intents
+        ):
+            raise ValueError(
+                "capacity reservation must be created in the same transaction "
+                "as its execution intent"
+            )
         client_reservation = conn.execute(
             """SELECT reservation_id FROM capacity_reservations
                WHERE account_scope_id=? AND client_order_id=?""",
@@ -1261,41 +2216,174 @@ class TradingStore:
         account_scope_id: str,
         reservation_id: str,
         *,
-        remaining_target_qty: int,
-        remaining_cash_yuan: object,
-        remaining_position_value_yuan: object,
-        remaining_open_risk_yuan: object,
+        cumulative_filled_qty: int,
     ) -> bool:
-        remaining = (
-            int(remaining_target_qty),
-            self._money(remaining_cash_yuan, "remaining_cash_yuan"),
-            self._money(
-                remaining_position_value_yuan, "remaining_position_value_yuan"
-            ),
-            self._money(remaining_open_risk_yuan, "remaining_open_risk_yuan"),
+        account_scope_id = self._required_text(
+            account_scope_id, "account_scope_id",
+        )
+        reservation_id = self._required_text(reservation_id, "reservation_id")
+        cumulative_filled_qty = self._quantity(
+            cumulative_filled_qty, "cumulative_filled_qty", positive=True,
         )
         row = conn.execute(
-            """SELECT target_qty, cash_yuan, position_value_yuan, open_risk_yuan,
-                      remaining_target_qty, remaining_cash_yuan,
-                      remaining_position_value_yuan, remaining_open_risk_yuan
-               FROM capacity_reservations
-               WHERE account_scope_id=? AND reservation_id=? AND status='active'""",
+            """SELECT r.client_order_id, r.stock_code, r.side, r.target_qty,
+                      r.cash_yuan,
+                      r.position_value_yuan, r.open_risk_yuan,
+                      r.remaining_target_qty, r.remaining_cash_yuan,
+                      r.remaining_position_value_yuan,
+                      r.remaining_open_risk_yuan, i.status AS intent_status,
+                      i.payload_json
+               FROM capacity_reservations AS r
+               JOIN execution_intents AS i
+                 ON i.account_scope_id=r.account_scope_id
+                AND i.client_order_id=r.client_order_id
+               WHERE r.account_scope_id=? AND r.reservation_id=?
+                 AND r.status='active'""",
             (account_scope_id, reservation_id),
         ).fetchone()
         if not row:
             return False
+        if str(row["intent_status"]).upper() != "PARTIALLY_FILLED":
+            raise ValueError(
+                "capacity reservation adjustment requires PARTIALLY_FILLED intent"
+            )
+        client_order_id = str(row["client_order_id"])
+        try:
+            intent = ExecutionIntent.from_dict(
+                json.loads(str(row["payload_json"]))
+            )
+        except Exception as exc:
+            raise ValueError(
+                "capacity reservation execution intent evidence is invalid"
+            ) from exc
+        if (
+            intent.account_scope_id != account_scope_id
+            or intent.client_order_id != client_order_id
+            or intent.code != str(row["stock_code"])
+            or intent.side != str(row["side"])
+            or intent.order_qty != int(row["target_qty"])
+        ):
+            raise ValueError(
+                "capacity reservation does not match execution intent"
+            )
+        broker_order = conn.execute(
+            """SELECT broker_order_id, stock_code, side, target_qty,
+                      filled_qty, status
+               FROM broker_order_current
+               WHERE account_scope_id=? AND client_order_id=?""",
+            (account_scope_id, client_order_id),
+        ).fetchone()
+        if broker_order is None:
+            raise ValueError(
+                "capacity reservation adjustment requires current broker order"
+            )
+        if (
+            str(broker_order["stock_code"]) != intent.code
+            or str(broker_order["side"]).lower() != intent.side
+            or int(broker_order["target_qty"]) != intent.order_qty
+            or str(broker_order["status"]).lower()
+            not in {"partially_filled", "pending_cancel"}
+            or int(broker_order["filled_qty"]) != cumulative_filled_qty
+        ):
+            raise ValueError(
+                "current broker order does not match partial-fill evidence"
+            )
+        order = conn.execute(
+            """SELECT order_id, stock_code, action, filled_qty,
+                      requested_qty, target_qty
+               FROM orders WHERE client_order_id=?""",
+            (client_order_id,),
+        ).fetchone()
+        order_filled = 0
+        linked_order_ids = {
+            str(broker_order["broker_order_id"] or "").strip()
+        }
+        if order is not None:
+            if (
+                str(order["stock_code"]) != intent.code
+                or str(order["action"]).lower() != intent.side
+                or order_allowed_quantity(
+                    order["requested_qty"], order["target_qty"],
+                ) != intent.order_qty
+            ):
+                raise ValueError(
+                    "legacy order does not match execution intent"
+                )
+            legacy_order_id = str(order["order_id"] or "").strip()
+            if (
+                legacy_order_id
+                and broker_order["broker_order_id"]
+                and legacy_order_id != str(broker_order["broker_order_id"])
+            ):
+                raise ValueError(
+                    "legacy and broker order identities conflict"
+                )
+            linked_order_ids.add(legacy_order_id)
+            order_filled = int(order["filled_qty"] or 0)
+        linked_order_ids.discard("")
+        fills = conn.execute(
+            """SELECT stock_code, action, qty, order_id
+               FROM fills WHERE client_order_id=?
+                  OR order_id=?
+                  OR order_id IN (
+                      SELECT order_id FROM orders
+                      WHERE client_order_id=? AND order_id IS NOT NULL
+                  )""",
+            (
+                client_order_id,
+                str(broker_order["broker_order_id"] or ""),
+                client_order_id,
+            ),
+        ).fetchall()
+        for fill in fills:
+            if (
+                str(fill["stock_code"]) != intent.code
+                or str(fill["action"]).lower() != intent.side
+                or (
+                    linked_order_ids
+                    and fill["order_id"]
+                    and str(fill["order_id"]) not in linked_order_ids
+                )
+            ):
+                raise ValueError("fill identity conflicts with execution intent")
+        fill_filled = sum(int(fill["qty"] or 0) for fill in fills)
+        evidenced_filled = max(
+            int(broker_order["filled_qty"]), order_filled, fill_filled,
+        )
+        if cumulative_filled_qty != evidenced_filled:
+            raise ValueError(
+                "cumulative_filled_qty does not match persisted order/fill evidence"
+            )
+        target_qty = int(row["target_qty"])
+        if cumulative_filled_qty >= target_qty:
+            raise ValueError(
+                "PARTIALLY_FILLED cumulative quantity must be below target quantity"
+            )
+        remaining_qty = target_qty - cumulative_filled_qty
+        ratio = Decimal(remaining_qty) / Decimal(target_qty)
         original = (
-            int(row[0]), Decimal(row[1]), Decimal(row[2]), Decimal(row[3]),
+            target_qty,
+            Decimal(row["cash_yuan"]),
+            Decimal(row["position_value_yuan"]),
+            Decimal(row["open_risk_yuan"]),
         )
         current = (
-            int(row[4]), Decimal(row[5]), Decimal(row[6]), Decimal(row[7]),
+            int(row["remaining_target_qty"]),
+            Decimal(row["remaining_cash_yuan"]),
+            Decimal(row["remaining_position_value_yuan"]),
+            Decimal(row["remaining_open_risk_yuan"]),
         )
-        if remaining[0] < 0 or any(
-            value > limit for value, limit in zip(remaining, original)
-        ):
-            raise ValueError("remaining reservation values exceed original values")
+        remaining = (
+            remaining_qty,
+            *((value * ratio).quantize(
+                Decimal("0.01"), rounding=ROUND_CEILING,
+            ) for value in original[1:]),
+        )
         if any(value > limit for value, limit in zip(remaining, current)):
             raise ValueError("remaining reservation values cannot increase")
+        remaining_text = tuple(
+            self._decimal_text(value) for value in remaining[1:]
+        )
         cursor = conn.execute(
             """UPDATE capacity_reservations
                SET remaining_target_qty=?, remaining_cash_yuan=?,
@@ -1305,23 +2393,63 @@ class TradingStore:
                  AND remaining_position_value_yuan=?
                  AND remaining_open_risk_yuan=?""",
             (
-                remaining[0], str(remaining[1]), str(remaining[2]), str(remaining[3]),
+                remaining[0], *remaining_text,
                 account_scope_id, reservation_id,
                 current[0], str(current[1]), str(current[2]), str(current[3]),
             ),
         )
         return cursor.rowcount == 1
 
+    def list_active_reservations(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+    ) -> list[dict[str, object]]:
+        account_scope_id = self._required_text(
+            account_scope_id, "account_scope_id",
+        )
+        rows = conn.execute(
+            """SELECT r.*, i.status AS intent_status
+               FROM capacity_reservations AS r
+               JOIN execution_intents AS i
+                 ON i.account_scope_id=r.account_scope_id
+                AND i.client_order_id=r.client_order_id
+               WHERE r.account_scope_id=? AND r.status='active'
+               ORDER BY r.reservation_id""",
+            (account_scope_id,),
+        ).fetchall()
+        return [{
+            "account_scope_id": str(row["account_scope_id"]),
+            "reservation_id": str(row["reservation_id"]),
+            "client_order_id": str(row["client_order_id"]),
+            "code": str(row["stock_code"]),
+            "side": str(row["side"]),
+            "intent_status": str(row["intent_status"]),
+            "original_target_qty": int(row["target_qty"]),
+            "original_cash_yuan": Decimal(row["cash_yuan"]),
+            "original_position_value_yuan": Decimal(
+                row["position_value_yuan"]
+            ),
+            "original_open_risk_yuan": Decimal(row["open_risk_yuan"]),
+            "remaining_target_qty": int(row["remaining_target_qty"]),
+            "remaining_cash_yuan": Decimal(row["remaining_cash_yuan"]),
+            "remaining_position_value_yuan": Decimal(
+                row["remaining_position_value_yuan"]
+            ),
+            "remaining_open_risk_yuan": Decimal(
+                row["remaining_open_risk_yuan"]
+            ),
+            "industry": str(row["industry"]),
+            "theme": str(row["theme"]),
+            "uncategorized": bool(row["uncategorized"]),
+        } for row in rows]
+
     def aggregate_active_reservations(
         self,
         conn: sqlite3.Connection,
         account_scope_id: str,
     ) -> dict[str, object]:
-        rows = conn.execute(
-            """SELECT * FROM capacity_reservations
-               WHERE account_scope_id=? AND status='active'""",
-            (account_scope_id,),
-        ).fetchall()
+        rows = self.list_active_reservations(conn, account_scope_id)
         result: dict[str, object] = {
             "target_qty": 0,
             "cash_yuan": Decimal("0"),
@@ -1332,11 +2460,11 @@ class TradingStore:
             "uncategorized_value_yuan": Decimal("0"),
         }
         for row in rows:
-            value = Decimal(row["remaining_position_value_yuan"])
+            value = row["remaining_position_value_yuan"]
             result["target_qty"] += int(row["remaining_target_qty"])
-            result["cash_yuan"] += Decimal(row["remaining_cash_yuan"])
+            result["cash_yuan"] += row["remaining_cash_yuan"]
             result["position_value_yuan"] += value
-            result["open_risk_yuan"] += Decimal(row["remaining_open_risk_yuan"])
+            result["open_risk_yuan"] += row["remaining_open_risk_yuan"]
             if row["industry"]:
                 industries = result["industry_value_yuan"]
                 industries[row["industry"]] = industries.get(
@@ -1359,7 +2487,266 @@ class TradingStore:
         *,
         released_at: str,
         reason: str,
+        reconciliation_id: str | None = None,
     ) -> bool:
+        account_scope_id = self._required_text(
+            account_scope_id, "account_scope_id",
+        )
+        reservation_id = self._required_text(reservation_id, "reservation_id")
+        released_at = self._aware_timestamp(released_at, "released_at")
+        reason = self._required_text(reason, "reason")
+        row = conn.execute(
+            """SELECT i.client_order_id, i.status AS intent_status,
+                      i.expires_at, i.status_updated_at, i.payload_json
+               FROM capacity_reservations AS r
+               JOIN execution_intents AS i
+                 ON i.account_scope_id=r.account_scope_id
+                AND i.client_order_id=r.client_order_id
+               WHERE r.account_scope_id=? AND r.reservation_id=?
+                 AND r.status='active'""",
+            (account_scope_id, reservation_id),
+        ).fetchone()
+        if row is None:
+            return False
+        intent_status = str(row["intent_status"]).upper()
+        if intent_status in {
+            "SUBMITTING", "SUBMIT_UNKNOWN", "SUBMITTED", "PARTIALLY_FILLED",
+        }:
+            raise ValueError(
+                f"{intent_status} capacity reservation cannot be released"
+            )
+        client_order_id = str(row["client_order_id"])
+        release_instant = self._timestamp_instant(released_at, "released_at")
+        if intent_status in {"READY", "EXPIRED"}:
+            expires_at = self._timestamp_instant(row["expires_at"], "expires_at")
+            if release_instant < expires_at:
+                raise ValueError(
+                    "READY capacity reservation cannot be released before expiry"
+                )
+            if intent_status == "READY":
+                raise ValueError(
+                    "READY intent must transition to EXPIRED before release"
+                )
+            if conn.execute(
+                "SELECT 1 FROM orders WHERE client_order_id=?",
+                (client_order_id,),
+            ).fetchone() is not None:
+                raise ValueError(
+                    "EXPIRED capacity release conflicts with submission evidence"
+                )
+            if conn.execute(
+                "SELECT 1 FROM fills WHERE client_order_id=?",
+                (client_order_id,),
+            ).fetchone() is not None:
+                raise ValueError(
+                    "EXPIRED capacity release conflicts with fill evidence"
+                )
+            if conn.execute(
+                """SELECT 1 FROM broker_order_current
+                   WHERE account_scope_id=? AND client_order_id=?""",
+                (account_scope_id, client_order_id),
+            ).fetchone() is not None:
+                raise ValueError(
+                    "EXPIRED capacity release conflicts with current broker order"
+                )
+            broker_snapshot = conn.execute(
+                """SELECT broker_time, generated_at
+                   FROM broker_snapshot_current WHERE account_scope_id=?""",
+                (account_scope_id,),
+            ).fetchone()
+            if broker_snapshot is None:
+                raise ValueError(
+                    "EXPIRED capacity release requires current broker snapshot"
+                )
+            broker_time = self._timestamp_instant(
+                broker_snapshot["broker_time"], "broker_snapshot.broker_time",
+            )
+            snapshot_generated_at = self._timestamp_instant(
+                broker_snapshot["generated_at"],
+                "broker_snapshot.generated_at",
+            )
+            if broker_time < expires_at or snapshot_generated_at < expires_at:
+                raise ValueError(
+                    "current broker snapshot predates execution intent expiry"
+                )
+            if release_instant < max(broker_time, snapshot_generated_at):
+                raise ValueError(
+                    "capacity release predates current broker snapshot"
+                )
+        elif intent_status in {
+            "NOT_SUBMITTED", "REJECTED", "CANCELLED", "FILLED",
+        }:
+            reconciliation_id = self._required_text(
+                reconciliation_id, "reconciliation_id",
+            )
+            reconciliation = conn.execute(
+                """SELECT account_scope_id, broker_snapshot_id,
+                          broker_snapshot_sha256, snapshot_broker_time,
+                          snapshot_generated_at, finished_at
+                   FROM reconciliation_runs
+                   WHERE reconciliation_id=? AND mode='full'
+                     AND result='matched' AND difference_count=0""",
+                (reconciliation_id,),
+            ).fetchone()
+            if reconciliation is None:
+                raise ValueError(
+                    "terminal capacity release requires matched full reconciliation"
+                )
+            required_reconciliation_evidence = (
+                reconciliation["account_scope_id"],
+                reconciliation["broker_snapshot_id"],
+                reconciliation["broker_snapshot_sha256"],
+                reconciliation["snapshot_broker_time"],
+                reconciliation["snapshot_generated_at"],
+            )
+            if any(
+                value is None or not str(value).strip()
+                for value in required_reconciliation_evidence
+            ):
+                raise ValueError(
+                    "terminal capacity release requires broker snapshot evidence"
+                )
+            if str(reconciliation["account_scope_id"]) != account_scope_id:
+                raise ValueError(
+                    "matched reconciliation account scope does not match reservation"
+                )
+            if conn.execute(
+                """SELECT 1 FROM broker_order_current
+                   WHERE account_scope_id=? AND client_order_id=?""",
+                (account_scope_id, client_order_id),
+            ).fetchone() is not None:
+                raise ValueError(
+                    "terminal capacity release conflicts with current broker order"
+                )
+            order = conn.execute(
+                """SELECT stock_code, action, status, filled_qty,
+                          requested_qty, target_qty, updated_at
+                   FROM orders WHERE client_order_id=?""",
+                (client_order_id,),
+            ).fetchone()
+            if intent_status == "NOT_SUBMITTED":
+                if order is not None:
+                    raise ValueError(
+                        "NOT_SUBMITTED capacity release conflicts with order evidence"
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM fills WHERE client_order_id=?",
+                    (client_order_id,),
+                ).fetchone() is not None:
+                    raise ValueError(
+                        "NOT_SUBMITTED capacity release conflicts with fill evidence"
+                    )
+                evidence_at = str(row["status_updated_at"])
+            else:
+                intent = ExecutionIntent.from_dict(
+                    json.loads(str(row["payload_json"]))
+                )
+                expected_order_statuses = {
+                    "REJECTED": {
+                        "rejected", "risk_rejected", "failed", "skipped",
+                    },
+                    "CANCELLED": {"cancelled"},
+                    "FILLED": {"filled"},
+                }
+                order_status = str(order["status"]).lower() if order else "missing"
+                if order is None or order_status not in expected_order_statuses[
+                    intent_status
+                ]:
+                    raise ValueError(
+                        f"{intent_status} intent does not match terminal order "
+                        f"status {order_status}"
+                    )
+                order_qty = order_allowed_quantity(
+                    order["requested_qty"], order["target_qty"],
+                )
+                if (
+                    str(order["stock_code"]) != intent.code
+                    or str(order["action"]).lower() != intent.side
+                    or order_qty != intent.order_qty
+                    or int(order["filled_qty"] or 0) > intent.order_qty
+                ):
+                    raise ValueError(
+                        "terminal order does not match execution intent"
+                    )
+                if (
+                    intent_status == "FILLED"
+                    and int(order["filled_qty"] or 0) < order_qty
+                ):
+                    raise ValueError(
+                        "FILLED terminal order quantity is incomplete"
+                    )
+                if (
+                    intent_status == "REJECTED"
+                    and int(order["filled_qty"] or 0) != 0
+                ):
+                    raise ValueError(
+                        "REJECTED terminal order cannot contain fills"
+                    )
+                evidence_at = max(
+                    (str(order["updated_at"]), str(row["status_updated_at"])),
+                    key=lambda value: self._timestamp_instant(
+                        value, "terminal evidence timestamp",
+                    ),
+                )
+            terminal_evidence_at = self._timestamp_instant(
+                evidence_at, "terminal evidence timestamp",
+            )
+            snapshot_broker_at = self._timestamp_instant(
+                reconciliation["snapshot_broker_time"],
+                "reconciliation.snapshot_broker_time",
+            )
+            snapshot_generated_at = self._timestamp_instant(
+                reconciliation["snapshot_generated_at"],
+                "reconciliation.snapshot_generated_at",
+            )
+            reconciliation_at = self._timestamp_instant(
+                reconciliation["finished_at"], "reconciliation.finished_at",
+            )
+            if (
+                snapshot_broker_at < terminal_evidence_at
+                or snapshot_generated_at < terminal_evidence_at
+                or reconciliation_at < max(
+                    terminal_evidence_at,
+                    snapshot_broker_at,
+                    snapshot_generated_at,
+                )
+            ):
+                raise ValueError(
+                    "matched reconciliation predates terminal execution evidence"
+                )
+            if reconciliation_at > release_instant:
+                raise ValueError(
+                    "capacity release predates matched reconciliation"
+                )
+            current_snapshot = conn.execute(
+                """SELECT snapshot_id, snapshot_sha256, broker_time, generated_at
+                   FROM broker_snapshot_current WHERE account_scope_id=?""",
+                (account_scope_id,),
+            ).fetchone()
+            if current_snapshot is None:
+                raise ValueError(
+                    "terminal capacity release requires current broker snapshot"
+                )
+            current_evidence = (
+                str(current_snapshot["snapshot_id"]),
+                str(current_snapshot["snapshot_sha256"]),
+                str(current_snapshot["broker_time"]),
+                str(current_snapshot["generated_at"]),
+            )
+            reconciliation_evidence = (
+                str(reconciliation["broker_snapshot_id"]),
+                str(reconciliation["broker_snapshot_sha256"]),
+                str(reconciliation["snapshot_broker_time"]),
+                str(reconciliation["snapshot_generated_at"]),
+            )
+            if current_evidence != reconciliation_evidence:
+                raise ValueError(
+                    "matched reconciliation does not describe current broker snapshot"
+                )
+        else:
+            raise ValueError(
+                f"unknown execution intent status cannot be released: {intent_status}"
+            )
         cursor = conn.execute(
             """UPDATE capacity_reservations
                SET status='released', released_at=?, release_reason=?
@@ -1891,14 +3278,86 @@ class TradingStore:
             )
 
     def upsert_order(self, conn: sqlite3.Connection, order: dict) -> bool:
-        row = conn.execute(
-            "SELECT * FROM orders WHERE client_order_id=? OR (order_id IS NOT NULL AND order_id=?) LIMIT 1",
+        rows = conn.execute(
+            """SELECT * FROM orders
+               WHERE client_order_id=?
+                  OR (order_id IS NOT NULL AND order_id=?)""",
             (order["client_order_id"], order.get("order_id")),
-        ).fetchone()
+        ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("order identity resolves to multiple ledger rows")
+        row = rows[0] if rows else None
+        if row is not None:
+            incoming_order_id = str(order.get("order_id") or "")
+            existing_order_id = str(row["order_id"] or "")
+            quantity_drift = False
+            for field in ("requested_qty", "target_qty"):
+                existing_qty = self._quantity(
+                    row[field] or 0, f"existing {field}", positive=False,
+                )
+                incoming_qty = self._quantity(
+                    order.get(field) or 0,
+                    f"incoming {field}",
+                    positive=False,
+                )
+                if (
+                    existing_qty > 0
+                    and incoming_qty > 0
+                    and existing_qty != incoming_qty
+                ):
+                    quantity_drift = True
+            if (
+                str(row["client_order_id"]) != str(order["client_order_id"])
+                or str(row["stock_code"]) != str(order["stock_code"])
+                or str(row["action"]) != str(order["action"])
+                or quantity_drift
+                or (
+                    incoming_order_id
+                    and existing_order_id
+                    and incoming_order_id != existing_order_id
+                )
+            ):
+                raise ValueError("order identity conflict")
         signal_id = order.get("signal_id")
         if signal_id and conn.execute("SELECT 1 FROM signals WHERE signal_id=?", (signal_id,)).fetchone() is None:
             signal_id = None
-        terminal = {"filled", "cancelled", "rejected", "risk_rejected"}
+        terminal = {
+            "filled", "cancelled", "rejected", "risk_rejected", "failed",
+            "skipped",
+        }
+        non_fill_terminal = {
+            "rejected", "risk_rejected", "failed", "skipped",
+        }
+        incoming_status = str(order["status"]).lower()
+        incoming_filled_qty = int(order["filled_qty"] or 0)
+        existing_status = str(row["status"]).lower() if row is not None else ""
+        existing_filled_qty = int(row["filled_qty"] or 0) if row is not None else 0
+        incoming_allowed_qty = order_allowed_quantity(
+            order.get("requested_qty"), order.get("target_qty"),
+        )
+        if incoming_status not in terminal and incoming_allowed_qty > 0:
+            if incoming_filled_qty >= incoming_allowed_qty:
+                incoming_status = "filled"
+                order["completed_at"] = order["updated_at"]
+            elif incoming_filled_qty > 0:
+                incoming_status = "partial"
+            elif incoming_status in {"partial", "partially_filled"}:
+                incoming_status = "submitted"
+            order["status"] = incoming_status
+        if (
+            incoming_status == "filled"
+            and incoming_allowed_qty > 0
+            and incoming_filled_qty < incoming_allowed_qty
+        ):
+            raise ValueError("filled order quantity is incomplete")
+        if (
+            incoming_status in non_fill_terminal
+            and max(incoming_filled_qty, existing_filled_qty) > 0
+        ) or (
+            existing_status in non_fill_terminal
+            and incoming_filled_qty > existing_filled_qty
+        ):
+            raise ValueError("terminal order cannot gain filled quantity")
         if row is None:
             conn.execute(
                 """INSERT INTO orders(
@@ -1918,19 +3377,85 @@ class TradingStore:
             inserted = True
         else:
             client_id = str(row["client_order_id"])
-            status = str(row["status"]) if str(row["status"]) in terminal else str(order["status"])
             filled_qty = max(int(row["filled_qty"]), int(order["filled_qty"]))
+            allowed_qty = order_allowed_quantity(
+                row["requested_qty"], row["target_qty"],
+            )
+            if (
+                existing_status in {"cancelled", "filled"}
+                and filled_qty > existing_filled_qty
+                and not (
+                    existing_status == "cancelled"
+                    and incoming_status == "filled"
+                    and allowed_qty > 0
+                    and filled_qty >= allowed_qty
+                )
+            ):
+                raise ValueError(
+                    "terminal order cannot gain filled quantity"
+                )
+            active_rank = {
+                "unknown": 0,
+                "new": 1,
+                "open": 1,
+                "held": 1,
+                "submitted": 1,
+                "partial": 2,
+                "partially_filled": 2,
+                "pending_cancel": 2,
+            }
+            if existing_status in terminal:
+                status = existing_status
+                if (
+                    existing_status == "cancelled"
+                    and incoming_status == "filled"
+                    and allowed_qty > 0
+                    and filled_qty >= allowed_qty
+                ):
+                    status = "filled"
+            elif incoming_status in terminal:
+                status = incoming_status
+            elif active_rank.get(incoming_status, 0) < active_rank.get(
+                existing_status, 0,
+            ):
+                status = existing_status
+            else:
+                status = incoming_status
+            incoming_instant = self._timestamp_instant(
+                order["updated_at"], "incoming order updated_at",
+            )
+            existing_instant = self._timestamp_instant(
+                row["updated_at"], "existing order updated_at",
+            )
+            metadata_stale = (
+                incoming_instant < existing_instant
+                or incoming_filled_qty < existing_filled_qty
+                or incoming_status != status
+            )
+            updated_at = (
+                row["updated_at"] if metadata_stale else order["updated_at"]
+            )
+            average_fill_price = (
+                row["average_fill_price"]
+                if metadata_stale or float(order["average_fill_price"] or 0) <= 0
+                else order["average_fill_price"]
+            )
+            reason = row["reason"] if metadata_stale else order["reason"]
+            raw_json = row["raw_json"] if metadata_stale else order["raw_json"]
+            completed_at = row["completed_at"] or (
+                updated_at if status in terminal else order.get("completed_at")
+            )
             conn.execute(
                 """UPDATE orders SET signal_id=COALESCE(signal_id, ?), order_id=COALESCE(order_id, ?),
                    target_qty=COALESCE(?, target_qty), requested_qty=max(requested_qty, ?),
-                   filled_qty=?, average_fill_price=CASE WHEN ?>0 THEN ? ELSE average_fill_price END,
-                   status=?, submit_count=max(submit_count, ?), reason=?, updated_at=max(updated_at, ?),
-                   completed_at=COALESCE(completed_at, ?), raw_json=? WHERE client_order_id=?""",
+                   filled_qty=?, average_fill_price=?,
+                   status=?, submit_count=max(submit_count, ?), reason=?, updated_at=?,
+                   completed_at=?, raw_json=? WHERE client_order_id=?""",
                 (
                     signal_id, order.get("order_id"), order.get("target_qty"), order["requested_qty"],
-                    filled_qty, order["average_fill_price"], order["average_fill_price"], status,
-                    order["submit_count"], order["reason"], order["updated_at"], order.get("completed_at"),
-                    order["raw_json"], client_id,
+                    filled_qty, average_fill_price, status,
+                    order["submit_count"], reason, updated_at, completed_at,
+                    raw_json, client_id,
                 ),
             )
             inserted = False
@@ -1945,13 +3470,24 @@ class TradingStore:
         existing = conn.execute("SELECT * FROM fills WHERE fill_id=?", (fill["fill_id"],)).fetchone()
         keys = (
             "order_id", "stock_code", "action", "qty", "price", "commission",
-            "stamp_tax", "other_fee", "filled_at", "raw_json",
+            "stamp_tax", "other_fee",
         )
-        expected = tuple(fill.get(key) for key in keys[:-1]) + (canonical_json(fill["raw_json"]),)
+        expected = tuple(fill.get(key) for key in keys)
         if existing is not None:
-            actual = tuple(existing[key] for key in keys[:-1]) + (canonical_json(existing["raw_json"]),)
-            if actual != expected:
+            actual = tuple(existing[key] for key in keys)
+            same_time = self._timestamp_instant(
+                existing["filled_at"], "existing fill filled_at",
+            ) == self._timestamp_instant(fill["filled_at"], "incoming fill filled_at")
+            same_raw = canonical_json(existing["raw_json"]) == canonical_json(
+                fill["raw_json"]
+            )
+            if actual != expected or not same_time or not same_raw:
                 raise FillConflictError(f"immutable fill conflict: {fill['fill_id']}")
+            if str(existing["filled_at"]) != str(fill["filled_at"]):
+                conn.execute(
+                    "UPDATE fills SET filled_at=? WHERE fill_id=?",
+                    (fill["filled_at"], fill["fill_id"]),
+                )
             if (
                 str(existing["fee_data_status"]) == "unknown"
                 and str(fill.get("fee_data_status") or "unknown") == "reported"

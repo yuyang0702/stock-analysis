@@ -12,46 +12,18 @@ from typing import Any
 
 import config as app_config
 from notifier import WeComNotifier
-from trading_store import TradingStore
-
-
-SCHEMA_10_TABLES = (
-    "schema_migrations",
-    "strategy_runs",
-    "signals",
-    "risk_decisions",
-    "system_state",
-    "position_cycles",
-    "order_events",
-    "exit_intents",
-    "trade_cooldowns",
-    "orders",
-    "fills",
-    "account_snapshots",
-    "position_snapshots",
-    "daily_equity",
-    "reconciliation_runs",
-    "reconciliation_items",
-    "control_events",
-    "execution_issue_state",
-    "gap_reentry_opportunities",
+from trading_store import (
+    TradingStore,
+    required_schema_columns,
+    validate_schema_contract,
 )
 
-SCHEMA_11_TABLES = (
-    "account_scopes",
-    "broker_snapshot_current",
-    "broker_position_current",
-    "broker_order_current",
-    "strategy_order_candidates",
-    "pre_trade_results",
-    "execution_intents",
-    "capacity_reservations",
-)
 
-CORE_TABLES = SCHEMA_10_TABLES + SCHEMA_11_TABLES
+SCHEMA_10_TABLES = tuple(required_schema_columns(10))
+CORE_TABLES = tuple(required_schema_columns(11))
 REQUIRED_TABLES_BY_SCHEMA = {
-    10: frozenset(SCHEMA_10_TABLES),
-    11: frozenset(CORE_TABLES),
+    version: frozenset(required_schema_columns(version))
+    for version in (10, 11)
 }
 
 
@@ -119,18 +91,8 @@ def database_facts(db_file: Path) -> dict[str, object]:
             )
         if schema_version == 11:
             store._validate_schema_v11(conn)
-            cycle_columns = {
-                str(row[1])
-                for row in conn.execute("PRAGMA table_info(position_cycles)")
-            }
-            missing_columns = {
-                "profit_protection_activated_at", "trailing_stop_active_from",
-            } - cycle_columns
-            if missing_columns:
-                raise RuntimeError(
-                    "schema 11 position_cycles missing required columns: "
-                    f"{sorted(missing_columns)}"
-                )
+        else:
+            validate_schema_contract(conn, schema_version)
         counts = {
             name: int(conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
             for name in required

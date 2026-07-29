@@ -1,9 +1,10 @@
+import copy
 import tempfile
 import unittest
 from unittest.mock import Mock
 from pathlib import Path
 
-from joinquant_sync import ingest_snapshot_payload
+from joinquant_sync import _legacy_broker_snapshot, ingest_snapshot_payload
 from reconciliation import (
     ReconciliationDifference, ReconciliationResult, build_reconciliation_markdown,
     notify_reconciliation, reconcile_snapshot,
@@ -38,15 +39,33 @@ class ReconciliationTest(unittest.TestCase):
         self.payload = snapshot()
         result = ingest_snapshot_payload(self.payload, self.store, "2026-07-14 10:00:02")
         self.snapshot_id = result["snapshot_id"]
+        self.reconciliation_sequence = 0
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
     def reconcile(self, payload: dict, mode: str = "full"):
+        self.reconciliation_sequence += 1
+        current_payload = copy.deepcopy(payload)
+        trade_date = str(current_payload.get("trade_date") or "2026-07-14")
+        broker_time = (
+            f"{trade_date} 10:01:{self.reconciliation_sequence:02d}"
+        )
+        current_payload["generated_at"] = broker_time
         with self.store.transaction() as conn:
+            scope = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()[0]
+            broker_snapshot = _legacy_broker_snapshot(
+                current_payload, str(scope), broker_time, {},
+            )
+            self.store.replace_current_broker_snapshot(conn, broker_snapshot)
             return reconcile_snapshot(
-                self.store, conn, payload, snapshot_id=self.snapshot_id,
-                mode=mode, now="2026-07-14 10:00:03",
+                self.store, conn, current_payload,
+                snapshot_id=self.snapshot_id,
+                broker_snapshot=broker_snapshot, mode=mode,
+                now=broker_time,
             )
 
     def test_matched_account_and_tolerance_boundary(self) -> None:
@@ -57,6 +76,120 @@ class ReconciliationTest(unittest.TestCase):
         result = self.reconcile(outside)
         self.assertEqual(result.severity, "ERROR")
         self.assertIn("ACCOUNT_BALANCE_MISMATCH", [item.reason_code for item in result.differences])
+
+    def test_same_broker_snapshot_replay_is_immutable_and_keeps_finish_time(self) -> None:
+        with self.store.transaction() as conn:
+            scope = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()[0]
+            broker_snapshot = self.store.load_current_broker_snapshot(
+                conn, str(scope),
+            )
+            first = reconcile_snapshot(
+                self.store, conn, self.payload, snapshot_id=self.snapshot_id,
+                broker_snapshot=broker_snapshot, mode="full",
+                now="2026-07-14 10:00:03",
+            )
+            finished_at = conn.execute(
+                """SELECT finished_at FROM reconciliation_runs
+                   WHERE reconciliation_id=?""",
+                (first.reconciliation_id,),
+            ).fetchone()[0]
+        with self.store.transaction() as conn:
+            replayed = reconcile_snapshot(
+                self.store, conn, self.payload, snapshot_id=self.snapshot_id,
+                broker_snapshot=broker_snapshot, mode="full",
+                now="2026-07-14 11:00:00",
+            )
+            self.assertEqual(replayed.reconciliation_id, first.reconciliation_id)
+            self.assertEqual(conn.execute(
+                """SELECT finished_at FROM reconciliation_runs
+                   WHERE reconciliation_id=?""",
+                (first.reconciliation_id,),
+            ).fetchone()[0], finished_at)
+            with self.assertRaisesRegex(ValueError, "not bound to payload"):
+                reconcile_snapshot(
+                    self.store, conn,
+                    dict(self.payload, total_value=100001),
+                    snapshot_id=self.snapshot_id,
+                    broker_snapshot=broker_snapshot, mode="full",
+                    now="2026-07-14 11:00:01",
+                )
+
+    def test_replayed_snapshot_freezes_time_dependent_exit_evidence(self) -> None:
+        with self.store.transaction() as conn:
+            scope = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()[0]
+            self.store.upsert_exit_intent(
+                conn, "exit-replay", "600000", 0, "hard_stop",
+                "2026-07-14 09:59:00",
+            )
+            current_payload = copy.deepcopy(self.payload)
+            current_payload["generated_at"] = "2026-07-14 10:01:00"
+            broker_snapshot = _legacy_broker_snapshot(
+                current_payload, str(scope), "2026-07-14 10:01:01", {},
+            )
+            self.store.replace_current_broker_snapshot(conn, broker_snapshot)
+            first = reconcile_snapshot(
+                self.store, conn, current_payload,
+                snapshot_id=self.snapshot_id,
+                broker_snapshot=broker_snapshot, mode="full",
+                now="2026-07-14 10:01:01",
+            )
+            replay = reconcile_snapshot(
+                self.store, conn, current_payload,
+                snapshot_id=self.snapshot_id,
+                broker_snapshot=broker_snapshot, mode="full",
+                now="2026-07-14 10:02:01",
+            )
+
+        self.assertEqual(first.differences, replay.differences)
+        self.assertEqual(first.reconciliation_id, replay.reconciliation_id)
+
+    def test_same_reason_count_with_changed_details_is_an_immutable_conflict(self) -> None:
+        with self.store.transaction() as conn:
+            scope = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()[0]
+            conn.execute(
+                """INSERT INTO orders(
+                   client_order_id, order_id, stock_code, action, target_qty,
+                   requested_qty, filled_qty, average_fill_price, status,
+                   submit_count, reason, updated_at, raw_json
+                   ) VALUES('local-a', 'order-a', '600000', 'buy', 100, 100,
+                   0, 0, 'submitted', 1, '', '2026-07-14 10:00:00', '{}')"""
+            )
+            current_payload = copy.deepcopy(self.payload)
+            current_payload["generated_at"] = "2026-07-14 10:01:00"
+            broker_snapshot = _legacy_broker_snapshot(
+                current_payload, str(scope), "2026-07-14 10:01:01", {},
+            )
+            self.store.replace_current_broker_snapshot(conn, broker_snapshot)
+            first = reconcile_snapshot(
+                self.store, conn, current_payload,
+                snapshot_id=self.snapshot_id,
+                broker_snapshot=broker_snapshot, mode="full",
+                now="2026-07-14 10:01:01",
+            )
+            self.assertEqual(
+                [item.reason_code for item in first.differences],
+                ["ORDER_MISSING_PLATFORM"],
+            )
+            conn.execute(
+                """UPDATE orders SET order_id='order-b'
+                   WHERE client_order_id='local-a'"""
+            )
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                reconcile_snapshot(
+                    self.store, conn, current_payload,
+                    snapshot_id=self.snapshot_id,
+                    broker_snapshot=broker_snapshot, mode="full",
+                    now="2026-07-14 10:01:02",
+                )
 
     def test_position_sellable_and_frozen_differences_have_stable_codes(self) -> None:
         changed = snapshot()
@@ -84,6 +217,60 @@ class ReconciliationTest(unittest.TestCase):
         self.assertIn("ORDER_FILL_QTY_MISMATCH", codes)
         self.assertIn("MANUAL_TRADE", codes)
 
+    def test_cancelled_local_order_cannot_match_submitted_broker_order(self) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """INSERT INTO orders(
+                   client_order_id, order_id, stock_code, action, target_qty,
+                   requested_qty, filled_qty, average_fill_price, status,
+                   submit_count, reason, updated_at, raw_json
+                   ) VALUES(
+                   'local-cancelled', 'o-cancelled', '600000', 'buy', 100,
+                   100, 0, 0, 'cancelled', 1, '',
+                   '2026-07-14 09:59:00', '{}'
+                   )"""
+            )
+        changed = snapshot()
+        changed["orders"] = [{
+            "order_id": "o-cancelled", "code": "600000", "action": "buy",
+            "amount": 100, "filled": 0, "avg_price": 0,
+            "status": "submitted", "datetime": "2026-07-14 10:00:00",
+        }]
+
+        result = self.reconcile(changed)
+
+        self.assertEqual(result.result, "mismatch")
+        self.assertEqual(result.severity, "ERROR")
+        status = [
+            item for item in result.differences
+            if item.reason_code == "ORDER_STATUS_MISMATCH"
+        ]
+        self.assertEqual(len(status), 1)
+        self.assertEqual(status[0].local_value, "cancelled")
+        self.assertEqual(status[0].platform_value, "submitted")
+
+    def test_failed_and_skipped_local_orders_may_be_absent_from_full_snapshot(self) -> None:
+        with self.store.transaction() as conn:
+            for index, status in enumerate(("failed", "skipped"), start=1):
+                conn.execute(
+                    """INSERT INTO orders(
+                       client_order_id, order_id, stock_code, action, target_qty,
+                       requested_qty, filled_qty, average_fill_price, status,
+                       submit_count, reason, updated_at, raw_json
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"local-{status}", f"o-{status}", f"60000{index}", "buy",
+                        100, 100, 0, 0, status, 1, "", "2026-07-14 09:59:00", "{}",
+                    ),
+                )
+
+        result = self.reconcile(self.payload)
+
+        self.assertNotIn(
+            "ORDER_MISSING_PLATFORM",
+            {item.reason_code for item in result.differences},
+        )
+
     def test_full_reconciliation_ignores_prior_day_local_fills(self) -> None:
         with self.store.transaction() as conn:
             conn.execute(
@@ -96,9 +283,17 @@ class ReconciliationTest(unittest.TestCase):
             current, self.store, "2026-07-15 10:00:02"
         )["snapshot_id"]
         with self.store.transaction() as conn:
+            scope = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()[0]
+            broker_snapshot = self.store.load_current_broker_snapshot(
+                conn, str(scope),
+            )
             result = reconcile_snapshot(
                 self.store, conn, current, snapshot_id=current_id,
-                mode="full", now="2026-07-15 10:00:03",
+                broker_snapshot=broker_snapshot, mode="full",
+                now="2026-07-15 10:00:03",
             )
         self.assertEqual(result.result, "matched")
         self.assertNotIn(
@@ -132,6 +327,11 @@ class ReconciliationTest(unittest.TestCase):
                    VALUES ('t-1','o-1','600000','sell',100,10,'2026-07-14 10:00:00','{}')"""
             )
         changed = snapshot()
+        changed["orders"] = [{
+            "order_id": "o-1", "code": "600000", "action": "sell",
+            "amount": 100, "filled": 100, "avg_price": 10.1,
+            "status": "filled", "datetime": "2026-07-14 10:00:00",
+        }]
         changed["trades"] = [{
             "trade_id": "t-1", "order_id": "o-1", "code": "600000", "action": "sell",
             "amount": 100, "price": 10.1, "datetime": "2026-07-14 10:00:00",
@@ -258,6 +458,159 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(cash["state"], "RECOVERED")
         self.assertTrue(cash["recovered_at"])
         self.assertIn("account:cash", [item["issue_key"] for item in transitions])
+
+    def test_issue_transitions_and_recovery_are_account_scoped(self) -> None:
+        difference = ReconciliationDifference(
+            "order", "shared-order", "ORDER_MISSING_PLATFORM",
+            "present", "missing", 0, "ERROR", {},
+        )
+        with self.store.transaction() as conn:
+            scopes = {
+                alias: self.store.get_or_create_account_scope(conn, adapter, alias)
+                for alias, adapter in (("primary", "joinquant"), ("paper", "qmt"))
+            }
+            for reconciliation_id, scope in (
+                ("r-joinquant-open", scopes["primary"]),
+                ("r-qmt-open", scopes["paper"]),
+                ("r-joinquant-clean", scopes["primary"]),
+            ):
+                conn.execute(
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, started_at, finished_at,
+                       result, severity, difference_count, control_action,
+                       summary_json, account_scope_id
+                       ) VALUES(?, 'full', '2026-07-15 09:30:00',
+                       '2026-07-15 09:30:01', 'mismatch', 'ERROR', 1, '',
+                       '{}', ?)""",
+                    (reconciliation_id, scope),
+                )
+            persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult(
+                    "r-joinquant-open", "mismatch", "ERROR",
+                    [difference], "", None,
+                ),
+                "2026-07-15 09:30:02",
+            )
+            persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult(
+                    "r-qmt-open", "mismatch", "ERROR",
+                    [difference], "", None,
+                ),
+                "2026-07-15 09:30:03",
+            )
+            transitions = persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult(
+                    "r-joinquant-clean", "matched", "INFO", [], "", None,
+                ),
+                "2026-07-15 09:30:04",
+            )
+            rows = conn.execute(
+                """SELECT issue_key, state, recovered_at
+                   FROM execution_issue_state ORDER BY issue_key"""
+            ).fetchall()
+
+        self.assertEqual(len(rows), 2)
+        by_scope = {
+            "joinquant" if scopes["primary"] in row["issue_key"] else "qmt": row
+            for row in rows
+        }
+        self.assertEqual(by_scope["joinquant"]["state"], "RECOVERED")
+        self.assertTrue(by_scope["joinquant"]["recovered_at"])
+        self.assertEqual(by_scope["qmt"]["state"], "ORDER_MISSING_PLATFORM")
+        self.assertIsNone(by_scope["qmt"]["recovered_at"])
+        self.assertEqual(len(transitions), 1)
+        self.assertIn(scopes["primary"], transitions[0]["issue_key"])
+
+    def test_unscoped_result_cannot_recover_scoped_issue(self) -> None:
+        difference = ReconciliationDifference(
+            "order", "qmt-order", "ORDER_MISSING_PLATFORM",
+            "present", "missing", 0, "ERROR", {},
+        )
+        with self.store.transaction() as conn:
+            scope = self.store.get_or_create_account_scope(conn, "qmt", "paper")
+            conn.execute(
+                """INSERT INTO reconciliation_runs(
+                   reconciliation_id, mode, started_at, finished_at, result,
+                   severity, difference_count, control_action, summary_json,
+                   account_scope_id
+                   ) VALUES('r-qmt-scoped', 'full', '2026-07-15 09:30:00',
+                   '2026-07-15 09:30:01', 'mismatch', 'ERROR', 1, '', '{}', ?)""",
+                (scope,),
+            )
+            persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult(
+                    "r-qmt-scoped", "mismatch", "ERROR",
+                    [difference], "", None,
+                ),
+                "2026-07-15 09:30:02",
+            )
+            transitions = persist_issue_transitions(
+                self.store, conn,
+                ReconciliationResult(
+                    "unscoped-clean", "matched", "INFO", [], "", None,
+                ),
+                "2026-07-15 09:30:03",
+            )
+            row = conn.execute(
+                """SELECT state, recovered_at FROM execution_issue_state
+                   WHERE issue_key=?""",
+                (f"scope:{scope}:order:qmt-order",),
+            ).fetchone()
+
+        self.assertEqual(transitions, [])
+        self.assertEqual(row["state"], "ORDER_MISSING_PLATFORM")
+        self.assertIsNone(row["recovered_at"])
+
+    def test_adopted_legacy_issue_recovers_only_as_primary_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.upsert_execution_issue(conn, {
+                    "issue_key": "order:legacy-order",
+                    "object_type": "order",
+                    "object_id": "legacy-order",
+                    "state": "ORDER_MISSING_PLATFORM",
+                    "severity": "ERROR",
+                    "stage_started_at": "2026-07-15 09:30:00",
+                    "seen_at": "2026-07-15 09:30:00",
+                    "details": {},
+                })
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                conn.execute(
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, started_at, finished_at,
+                       result, severity, difference_count, control_action,
+                       summary_json, account_scope_id
+                       ) VALUES('r-primary-clean', 'full',
+                       '2026-07-15 09:31:00', '2026-07-15 09:31:01',
+                       'matched', 'INFO', 0, '', '{}', ?)""",
+                    (scope,),
+                )
+                transitions = persist_issue_transitions(
+                    store, conn,
+                    ReconciliationResult(
+                        "r-primary-clean", "matched", "INFO", [], "", None,
+                    ),
+                    "2026-07-15 09:31:02",
+                )
+                row = conn.execute(
+                    """SELECT issue_key, state, recovered_at
+                       FROM execution_issue_state"""
+                ).fetchone()
+
+        self.assertEqual(
+            row["issue_key"], f"scope:{scope}:order:legacy-order",
+        )
+        self.assertEqual(row["state"], "RECOVERED")
+        self.assertTrue(row["recovered_at"])
+        self.assertEqual(transitions[0]["state"], "RECOVERED")
 
     def test_matched_snapshot_does_not_auto_recover_sticky_critical(self) -> None:
         with self.store.transaction() as conn:

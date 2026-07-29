@@ -45,6 +45,35 @@ class TradingControlTest(unittest.TestCase):
         with self.store.connect() as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM control_events").fetchone()[0], 2)
 
+    def test_replayed_reconciliation_preserves_recorded_control_action(self) -> None:
+        with self.store.transaction() as conn:
+            conn.execute(
+                """INSERT INTO reconciliation_runs(
+                   reconciliation_id, mode, started_at, finished_at, result,
+                   severity, difference_count, control_action, summary_json
+                   ) VALUES('r-1', 'full', '2026-07-14 10:00:00',
+                   '2026-07-14 10:00:01', 'mismatch', 'ERROR', 1, '', '{}')"""
+            )
+            self.store.set_system_state(conn, "buy_enabled", "1", "initial")
+            first = self.result("ERROR")
+            self.assertEqual(
+                apply_reconciliation_control(self.store, conn, first),
+                ["stop_buy"],
+            )
+            replay = self.result("ERROR")
+            self.assertEqual(
+                apply_reconciliation_control(self.store, conn, replay),
+                [],
+            )
+            recorded = conn.execute(
+                """SELECT control_action FROM reconciliation_runs
+                   WHERE reconciliation_id='r-1'"""
+            ).fetchone()[0]
+
+        self.assertEqual(first.control_action, "stop_buy")
+        self.assertEqual(replay.control_action, "stop_buy")
+        self.assertEqual(recorded, "stop_buy")
+
     def test_unlock_requires_two_distinct_recent_matched_full_reconciliations(self) -> None:
         payload = {
             "schema_version": 1, "trade_date": "2026-07-14", "generated_at": "2026-07-14 10:00:00",
@@ -54,8 +83,12 @@ class TradingControlTest(unittest.TestCase):
         first = ingest_snapshot_payload(payload, self.store, "2026-07-14 10:00:01")["snapshot_id"]
         with self.store.transaction() as conn:
             conn.execute(
-                """INSERT INTO reconciliation_runs VALUES
-                   ('r-1','full',?,'2026-07-14 10:00:02','2026-07-14 10:00:03','matched','INFO',0,'','{}')""",
+                """INSERT INTO reconciliation_runs(
+                   reconciliation_id, mode, snapshot_id, started_at,
+                   finished_at, result, severity, difference_count,
+                   control_action, summary_json
+                   ) VALUES('r-1','full',?,'2026-07-14 10:00:02',
+                   '2026-07-14 10:00:03','matched','INFO',0,'','{}')""",
                 (first,),
             )
         ok, reasons = unlock_eligibility(self.store, now="2026-07-14 10:05:00")
@@ -66,8 +99,12 @@ class TradingControlTest(unittest.TestCase):
         second = ingest_snapshot_payload(second_payload, self.store, "2026-07-14 10:04:01")["snapshot_id"]
         with self.store.transaction() as conn:
             conn.execute(
-                """INSERT INTO reconciliation_runs VALUES
-                   ('r-2','full',?,'2026-07-14 10:04:02','2026-07-14 10:04:03','matched','INFO',0,'','{}')""",
+                """INSERT INTO reconciliation_runs(
+                   reconciliation_id, mode, snapshot_id, started_at,
+                   finished_at, result, severity, difference_count,
+                   control_action, summary_json
+                   ) VALUES('r-2','full',?,'2026-07-14 10:04:02',
+                   '2026-07-14 10:04:03','matched','INFO',0,'','{}')""",
                 (second,),
             )
         self.assertEqual(unlock_eligibility(self.store, now="2026-07-14 10:05:00"), (True, []))
@@ -106,14 +143,55 @@ class TradingControlTest(unittest.TestCase):
     def test_reconciliation_owned_stop_can_auto_resume_after_two_fresh_matches(self) -> None:
         with self.store.transaction() as conn:
             self.store.set_system_state(conn, "buy_enabled", "1", "initial")
+            scope = self.store.get_or_create_account_scope(
+                conn, "joinquant", "primary",
+            )
             conn.execute(
-                """INSERT INTO reconciliation_runs VALUES
-                   ('r-stop','incremental',NULL,'2026-07-15 09:30:00','2026-07-15 09:30:00',
-                    'mismatch','ERROR',1,'','{}')"""
+                """INSERT INTO reconciliation_runs(
+                   reconciliation_id, mode, snapshot_id, started_at,
+                   finished_at, result, severity, difference_count,
+                   control_action, summary_json, account_scope_id
+                   ) VALUES('r-stop','incremental',NULL,
+                   '2026-07-15 09:30:00','2026-07-15 09:30:00',
+                   'mismatch','ERROR',1,'','{}',?)""",
+                (scope,),
             )
             stopped = self.result("ERROR")
             stopped.reconciliation_id = "r-stop"
             apply_reconciliation_control(self.store, conn, stopped)
+            other_scope = self.store.get_or_create_account_scope(
+                conn, "qmt", "paper",
+            )
+            for sid, finished in (
+                ("qmt-snap-1", "2026-07-15 09:30:10"),
+                ("qmt-snap-2", "2026-07-15 09:30:20"),
+            ):
+                conn.execute(
+                    """INSERT INTO account_snapshots(
+                       snapshot_id,trade_date,generated_at,received_at,cash,
+                       available_cash,total_value,position_market_value,
+                       state_hash,template_version)
+                       VALUES (?, '2026-07-15', ?, ?, 1,1,1,0,?,?)""",
+                    (
+                        sid, finished, finished, sid,
+                        "2026-07-15.1-execution-state-recovery",
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, snapshot_id, started_at,
+                       finished_at, result, severity, difference_count,
+                       control_action, summary_json, account_scope_id
+                       ) VALUES(?, 'incremental', ?, ?, ?, 'matched','INFO',
+                       0,'','{}',?)""",
+                    ("r-" + sid, sid, finished, finished, other_scope),
+                )
+            eligible, reasons, _ = auto_resume_eligibility(
+                self.store, conn, now="2026-07-15 09:30:30",
+                required_template="2026-07-15.1-execution-state-recovery",
+            )
+            self.assertFalse(eligible)
+            self.assertIn("TWO_DISTINCT_POST_STOP_MATCHES_REQUIRED", reasons)
             for sid, finished in (("snap-1", "2026-07-15 09:31:00"), ("snap-2", "2026-07-15 09:32:00")):
                 conn.execute(
                     """INSERT INTO account_snapshots(
@@ -123,17 +201,32 @@ class TradingControlTest(unittest.TestCase):
                     (sid, finished, finished, sid, "2026-07-15.1-execution-state-recovery"),
                 )
                 conn.execute(
-                    """INSERT INTO reconciliation_runs VALUES
-                       (?, 'incremental', ?, ?, ?, 'matched','INFO',0,'','{}')""",
-                    ("r-" + sid, sid, finished, finished),
+                    """INSERT INTO reconciliation_runs(
+                       reconciliation_id, mode, snapshot_id, started_at,
+                       finished_at, result, severity, difference_count,
+                       control_action, summary_json, account_scope_id
+                       ) VALUES(?, 'incremental', ?, ?, ?, 'matched','INFO',
+                       0,'','{}',?)""",
+                    ("r-" + sid, sid, finished, finished, scope),
                 )
             ok, reasons, _ = auto_resume_eligibility(
                 self.store, conn, now="2026-07-15 09:32:30",
                 required_template="2026-07-15.1-execution-state-recovery",
             )
             self.assertTrue(ok, reasons)
+            other_result = ReconciliationResult(
+                "r-qmt-snap-2", "matched", "INFO", [], "", "qmt-snap-2",
+            )
+            self.assertIsNone(apply_automatic_buy_recovery(
+                self.store, conn, other_result,
+                now="2026-07-15 09:32:30",
+                required_template="2026-07-15.1-execution-state-recovery",
+            ))
+            matched = ReconciliationResult(
+                "r-snap-2", "matched", "INFO", [], "", "snap-2",
+            )
             recovered = apply_automatic_buy_recovery(
-                self.store, conn, stopped, now="2026-07-15 09:32:30",
+                self.store, conn, matched, now="2026-07-15 09:32:30",
                 required_template="2026-07-15.1-execution-state-recovery",
             )
         self.assertEqual(recovered["action"], "auto_resume_buy")
