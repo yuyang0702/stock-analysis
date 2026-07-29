@@ -867,6 +867,33 @@ class ExecutionContractsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, field):
                     PreTradeResult(**{**sell_values, field: value})
 
+    def test_sell_result_rejects_buy_only_risk_and_economic_evidence(self) -> None:
+        candidate = make_candidate(side="sell")
+        values = pre_trade_values(candidate)
+        for field, value in (
+            (
+                "round_trip_cost",
+                FEES.estimate_round_trip(D("9.40"), D("9.30"), 100),
+            ),
+            (
+                "target_round_trip_cost",
+                FEES.estimate_round_trip(D("9.40"), D("9.50"), 100),
+            ),
+            ("planned_stop_loss_yuan", D("1")),
+            ("gap_price", D("9.20")),
+            (
+                "gap_round_trip_cost",
+                FEES.estimate_round_trip(D("9.40"), D("9.20"), 100),
+            ),
+            ("gap_loss_yuan", D("1")),
+            ("fee_erosion_ratio", D("0.01")),
+            ("cost_to_expected_edge_ratio", D("0.01")),
+            ("per_trade_risk_yuan", D("1")),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    PreTradeResult(**{**values, field: value})
+
     def test_rejected_result_does_not_fabricate_missing_evidence_or_lot_costs(self) -> None:
         candidate = make_candidate()
         values = pre_trade_values(

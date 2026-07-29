@@ -1504,6 +1504,21 @@ class PreTradeResult:
                     )
             if candidate.side == "sell" and self.actual_trade_risk_fraction != ZERO:
                 raise ValueError("allowed sell actual_trade_risk_fraction must be zero")
+            if candidate.side == "sell":
+                for name in (
+                    "round_trip_cost",
+                    "target_round_trip_cost",
+                    "planned_stop_loss_yuan",
+                    "gap_price",
+                    "gap_round_trip_cost",
+                    "gap_loss_yuan",
+                    "fee_erosion_ratio",
+                    "cost_to_expected_edge_ratio",
+                ):
+                    if getattr(self, name) is not None:
+                        raise ValueError(f"allowed sell cannot carry {name}")
+                if self.per_trade_risk_yuan != ZERO:
+                    raise ValueError("allowed sell per_trade_risk_yuan must be zero")
         else:
             if self.approved_qty != 0:
                 raise ValueError("rejected result approved_qty must be zero")
