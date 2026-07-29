@@ -15,7 +15,7 @@ from notifier import WeComNotifier
 from trading_store import TradingStore
 
 
-CORE_TABLES = (
+SCHEMA_10_TABLES = (
     "schema_migrations",
     "strategy_runs",
     "signals",
@@ -36,6 +36,23 @@ CORE_TABLES = (
     "execution_issue_state",
     "gap_reentry_opportunities",
 )
+
+SCHEMA_11_TABLES = (
+    "account_scopes",
+    "broker_snapshot_current",
+    "broker_position_current",
+    "broker_order_current",
+    "strategy_order_candidates",
+    "pre_trade_results",
+    "execution_intents",
+    "capacity_reservations",
+)
+
+CORE_TABLES = SCHEMA_10_TABLES + SCHEMA_11_TABLES
+REQUIRED_TABLES_BY_SCHEMA = {
+    10: frozenset(SCHEMA_10_TABLES),
+    11: frozenset(CORE_TABLES),
+}
 
 
 def _sha256(path: Path) -> str:
@@ -91,10 +108,32 @@ def database_facts(db_file: Path) -> dict[str, object]:
         if "schema_migrations" not in tables:
             raise ValueError("schema_migrations table missing")
         version_row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        schema_version = int(version_row[0] or 0) if version_row is not None else 0
+        required = REQUIRED_TABLES_BY_SCHEMA.get(schema_version)
+        if required is None:
+            raise RuntimeError(f"unsupported backup schema version: {schema_version}")
+        missing = required - tables
+        if missing:
+            raise RuntimeError(
+                f"schema {schema_version} missing required tables: {sorted(missing)}"
+            )
+        if schema_version == 11:
+            store._validate_schema_v11(conn)
+            cycle_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(position_cycles)")
+            }
+            missing_columns = {
+                "profit_protection_activated_at", "trailing_stop_active_from",
+            } - cycle_columns
+            if missing_columns:
+                raise RuntimeError(
+                    "schema 11 position_cycles missing required columns: "
+                    f"{sorted(missing_columns)}"
+                )
         counts = {
             name: int(conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
-            for name in CORE_TABLES
-            if name in tables
+            for name in required
         }
         check_row = conn.execute("PRAGMA integrity_check").fetchone()
     check = str(check_row[0]) if check_row is not None else "missing"
@@ -102,7 +141,7 @@ def database_facts(db_file: Path) -> dict[str, object]:
         raise ValueError(f"integrity_check failed: {check}")
     return {
         "integrity_check": check,
-        "schema_version": int(version_row[0] or 0) if version_row is not None else 0,
+        "schema_version": schema_version,
         "table_counts": counts,
     }
 

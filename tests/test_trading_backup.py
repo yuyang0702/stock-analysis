@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -25,6 +26,48 @@ from trading_store import SCHEMA_VERSION, TradingStore
 
 
 class TradingBackupTest(unittest.TestCase):
+    def test_schema_v11_backup_contract_requires_all_new_tables_and_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            facts = trading_backup.database_facts(path)
+            self.assertEqual(facts["schema_version"], 11)
+            self.assertTrue({
+                "account_scopes", "broker_snapshot_current",
+                "broker_position_current", "broker_order_current",
+                "strategy_order_candidates", "pre_trade_results",
+                "execution_intents", "capacity_reservations",
+            }.issubset(facts["table_counts"]))
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("DROP TABLE capacity_reservations")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(RuntimeError, "capacity_reservations"):
+                trading_backup.database_facts(path)
+
+    def test_schema_v10_backup_contract_remains_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            with TradingStore(path).connect() as conn:
+                conn.execute("DELETE FROM schema_migrations WHERE version=11")
+            facts = trading_backup.database_facts(path)
+            self.assertEqual(facts["schema_version"], 10)
+            self.assertEqual(set(facts["table_counts"]), set(trading_backup.SCHEMA_10_TABLES))
+
+    def test_schema_v11_backup_rejects_missing_profit_protection_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            with TradingStore(path).connect() as conn:
+                conn.execute(
+                    "ALTER TABLE position_cycles DROP COLUMN trailing_stop_active_from"
+                )
+            with self.assertRaisesRegex(RuntimeError, "trailing_stop_active_from"):
+                trading_backup.database_facts(path)
+
     def test_schema_v7_backup_counts_current_execution_issue_state(self) -> None:
         self.assertIn("execution_issue_state", trading_backup.CORE_TABLES)
 

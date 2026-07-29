@@ -65,6 +65,164 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertEqual(equity["realized_pnl_status"], "unknown")
             self.assertEqual(equity["unrealized_pnl"], 500)
 
+    def test_ingest_persists_strict_scoped_current_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            snapshot = self._ledger_snapshot()
+            snapshot["token"] = "must-not-enter-current-contract"
+            snapshot["orders"][0].update(
+                status="partial_filled", amount=1000, filled=500,
+            )
+            snapshot["trades"] = []
+
+            joinquant_sync.ingest_snapshot_payload(
+                snapshot, store, "2026-07-07 10:05:02",
+            )
+
+            with store.connect() as conn:
+                scope = conn.execute(
+                    """SELECT account_scope_id FROM account_scopes
+                       WHERE adapter='joinquant' AND scope_alias='primary'"""
+                ).fetchone()[0]
+                payload = conn.execute(
+                    """SELECT payload_json FROM broker_snapshot_current
+                       WHERE account_scope_id=?""",
+                    (scope,),
+                ).fetchone()[0]
+                history_payload = conn.execute(
+                    """SELECT raw_json FROM account_snapshots
+                       WHERE raw_json IS NOT NULL"""
+                ).fetchone()[0]
+                current = store.load_current_broker_snapshot(conn, scope)
+            self.assertEqual(current.broker_time, "2026-07-07T02:05:00+00:00")
+            self.assertEqual(current.open_orders[0]["status"], "partially_filled")
+            self.assertEqual(current.positions[0].sellable_qty, 1000)
+            self.assertNotIn("token", payload.lower())
+            self.assertNotIn("must-not-enter", history_payload)
+
+    def test_missing_fill_order_link_rolls_back_history_and_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            snapshot = self._ledger_snapshot()
+            snapshot["trades"][0]["order_id"] = "missing-order"
+
+            with self.assertRaisesRegex(ValueError, "matching order"):
+                joinquant_sync.ingest_snapshot_payload(
+                    snapshot, store, "2026-07-07 10:05:02",
+                )
+
+            with store.connect() as conn:
+                for table in (
+                    "account_scopes", "broker_snapshot_current",
+                    "account_snapshots", "orders", "fills",
+                ):
+                    self.assertEqual(
+                        conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0],
+                        0,
+                    )
+
+    def test_stale_current_snapshot_rolls_back_new_history_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            newer = self._ledger_snapshot("2026-07-07 10:06:00")
+            newer["trades"] = []
+            newer["orders"] = []
+            joinquant_sync.ingest_snapshot_payload(
+                newer, store, "2026-07-07 10:06:02",
+            )
+            stale = self._ledger_snapshot("2026-07-07 10:05:00")
+            stale["trades"] = []
+            stale["orders"] = []
+
+            with self.assertRaisesRegex(ValueError, "stale"):
+                joinquant_sync.ingest_snapshot_payload(
+                    stale, store, "2026-07-07 10:06:03",
+                )
+
+            with store.connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0],
+                    1,
+                )
+                scope = conn.execute(
+                    "SELECT account_scope_id FROM account_scopes"
+                ).fetchone()[0]
+                current = store.load_current_broker_snapshot(conn, scope)
+            self.assertEqual(current.broker_time, "2026-07-07T02:06:00+00:00")
+
+    def test_strict_mapping_rejects_negative_or_fractional_quantities(self) -> None:
+        cases = (
+            ("negative order", ("orders", 0, "amount"), -100),
+            ("fractional position", ("positions", 0, "qty"), 100.9),
+        )
+        for label, (collection, index, field), value in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                store = TradingStore(Path(tmp) / "trading.db")
+                snapshot = self._ledger_snapshot()
+                snapshot[collection][index][field] = value
+                with self.assertRaisesRegex(ValueError, "nonnegative|integer"):
+                    joinquant_sync.ingest_snapshot_payload(
+                        snapshot, store, "2026-07-07 10:05:02",
+                    )
+                with store.connect() as conn:
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT count(*) FROM account_snapshots"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_event_only_legacy_payload_never_creates_broker_current_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            result = joinquant_sync.ingest_snapshot_payload(
+                {
+                    "schema_version": 1, "positions": [], "orders": [],
+                    "trades": [],
+                },
+                store,
+                "2026-07-07 10:05:02",
+            )
+            self.assertTrue(result["snapshot_id"])
+            with store.connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM account_scopes").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM broker_snapshot_current"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM account_snapshots"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_timed_snapshot_requires_complete_account_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            snapshot = self._ledger_snapshot()
+            snapshot.pop("cash")
+            with self.assertRaisesRegex(ValueError, "missing account fields"):
+                joinquant_sync.ingest_snapshot_payload(
+                    snapshot, store, "2026-07-07 10:05:02",
+                )
+            with store.connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM account_scopes").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM account_snapshots"
+                    ).fetchone()[0],
+                    0,
+                )
+
     def test_missing_fee_fields_are_not_reported_as_known_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")

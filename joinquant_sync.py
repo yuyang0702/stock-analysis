@@ -4,15 +4,37 @@ import argparse
 import hashlib
 import json
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import config as app_config
+from execution_contracts import BrokerPosition, BrokerSnapshot
 from order_ledger import normalize_fill, normalize_order
 from reconciliation import persist_issue_transitions, reconcile_snapshot
 from trading_control import apply_automatic_buy_recovery, apply_reconciliation_control
 from trading_store import TradingStore, canonical_json
 from exit_policy import PositionExitState, resolve_effective_stop
+
+
+_CREDENTIAL_KEYS = {
+    "account", "account_id", "account_number", "api_key", "authorization",
+    "broker_account", "cookie", "password", "secret", "sync_token", "token",
+    "url", "webhook", "webhook_url",
+}
+
+
+def _without_credentials(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_credentials(item)
+            for key, item in value.items()
+            if str(key).strip().lower() not in _CREDENTIAL_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_credentials(item) for item in value]
+    return value
 
 
 def _code(value: Any) -> str:
@@ -161,6 +183,282 @@ def snapshot_id(snapshot: dict[str, Any]) -> str:
     stable = dict(snapshot)
     stable.pop("received_at", None)
     return hashlib.sha256(canonical_json(stable).encode("utf-8")).hexdigest()[:32]
+
+
+def _shanghai_timestamp(value: object, name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{name} is required")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{name} is not a valid timestamp") from exc
+    shanghai = ZoneInfo("Asia/Shanghai")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=shanghai)
+    else:
+        parsed = parsed.astimezone(shanghai)
+    return parsed.isoformat(timespec="seconds")
+
+
+def _strict_decimal(
+    value: object,
+    name: str,
+    *,
+    default: object | None = None,
+) -> Decimal:
+    source = default if value in (None, "") else value
+    try:
+        result = Decimal(str(source))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{name} must be a decimal") from exc
+    if not result.is_finite() or result < 0:
+        raise ValueError(f"{name} must be finite and nonnegative")
+    return result
+
+
+def _strict_signed_decimal(
+    value: object,
+    name: str,
+    *,
+    default: object = 0,
+) -> Decimal:
+    source = default if value in (None, "") else value
+    try:
+        result = Decimal(str(source))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"{name} must be a decimal") from exc
+    if not result.is_finite():
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _strict_quantity(
+    value: object,
+    name: str,
+    *,
+    default: object = 0,
+) -> int:
+    amount = _strict_decimal(value, name, default=default)
+    if amount != amount.to_integral_value():
+        raise ValueError(f"{name} must be an integer")
+    return int(amount)
+
+
+def _legacy_broker_snapshot(
+    snapshot: dict[str, Any],
+    account_scope_id: str,
+    received_at: str,
+) -> BrokerSnapshot:
+    required_account_fields = ("cash", "available_cash", "total_value")
+    missing_account_fields = [
+        name for name in required_account_fields
+        if name not in snapshot or snapshot.get(name) in (None, "")
+    ]
+    if missing_account_fields:
+        raise ValueError(
+            "complete JoinQuant snapshot missing account fields: "
+            + ",".join(missing_account_fields)
+        )
+    generated_at = _shanghai_timestamp(
+        snapshot.get("generated_at") or snapshot.get("received_at") or received_at,
+        "generated_at",
+    )
+    trade_date = str(snapshot.get("trade_date") or generated_at[:10])[:10]
+    cash = _strict_decimal(snapshot.get("cash"), "cash")
+    available_cash = _strict_decimal(
+        snapshot.get("available_cash"), "available_cash", default=cash,
+    )
+    if available_cash > cash:
+        raise ValueError("available_cash exceeds cash")
+    total_equity = _strict_decimal(snapshot.get("total_value"), "total_value")
+    positions: list[BrokerPosition] = []
+    for item in snapshot.get("positions", []):
+        if not isinstance(item, dict):
+            raise ValueError("position must be an object")
+        code = _code(item.get("code") or item.get("jq_code"))
+        if not code:
+            raise ValueError("position code is required")
+        total_qty = _strict_quantity(item.get("qty"), "position.qty")
+        positions.append(BrokerPosition.from_values(
+            code=code,
+            total_qty=total_qty,
+            sellable_qty=_strict_quantity(
+                item.get("closeable_amount"), "position.closeable_amount",
+                default=total_qty,
+            ),
+            frozen_qty=_strict_quantity(
+                item.get("locked_amount"), "position.locked_amount", default=0,
+            ),
+            today_buy_qty=_strict_quantity(
+                item.get("today_amount"), "position.today_amount", default=0,
+            ),
+            average_cost=_strict_decimal(
+                item.get("avg_cost"), "position.avg_cost", default=0,
+            ),
+            last_price=_strict_decimal(
+                item.get("price"), "position.price", default=0,
+            ),
+            market_value=_strict_decimal(
+                item.get("market_value"), "position.market_value", default=0,
+            ),
+        ))
+
+    strategy_version = str(
+        snapshot.get("strategy_template_version")
+        or snapshot.get("template_version")
+        or snapshot.get("strategy_version")
+        or ""
+    )
+    normalized_orders: dict[str, dict[str, object]] = {}
+    open_orders: list[dict[str, object]] = []
+    terminal = {
+        "filled", "cancelled", "rejected", "risk_rejected", "failed", "skipped",
+    }
+    status_map = {
+        "submitted": "submitted",
+        "held": "submitted",
+        "open": "submitted",
+        "new": "submitted",
+        "partial": "partially_filled",
+        "partial_filled": "partially_filled",
+        "partially_filled": "partially_filled",
+        "pending_cancel": "pending_cancel",
+        "submit_unknown": "submit_unknown",
+    }
+    for item in snapshot.get("orders", []):
+        if not isinstance(item, dict):
+            raise ValueError("order must be an object")
+        order = normalize_order(
+            item, trade_date=trade_date, strategy_version=strategy_version,
+        )
+        requested_qty = _strict_quantity(
+            item.get("amount", item.get("requested_qty")), "order.amount",
+        )
+        filled_qty = _strict_quantity(
+            item.get("filled", item.get("filled_qty")), "order.filled",
+        )
+        broker_order_id = str(order.get("order_id") or "")
+        if broker_order_id:
+            normalized_orders[broker_order_id] = order
+        status = str(order["status"])
+        if status in terminal:
+            continue
+        target_qty = max(
+            requested_qty, filled_qty,
+        )
+        if target_qty <= filled_qty:
+            continue
+        mapped_status = status_map.get(status)
+        if mapped_status is None:
+            raise ValueError(f"unsupported JoinQuant open-order status: {status}")
+        if not order.get("order_id"):
+            mapped_status = "submit_unknown"
+        open_orders.append({
+            "client_order_id": order["client_order_id"],
+            "broker_order_id": order.get("order_id"),
+            "stock_code": order["stock_code"],
+            "side": order["action"],
+            "target_qty": target_qty,
+            "filled_qty": filled_qty,
+            "status": mapped_status,
+            "updated_at": _shanghai_timestamp(
+                order.get("updated_at") or generated_at, "order.updated_at",
+            ),
+        })
+
+    fills: list[dict[str, object]] = []
+    for item in snapshot.get("trades", []):
+        if not isinstance(item, dict):
+            raise ValueError("trade must be an object")
+        broker_order_id = str(item.get("order_id") or "").strip()
+        order = normalized_orders.get(broker_order_id)
+        if order is None:
+            raise ValueError("JoinQuant fill requires a matching order")
+        fill = normalize_fill(item, orders=normalized_orders)
+        if (
+            fill["stock_code"] != order["stock_code"]
+            or fill["action"] != order["action"]
+        ):
+            raise ValueError("JoinQuant fill does not match its order")
+        fills.append({
+            "broker_fill_id": fill["fill_id"],
+            "client_order_id": order["client_order_id"],
+            "broker_order_id": broker_order_id,
+            "stock_code": fill["stock_code"],
+            "side": fill["action"],
+            "qty": _strict_quantity(
+                item.get("amount", item.get("qty")), "fill.amount",
+            ),
+            "price": _strict_decimal(item.get("price"), "fill.price"),
+            "commission_yuan": _strict_decimal(
+                item.get("commission"), "fill.commission", default=0,
+            ),
+            "stamp_tax_yuan": _strict_decimal(
+                item.get("stamp_tax"), "fill.stamp_tax", default=0,
+            ),
+            "transfer_fee_yuan": 0,
+            "other_fee_yuan": _strict_decimal(
+                item.get("other_fee"), "fill.other_fee", default=0,
+            ),
+            "fee_data_status": fill["fee_data_status"],
+            "filled_at": _shanghai_timestamp(
+                fill.get("filled_at") or generated_at, "fill.filled_at",
+            ),
+        })
+
+    compatibility = "legacy-joinquant-v1"
+    return BrokerSnapshot.from_values(
+        account_scope_id=account_scope_id,
+        trade_date=trade_date,
+        broker_time=generated_at,
+        generated_at=generated_at,
+        total_equity=total_equity,
+        cash=cash,
+        available_cash=available_cash,
+        frozen_cash=cash - available_cash,
+        positions=tuple(positions),
+        open_orders=tuple(open_orders),
+        fills=tuple(fills),
+        adapter_version=f"{compatibility}-adapter",
+        node_version=f"{compatibility}-node",
+        session_id=f"{compatibility}-session",
+        capabilities_version=f"{compatibility}-capabilities",
+        intraday_pnl=_strict_signed_decimal(
+            snapshot.get("intraday_pnl"), "intraday_pnl", default=0,
+        ),
+        account_drawdown_pct=_strict_signed_decimal(
+            snapshot.get("account_drawdown_pct"), "account_drawdown_pct", default=0,
+        ),
+    )
+
+
+def _is_event_only_legacy_payload(snapshot: dict[str, Any]) -> bool:
+    evidence_fields = (
+        "generated_at", "trade_date", "cash", "available_cash", "total_value",
+    )
+    return all(name not in snapshot for name in evidence_fields)
+
+
+def _validate_event_only_quantities(snapshot: dict[str, Any]) -> None:
+    for item in snapshot.get("positions", []):
+        if not isinstance(item, dict):
+            raise ValueError("position must be an object")
+        for field in ("qty", "closeable_amount", "locked_amount", "today_amount"):
+            if field in item:
+                _strict_quantity(item[field], f"position.{field}")
+    for item in snapshot.get("orders", []):
+        if not isinstance(item, dict):
+            raise ValueError("order must be an object")
+        for field in ("amount", "requested_qty", "filled", "filled_qty"):
+            if field in item:
+                _strict_quantity(item[field], f"order.{field}")
+    for item in snapshot.get("trades", []):
+        if not isinstance(item, dict):
+            raise ValueError("trade must be an object")
+        for field in ("amount", "qty"):
+            if field in item:
+                _strict_quantity(item[field], f"fill.{field}")
 
 
 def should_retain_details(conn: Any, snapshot: dict[str, Any], state_hash: str | None = None) -> bool:
@@ -341,14 +639,28 @@ def persist_account_snapshot(
 def ingest_snapshot_payload(
     snapshot: dict[str, Any], store: TradingStore, received_at: str, mode: str = "incremental"
 ) -> dict[str, Any]:
+    snapshot = _without_credentials(snapshot)
     store.initialize()
+    event_only = _is_event_only_legacy_payload(snapshot)
+    if event_only:
+        _validate_event_only_quantities(snapshot)
     positions = [
         _position(item, snapshot) for item in snapshot.get("positions", []) if isinstance(item, dict)
     ]
     positions = [item for item in positions if item["code"] and item["qty"] > 0]
     snapshot_at = str(snapshot.get("generated_at") or snapshot.get("received_at") or received_at)
     with store.transaction() as conn:
+        broker_snapshot = None
+        if not event_only:
+            account_scope_id = store.get_or_create_account_scope(
+                conn, "joinquant", "primary",
+            )
+            broker_snapshot = _legacy_broker_snapshot(
+                snapshot, account_scope_id, received_at,
+            )
         result = persist_account_snapshot(store, conn, snapshot, received_at)
+        if broker_snapshot is not None:
+            store.replace_current_broker_snapshot(conn, broker_snapshot)
         store.reconcile_position_cycles(conn, positions, snapshot_at)
         store.reconcile_order_events(conn, snapshot.get("orders", []), snapshot_at)
         store.reconcile_exit_intents(conn, positions, snapshot_at)

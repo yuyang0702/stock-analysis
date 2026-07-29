@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
 import json
 import re
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterator
 
+from execution_contracts import (
+    BrokerSnapshot,
+    ExecutionIntent,
+    PreTradeResult,
+    StrategyOrderCandidate,
+    canonical_json as contract_canonical_json,
+    canonical_sha256,
+)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class SignalConflictError(RuntimeError):
@@ -356,6 +366,200 @@ SCHEMA_V10 = """
 -- Evidence-status columns are added idempotently in initialize().
 """
 
+SCHEMA_V11_TABLES = {
+    "account_scopes": {
+        "account_scope_id", "adapter", "scope_alias", "created_at",
+    },
+    "broker_snapshot_current": {
+        "account_scope_id", "snapshot_id", "trade_date", "broker_time",
+        "generated_at", "snapshot_sha256", "payload_json",
+    },
+    "broker_position_current": {
+        "account_scope_id", "stock_code", "total_qty", "sellable_qty",
+        "frozen_qty", "today_buy_qty", "average_cost", "last_price",
+        "market_value",
+    },
+    "broker_order_current": {
+        "account_scope_id", "client_order_id", "broker_order_id", "stock_code",
+        "side", "target_qty", "filled_qty", "status", "updated_at",
+        "content_sha256",
+    },
+    "strategy_order_candidates": {
+        "account_scope_id", "candidate_id", "logical_signal_id",
+        "payload_sha256", "payload_json", "created_at",
+    },
+    "pre_trade_results": {
+        "account_scope_id", "pre_trade_result_id", "candidate_id", "allowed",
+        "result_sha256", "payload_json", "checked_at", "valid_until",
+    },
+    "execution_intents": {
+        "account_scope_id", "client_order_id", "pre_trade_result_id",
+        "intent_sha256", "submission_attempt_id", "payload_json", "status",
+        "expires_at",
+    },
+    "capacity_reservations": {
+        "account_scope_id", "reservation_id", "client_order_id", "stock_code",
+        "side", "target_qty", "cash_yuan", "position_value_yuan",
+        "open_risk_yuan", "remaining_target_qty", "remaining_cash_yuan",
+        "remaining_position_value_yuan", "remaining_open_risk_yuan",
+        "industry", "theme", "uncategorized", "status", "created_at",
+        "released_at", "release_reason",
+    },
+}
+
+SCHEMA_V11_NAMED_INDEXES = {
+    "idx_candidates_scope_signal": (
+        "strategy_order_candidates", ("account_scope_id", "logical_signal_id"),
+    ),
+    "idx_execution_intents_scope_status": (
+        "execution_intents", ("account_scope_id", "status"),
+    ),
+    "idx_reservations_scope_status": (
+        "capacity_reservations", ("account_scope_id", "status"),
+    ),
+    "idx_broker_orders_scope_status": (
+        "broker_order_current", ("account_scope_id", "status"),
+    ),
+}
+SCHEMA_V11_INDEXES = frozenset(SCHEMA_V11_NAMED_INDEXES)
+
+SCHEMA_V11_PRIMARY_KEYS = {
+    "account_scopes": ("account_scope_id",),
+    "broker_snapshot_current": ("account_scope_id",),
+    "broker_position_current": ("account_scope_id", "stock_code"),
+    "broker_order_current": ("account_scope_id", "client_order_id"),
+    "strategy_order_candidates": ("account_scope_id", "candidate_id"),
+    "pre_trade_results": ("account_scope_id", "pre_trade_result_id"),
+    "execution_intents": ("account_scope_id", "client_order_id"),
+    "capacity_reservations": ("account_scope_id", "reservation_id"),
+}
+
+SCHEMA_V11_UNIQUE_KEYS = {
+    "account_scopes": {("adapter", "scope_alias")},
+    "execution_intents": {("account_scope_id", "pre_trade_result_id")},
+    "capacity_reservations": {("account_scope_id", "client_order_id")},
+}
+
+SCHEMA_V11_STATEMENTS = (
+    """CREATE TABLE account_scopes(
+       account_scope_id TEXT PRIMARY KEY,
+       adapter TEXT NOT NULL CHECK(adapter IN ('joinquant','qmt')),
+       scope_alias TEXT NOT NULL,
+       created_at TEXT NOT NULL,
+       UNIQUE(adapter, scope_alias)
+       )""",
+    """CREATE TABLE broker_snapshot_current(
+       account_scope_id TEXT PRIMARY KEY
+           REFERENCES account_scopes(account_scope_id),
+       snapshot_id TEXT NOT NULL,
+       trade_date TEXT NOT NULL,
+       broker_time TEXT NOT NULL,
+       generated_at TEXT NOT NULL,
+       snapshot_sha256 TEXT NOT NULL,
+       payload_json TEXT NOT NULL
+       )""",
+    """CREATE TABLE broker_position_current(
+       account_scope_id TEXT NOT NULL,
+       stock_code TEXT NOT NULL,
+       total_qty INTEGER NOT NULL,
+       sellable_qty INTEGER NOT NULL,
+       frozen_qty INTEGER NOT NULL,
+       today_buy_qty INTEGER NOT NULL,
+       average_cost TEXT NOT NULL,
+       last_price TEXT NOT NULL,
+       market_value TEXT NOT NULL,
+       PRIMARY KEY(account_scope_id, stock_code),
+       FOREIGN KEY(account_scope_id)
+           REFERENCES broker_snapshot_current(account_scope_id) ON DELETE CASCADE
+       )""",
+    """CREATE TABLE broker_order_current(
+       account_scope_id TEXT NOT NULL,
+       client_order_id TEXT NOT NULL,
+       broker_order_id TEXT,
+       stock_code TEXT NOT NULL,
+       side TEXT NOT NULL,
+       target_qty INTEGER NOT NULL,
+       filled_qty INTEGER NOT NULL,
+       status TEXT NOT NULL,
+       updated_at TEXT NOT NULL,
+       content_sha256 TEXT NOT NULL,
+       PRIMARY KEY(account_scope_id, client_order_id),
+       FOREIGN KEY(account_scope_id)
+           REFERENCES broker_snapshot_current(account_scope_id) ON DELETE CASCADE
+       )""",
+    """CREATE TABLE strategy_order_candidates(
+       account_scope_id TEXT NOT NULL,
+       candidate_id TEXT NOT NULL,
+       logical_signal_id TEXT NOT NULL,
+       payload_sha256 TEXT NOT NULL,
+       payload_json TEXT NOT NULL,
+       created_at TEXT NOT NULL,
+       PRIMARY KEY(account_scope_id, candidate_id),
+       FOREIGN KEY(account_scope_id) REFERENCES account_scopes(account_scope_id)
+       )""",
+    """CREATE TABLE pre_trade_results(
+       account_scope_id TEXT NOT NULL,
+       pre_trade_result_id TEXT NOT NULL,
+       candidate_id TEXT NOT NULL,
+       allowed INTEGER NOT NULL,
+       result_sha256 TEXT NOT NULL,
+       payload_json TEXT NOT NULL,
+       checked_at TEXT NOT NULL,
+       valid_until TEXT NOT NULL,
+       PRIMARY KEY(account_scope_id, pre_trade_result_id),
+       FOREIGN KEY(account_scope_id, candidate_id)
+           REFERENCES strategy_order_candidates(account_scope_id, candidate_id)
+       )""",
+    """CREATE TABLE execution_intents(
+       account_scope_id TEXT NOT NULL,
+       client_order_id TEXT NOT NULL,
+       pre_trade_result_id TEXT NOT NULL,
+       intent_sha256 TEXT NOT NULL,
+       submission_attempt_id TEXT NOT NULL,
+       payload_json TEXT NOT NULL,
+       status TEXT NOT NULL,
+       expires_at TEXT NOT NULL,
+       PRIMARY KEY(account_scope_id, client_order_id),
+       UNIQUE(account_scope_id, pre_trade_result_id),
+       FOREIGN KEY(account_scope_id, pre_trade_result_id)
+           REFERENCES pre_trade_results(account_scope_id, pre_trade_result_id)
+       )""",
+    """CREATE TABLE capacity_reservations(
+       account_scope_id TEXT NOT NULL,
+       reservation_id TEXT NOT NULL,
+       client_order_id TEXT NOT NULL,
+       stock_code TEXT NOT NULL,
+       side TEXT NOT NULL,
+       target_qty INTEGER NOT NULL,
+       cash_yuan TEXT NOT NULL,
+       position_value_yuan TEXT NOT NULL,
+       open_risk_yuan TEXT NOT NULL,
+       remaining_target_qty INTEGER NOT NULL,
+       remaining_cash_yuan TEXT NOT NULL,
+       remaining_position_value_yuan TEXT NOT NULL,
+       remaining_open_risk_yuan TEXT NOT NULL,
+       industry TEXT NOT NULL,
+       theme TEXT NOT NULL,
+       uncategorized INTEGER NOT NULL,
+       status TEXT NOT NULL CHECK(status IN ('active','released')),
+       created_at TEXT NOT NULL,
+       released_at TEXT,
+       release_reason TEXT,
+       PRIMARY KEY(account_scope_id, reservation_id),
+       UNIQUE(account_scope_id, client_order_id),
+       FOREIGN KEY(account_scope_id, client_order_id)
+           REFERENCES execution_intents(account_scope_id, client_order_id)
+       )""",
+    """CREATE INDEX idx_candidates_scope_signal
+       ON strategy_order_candidates(account_scope_id, logical_signal_id)""",
+    """CREATE INDEX idx_execution_intents_scope_status
+       ON execution_intents(account_scope_id, status)""",
+    """CREATE INDEX idx_reservations_scope_status
+       ON capacity_reservations(account_scope_id, status)""",
+    """CREATE INDEX idx_broker_orders_scope_status
+       ON broker_order_current(account_scope_id, status)""",
+)
+
 
 @dataclass(frozen=True)
 class StoreHealth:
@@ -419,6 +623,24 @@ class TradingStore:
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
+            has_migrations = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type='table' AND name='schema_migrations'"""
+            ).fetchone()
+            current_version = 0
+            if has_migrations:
+                current_version = int(
+                    conn.execute(
+                        "SELECT MAX(version) FROM schema_migrations"
+                    ).fetchone()[0] or 0
+                )
+                if current_version > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"database schema {current_version} is newer than supported {SCHEMA_VERSION}"
+                    )
+                if current_version == SCHEMA_VERSION:
+                    self._validate_schema_v11(conn)
+                    return
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA_V1)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))")
@@ -473,6 +695,176 @@ class TradingStore:
                 )
             conn.executescript(SCHEMA_V10)
             conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (10, datetime('now'))")
+            conn.commit()
+            self._migrate_schema_v11(conn)
+
+    def _migrate_schema_v11(self, conn: sqlite3.Connection) -> None:
+        current_version = int(
+            conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0
+        )
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema {current_version} is newer than supported {SCHEMA_VERSION}"
+            )
+        if current_version == SCHEMA_VERSION:
+            self._validate_schema_v11(conn)
+            return
+        if current_version != 10:
+            raise RuntimeError(f"schema 11 migration requires schema 10, got {current_version}")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in SCHEMA_V11_STATEMENTS:
+                conn.execute(statement)
+            cycle_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(position_cycles)")
+            }
+            if "profit_protection_activated_at" not in cycle_columns:
+                conn.execute(
+                    "ALTER TABLE position_cycles ADD COLUMN profit_protection_activated_at TEXT"
+                )
+            if "trailing_stop_active_from" not in cycle_columns:
+                conn.execute(
+                    "ALTER TABLE position_cycles ADD COLUMN trailing_stop_active_from TEXT"
+                )
+            conn.execute(
+                """INSERT INTO schema_migrations(version, applied_at)
+                   VALUES(11, datetime('now'))"""
+            )
+            self._validate_schema_v11(conn)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
+    @staticmethod
+    def _validate_schema_v11(conn: sqlite3.Connection) -> None:
+        for table, required_columns in SCHEMA_V11_TABLES.items():
+            table_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            columns = {str(row[1]) for row in table_info}
+            missing = required_columns - columns
+            if missing:
+                raise RuntimeError(
+                    f"schema 11 table {table} missing columns: {sorted(missing)}"
+                )
+            primary_key = tuple(
+                str(row[1])
+                for row in sorted(
+                    (row for row in table_info if int(row[5]) > 0),
+                    key=lambda row: int(row[5]),
+                )
+            )
+            if primary_key != SCHEMA_V11_PRIMARY_KEYS[table]:
+                raise RuntimeError(
+                    f"schema 11 table {table} has invalid primary key: {primary_key}"
+                )
+        cycle_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(position_cycles)")
+        }
+        missing_cycle = {
+            "profit_protection_activated_at", "trailing_stop_active_from",
+        } - cycle_columns
+        if missing_cycle:
+            raise RuntimeError(
+                f"schema 11 position_cycles missing columns: {sorted(missing_cycle)}"
+            )
+        for index_name, (expected_table, expected_columns) in (
+            SCHEMA_V11_NAMED_INDEXES.items()
+        ):
+            index_row = conn.execute(
+                """SELECT tbl_name FROM sqlite_master
+                   WHERE type='index' AND name=?""",
+                (index_name,),
+            ).fetchone()
+            actual_columns = tuple(
+                str(row[2])
+                for row in sorted(
+                    conn.execute(
+                        f'PRAGMA index_info("{index_name}")'
+                    ).fetchall(),
+                    key=lambda row: int(row[0]),
+                )
+            )
+            if (
+                index_row is None
+                or str(index_row[0]) != expected_table
+                or actual_columns != expected_columns
+            ):
+                raise RuntimeError(
+                    f"schema 11 index {index_name} has invalid table or columns"
+                )
+        for table, primary_key in SCHEMA_V11_PRIMARY_KEYS.items():
+            unique_sets = set()
+            for index in conn.execute(f"PRAGMA index_list({table})"):
+                if not int(index[2]):
+                    continue
+                unique_sets.add(tuple(
+                    str(row[2])
+                    for row in sorted(
+                        conn.execute(f'PRAGMA index_info("{index[1]}")').fetchall(),
+                        key=lambda row: int(row[0]),
+                    )
+                ))
+            expected_unique = {primary_key} | SCHEMA_V11_UNIQUE_KEYS.get(
+                table, set()
+            )
+            if unique_sets != expected_unique:
+                raise RuntimeError(
+                    f"schema 11 table {table} has invalid unique keys: "
+                    f"{sorted(unique_sets)}"
+                )
+        required_foreign_keys = {
+            "broker_snapshot_current": {("account_scope_id", "account_scopes", "account_scope_id")},
+            "broker_position_current": {
+                ("account_scope_id", "broker_snapshot_current", "account_scope_id"),
+            },
+            "broker_order_current": {
+                ("account_scope_id", "broker_snapshot_current", "account_scope_id"),
+            },
+            "strategy_order_candidates": {
+                ("account_scope_id", "account_scopes", "account_scope_id"),
+            },
+            "pre_trade_results": {
+                ("account_scope_id", "strategy_order_candidates", "account_scope_id"),
+                ("candidate_id", "strategy_order_candidates", "candidate_id"),
+            },
+            "execution_intents": {
+                ("account_scope_id", "pre_trade_results", "account_scope_id"),
+                ("pre_trade_result_id", "pre_trade_results", "pre_trade_result_id"),
+            },
+            "capacity_reservations": {
+                ("account_scope_id", "execution_intents", "account_scope_id"),
+                ("client_order_id", "execution_intents", "client_order_id"),
+            },
+        }
+        for table, required in required_foreign_keys.items():
+            grouped: dict[int, list[sqlite3.Row]] = {}
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
+                grouped.setdefault(int(row[0]), []).append(row)
+            actual_groups = {
+                tuple(
+                    (str(row[3]), str(row[2]), str(row[4]))
+                    for row in sorted(rows, key=lambda item: int(item[1]))
+                )
+                for rows in grouped.values()
+            }
+            expected_groups: set[tuple[tuple[str, str, str], ...]] = set()
+            if table in {
+                "pre_trade_results", "execution_intents",
+                "capacity_reservations",
+            }:
+                expected_groups.add(tuple(sorted(
+                    required,
+                    key=lambda item: (
+                        0 if item[0] == "account_scope_id" else 1
+                    ),
+                )))
+            else:
+                expected_groups = {(item,) for item in required}
+            if actual_groups != expected_groups:
+                raise RuntimeError(
+                    f"schema 11 table {table} has invalid foreign keys"
+                )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -491,9 +883,490 @@ class TradingStore:
             with self.connect() as conn:
                 version = int(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0)
                 conn.execute("SELECT 1").fetchone()
+                if version == 11:
+                    self._validate_schema_v11(conn)
             return StoreHealth(ok=version == SCHEMA_VERSION, schema_version=version)
         except Exception as exc:
             return StoreHealth(ok=False, schema_version=0, error=str(exc))
+
+    @staticmethod
+    def _money(value: object, name: str) -> Decimal:
+        try:
+            amount = value if isinstance(value, Decimal) else Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"{name} must be a decimal") from exc
+        if not amount.is_finite() or amount < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+        return amount
+
+    def get_or_create_account_scope(
+        self,
+        conn: sqlite3.Connection,
+        adapter: str,
+        scope_alias: str,
+    ) -> str:
+        adapter = str(adapter).strip().lower()
+        scope_alias = str(scope_alias).strip()
+        if adapter not in {"joinquant", "qmt"}:
+            raise ValueError("adapter must be joinquant or qmt")
+        if not scope_alias:
+            raise ValueError("scope_alias is required")
+        row = conn.execute(
+            """SELECT account_scope_id FROM account_scopes
+               WHERE adapter=? AND scope_alias=?""",
+            (adapter, scope_alias),
+        ).fetchone()
+        if row:
+            return str(row[0])
+        account_scope_id = str(uuid.uuid4())
+        try:
+            conn.execute(
+                """INSERT INTO account_scopes(
+                   account_scope_id, adapter, scope_alias, created_at
+                   ) VALUES(?,?,?,datetime('now'))""",
+                (account_scope_id, adapter, scope_alias),
+            )
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter=? AND scope_alias=?""",
+                (adapter, scope_alias),
+            ).fetchone()
+            if not row:
+                raise
+            return str(row[0])
+        return account_scope_id
+
+    def replace_current_broker_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        snapshot: BrokerSnapshot | dict,
+    ) -> str:
+        normalized = BrokerSnapshot.from_dict(
+            snapshot.to_dict() if isinstance(snapshot, BrokerSnapshot) else snapshot
+        )
+        payload_json = contract_canonical_json(normalized.to_dict())
+        if len(payload_json.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("broker snapshot canonical payload exceeds 1 MiB")
+        scope = normalized.account_scope_id
+        if not conn.execute(
+            "SELECT 1 FROM account_scopes WHERE account_scope_id=?", (scope,)
+        ).fetchone():
+            raise ValueError("unknown account_scope_id")
+        current = conn.execute(
+            """SELECT snapshot_id, broker_time, generated_at, snapshot_sha256
+               FROM broker_snapshot_current WHERE account_scope_id=?""",
+            (scope,),
+        ).fetchone()
+        if current:
+            if current["snapshot_id"] == normalized.snapshot_id:
+                if current["snapshot_sha256"] == normalized.snapshot_sha256:
+                    return normalized.snapshot_id
+                raise ValueError("broker snapshot ID conflicts with existing hash")
+            incoming_time = (
+                datetime.fromisoformat(normalized.broker_time),
+                datetime.fromisoformat(normalized.generated_at),
+            )
+            current_time = (
+                datetime.fromisoformat(str(current["broker_time"])),
+                datetime.fromisoformat(str(current["generated_at"])),
+            )
+            if incoming_time < current_time:
+                raise ValueError("stale broker snapshot")
+            if incoming_time == current_time:
+                raise ValueError("ambiguous broker snapshot ordering conflict")
+
+        conn.execute(
+            "DELETE FROM broker_position_current WHERE account_scope_id=?", (scope,)
+        )
+        conn.execute(
+            "DELETE FROM broker_order_current WHERE account_scope_id=?", (scope,)
+        )
+        conn.execute(
+            "DELETE FROM broker_snapshot_current WHERE account_scope_id=?", (scope,)
+        )
+        conn.execute(
+            """INSERT INTO broker_snapshot_current(
+               account_scope_id, snapshot_id, trade_date, broker_time, generated_at,
+               snapshot_sha256, payload_json
+               ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                scope, normalized.snapshot_id, normalized.trade_date,
+                normalized.broker_time, normalized.generated_at,
+                normalized.snapshot_sha256, payload_json,
+            ),
+        )
+        for position in normalized.positions:
+            conn.execute(
+                """INSERT INTO broker_position_current(
+                   account_scope_id, stock_code, total_qty, sellable_qty,
+                   frozen_qty, today_buy_qty, average_cost, last_price, market_value
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    scope, position.code, position.total_qty, position.sellable_qty,
+                    position.frozen_qty, position.today_buy_qty,
+                    str(position.average_cost), str(position.last_price),
+                    str(position.market_value),
+                ),
+            )
+        for order in normalized.open_orders:
+            conn.execute(
+                """INSERT INTO broker_order_current(
+                   account_scope_id, client_order_id, broker_order_id, stock_code,
+                   side, target_qty, filled_qty, status, updated_at, content_sha256
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    scope, order["client_order_id"], order["broker_order_id"],
+                    order["stock_code"], order["side"], order["target_qty"],
+                    order["filled_qty"], order["status"], order["updated_at"],
+                    canonical_sha256(order),
+                ),
+            )
+        return normalized.snapshot_id
+
+    def load_current_broker_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+    ) -> BrokerSnapshot | None:
+        row = conn.execute(
+            """SELECT payload_json FROM broker_snapshot_current
+               WHERE account_scope_id=?""",
+            (account_scope_id,),
+        ).fetchone()
+        return BrokerSnapshot.from_dict(json.loads(row[0])) if row else None
+
+    @staticmethod
+    def _insert_immutable_fact(
+        conn: sqlite3.Connection,
+        *,
+        table: str,
+        scope: str,
+        identity_column: str,
+        identity: str,
+        hash_column: str,
+        content_hash: str,
+        statement: str,
+        parameters: tuple[object, ...],
+    ) -> str:
+        row = conn.execute(
+            f"""SELECT {hash_column} FROM {table}
+                WHERE account_scope_id=? AND {identity_column}=?""",
+            (scope, identity),
+        ).fetchone()
+        if row:
+            if str(row[0]) == content_hash:
+                return identity
+            raise ValueError(f"{table} immutable ID conflicts with existing hash")
+        conn.execute(statement, parameters)
+        return identity
+
+    def insert_strategy_order_candidate(
+        self,
+        conn: sqlite3.Connection,
+        candidate: StrategyOrderCandidate | dict,
+    ) -> str:
+        record = StrategyOrderCandidate.from_dict(
+            candidate.to_dict()
+            if isinstance(candidate, StrategyOrderCandidate)
+            else candidate
+        )
+        payload = contract_canonical_json(record.to_dict())
+        return self._insert_immutable_fact(
+            conn,
+            table="strategy_order_candidates",
+            scope=record.account_scope_id,
+            identity_column="candidate_id",
+            identity=record.candidate_id,
+            hash_column="payload_sha256",
+            content_hash=record.payload_sha256,
+            statement="""INSERT INTO strategy_order_candidates(
+                account_scope_id, candidate_id, logical_signal_id, payload_sha256,
+                payload_json, created_at
+                ) VALUES(?,?,?,?,?,?)""",
+            parameters=(
+                record.account_scope_id, record.candidate_id,
+                record.logical_signal_id, record.payload_sha256, payload,
+                record.signal_time,
+            ),
+        )
+
+    def insert_pre_trade_result(
+        self,
+        conn: sqlite3.Connection,
+        result: PreTradeResult | dict,
+    ) -> str:
+        record = PreTradeResult.from_dict(
+            result.to_dict() if isinstance(result, PreTradeResult) else result
+        )
+        scope = record.candidate.account_scope_id
+        candidate_row = conn.execute(
+            """SELECT payload_sha256 FROM strategy_order_candidates
+               WHERE account_scope_id=? AND candidate_id=?""",
+            (scope, record.candidate_id),
+        ).fetchone()
+        if (
+            candidate_row is None
+            or str(candidate_row[0]) != record.candidate.payload_sha256
+        ):
+            raise ValueError("pre-trade result candidate evidence is not persisted")
+        payload = contract_canonical_json(record.to_dict())
+        return self._insert_immutable_fact(
+            conn,
+            table="pre_trade_results",
+            scope=scope,
+            identity_column="pre_trade_result_id",
+            identity=record.pre_trade_result_id,
+            hash_column="result_sha256",
+            content_hash=record.result_sha256,
+            statement="""INSERT INTO pre_trade_results(
+                account_scope_id, pre_trade_result_id, candidate_id, allowed,
+                result_sha256, payload_json, checked_at, valid_until
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+            parameters=(
+                scope, record.pre_trade_result_id, record.candidate_id,
+                int(record.allowed), record.result_sha256, payload,
+                record.checked_at, record.valid_until,
+            ),
+        )
+
+    def insert_execution_intent(
+        self,
+        conn: sqlite3.Connection,
+        intent: ExecutionIntent | dict,
+        *,
+        status: str = "READY",
+    ) -> str:
+        record = ExecutionIntent.from_dict(
+            intent.to_dict() if isinstance(intent, ExecutionIntent) else intent
+        )
+        if record.account_scope_id != record.pre_trade_result.candidate.account_scope_id:
+            raise ValueError("execution intent scope does not match pre-trade result")
+        result_row = conn.execute(
+            """SELECT result_sha256 FROM pre_trade_results
+               WHERE account_scope_id=? AND pre_trade_result_id=?""",
+            (record.account_scope_id, record.pre_trade_result_id),
+        ).fetchone()
+        if (
+            result_row is None
+            or str(result_row[0]) != record.pre_trade_result_sha256
+        ):
+            raise ValueError("execution intent pre-trade evidence is not persisted")
+        payload = contract_canonical_json(record.to_dict())
+        return self._insert_immutable_fact(
+            conn,
+            table="execution_intents",
+            scope=record.account_scope_id,
+            identity_column="client_order_id",
+            identity=record.client_order_id,
+            hash_column="intent_sha256",
+            content_hash=record.intent_sha256,
+            statement="""INSERT INTO execution_intents(
+                account_scope_id, client_order_id, pre_trade_result_id,
+                intent_sha256, submission_attempt_id, payload_json, status,
+                expires_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+            parameters=(
+                record.account_scope_id, record.client_order_id,
+                record.pre_trade_result_id, record.intent_sha256,
+                record.submission_attempt_id, payload, str(status), record.expires_at,
+            ),
+        )
+
+    def compare_and_set_execution_intent_status(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+        client_order_id: str,
+        *,
+        expected_status: str,
+        new_status: str,
+    ) -> bool:
+        cursor = conn.execute(
+            """UPDATE execution_intents SET status=?
+               WHERE account_scope_id=? AND client_order_id=? AND status=?""",
+            (new_status, account_scope_id, client_order_id, expected_status),
+        )
+        return cursor.rowcount == 1
+
+    def reserve_capacity(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        account_scope_id: str,
+        reservation_id: str,
+        client_order_id: str,
+        stock_code: str,
+        side: str,
+        target_qty: int,
+        cash_yuan: object,
+        position_value_yuan: object,
+        open_risk_yuan: object,
+        industry: str,
+        theme: str,
+        uncategorized: bool,
+        created_at: str,
+    ) -> str:
+        if int(target_qty) <= 0:
+            raise ValueError("target_qty must be positive")
+        cash = self._money(cash_yuan, "cash_yuan")
+        position_value = self._money(position_value_yuan, "position_value_yuan")
+        open_risk = self._money(open_risk_yuan, "open_risk_yuan")
+        values = (
+            account_scope_id, reservation_id, client_order_id, str(stock_code),
+            str(side).lower(), int(target_qty), str(cash), str(position_value),
+            str(open_risk), int(target_qty), str(cash), str(position_value),
+            str(open_risk), str(industry), str(theme), int(bool(uncategorized)),
+            "active", str(created_at),
+        )
+        existing = conn.execute(
+            """SELECT * FROM capacity_reservations
+               WHERE account_scope_id=? AND reservation_id=?""",
+            (account_scope_id, reservation_id),
+        ).fetchone()
+        if existing:
+            columns = (
+                "account_scope_id", "reservation_id", "client_order_id",
+                "stock_code", "side", "target_qty", "cash_yuan",
+                "position_value_yuan", "open_risk_yuan", "remaining_target_qty",
+                "remaining_cash_yuan", "remaining_position_value_yuan",
+                "remaining_open_risk_yuan", "industry", "theme", "uncategorized",
+                "status", "created_at",
+            )
+            if tuple(existing[name] for name in columns) == values:
+                return reservation_id
+            raise ValueError("capacity reservation immutable ID conflict")
+        client_reservation = conn.execute(
+            """SELECT reservation_id FROM capacity_reservations
+               WHERE account_scope_id=? AND client_order_id=?""",
+            (account_scope_id, client_order_id),
+        ).fetchone()
+        if client_reservation:
+            raise ValueError("execution intent already has a capacity reservation")
+        conn.execute(
+            """INSERT INTO capacity_reservations(
+               account_scope_id, reservation_id, client_order_id, stock_code,
+               side, target_qty, cash_yuan, position_value_yuan, open_risk_yuan,
+               remaining_target_qty, remaining_cash_yuan,
+               remaining_position_value_yuan, remaining_open_risk_yuan,
+               industry, theme, uncategorized, status, created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            values,
+        )
+        return reservation_id
+
+    def adjust_capacity_reservation(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+        reservation_id: str,
+        *,
+        remaining_target_qty: int,
+        remaining_cash_yuan: object,
+        remaining_position_value_yuan: object,
+        remaining_open_risk_yuan: object,
+    ) -> bool:
+        remaining = (
+            int(remaining_target_qty),
+            self._money(remaining_cash_yuan, "remaining_cash_yuan"),
+            self._money(
+                remaining_position_value_yuan, "remaining_position_value_yuan"
+            ),
+            self._money(remaining_open_risk_yuan, "remaining_open_risk_yuan"),
+        )
+        row = conn.execute(
+            """SELECT target_qty, cash_yuan, position_value_yuan, open_risk_yuan,
+                      remaining_target_qty, remaining_cash_yuan,
+                      remaining_position_value_yuan, remaining_open_risk_yuan
+               FROM capacity_reservations
+               WHERE account_scope_id=? AND reservation_id=? AND status='active'""",
+            (account_scope_id, reservation_id),
+        ).fetchone()
+        if not row:
+            return False
+        original = (
+            int(row[0]), Decimal(row[1]), Decimal(row[2]), Decimal(row[3]),
+        )
+        current = (
+            int(row[4]), Decimal(row[5]), Decimal(row[6]), Decimal(row[7]),
+        )
+        if remaining[0] < 0 or any(
+            value > limit for value, limit in zip(remaining, original)
+        ):
+            raise ValueError("remaining reservation values exceed original values")
+        if any(value > limit for value, limit in zip(remaining, current)):
+            raise ValueError("remaining reservation values cannot increase")
+        cursor = conn.execute(
+            """UPDATE capacity_reservations
+               SET remaining_target_qty=?, remaining_cash_yuan=?,
+                   remaining_position_value_yuan=?, remaining_open_risk_yuan=?
+               WHERE account_scope_id=? AND reservation_id=? AND status='active'
+                 AND remaining_target_qty=? AND remaining_cash_yuan=?
+                 AND remaining_position_value_yuan=?
+                 AND remaining_open_risk_yuan=?""",
+            (
+                remaining[0], str(remaining[1]), str(remaining[2]), str(remaining[3]),
+                account_scope_id, reservation_id,
+                current[0], str(current[1]), str(current[2]), str(current[3]),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def aggregate_active_reservations(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+    ) -> dict[str, object]:
+        rows = conn.execute(
+            """SELECT * FROM capacity_reservations
+               WHERE account_scope_id=? AND status='active'""",
+            (account_scope_id,),
+        ).fetchall()
+        result: dict[str, object] = {
+            "target_qty": 0,
+            "cash_yuan": Decimal("0"),
+            "position_value_yuan": Decimal("0"),
+            "open_risk_yuan": Decimal("0"),
+            "industry_value_yuan": {},
+            "theme_value_yuan": {},
+            "uncategorized_value_yuan": Decimal("0"),
+        }
+        for row in rows:
+            value = Decimal(row["remaining_position_value_yuan"])
+            result["target_qty"] += int(row["remaining_target_qty"])
+            result["cash_yuan"] += Decimal(row["remaining_cash_yuan"])
+            result["position_value_yuan"] += value
+            result["open_risk_yuan"] += Decimal(row["remaining_open_risk_yuan"])
+            if row["industry"]:
+                industries = result["industry_value_yuan"]
+                industries[row["industry"]] = industries.get(
+                    row["industry"], Decimal("0")
+                ) + value
+            if row["theme"]:
+                themes = result["theme_value_yuan"]
+                themes[row["theme"]] = themes.get(
+                    row["theme"], Decimal("0")
+                ) + value
+            if row["uncategorized"]:
+                result["uncategorized_value_yuan"] += value
+        return result
+
+    def release_capacity_reservation(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+        reservation_id: str,
+        *,
+        released_at: str,
+        reason: str,
+    ) -> bool:
+        cursor = conn.execute(
+            """UPDATE capacity_reservations
+               SET status='released', released_at=?, release_reason=?
+               WHERE account_scope_id=? AND reservation_id=? AND status='active'""",
+            (released_at, reason, account_scope_id, reservation_id),
+        )
+        return cursor.rowcount == 1
 
     def record_strategy_run(self, conn: sqlite3.Connection, run: StrategyRunRecord) -> bool:
         cursor = conn.execute(

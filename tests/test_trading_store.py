@@ -1,8 +1,22 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from decimal import Decimal
 import sqlite3
 import unittest
+from unittest.mock import patch
 
+import trading_store
+from execution_contracts import (
+    BrokerPosition,
+    BrokerSnapshot,
+    ExecutionIntent,
+    PreTradeResult,
+)
+from tests.test_execution_contracts import (
+    intent_values,
+    make_candidate,
+    pre_trade_values,
+)
 from trading_store import (
     SCHEMA_VERSION,
     SCHEMA_V1,
@@ -22,6 +36,379 @@ from trading_store import (
 
 
 class TradingStoreTest(unittest.TestCase):
+    @staticmethod
+    def _broker_snapshot(
+        scope: str,
+        snapshot_id: str,
+        *,
+        broker_time: str = "2026-07-29T10:00:00+08:00",
+        generated_at: str = "2026-07-29T10:00:01+08:00",
+        qty: int = 100,
+    ) -> BrokerSnapshot:
+        return BrokerSnapshot.from_values(
+            snapshot_id=snapshot_id,
+            account_scope_id=scope,
+            trade_date="2026-07-29",
+            broker_time=broker_time,
+            generated_at=generated_at,
+            total_equity=Decimal("10000"),
+            cash=Decimal("9000"),
+            available_cash=Decimal("9000"),
+            frozen_cash=Decimal("0"),
+            positions=(
+                BrokerPosition.from_values(
+                    code="600000", total_qty=qty, sellable_qty=qty,
+                    frozen_qty=0, today_buy_qty=0, average_cost="10",
+                    last_price="10", market_value=str(qty * 10),
+                ),
+            ),
+            open_orders=({
+                "client_order_id": "open-1", "broker_order_id": "jq-1",
+                "stock_code": "600001", "side": "buy", "target_qty": 100,
+                "filled_qty": 0, "status": "submitted",
+                "updated_at": broker_time,
+            },),
+            fills=(),
+            adapter_version="legacy-joinquant-v1-adapter",
+            node_version="legacy-joinquant-v1-node",
+            session_id="legacy-joinquant-v1-session",
+            capabilities_version="legacy-joinquant-v1-capabilities",
+        )
+
+    def test_schema_v11_is_idempotent_and_has_scoped_execution_chain(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            store.initialize()
+
+            self.assertEqual(store.health().schema_version, 11)
+            with store.connect() as conn:
+                tables = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                self.assertTrue({
+                    "account_scopes", "broker_snapshot_current",
+                    "broker_position_current", "broker_order_current",
+                    "strategy_order_candidates", "pre_trade_results",
+                    "execution_intents", "capacity_reservations",
+                }.issubset(tables))
+                cycle_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(position_cycles)")
+                }
+                self.assertTrue({
+                    "profit_protection_activated_at", "trailing_stop_active_from",
+                }.issubset(cycle_columns))
+                result_fks = conn.execute(
+                    "PRAGMA foreign_key_list(pre_trade_results)"
+                ).fetchall()
+                self.assertEqual(
+                    {row[3] for row in result_fks if row[2] == "strategy_order_candidates"},
+                    {"account_scope_id", "candidate_id"},
+                )
+                self.assertEqual(
+                    len({
+                        row[0] for row in result_fks
+                        if row[2] == "strategy_order_candidates"
+                    }),
+                    1,
+                )
+
+    def test_schema_v11_health_rejects_forbidden_global_unique_key(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.connect() as conn:
+                conn.execute(
+                    """CREATE UNIQUE INDEX forbidden_global_candidate
+                       ON strategy_order_candidates(candidate_id)"""
+                )
+            health = store.health()
+            self.assertFalse(health.ok)
+            self.assertIn("unique keys", health.error)
+
+    def test_schema_v11_refuses_newer_database_without_mutation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO schema_migrations VALUES(12, '2026-07-29T00:00:00+08:00')"
+                )
+                conn.execute("CREATE TABLE sentinel(value TEXT)")
+                conn.execute("INSERT INTO sentinel VALUES('keep')")
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(RuntimeError, "newer"):
+                TradingStore(path).initialize()
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(conn.execute("SELECT value FROM sentinel").fetchone()[0], "keep")
+                self.assertIsNone(conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name='account_scopes'"
+                ).fetchone())
+            finally:
+                conn.close()
+
+    def test_schema_v11_migration_rolls_back_all_objects_on_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            statements = (
+                trading_store.SCHEMA_V11_STATEMENTS[0],
+                "CREATE TABLE broken(",
+            )
+            with patch.object(
+                trading_store, "SCHEMA_V11_STATEMENTS", statements,
+            ), self.assertRaises(sqlite3.OperationalError):
+                TradingStore(path).initialize()
+
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT MAX(version) FROM schema_migrations"
+                    ).fetchone()[0],
+                    10,
+                )
+                self.assertIsNone(conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type='table' AND name='account_scopes'"""
+                ).fetchone())
+            finally:
+                conn.close()
+
+    def test_current_snapshot_replacement_is_scoped_and_newness_checked(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                first_scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
+                second_scope = store.get_or_create_account_scope(conn, "qmt", "paper")
+                first = self._broker_snapshot(first_scope, "same-id")
+                other = self._broker_snapshot(second_scope, "same-id", qty=200)
+                self.assertEqual(store.replace_current_broker_snapshot(conn, first), "same-id")
+                self.assertEqual(store.replace_current_broker_snapshot(conn, first), "same-id")
+                store.replace_current_broker_snapshot(conn, other)
+
+            with store.connect() as conn:
+                self.assertEqual(
+                    store.load_current_broker_snapshot(
+                        conn, first_scope,
+                    ).positions[0].total_qty,
+                    100,
+                )
+                self.assertEqual(
+                    store.load_current_broker_snapshot(
+                        conn, second_scope,
+                    ).positions[0].total_qty,
+                    200,
+                )
+            stale = self._broker_snapshot(
+                first_scope, "stale",
+                broker_time="2026-07-29T09:59:00+08:00",
+                generated_at="2026-07-29T09:59:01+08:00",
+            )
+            with store.transaction() as conn, self.assertRaisesRegex(ValueError, "stale"):
+                store.replace_current_broker_snapshot(conn, stale)
+
+    def test_current_snapshot_conflicts_and_outer_rollback_preserve_children(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                first = self._broker_snapshot(scope, "first")
+                store.replace_current_broker_snapshot(conn, first)
+                conn.execute(
+                    """CREATE TRIGGER fail_snapshot_insert
+                       BEFORE INSERT ON broker_snapshot_current
+                       WHEN NEW.snapshot_id='fail'
+                       BEGIN SELECT RAISE(ABORT, 'forced snapshot failure'); END"""
+                )
+            ambiguous = self._broker_snapshot(scope, "ambiguous")
+            with store.transaction() as conn, self.assertRaisesRegex(
+                ValueError, "ambiguous",
+            ):
+                store.replace_current_broker_snapshot(conn, ambiguous)
+            conflicting = self._broker_snapshot(scope, "first", qty=200)
+            with store.transaction() as conn, self.assertRaisesRegex(
+                ValueError, "conflicts",
+            ):
+                store.replace_current_broker_snapshot(conn, conflicting)
+            newer = self._broker_snapshot(
+                scope, "fail",
+                broker_time="2026-07-29T10:01:00+08:00",
+                generated_at="2026-07-29T10:01:01+08:00",
+                qty=300,
+            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "forced"):
+                with store.transaction() as conn:
+                    store.replace_current_broker_snapshot(conn, newer)
+            with store.connect() as conn:
+                loaded = store.load_current_broker_snapshot(conn, scope)
+                position_row = conn.execute(
+                    """SELECT stock_code, total_qty FROM broker_position_current
+                       WHERE account_scope_id=?""",
+                    (scope,),
+                ).fetchone()
+                order_row = conn.execute(
+                    """SELECT client_order_id, status FROM broker_order_current
+                       WHERE account_scope_id=?""",
+                    (scope,),
+                ).fetchone()
+            self.assertEqual(loaded.snapshot_id, "first")
+            self.assertEqual(loaded.positions[0].total_qty, 100)
+            self.assertEqual(loaded.open_orders[0]["client_order_id"], "open-1")
+            self.assertEqual(tuple(position_row), ("600000", 100))
+            self.assertEqual(tuple(order_row), ("open-1", "submitted"))
+
+    def test_oversized_current_snapshot_fails_before_mutation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                first = self._broker_snapshot(scope, "first")
+                store.replace_current_broker_snapshot(conn, first)
+            payload = first.to_dict()
+            payload["snapshot_id"] = "oversized"
+            payload["session_id"] = "x" * (1024 * 1024)
+            payload["snapshot_sha256"] = ""
+            oversized = BrokerSnapshot(**payload)
+            with store.transaction() as conn, self.assertRaisesRegex(
+                ValueError, "1 MiB",
+            ):
+                store.replace_current_broker_snapshot(conn, oversized)
+            with store.connect() as conn:
+                self.assertEqual(
+                    store.load_current_broker_snapshot(
+                        conn, scope,
+                    ).snapshot_id,
+                    "first",
+                )
+
+    def test_immutable_chain_and_reservation_are_scoped_and_idempotent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (candidate.account_scope_id,),
+                )
+                self.assertEqual(store.insert_strategy_order_candidate(conn, candidate), candidate.candidate_id)
+                self.assertEqual(store.insert_strategy_order_candidate(conn, candidate), candidate.candidate_id)
+                self.assertEqual(store.insert_pre_trade_result(conn, result), result.pre_trade_result_id)
+                self.assertEqual(store.insert_pre_trade_result(conn, result), result.pre_trade_result_id)
+                self.assertEqual(store.insert_execution_intent(conn, intent), intent.client_order_id)
+                self.assertEqual(store.insert_execution_intent(conn, intent), intent.client_order_id)
+                later_result = PreTradeResult(**pre_trade_values(
+                    candidate, pre_trade_result_id="risk-2",
+                    checked_at="2026-07-28T09:57:00+08:00",
+                    valid_until="2026-07-28T10:02:00+08:00",
+                ))
+                self.assertEqual(
+                    store.insert_pre_trade_result(conn, later_result), "risk-2",
+                )
+                reservation_id = store.reserve_capacity(
+                    conn, account_scope_id=candidate.account_scope_id,
+                    reservation_id="reservation-1", client_order_id=intent.client_order_id,
+                    stock_code="600000", side="buy", target_qty=100,
+                    cash_yuan="1006", position_value_yuan="1000",
+                    open_risk_yuan="60", industry="technology",
+                    theme="artificial-intelligence", uncategorized=False,
+                    created_at="2026-07-29T10:00:00+08:00",
+                )
+                self.assertEqual(reservation_id, "reservation-1")
+                totals = store.aggregate_active_reservations(
+                    conn, candidate.account_scope_id,
+                )
+                self.assertEqual(totals["cash_yuan"], Decimal("1006"))
+                self.assertEqual(totals["target_qty"], 100)
+                self.assertTrue(store.adjust_capacity_reservation(
+                    conn, candidate.account_scope_id, "reservation-1",
+                    remaining_target_qty=50, remaining_cash_yuan="503",
+                    remaining_position_value_yuan="500",
+                    remaining_open_risk_yuan="30",
+                ))
+                adjusted = store.aggregate_active_reservations(
+                    conn, candidate.account_scope_id,
+                )
+                self.assertEqual(adjusted["cash_yuan"], Decimal("503"))
+                self.assertEqual(adjusted["target_qty"], 50)
+                with self.assertRaisesRegex(ValueError, "cannot increase"):
+                    store.adjust_capacity_reservation(
+                        conn, candidate.account_scope_id, "reservation-1",
+                        remaining_target_qty=75, remaining_cash_yuan="750",
+                        remaining_position_value_yuan="750",
+                        remaining_open_risk_yuan="45",
+                    )
+                self.assertTrue(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id, "reservation-1",
+                    released_at="2026-07-29T10:01:00+08:00", reason="expired",
+                ))
+                self.assertFalse(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id, "reservation-1",
+                    released_at="2026-07-29T10:02:00+08:00", reason="overwrite",
+                ))
+                row = conn.execute(
+                    """SELECT target_qty, remaining_target_qty, release_reason
+                       FROM capacity_reservations"""
+                ).fetchone()
+                self.assertEqual((row[0], row[1], row[2]), (100, 50, "expired"))
+
+    def test_immutable_chain_rejects_changed_embedded_evidence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            original = make_candidate()
+            changed = make_candidate(target_price="12")
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (original.account_scope_id,),
+                )
+                store.insert_strategy_order_candidate(conn, original)
+                with self.assertRaisesRegex(ValueError, "immutable"):
+                    store.insert_strategy_order_candidate(conn, changed)
+                changed_result = PreTradeResult(**pre_trade_values(changed))
+                with self.assertRaisesRegex(ValueError, "candidate evidence"):
+                    store.insert_pre_trade_result(conn, changed_result)
+
+    def test_scope_registry_and_partial_reservation_are_exact(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                first = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                self.assertEqual(
+                    first,
+                    store.get_or_create_account_scope(
+                        conn, "joinquant", "primary",
+                    ),
+                )
+                self.assertEqual(__import__("uuid").UUID(first).version, 4)
+                with self.assertRaisesRegex(ValueError, "adapter"):
+                    store.get_or_create_account_scope(conn, "other", "primary")
+
     def test_schema_v10_marks_historical_fee_and_pnl_evidence_unknown(self) -> None:
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = Path(tmp) / "trading.db"
@@ -63,7 +450,7 @@ class TradingStoreTest(unittest.TestCase):
                     """SELECT fee_data_status, realized_pnl_status
                        FROM daily_equity WHERE trade_date='2026-07-14'"""
                 ).fetchone()
-            self.assertEqual(store.health().schema_version, 10)
+            self.assertEqual(store.health().schema_version, SCHEMA_VERSION)
             self.assertEqual(fill["fee_data_status"], "unknown")
             self.assertEqual(equity["fee_data_status"], "unknown")
             self.assertEqual(equity["realized_pnl_status"], "unknown")
