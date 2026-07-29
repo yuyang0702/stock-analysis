@@ -83,6 +83,22 @@ def _optional_text(value: object, name: str) -> str | None:
     return _text(value, name)
 
 
+def _evidence_status(value: object, name: str) -> str:
+    status = _text(value, name).lower()
+    if status not in {"available", "unavailable"}:
+        raise ValueError(f"{name} must be available or unavailable")
+    return status
+
+
+def _evidence_sha256(value: object, name: str, status: str) -> str:
+    text = _text(value, name)
+    if status == "unavailable":
+        if text.lower() != "not-applicable":
+            raise ValueError(f"{name} must be not-applicable when evidence is unavailable")
+        return "not-applicable"
+    return _sha256_text(text, name)
+
+
 def _date_text(value: object, name: str) -> str:
     result = _text(value, name)
     try:
@@ -1195,15 +1211,19 @@ class PreTradeResult:
     target_position_qty: int
     fee_schedule_version: str
     fee_schedule_sha256: str
+    fee_evidence_status: str
+    rule_evidence_status: str
     checked_at: str
     valid_until: str
-    estimated_cash_yuan: Decimal = ZERO
-    projected_position_value_yuan: Decimal = ZERO
-    projected_industry_value_yuan: Decimal = ZERO
-    projected_theme_value_yuan: Decimal = ZERO
-    projected_open_risk_yuan: Decimal = ZERO
+    projected_available_cash_yuan: Decimal
+    projected_single_position_value_yuan: Decimal
+    projected_total_position_value_yuan: Decimal
+    projected_industry_value_yuan: Decimal
+    projected_theme_value_yuan: Decimal
+    projected_uncategorized_value_yuan: Decimal
+    projected_open_risk_yuan: Decimal
+    actual_trade_risk_fraction: Decimal
     per_trade_risk_yuan: Decimal = ZERO
-    percentage_risk: Decimal = ZERO
     approved_limit_price: Decimal | None = None
     approved_price_cap: Decimal | None = None
     submission_attempt_id: str = "not-applicable"
@@ -1229,7 +1249,6 @@ class PreTradeResult:
         for name in (
             "pre_trade_result_id",
             "candidate_id",
-            "fee_schedule_version",
             "broker_snapshot_id",
             "quote_snapshot_id",
             "strategy_version",
@@ -1238,20 +1257,47 @@ class PreTradeResult:
             object.__setattr__(self, name, _text(getattr(self, name), name))
         object.__setattr__(
             self,
-            "fee_schedule_sha256",
-            _sha256_text(self.fee_schedule_sha256, "fee_schedule_sha256"),
+            "fee_evidence_status",
+            _evidence_status(self.fee_evidence_status, "fee_evidence_status"),
         )
-        for name in (
-            "broker_snapshot_sha256",
-            "quote_snapshot_sha256",
-            "instrument_rules_sha256",
-        ):
+        object.__setattr__(
+            self,
+            "rule_evidence_status",
+            _evidence_status(self.rule_evidence_status, "rule_evidence_status"),
+        )
+        fee_schedule_version = _text(self.fee_schedule_version, "fee_schedule_version")
+        if self.fee_evidence_status == "unavailable":
+            if fee_schedule_version.lower() != "not-applicable":
+                raise ValueError(
+                    "fee_schedule_version must be not-applicable when fee evidence is unavailable"
+                )
+            fee_schedule_version = "not-applicable"
+        object.__setattr__(self, "fee_schedule_version", fee_schedule_version)
+        object.__setattr__(
+            self,
+            "fee_schedule_sha256",
+            _evidence_sha256(
+                self.fee_schedule_sha256,
+                "fee_schedule_sha256",
+                self.fee_evidence_status,
+            ),
+        )
+        for name in ("broker_snapshot_sha256", "quote_snapshot_sha256"):
             value = _text(getattr(self, name), name)
             object.__setattr__(
                 self,
                 name,
                 "not-applicable" if value.lower() == "not-applicable" else _sha256_text(value, name),
             )
+        object.__setattr__(
+            self,
+            "instrument_rules_sha256",
+            _evidence_sha256(
+                self.instrument_rules_sha256,
+                "instrument_rules_sha256",
+                self.rule_evidence_status,
+            ),
+        )
         object.__setattr__(self, "allowed", _boolean(self.allowed, "allowed"))
         candidate = (
             self.candidate
@@ -1260,7 +1306,10 @@ class PreTradeResult:
         )
         if candidate.candidate_id != self.candidate_id:
             raise ValueError("candidate_id does not match normalized candidate")
-        if candidate.fee_schedule_version != self.fee_schedule_version:
+        if (
+            self.fee_evidence_status == "available"
+            and candidate.fee_schedule_version != self.fee_schedule_version
+        ):
             raise ValueError("fee_schedule_version does not match normalized candidate")
         if candidate.strategy_version != self.strategy_version:
             raise ValueError("strategy_version does not match normalized candidate")
@@ -1272,15 +1321,27 @@ class PreTradeResult:
         for name in ("approved_qty", "target_position_qty"):
             object.__setattr__(self, name, _qty(getattr(self, name), name))
         for name in (
-            "estimated_cash_yuan",
-            "projected_position_value_yuan",
+            "projected_available_cash_yuan",
+            "projected_single_position_value_yuan",
+            "projected_total_position_value_yuan",
             "projected_industry_value_yuan",
             "projected_theme_value_yuan",
+            "projected_uncategorized_value_yuan",
             "projected_open_risk_yuan",
             "per_trade_risk_yuan",
-            "percentage_risk",
+            "actual_trade_risk_fraction",
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        if self.actual_trade_risk_fraction > Decimal("1"):
+            raise ValueError("actual_trade_risk_fraction must not exceed 1")
+        for name in (
+            "projected_single_position_value_yuan",
+            "projected_industry_value_yuan",
+            "projected_theme_value_yuan",
+            "projected_uncategorized_value_yuan",
+        ):
+            if getattr(self, name) > self.projected_total_position_value_yuan:
+                raise ValueError(f"{name} must not exceed projected_total_position_value_yuan")
         for name in (
             "planned_stop_loss_yuan",
             "gap_loss_yuan",
@@ -1316,6 +1377,8 @@ class PreTradeResult:
         execution_fee = self.execution_fee
         if execution_fee is not None and not isinstance(execution_fee, FeeBreakdown):
             raise ValueError("execution_fee must be a FeeBreakdown")
+        if self.fee_evidence_status == "unavailable" and execution_fee is not None:
+            raise ValueError("execution_fee must be absent when fee evidence is unavailable")
         if execution_fee is not None and (
             execution_fee.schedule_version != self.fee_schedule_version
             or execution_fee.fee_schedule_sha256 != self.fee_schedule_sha256
@@ -1324,6 +1387,20 @@ class PreTradeResult:
         ):
             raise ValueError("execution_fee side, fee schedule contract or quantity mismatch")
         if self.allowed:
+            if candidate.side == "buy" and (
+                self.fee_evidence_status != "available"
+                or self.rule_evidence_status != "available"
+            ):
+                raise ValueError("allowed buy requires available fee and rule evidence")
+            if candidate.side == "sell":
+                required_warnings = {
+                    "fee_evidence_status": "SELL_FEE_EVIDENCE_UNAVAILABLE",
+                    "rule_evidence_status": "SELL_RULE_EVIDENCE_UNAVAILABLE",
+                }
+                for status_name, warning in required_warnings.items():
+                    unavailable = getattr(self, status_name) == "unavailable"
+                    if (warning in self.warnings) != unavailable:
+                        raise ValueError(f"{warning} must match {status_name}")
             if self.broker_snapshot_id.lower() == "not-applicable":
                 raise ValueError("allowed result requires broker_snapshot_id")
             if self.broker_snapshot_sha256 == "not-applicable":
@@ -1332,26 +1409,48 @@ class PreTradeResult:
                 raise ValueError("allowed result requires quote_snapshot_id")
             if self.quote_snapshot_sha256 == "not-applicable":
                 raise ValueError("allowed result requires quote_snapshot_sha256")
-            if self.instrument_rules_sha256 == "not-applicable":
+            if (
+                self.rule_evidence_status == "available"
+                and self.instrument_rules_sha256 == "not-applicable"
+            ):
                 raise ValueError("allowed result requires instrument_rules_sha256")
             if self.approved_qty <= 0:
                 raise ValueError("allowed result requires positive approved_qty")
             if self.submission_attempt_id.lower() == "not-applicable":
                 raise ValueError("allowed result requires submission_attempt_id")
-            if execution_fee is None:
+            if self.fee_evidence_status == "available" and execution_fee is None:
                 raise ValueError("allowed result requires execution_fee")
             if self.approved_limit_price is None and self.approved_price_cap is None:
                 raise ValueError("allowed result requires approved price protection")
             if candidate.side == "sell" and self.approved_limit_price is None:
                 raise ValueError("allowed sell result requires approved_limit_price")
+            if (
+                candidate.side == "buy"
+                and self.approved_price_cap != candidate.buy_price_cap
+            ):
+                raise ValueError("approved_price_cap does not match buy candidate")
+            if (
+                candidate.side == "sell"
+                and self.approved_limit_price != candidate.sell_limit_price
+            ):
+                raise ValueError("approved_limit_price does not match sell candidate")
+            if (
+                candidate.side == "sell"
+                and self.approved_price_cap != candidate.sell_price_floor
+            ):
+                raise ValueError("approved_price_cap does not match sell candidate")
             if self.approved_limit_price is not None and self.approved_price_cap is not None:
                 if candidate.side == "buy" and self.approved_limit_price > self.approved_price_cap:
                     raise ValueError("approved buy limit price must not exceed price cap")
                 if candidate.side == "sell" and self.approved_limit_price < self.approved_price_cap:
                     raise ValueError("approved sell limit price must not be below price cap")
-            if self.approved_limit_price is not None and execution_fee.price != self.approved_limit_price:
+            if (
+                execution_fee is not None
+                and self.approved_limit_price is not None
+                and execution_fee.price != self.approved_limit_price
+            ):
                 raise ValueError("execution_fee price does not match approved_limit_price")
-            if self.approved_price_cap is not None:
+            if execution_fee is not None and self.approved_price_cap is not None:
                 if (
                     candidate.side == "buy"
                     and self.approved_limit_price is None
@@ -1378,6 +1477,58 @@ class PreTradeResult:
                 ):
                     if getattr(self, name) is None:
                         raise ValueError(f"allowed buy result requires {name}")
+                if self.gap_price != candidate.buy_gap_price:
+                    raise ValueError("gap_price does not match buy candidate")
+            if candidate.side == "buy" and self.actual_trade_risk_fraction <= ZERO:
+                raise ValueError("allowed buy requires positive actual_trade_risk_fraction")
+            if candidate.side == "buy":
+                classification_projections = (
+                    (
+                        candidate.industry != UNCATEGORIZED,
+                        "projected_industry_value_yuan",
+                    ),
+                    (
+                        candidate.theme != UNCATEGORIZED,
+                        "projected_theme_value_yuan",
+                    ),
+                    (candidate.uncategorized, "projected_uncategorized_value_yuan"),
+                )
+                for applies, name in classification_projections:
+                    if applies and getattr(self, name) < self.projected_single_position_value_yuan:
+                        raise ValueError(
+                            f"{name} must include projected_single_position_value_yuan"
+                        )
+                if self.projected_open_risk_yuan < self.per_trade_risk_yuan:
+                    raise ValueError(
+                        "projected_open_risk_yuan must include per_trade_risk_yuan"
+                    )
+            if candidate.side == "sell" and self.actual_trade_risk_fraction != ZERO:
+                raise ValueError("allowed sell actual_trade_risk_fraction must be zero")
+        else:
+            if self.approved_qty != 0:
+                raise ValueError("rejected result approved_qty must be zero")
+            if self.submission_attempt_id.lower() != "not-applicable":
+                raise ValueError("rejected result submission_attempt_id must be not-applicable")
+            if self.approved_limit_price is not None or self.approved_price_cap is not None:
+                raise ValueError("rejected result cannot carry approved price protection")
+            absent_fields = (
+                "execution_fee",
+                "round_trip_cost",
+                "target_round_trip_cost",
+                "planned_stop_loss_yuan",
+                "gap_price",
+                "gap_round_trip_cost",
+                "gap_loss_yuan",
+                "fee_erosion_ratio",
+                "cost_to_expected_edge_ratio",
+            )
+            for name in absent_fields:
+                if getattr(self, name) is not None:
+                    raise ValueError(f"rejected result cannot carry {name}")
+            if self.per_trade_risk_yuan != ZERO:
+                raise ValueError("rejected result per_trade_risk_yuan must be zero")
+            if self.actual_trade_risk_fraction != ZERO:
+                raise ValueError("rejected result actual_trade_risk_fraction must be zero")
         if self.round_trip_cost is not None:
             if not isinstance(self.round_trip_cost, RoundTripCost):
                 raise ValueError("round_trip_cost must be a RoundTripCost")
@@ -1530,6 +1681,8 @@ class ExecutionIntent:
     model_version: str
     fee_schedule_version: str
     fee_schedule_sha256: str
+    fee_evidence_status: str
+    rule_evidence_status: str
     code: str
     side: str
     order_qty: int
@@ -1561,20 +1714,53 @@ class ExecutionIntent:
             "strategy_version",
             "parameter_version",
             "model_version",
-            "fee_schedule_version",
             "code",
             "broker_snapshot_id",
             "quote_snapshot_id",
         ):
             object.__setattr__(self, name, _text(getattr(self, name), name))
+        object.__setattr__(
+            self,
+            "fee_evidence_status",
+            _evidence_status(self.fee_evidence_status, "fee_evidence_status"),
+        )
+        object.__setattr__(
+            self,
+            "rule_evidence_status",
+            _evidence_status(self.rule_evidence_status, "rule_evidence_status"),
+        )
+        fee_schedule_version = _text(self.fee_schedule_version, "fee_schedule_version")
+        if self.fee_evidence_status == "unavailable":
+            if fee_schedule_version.lower() != "not-applicable":
+                raise ValueError(
+                    "fee_schedule_version must be not-applicable when fee evidence is unavailable"
+                )
+            fee_schedule_version = "not-applicable"
+        object.__setattr__(self, "fee_schedule_version", fee_schedule_version)
         for name in (
             "pre_trade_result_sha256",
-            "fee_schedule_sha256",
             "broker_snapshot_sha256",
             "quote_snapshot_sha256",
-            "instrument_rules_sha256",
         ):
             object.__setattr__(self, name, _sha256_text(getattr(self, name), name))
+        object.__setattr__(
+            self,
+            "fee_schedule_sha256",
+            _evidence_sha256(
+                self.fee_schedule_sha256,
+                "fee_schedule_sha256",
+                self.fee_evidence_status,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "instrument_rules_sha256",
+            _evidence_sha256(
+                self.instrument_rules_sha256,
+                "instrument_rules_sha256",
+                self.rule_evidence_status,
+            ),
+        )
         object.__setattr__(self, "side", _side(self.side))
         object.__setattr__(self, "order_qty", _qty(self.order_qty, "order_qty", positive=True))
         for name in ("expected_current_qty", "target_position_qty"):
@@ -1618,6 +1804,8 @@ class ExecutionIntent:
             ("pre_trade_result_id", self.pre_trade_result_id, result.pre_trade_result_id),
             ("pre_trade_result_sha256", self.pre_trade_result_sha256, result.result_sha256),
             ("submission_attempt_id", self.submission_attempt_id, result.submission_attempt_id),
+            ("fee_evidence_status", self.fee_evidence_status, result.fee_evidence_status),
+            ("rule_evidence_status", self.rule_evidence_status, result.rule_evidence_status),
             ("fee_schedule_version", self.fee_schedule_version, result.fee_schedule_version),
             ("fee_schedule_sha256", self.fee_schedule_sha256, result.fee_schedule_sha256),
             ("broker_snapshot_id", self.broker_snapshot_id, result.broker_snapshot_id),
@@ -1641,7 +1829,6 @@ class ExecutionIntent:
             "strategy_version",
             "parameter_version",
             "model_version",
-            "fee_schedule_version",
             "code",
             "side",
             "signal_time",
@@ -1693,6 +1880,8 @@ class ExecutionIntent:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> ExecutionIntent:
         values = dict(value)
+        if set(values) != {field.name for field in fields(cls)}:
+            raise ValueError("execution intent fields do not match the signed contract")
         values["intent_sha256"] = _sha256_text(
             values.get("intent_sha256"), "intent_sha256"
         )
