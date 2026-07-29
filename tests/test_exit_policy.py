@@ -129,6 +129,12 @@ class ExitPolicyTest(unittest.TestCase):
         self.assertEqual(normal, 10.0)
         self.assertEqual(caution, 5.0)
         self.assertEqual(risk_off, 0.0)
+        self.assertEqual(exit_policy.trade_risk_budget_pct("main_low", "NORMAL"), 0.65)
+        self.assertEqual(exit_policy.trade_risk_budget_pct("main_active", "CAUTION"), 0.25)
+        self.assertEqual(exit_policy.trade_risk_budget_pct("growth", "RISK_OFF"), 0.0)
+        self.assertEqual(exit_policy.strict_market_regime("弱势震荡"), "CAUTION")
+        self.assertEqual(exit_policy.strict_market_regime("BROKEN"), "")
+        self.assertEqual(exit_policy.market_regime("BROKEN"), "NORMAL")
 
     def test_build_buy_execution_plan_is_single_two_r_contract(self) -> None:
         plan = exit_policy.build_buy_execution_plan(

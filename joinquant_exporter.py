@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,14 @@ from typing import Any
 import pandas as pd
 
 import config as app_config
-from exit_policy import EXECUTION_PLAN_VERSION, build_buy_execution_plan, market_regime
+from execution_contracts import InstrumentRules
+from exit_policy import (
+    EXECUTION_PLAN_VERSION,
+    build_buy_execution_plan,
+    market_regime,
+    strict_market_regime,
+    trade_risk_budget_pct,
+)
 from pre_trade_check import PortfolioState, RiskLimits, evaluate_observation
 from ml_contracts import canonical_hash
 from ml_dataset import FEATURE_COLUMNS, append_signal_samples, record_candidate_batch
@@ -20,7 +29,7 @@ from ml_store import MlCapacityError, MlDataConflict, MlStore
 from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore, canonical_json
 from trade_safety import tradability_reject_reason
 from gap_reentry import (
-    GapReentryInput, estimated_limit_up_price, evaluate_gap_reentry,
+    GapReentryDecision, GapReentryInput, estimated_limit_up_price, evaluate_gap_reentry,
     minimum_lot_position,
 )
 
@@ -58,8 +67,12 @@ _REJECTION_STAGES = {
         "buy_risk_disallowed", "buy_bad_position", "buy_open_risk_limit",
         "buy_sector_limit", "buy_theme_limit", "buy_uncategorized_limit",
         "buy_insufficient_available_cash", "buy_total_position_limit",
-        "buy_too_small_for_board_lot",
+        "buy_too_small_for_board_lot", "buy_single_position_limit",
         "gap_reentry_min_lot_risk_exceeded", "gap_reentry_insufficient_cash",
+        "gap_reentry_per_trade_risk_exceeded",
+        "gap_reentry_portfolio_open_risk_exceeded",
+        "gap_reentry_per_trade_and_portfolio_risk_exceeded",
+        "gap_reentry_fee_schedule_required",
         "gap_reentry_pending_order", "gap_reentry_current_risk_disallowed",
     },
     "execution": {
@@ -151,29 +164,33 @@ def _prepare_gap_reentry_row(
         attempts += 1
         first_open_at = ""
         first_open_price = 0.0
-    decision = evaluate_gap_reentry(GapReentryInput(
-        trade_date=trade_date,
-        code=code,
-        parent_signal_id=_text(parent.get("id")),
-        batch_id=run_id or generated_at,
-        now=generated_at,
-        price=price,
-        limit_up_price=limit_up,
-        original_entry_price=original_entry,
-        original_stop_price=original_stop,
-        market_state=market_regime(_text(row.get("market_state"))),
-        current_score=_num(row.get("final_score")),
-        required_score=max(min_score, 85.0) if market_regime(_text(row.get("market_state"))) == "CAUTION" else min_score,
-        quote_age_sec=_num(row.get("quote_age_sec")),
-        first_open_at=first_open_at,
-        first_open_price=first_open_price,
-        first_batch_id=_text((existing or {}).get("first_batch_id")),
-        confirmation_count=int((existing or {}).get("confirmation_count") or 0),
-        attempt_count=attempts,
-        at_limit=locked,
-        resealed=resealed,
-        buy_enabled=allow_buy,
-    ))
+    normalized_market_state = strict_market_regime(_text(row.get("market_state")))
+    try:
+        decision = evaluate_gap_reentry(GapReentryInput(
+            trade_date=trade_date,
+            code=code,
+            parent_signal_id=_text(parent.get("id")),
+            batch_id=run_id or generated_at,
+            now=generated_at,
+            price=price,
+            limit_up_price=limit_up,
+            original_entry_price=original_entry,
+            original_stop_price=original_stop,
+            market_state=normalized_market_state,
+            current_score=_num(row.get("final_score")),
+            required_score=max(min_score, 85.0) if normalized_market_state == "CAUTION" else min_score,
+            quote_age_sec=_num(row.get("quote_age_sec")),
+            first_open_at=first_open_at,
+            first_open_price=first_open_price,
+            first_batch_id=_text((existing or {}).get("first_batch_id")),
+            confirmation_count=int((existing or {}).get("confirmation_count") or 0),
+            attempt_count=attempts,
+            at_limit=locked,
+            resealed=resealed,
+            buy_enabled=allow_buy,
+        ))
+    except (TypeError, ValueError):
+        decision = GapReentryDecision("INELIGIBLE", "gap_reentry_parent_invalid")
     opportunity_id = _text((existing or {}).get("opportunity_id")) or (
         f"gap-{trade_date.replace('-', '')}-{code}-{_text(parent.get('id'))[:12]}"
     )
@@ -453,6 +470,12 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
     if not allow_buy:
         return "buy_disabled"
     risk_enabled = app_config.JOINQUANT_PORTFOLIO_RISK_ENABLE_DEFAULT
+    try:
+        current_open_risk_pct = float(current_open_risk_pct)
+    except (TypeError, ValueError):
+        return "buy_risk_disallowed"
+    if not math.isfinite(current_open_risk_pct) or current_open_risk_pct < 0:
+        return "buy_risk_disallowed"
     if current_position_count >= app_config.JOINQUANT_MAX_POSITIONS_DEFAULT:
         return "buy_max_positions"
     if risk_enabled:
@@ -498,10 +521,13 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
         and _text(row.get("gap_reentry_state")) != "OPEN_CONFIRMED"
     ):
         return _text(row.get("gap_reentry_reason")) or "gap_reentry_parent_invalid"
-    regime = market_regime(_text(row.get("market_state")))
+    gap_reentry = _confirmed_gap_reentry(row)
+    strict_regime = strict_market_regime(_text(row.get("market_state")))
+    if gap_reentry and not strict_regime:
+        return "gap_reentry_current_risk_disallowed"
+    regime = strict_regime if gap_reentry else market_regime(_text(row.get("market_state")))
     if regime == "RISK_OFF":
         return "buy_disabled"
-    gap_reentry = _confirmed_gap_reentry(row)
     if gap_reentry and price > _num(row.get("reentry_cap_price")):
         return "gap_reentry_too_far"
     tradability_reason = tradability_reject_reason(row) if app_config.JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT else ""
@@ -524,21 +550,37 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
     if stop <= 0 or stop >= entry:
         return "buy_invalid_stop_loss"
     open_risk_limit = app_config.MAX_OPEN_RISK_CAUTION_PCT if regime == "CAUTION" else app_config.MAX_OPEN_RISK_NORMAL_PCT
-    if account_total_value > 0 and account_total_value * adjusted_position_pct / 100.0 < entry * 100:
+    if account_total_value > 0 and account_total_value * adjusted_position_pct / 100.0 <= entry * 100:
         if not gap_reentry:
             return "buy_too_small_for_board_lot"
+        plan_board = _text(plan.get("board_type"))
+        if plan_board not in {"main_low", "main_active", "growth"}:
+            return "buy_execution_plan_invalid"
         lot = minimum_lot_position(
             entry_price=entry, stop_price=stop, account_value=account_total_value,
             available_cash=float(available_cash or 0),
-            risk_budget_pct=max(0.0, open_risk_limit - current_open_risk_pct),
+            per_trade_risk_yuan=Decimal(str(
+                account_total_value
+                * trade_risk_budget_pct(plan_board, regime)
+                / 100.0
+            )),
+            remaining_open_risk_yuan=Decimal(str(
+                account_total_value
+                * max(0.0, open_risk_limit - current_open_risk_pct)
+                / 100.0
+            )),
             current_position_pct=current_position_pct,
             max_total_position_pct=app_config.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT,
+            rules=InstrumentRules.a_share(clean_code(row.get("code"))),
             max_single_position_pct=app_config.MAX_SINGLE_POSITION_PCT,
+            fees=app_config.SIMULATION_FEE_SCHEDULE,
         )
         if not lot.allowed:
             return lot.reason
-        adjusted_position_pct = lot.position_pct
-        row["position_pct"] = lot.position_pct
+        row["gap_reentry_open_risk_pct"] = lot.risk_pct
+        row["gap_reentry_cash_required_yuan"] = lot.cash_required_yuan
+        adjusted_position_pct = float(lot.position_pct)
+        row["position_pct"] = adjusted_position_pct
         row["target_qty"] = lot.qty
     sector = _industry(row)
     theme = _theme(row)
@@ -753,9 +795,14 @@ def export_signals(
                 current_position_count += 1
                 current_position_pct += float(signal.get("position_pct") or 0)
                 entry = float(signal.get("entry_price") or 0)
-                current_open_risk_pct += float(signal.get("position_pct") or 0) * max(
-                    entry - float(signal.get("stop_loss") or entry), 0,
-                ) / entry if entry > 0 else 0
+                gap_open_risk_pct = _num(row.get("gap_reentry_open_risk_pct"))
+                current_open_risk_pct += (
+                    gap_open_risk_pct
+                    if _confirmed_gap_reentry(row) and gap_open_risk_pct > 0
+                    else float(signal.get("position_pct") or 0) * max(
+                        entry - float(signal.get("stop_loss") or entry), 0,
+                    ) / entry if entry > 0 else 0
+                )
                 sector = _industry(row)
                 if sector:
                     sector_exposure_pct = dict(sector_exposure_pct or {})
@@ -768,7 +815,12 @@ def export_signals(
                     sector_exposure_pct = dict(sector_exposure_pct or {})
                     sector_exposure_pct[UNCATEGORIZED] = sector_exposure_pct.get(UNCATEGORIZED, 0) + float(signal.get("position_pct") or 0)
                 if available_cash is not None:
-                    available_cash -= account_total_value * float(signal.get("position_pct") or 0) / 100.0
+                    gap_cash_required = _num(row.get("gap_reentry_cash_required_yuan"))
+                    available_cash -= (
+                        gap_cash_required
+                        if _confirmed_gap_reentry(row) and gap_cash_required > 0
+                        else account_total_value * float(signal.get("position_pct") or 0) / 100.0
+                    )
                 sample_rows.append((row, signal))
             elif _is_sell(row) and _has_holding(row) and allow_sell:
                 sell = _sell_signal(row, run_id, index)

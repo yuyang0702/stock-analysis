@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from dataclasses import FrozenInstanceError, fields, replace
-from decimal import Decimal
+from decimal import Decimal, Inexact, ROUND_DOWN, ROUND_UP, Rounded, localcontext
 
 from execution_contracts import FeeSchedule, InstrumentRules, RoundTripCost
 from position_sizing import (
@@ -54,6 +55,10 @@ def allocate(**changes: object):
 
 
 class PositionSizingTest(unittest.TestCase):
+    def test_allocator_keeps_its_public_signature(self) -> None:
+        self.assertEqual(allocate_buy_quantity.__name__, "allocate_buy_quantity")
+        self.assertIn("entry_price", inspect.signature(allocate_buy_quantity).parameters)
+
     def test_allocator_searches_down_by_lot_and_freezes_exact_fee_evidence(self) -> None:
         result = allocate()
 
@@ -82,6 +87,16 @@ class PositionSizingTest(unittest.TestCase):
         self.assertEqual(result.target_cost.sell.stamp_tax_yuan, D("1.03"))
         self.assertEqual(result.fee_schedule_version, FEES.version)
         self.assertEqual(result.fee_schedule_sha256, FEES.contract_sha256)
+        self.assertEqual(result.available_cash_yuan, D("12000"))
+        self.assertEqual(result.capacity_max_qty, 1300)
+        self.assertEqual(result.entry_price, D("10"))
+        self.assertEqual(result.planned_stop_price, D("9.5"))
+        self.assertEqual(result.gap_scenario_price, D("9"))
+        self.assertEqual(result.equity_yuan, D("50000"))
+        self.assertEqual(result.risk_pct, D("0.01"))
+        self.assertEqual(result.expected_gross_return, D("0.03"))
+        self.assertEqual(result.fee_schedule, FEES)
+        self.assertEqual(result.instrument_rules, RULES_100)
 
     def test_planned_stop_can_be_the_worst_loss_scenario(self) -> None:
         result = allocate(gap_price=D("9.8"))
@@ -138,6 +153,69 @@ class PositionSizingTest(unittest.TestCase):
         )
         self.assertEqual(one_cent_short.reasons, ("CASH_CAPACITY_EXCEEDED",))
 
+    def test_decision_recomputes_cash_and_board_lot_rejections(self) -> None:
+        allowed = allocate()
+        cash_rejected = allocate(available_cash=D("1"))
+        no_board_lot = allocate(capacity=CapacityBudget(50, D("500")))
+
+        for value, changes in (
+            (cash_rejected, {"reasons": ("NO_BOARD_LOT",)}),
+            (
+                allowed,
+                {
+                    "allowed": False,
+                    "target_qty": 0,
+                    "reasons": ("CASH_CAPACITY_EXCEEDED",),
+                },
+            ),
+            (
+                allowed,
+                {"available_cash_yuan": allowed.buy_cash_required_yuan - D("0.01")},
+            ),
+            (allowed, {"capacity_max_qty": allowed.target_qty - 1}),
+            (no_board_lot, {"capacity_max_qty": 100}),
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(value, **changes)
+
+        for changes in (
+            {"available_cash_yuan": D("NaN")},
+            {"capacity_max_qty": True},
+            {"instrument_rules": None},
+            {
+                "instrument_rules": InstrumentRules.a_share(
+                    "600000", buy_min_qty=300, buy_qty_step=100,
+                ),
+            },
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(allowed, **changes)
+
+    def test_decision_replays_the_full_descending_quantity_search(self) -> None:
+        one_lot = allocate(
+            risk_cap_yuan=D("1000"),
+            capacity=CapacityBudget(100, D("1000")),
+            expected_gross_return=D("0.10"),
+            max_cost_edge_ratio=D("0.5"),
+        )
+        uneconomic_one_lot = allocate(
+            risk_cap_yuan=D("1000"),
+            capacity=CapacityBudget(100, D("1000")),
+        )
+
+        self.assertTrue(one_lot.allowed)
+        self.assertEqual(one_lot.target_qty, 100)
+        self.assertEqual(
+            uneconomic_one_lot.reasons,
+            ("ECONOMIC_EDGE_INSUFFICIENT",),
+        )
+        with self.assertRaises(ValueError):
+            replace(one_lot, capacity_max_qty=1300)
+        with self.assertRaises(ValueError):
+            replace(uneconomic_one_lot, capacity_max_qty=1300)
+
     def test_rejection_reasons_are_complete_and_in_fixed_order(self) -> None:
         result = allocate(
             stop_price=D("9.5"),
@@ -167,6 +245,26 @@ class PositionSizingTest(unittest.TestCase):
         )
 
         self.assertEqual(result.reasons, ("INVALID_STOP_DISTANCE",))
+        self.assertEqual(
+            allocate(
+                stop_price=D("-1"),
+                expected_gross_return=D("0.10"),
+                max_cost_edge_ratio=D("0.5"),
+            ).reasons,
+            ("INVALID_STOP_DISTANCE",),
+        )
+        self.assertEqual(
+            allocate(
+                gap_price=D("-1"),
+                expected_gross_return=D("0.10"),
+                max_cost_edge_ratio=D("0.5"),
+            ).reasons,
+            ("INVALID_STOP_DISTANCE",),
+        )
+        self.assertEqual(
+            allocate(stop_price=D("-1"), fees=None).reasons,
+            ("FEE_SCHEDULE_REQUIRED", "INVALID_STOP_DISTANCE"),
+        )
 
     def test_trade_and_portfolio_risk_reasons_are_independent(self) -> None:
         trade = allocate(
@@ -216,6 +314,49 @@ class PositionSizingTest(unittest.TestCase):
         self.assertFalse(result.economic_trade_allowed)
         self.assertEqual(result.target_cost.sell.price, D("10.050"))
 
+    def test_rule_target_price_floors_to_the_instrument_tick(self) -> None:
+        result = allocate(entry_price=D("10.01"))
+
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.rule_target_price, D("10.31"))
+        self.assertEqual(result.target_cost.sell.price, D("10.31"))
+
+    def test_allocator_and_decision_ignore_external_decimal_context(self) -> None:
+        decisions = []
+        for precision in (8, 12, 28):
+            for rounding in (ROUND_DOWN, ROUND_UP):
+                with localcontext() as context:
+                    context.prec = precision
+                    context.rounding = rounding
+                    decisions.append(allocate(
+                        expected_gross_return=D("0.0319999999"),
+                        max_cost_edge_ratio=D("0.24"),
+                    ))
+        self.assertTrue(all(decision == decisions[0] for decision in decisions))
+        with localcontext() as context:
+            context.traps[Inexact] = True
+            context.traps[Rounded] = True
+            self.assertEqual(
+                allocate(
+                    expected_gross_return=D("0.0319999999"),
+                    max_cost_edge_ratio=D("0.24"),
+                ),
+                decisions[0],
+            )
+
+        precise = allocate(
+            stop_price=D("9.987654321"),
+            gap_price=D("9.87654321"),
+            risk_cap_yuan=D("1000"),
+            capacity=CapacityBudget(1100, D("1000")),
+            expected_gross_return=D("0.10"),
+            max_cost_edge_ratio=D("0.5"),
+        )
+        with localcontext() as context:
+            context.prec = 5
+            context.rounding = ROUND_DOWN
+            self.assertEqual(replace(precise), precise)
+
     def test_rule_target_price_must_pass_instrument_price_rules(self) -> None:
         limited_rules = InstrumentRules.a_share("600000", limit_up_price=D("10.20"))
         result = allocate(
@@ -225,6 +366,15 @@ class PositionSizingTest(unittest.TestCase):
         )
 
         self.assertEqual(result.reasons, ("ECONOMIC_EDGE_INSUFFICIENT",))
+        with self.assertRaises(ValueError):
+            replace(
+                result,
+                allowed=True,
+                reasons=(),
+                target_qty=result.evaluated_qty,
+                target_rule_valid=True,
+                economic_trade_allowed=True,
+            )
 
     def test_missing_fee_schedule_rejects_without_fabricated_costs(self) -> None:
         result = allocate(fees=None)
@@ -233,6 +383,8 @@ class PositionSizingTest(unittest.TestCase):
         self.assertIsNone(result.buy_fee)
         self.assertIsNone(result.planned_stop_cost)
         self.assertEqual(result.fee_schedule_version, "")
+        with self.assertRaises(ValueError):
+            replace(result, target_rule_valid=True)
 
     def test_non_finite_stop_rejects_and_other_non_finite_inputs_raise(self) -> None:
         self.assertEqual(
@@ -265,6 +417,8 @@ class PositionSizingTest(unittest.TestCase):
             "worst_case_loss_yuan", "rule_target_price", "gross_edge_yuan",
             "expected_net_pnl_yuan", "fee_erosion_ratio",
             "cost_to_expected_edge_ratio", "max_cost_edge_ratio",
+            "available_cash_yuan", "entry_price", "planned_stop_price",
+            "gap_scenario_price", "equity_yuan", "risk_pct",
         )
         bad_changes = (
             {"allowed": "yes"},
@@ -272,7 +426,10 @@ class PositionSizingTest(unittest.TestCase):
             {"reasons": ("PER_TRADE_RISK_EXCEEDED",)},
             {"target_qty": -1},
             {"evaluated_qty": 0},
+            {"target_rule_valid": "yes"},
             {"economic_trade_allowed": False},
+            {"expected_gross_return": D("NaN")},
+            {"fee_schedule": None},
         )
         for changes in bad_changes:
             with self.subTest(changes=changes):
@@ -331,11 +488,80 @@ class PositionSizingTest(unittest.TestCase):
             },
             {"fee_schedule_version": "other"},
             {"fee_schedule_sha256": "0" * 64},
+            {"target_rule_valid": False},
         )
         for changes in bad_changes:
             with self.subTest(changes=changes):
                 with self.assertRaises(ValueError):
                     replace(result, **changes)
+
+        cash_rejected = allocate(
+            available_cash=D("0"),
+            expected_gross_return=D("0.10"),
+            max_cost_edge_ratio=D("0.5"),
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                cash_rejected,
+                reasons=("ECONOMIC_EDGE_INSUFFICIENT",),
+                available_cash_yuan=D("12000"),
+                economic_trade_allowed=False,
+            )
+
+        economic_rejected = allocate(
+            risk_cap_yuan=D("1000"),
+            capacity=CapacityBudget(100, D("1000")),
+            expected_gross_return=D("0.005"),
+            max_cost_edge_ratio=D("0.35"),
+        )
+        richer_target = allocate(
+            risk_cap_yuan=D("1000"),
+            capacity=CapacityBudget(100, D("1000")),
+            expected_gross_return=D("0.05"),
+            max_cost_edge_ratio=D("0.35"),
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                economic_rejected,
+                allowed=True,
+                reasons=(),
+                target_qty=economic_rejected.evaluated_qty,
+                rule_target_price=richer_target.rule_target_price,
+                target_cost=richer_target.target_cost,
+                gross_edge_yuan=richer_target.gross_edge_yuan,
+                expected_net_pnl_yuan=richer_target.expected_net_pnl_yuan,
+                fee_erosion_ratio=richer_target.fee_erosion_ratio,
+                cost_to_expected_edge_ratio=richer_target.cost_to_expected_edge_ratio,
+                target_rule_valid=True,
+                economic_trade_allowed=True,
+            )
+
+        risk_rejected = allocate(
+            risk_cap_yuan=D("80"),
+            capacity=CapacityBudget(100, D("200")),
+            expected_gross_return=D("0.10"),
+            max_cost_edge_ratio=D("0.5"),
+        )
+        tighter_stops = allocate(
+            stop_price=D("9.9"),
+            gap_price=D("9.85"),
+            risk_cap_yuan=D("80"),
+            capacity=CapacityBudget(100, D("200")),
+            expected_gross_return=D("0.10"),
+            max_cost_edge_ratio=D("0.5"),
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                risk_rejected,
+                allowed=True,
+                reasons=(),
+                target_qty=risk_rejected.evaluated_qty,
+                planned_stop_cost=tighter_stops.planned_stop_cost,
+                gap_cost=tighter_stops.gap_cost,
+                planned_stop_loss_yuan=tighter_stops.planned_stop_loss_yuan,
+                gap_loss_yuan=tighter_stops.gap_loss_yuan,
+                worst_case_loss_yuan=tighter_stops.worst_case_loss_yuan,
+            )
 
     def test_rejected_sizing_decision_enforces_audited_evidence_identity(self) -> None:
         result = allocate(

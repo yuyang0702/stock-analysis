@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ import pandas as pd
 import a_share_strategy
 import exit_policy
 import joinquant_exporter
+from execution_contracts import scenario_loss_yuan
 from ml_store import MlCapacityError, MlStore
 from trading_store import TradingStore
 
@@ -63,6 +65,51 @@ class JoinQuantExporterTest(unittest.TestCase):
                 ),
                 "gap_reentry_too_far",
             )
+            self.assertEqual(
+                joinquant_exporter._buy_reject_reason(
+                    pd.Series({**row.to_dict(), "market_state": "BROKEN"}),
+                    75,
+                ),
+                "gap_reentry_current_risk_disallowed",
+            )
+
+    def test_unknown_gap_market_state_blocks_buy_but_not_same_batch_sell(self) -> None:
+        rows = pd.DataFrame([
+            {
+                "code": "002432", "price": 76.0, "entry_price": 76.0,
+                "stop_loss": 72.0, "take_profit": 84.0, "position_pct": 1.5,
+                "final_score": 90, "market_state": "BROKEN", "atr14": 2.0,
+                "entry_path": "gap_reentry", "gap_reentry_state": "OPEN_CONFIRMED",
+                "parent_signal_id": "old", "reentry_cap_price": 77.0,
+            },
+            {
+                "code": "600001", "price": 9.5, "signal_action": "hard_stop",
+                "has_holding": True, "risk_reason": "hard_stop",
+                "market_state": "BROKEN",
+            },
+        ])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter.app_config, "GAP_REENTRY_ENABLE_DEFAULT", True,
+        ):
+            base = Path(tmp)
+            output = joinquant_exporter.export_signals(
+                rows,
+                run_id="strict-gap-market",
+                output_path=base / "signals.json",
+                account_total_value=100_000,
+                available_cash=100_000,
+                store=TradingStore(base / "trading.db"),
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            [(signal["code"], signal["action"]) for signal in payload["signals"]],
+            [("600001", "sell")],
+        )
+        self.assertEqual(
+            payload["diagnostics"]["reject_reasons"],
+            {"gap_reentry_current_risk_disallowed": 1},
+        )
 
     def test_gap_reentry_allows_one_lot_within_risk_budget(self) -> None:
         row = pd.Series({
@@ -97,8 +144,94 @@ class JoinQuantExporterTest(unittest.TestCase):
             ), "gap_reentry_insufficient_cash")
             self.assertEqual(joinquant_exporter._buy_reject_reason(
                 row.copy(), 75, account_total_value=100_000, available_cash=10_000,
-                current_open_risk_pct=3.6,
-            ), "gap_reentry_min_lot_risk_exceeded")
+                current_open_risk_pct=3.7,
+            ), "gap_reentry_portfolio_open_risk_exceeded")
+            self.assertEqual(joinquant_exporter._buy_reject_reason(
+                pd.Series({**row.to_dict(), "atr14": 4.0}), 75,
+                account_total_value=100_000, available_cash=10_000,
+            ), "gap_reentry_per_trade_risk_exceeded")
+            self.assertEqual(joinquant_exporter._buy_reject_reason(
+                pd.Series({**row.to_dict(), "atr14": 4.0}), 75,
+                account_total_value=100_000, available_cash=10_000,
+                current_open_risk_pct=3.7,
+            ), "gap_reentry_per_trade_and_portfolio_risk_exceeded")
+            self.assertEqual(joinquant_exporter._buy_reject_reason(
+                pd.Series({
+                    **row.to_dict(),
+                    "execution_plan_version": joinquant_exporter.EXECUTION_PLAN_VERSION,
+                    "board_type": "unknown",
+                    "market_regime": "NORMAL",
+                }),
+                75, account_total_value=100_000, available_cash=10_000,
+            ), "buy_execution_plan_invalid")
+            self.assertEqual(joinquant_exporter._buy_reject_reason(
+                pd.Series({**row.to_dict(), "market_state": "CAUTION"}), 75,
+                account_total_value=100_000, available_cash=10_000,
+            ), "gap_reentry_per_trade_risk_exceeded")
+            self.assertEqual(joinquant_exporter._buy_reject_reason(
+                row.copy(), 75, account_total_value=100_000,
+                available_cash=10_000, current_open_risk_pct=-0.01,
+            ), "buy_risk_disallowed")
+            self.assertEqual(joinquant_exporter._buy_reject_reason(
+                pd.Series({
+                    **row.to_dict(),
+                    "position_pct": 3.0,
+                    "execution_plan_version": joinquant_exporter.EXECUTION_PLAN_VERSION,
+                    "board_type": "unknown",
+                    "market_regime": "NORMAL",
+                }),
+                75, account_total_value=100_000, available_cash=10_000,
+            ), "buy_execution_plan_invalid")
+
+    def test_gap_reentry_batch_reserves_true_risk_and_buy_cash(self) -> None:
+        rows = pd.DataFrame([
+            {
+                "code": code, "price": 10.0, "entry_price": 10.0,
+                "stop_loss": 9.9, "take_profit": 10.2, "position_pct": 0.5,
+                "final_score": score, "market_state": "NORMAL", "atr14": 0.3,
+                "entry_path": "gap_reentry", "gap_reentry_state": "OPEN_CONFIRMED",
+                "parent_signal_id": f"parent-{code}", "reentry_cap_price": 10.1,
+                "execution_plan_version": joinquant_exporter.EXECUTION_PLAN_VERSION,
+                "board_type": "main_active", "market_regime": "NORMAL",
+            }
+            for code, score in (("600001", 99), ("600002", 98))
+        ])
+        fees = joinquant_exporter.app_config.SIMULATION_FEE_SCHEDULE
+        costs = fees.estimate_round_trip(Decimal("10"), Decimal("9.9"), 100)
+        lot_risk_pct = float(
+            scenario_loss_yuan(Decimal("10"), Decimal("9.9"), 100, costs)
+            / Decimal("100000") * 100
+        )
+        buy_fee = float(costs.buy.total_yuan)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter.app_config, "GAP_REENTRY_ENABLE_DEFAULT", True,
+        ):
+            base = Path(tmp)
+            risk_path = joinquant_exporter.export_signals(
+                rows.copy(), run_id="gap-risk-batch", output_path=base / "risk.json",
+                account_total_value=100_000, available_cash=100_000,
+                current_open_risk_pct=4.0 - 1.5 * lot_risk_pct,
+                store=TradingStore(base / "risk.db"),
+            )
+            cash_path = joinquant_exporter.export_signals(
+                rows.copy(), run_id="gap-cash-batch", output_path=base / "cash.json",
+                account_total_value=100_000,
+                available_cash=2_000 + 1.5 * buy_fee,
+                store=TradingStore(base / "cash.db"),
+            )
+            risk_payload = json.loads(risk_path.read_text(encoding="utf-8"))
+            cash_payload = json.loads(cash_path.read_text(encoding="utf-8"))
+        self.assertEqual([item["code"] for item in risk_payload["signals"]], ["600001"])
+        self.assertEqual(
+            risk_payload["diagnostics"]["reject_reasons"],
+            {"gap_reentry_portfolio_open_risk_exceeded": 1},
+        )
+        self.assertEqual([item["code"] for item in cash_payload["signals"]], ["600001"])
+        self.assertEqual(
+            cash_payload["diagnostics"]["reject_reasons"],
+            {"gap_reentry_insufficient_cash": 1},
+        )
 
     def test_export_confirms_gap_only_on_second_distinct_scan(self) -> None:
         store = TradingStore(Path(self._ledger_tmp.name) / "trading.db")

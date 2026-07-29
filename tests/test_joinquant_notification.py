@@ -59,11 +59,12 @@ class JoinQuantNotificationTest(unittest.TestCase):
             "dry_run": False,
             "signals": [],
             "diagnostics": {
-                "candidate_count": 3,
+                "candidate_count": 4,
                 "allow_buy": False,
                 "min_score": 75.0,
                 "reject_reasons": {
                     "buy_disabled": 2,
+                    "gap_reentry_per_trade_and_portfolio_risk_exceeded": 1,
                     "sell_without_holding": 1,
                 },
             },
@@ -71,8 +72,9 @@ class JoinQuantNotificationTest(unittest.TestCase):
 
         md = a_share_strategy.build_joinquant_dry_run_markdown(payload)
 
-        self.assertIn("候选 3 只", md)
+        self.assertIn("候选 4 只", md)
         self.assertIn("非交易时间禁止买入 2", md)
+        self.assertIn("最小一手同时超过单笔和组合风险 1", md)
         self.assertIn("未持仓不卖出 1", md)
 
 

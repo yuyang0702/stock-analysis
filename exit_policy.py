@@ -88,13 +88,19 @@ def exit_priority(reason_or_action: str) -> int:
     }.get(normalize_exit_action(reason_or_action), 0)
 
 
-def market_regime(value: str) -> str:
+def strict_market_regime(value: str) -> str:
     text = str(value or "").strip()
     if text in {"RISK_OFF", "风险释放"}:
         return "RISK_OFF"
     if text in {"CAUTION", "弱势震荡"}:
         return "CAUTION"
-    return "NORMAL"
+    if text in {"NORMAL", "强势进攻", "温和修复"}:
+        return "NORMAL"
+    return ""
+
+
+def market_regime(value: str) -> str:
+    return strict_market_regime(value) or "NORMAL"
 
 
 def initial_stop_price(
@@ -175,11 +181,17 @@ def risk_position_pct(
     if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price or market_state == "RISK_OFF":
         return 0.0
     stop_distance_pct = (entry_price - stop_price) / entry_price * 100
-    risk_budget_pct = _BOARD_RISK_BUDGET.get(board, 0.5)
+    risk_budget_pct = trade_risk_budget_pct(board, market_state)
     position_pct = min(original_cap_pct, risk_budget_pct / stop_distance_pct * 100)
-    if market_state == "CAUTION":
-        position_pct *= 0.5
     return round(max(position_pct, 0.0), 2)
+
+
+def trade_risk_budget_pct(board: str, market_state: str) -> float:
+    regime = market_regime(market_state)
+    if regime == "RISK_OFF":
+        return 0.0
+    budget = _BOARD_RISK_BUDGET.get(board, 0.5)
+    return budget * 0.5 if regime == "CAUTION" else budget
 
 
 def build_buy_execution_plan(

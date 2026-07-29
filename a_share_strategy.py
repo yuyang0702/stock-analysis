@@ -3330,7 +3330,12 @@ def build_joinquant_dry_run_markdown(payload: dict[str, Any]) -> str:
                 "gap_reentry_resealed": "开板后回封，确认已重置",
                 "gap_reentry_too_far": "超过二次入场价格上限",
                 "gap_reentry_min_lot_risk_exceeded": "最小一手风险超限",
+                "gap_reentry_per_trade_risk_exceeded": "最小一手超过单笔风险预算",
+                "gap_reentry_portfolio_open_risk_exceeded": "最小一手超过组合剩余风险",
+                "gap_reentry_per_trade_and_portfolio_risk_exceeded": "最小一手同时超过单笔和组合风险",
+                "gap_reentry_fee_schedule_required": "最小一手缺少有效费用参数",
                 "gap_reentry_insufficient_cash": "最小一手现金不足",
+                "buy_single_position_limit": "超过单票仓位上限",
                 "sell_without_holding": "未持仓不卖出",
             }
             summary = "；".join(
