@@ -16,7 +16,12 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             app_dir = Path(temp_dir)
-            for name in ("run_ubuntu.sh", "config.py", "trading_store.py"):
+            for name in (
+                "run_ubuntu.sh",
+                "config.py",
+                "trading_store.py",
+                "ledger_check.py",
+            ):
                 shutil.copy2(name, app_dir / name)
             venv_python = app_dir / ".venv" / "bin" / "python"
             venv_python.parent.mkdir(parents=True)
