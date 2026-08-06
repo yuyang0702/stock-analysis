@@ -13,9 +13,9 @@
 - Task 1 complete and independently approved: shared candidate scoring and immutable strict-time ML contracts.
 - Task 2 complete and independently approved: bounded independent ML SQLite schema v1, state, backup and integrity primitives.
 - Task 3 complete and independently approved: complete live five-minute cohorts, post-ledger provenance, strict replay refusal and disabled-by-default wiring.
-- Tasks 4–10 are implemented locally in the current worktree: strict historical imports, cost-aware labels, leakage-safe training data, five-head challenger bundles, manual governance, verified L0 runtime, and bounded reports/maintenance.
-- Task 11 local full verification, documentation truth and security review is in progress. Task 12 server deployment, L0 enablement and trading-day observation is not authorized and has not run.
-- Current Batch C delta state: `implemented locally / not committed / not deployed / not observed / not validated`. Tasks 1–3 remain the earlier pushed foundation. No real one-year strict dataset evidence, trustworthy/approvable trained model, human approval, active model or server L0 evidence exists; ML does not affect trading.
+- Tasks 4–10 are implemented, committed and deployed as inactive server code: strict historical imports, cost-aware labels, leakage-safe training data, five-head challenger bundles, manual governance, verified L0 runtime, and bounded reports/maintenance.
+- Task 11 full verification, documentation truth and security review is complete, including Linux 1003/1003. Task 12 has completed dependency/server-code deployment only; L0 enablement and trading-day observation have not run.
+- Current Batch C state: `implemented / committed / server code deployed / model not deployed / not observed / not validated`. ML remains `enabled=0 / max_level=0 / dataset_configured=no`. No real one-year strict dataset evidence, trustworthy/approvable trained model, human approval, active model or server L0 evidence exists; ML does not affect trading.
 
 The step checkboxes below are retained as the implementation procedure and historical review trail; they do not override this current status snapshot.
 
@@ -839,7 +839,7 @@ Expected: clean. Suggested authorized commit: `feat: operate shadow model eviden
 
 ---
 
-### Task 11: Documentation Truth, Full Verification and Security Review — in progress locally
+### Task 11: Documentation Truth, Full Verification and Security Review — completed 2026-08-06
 
 **Files:**
 - Modify: `docs/project_roadmap.md`
@@ -904,7 +904,7 @@ Expected: clean. Suggested authorized commit: `docs: record trained shadow model
 
 ---
 
-### Task 12: Separately Authorized Server Deployment and L0 Observation — not authorized / not started
+### Task 12: Separately Authorized Server Deployment and L0 Observation — server code deployed; L0/observation not started
 
 **Files:**
 - No additional source files unless deployment evidence exposes a defect.

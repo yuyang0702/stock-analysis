@@ -1,10 +1,6 @@
 # 数据存储、文件增长与保留规范
 
-> 2026-08-05 schema 11 小资金执行增量和 schema 12 通知 outbox 均仅在本地功能分支实现，状态为 `implemented（本地功能分支，未提交） / not deployed / not observed / not validated`。最后有文档证据的服务器正式库仍是 schema 10；服务器、远端 Git 和 JoinQuant 的实时状态仍须部署前重新核验。schema 11/12 未经各自单独授权不得迁移，也不能因本地测试通过写成已部署。
-
-> 2026-08-05 Batch B Tasks 1–7 把未提交本地目标升级为 schema 12：通知 outbox/gap、逻辑计划/TTL、来源事务生产者、租约 worker、有限重试、歧义证据、保留/清理/容量控制、CRITICAL 交易分钟复报、规则影子退役、systemd 路由、详细 `ledger-check`、人工解除 CLI、备份 manifest 和外键恢复校验已实现。Linux bash 脚本复验、提交/推送、schema 11→12 迁移、部署、真实通知观察和 20 日验证仍未完成；服务器仍保持上段 schema 10 外部基线。
-
-> 2026-08-06 Batch C ML-7 存储检查点：Tasks 4–10 的 strict 历史读取、标签、训练帧、五头模型包、治理、L0 旁路和维护代码已在本地实现，状态为 `implemented（本地未提交）`；Task 11 本地总验收进行中；Task 12 未授权/未运行。Batch C 整体为 `not committed / not deployed / not observed / not validated`。没有真实一年/365 天 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。`cache/ml/ml.db`、`cache/backtest/history.db` 和 `cache/ml/models/` 的容量/备份规则仍是设计约束，不能据本地文件或 synthetic 测试推断服务器已有数据。
+> 2026-08-06 最新存储检查点：schema 11/12 增量与 Batch C ML-7 Tasks 4–10 已随 `5d2c4a2018ca95b9febd6751b4964fec507fe1bc` 部署服务器，正式交易库 schema 12。Linux 全量测试 1003/1003、`ledger-check` 健康/可写、迁移后在线备份 `/opt/stock-analysis-backups/daily/trading-2026-08-06-afbde6491e4d.db`（7,221,248 bytes、`integrity_check=ok`）、环境哈希和核心服务均通过。通知 outbox 已由 worker 消费 3 条，pending/dead/gap=0。ML 代码和依赖已部署但运行仍关闭，数据集未配置，标签/训练/ML 与历史库备份 timer 未启用；不能据部署推断已有真实 strict 数据、模型包或 L0 证据。当前为 `implemented / committed / deployed / not observed / not validated`。
 
 > 2026-07-26 schema 10 运行证据增量已推送并部署服务器：只给 `fills` 增加 `fee_data_status`，给 `daily_equity` 增加 `fee_data_status` 与 `realized_pnl_status`，历史值幂等回填 `unknown`；只有来源明确声明 `fee_data_status=reported` 且三个费用字段均可解析时才标记 `reported`，旧模板合成的兼容0仍为 `unknown`。不重建表、不猜测历史收益。`strategy_runs` 每轮一行；超过366天且无信号引用的空/失败运行由既有每日清理删除，有信号引用的运行长期保留，`signals` 只填充既有列。按约40轮/交易日估算约1万运行行/年，进入现有SQLite备份和年度容量复核。通知失败队列复用原文件，最多100项、保留30天、pending最多5次后转dead；旧 `errcode=40058` 直接转dead，避免部署后重放旧消息。没有新增逐扫描文件、秘密字段或第三方依赖。服务器部署前 schema 9 备份、迁移后 schema 10 备份及隔离恢复演练完整性均为 `ok`，表计数一致。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
@@ -101,7 +97,7 @@
 - 必须有在线备份、完整性检查和恢复演练。
 - 任何删除或压缩必须基于明确的审计和策略验证要求。
 
-Batch G 半自动参数复核计划使用同一 SQLite 保存不可变参数版本、聚合评价、人工决定和激活/回滚事件。该范围当前仅为 `planned`，不属于最后记录的服务器 schema 10 或本地 Batch A schema 11。报告不是审批事实源，`output/parameter_review_latest.md` 只允许原子覆盖；不得为每轮扫描或每个参数组合新增 JSONL/独立文件。
+Batch G 半自动参数复核计划使用同一 SQLite 保存不可变参数版本、聚合评价、人工决定和激活/回滚事件。该范围当前仍仅为 `planned`，不属于已部署的服务器 schema 12。报告不是审批事实源，`output/parameter_review_latest.md` 只允许原子覆盖；不得为每轮扫描或每个参数组合新增 JSONL/独立文件。
 
 ### 3.3 事件历史
 
@@ -199,7 +195,7 @@ output/
 | 账户权益摘要 | 长期 | 可压缩 | 长期保留 |
 | 盘中扫描文件 | 30天 | 180天压缩 | 每日最终版长期 |
 | 策略信号样本 | 长期 | 定期备份 | 逐步迁入SQLite |
-| ML五分钟候选、标签和预测 | 目标为最近400个自然日热数据；当前不自动归档/清理 | 标签完整后按年度只读归档（planned / not implemented） | 独立 `cache/ml/ml.db`；目标低于1GB/年，超过1GB/年告警，超过2GB/年暂停新增明细并人工评审；容量保护、备份和手工维护入口已在本地实现，服务器数据、真实一年 strict 数据和活动模型均不存在 |
+| ML五分钟候选、标签和预测 | 目标为最近400个自然日热数据；当前不自动归档/清理 | 标签完整后按年度只读归档（planned / not implemented） | 独立 `cache/ml/ml.db`；容量保护、备份和手工维护代码已部署，但 ML 关闭、数据集未配置，真实一年 strict 数据和活动模型均无证据 |
 | SQLite交易账本 | 长期 | 多级备份 | 不按日志清理 |
 | 历史回测库 | 长期、可重建 | 独立备份或从有版本的数据源重建 | 年度目标低于2GB；达到3GB导入上限即拒绝，不自动删除；不得写入正式交易账本 |
 | 参数版本、评价和人工决定 | 长期 | 随SQLite多级备份 | 低频审计数据；每次最多5个候选，不复制全量行情/订单 |
@@ -356,10 +352,10 @@ SQLite WAL持续异常增长：warning
 
 高频账户摘要保留366天热数据；订单、逐笔成交、日权益、控制事件、异常对账及其引用快照长期保留。清理每日最多运行一次，只删除超过热保留期且没有异常对账引用的账户快照与无差异摘要；未来压缩或扩大清理范围必须另行设计、dry-run并人工授权。
 
-`TradingStore.backup_to`、目标连接显式关闭、项目外路径保护、原子发布、SHA-256、`PRAGMA integrity_check`、schema/核心计数、7份每日/4份每周/12份每月保留、保守清理、隔离季度恢复演练、latest/季度报告、告警复用和 systemd 模板已在 `origin/main` 中 `implemented（已推送）`。服务器 timer 安装和自动证据状态待重新只读核验，因此仍为 `not observed / not validated`；原“运行治理能力部分实现”的结论不变。
+`TradingStore.backup_to`、目标连接显式关闭、项目外路径保护、原子发布、SHA-256、`PRAGMA integrity_check`、schema/核心计数、7份每日/4份每周/12份每月保留、保守清理、隔离恢复演练、latest/季度报告、告警复用和 systemd 模板已部署。2026-08-06 迁移后 schema 12 在线备份完整性通过；timer 连续运行和季度恢复演练仍为 `not observed / not validated`。
 历史状态快照（2026-07-14）：本规范已经生效，但运行治理能力仍为部分实现。schema 6完整账本、366天热保留、自动对账、控制审计以及自动备份/恢复演练均已随提交 `9f4c12d` 进入 `origin/main`，并包含在当时服务器检查点 `52b3653` 中；该次部署前完整备份/校验成功，部署后 schema 6 健康可写且三个核心服务 active。`health_history.jsonl`、`api_events.jsonl`、盘中扫描文件、备份 timer 连续证据和恢复演练仍需只读核验。因此该历史服务器代码为 `deployed`，运行治理仍为 `not observed / not validated`。
 
-2026-07-14 通知与复盘增量（历史服务器基线）：执行回报复用长期 `fills` 唯一约束，只在当前事务内返回少量新成交，不新增通知表、JSONL 或逐轮报告；失败通知继续沿用成功后移除的队列。`signal_watchlist.json` 调整为原子覆盖、20个自然日热保留和500条硬上限，目标低于1 MB。该增量已包含在 2026-07-14 当时服务器检查点 `52b3653` 中，状态为 `implemented（已推送） / deployed / not observed / not validated`；Batch B 本地 schema 12 outbox 已取代其通知存储方案，尚未部署。
+2026-07-14 通知与复盘增量（历史服务器基线）：执行回报复用长期 `fills` 唯一约束，只在当前事务内返回少量新成交，不新增通知表、JSONL 或逐轮报告；失败通知继续沿用成功后移除的队列。`signal_watchlist.json` 调整为原子覆盖、20个自然日热保留和500条硬上限，目标低于1 MB。该增量已包含在 2026-07-14 当时服务器检查点 `52b3653` 中，状态为 `implemented（已推送） / deployed / not observed / not validated`；2026-08-06 部署的 Batch B schema 12 SQLite outbox 已取代其活动通知存储方案，旧 JSON 仅保留显式 legacy audit。
 
 2026-07-14 五项执行正确性 P0 增量不改变 SQLite schema version 6，不新增表、数据库、JSONL、逐轮快照或第三方依赖。持仓与挂单分类从现有 `signals.raw_json`、`position_cycles` 和 `orders` 做有界查询；执行计划版本和分类只随既有信号 JSON 保存，退出续执行复用现有 `exit_intents`。因此长期增长、366天热保留、备份和7/4/12轮转策略均不变。该增量已随 `52b3653` 推送并部署；部署前备份完整性通过，部署后 `ledger-check` 仍为 schema version 6 且健康可写。当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
@@ -367,7 +363,7 @@ SQLite WAL持续异常增长：warning
 
 ### 14.2 2026-07-15 ML-7 训练型影子模型计划增量
 
-2026-07-16 状态（历史）：实施计划 Task 1–3 已实现并推送，包含独立 schema v1、容量/并发/备份边界和完整实时候选采集。该历史状态已被 2026-08-06 检查点取代：Tasks 4–10 为 `implemented（本地未提交）`，Task 11 本地总验收进行中，Task 12 未授权/未运行；服务器尚未创建或启用该库。Batch C 整体严格为 `not committed / not deployed / not observed / not validated`。详细设计见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`。
+2026-07-16 状态（历史）：实施计划 Task 1–3 已实现并推送，包含独立 schema v1、容量/并发/备份边界和完整实时候选采集。该历史状态已被 2026-08-06 部署检查点取代：Tasks 4–10 已实现、提交并部署，Task 11 已完成；Task 12 只完成代码与依赖部署，ML 未启用、数据集未配置且没有真实模型证据。详细设计见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`。
 
 - 高频候选、标签、预测和模型登记使用独立 `cache/ml/ml.db`，不得写入正式 `cache/trading/trading.db`。
 - strict 历史行情和历史五分钟候选继续位于 `cache/backtest/history.db`，训练按日期读取，不复制进 ML 库。
@@ -381,7 +377,7 @@ SQLite WAL持续异常增长：warning
 
 ### 14.3 2026-08-01 schema 11 小资金执行增量
 
-schema 11 在正式交易库中增加以下两类数据；当前都只是本地实现：
+schema 11 曾在正式交易库设计中增加以下两类数据；这些结构现已随 schema 12 部署服务器：
 
 - 当前态：`broker_snapshot_current`、`broker_position_current`、`broker_order_current`。每个账户作用域只保留一个完整当前快照及其当前持仓、当前订单子集，更新时在同一事务覆盖，不按五分钟批次追加历史。
 - 长期身份与审计：持久账户身份 `account_scopes`，以及 `strategy_order_candidates`、`pre_trade_results`、`execution_intents`、`capacity_reservations`、`position_capacity_adoptions`、持仓周期盈利保护时间和对账账户/快照证据。稳定 ID 重放不得新增行；拒绝只落候选和结果，允许后才落意图与预留。
@@ -395,11 +391,11 @@ schema 11 在正式交易库中增加以下两类数据；当前都只是本地�
 - 正式交易库继续沿用年度新增连索引目标低于200MB、超过300MB/年或2MB/日告警的口径。当前代码只在备份 manifest 记录 `source_size`，尚未实现年度行数和增长率自动告警；自动容量告警为 `planned / not implemented`，发布前仍须人工比较备份证据。schema 11 审计链不得为满足容量而静默丢弃、改写或无证据清理；扩大限额或新增清理必须另行设计、dry-run、备份并人工授权。
 - 当前代码不清理候选、结果、意图、预留或收养证据；它们按交易审计数据长期保留。366天热保留和异常引用保护仅指既有 `account_snapshots` 历史；三个 `broker_*_current` 表只保存覆盖式当前状态，不形成快照历史。
 
-备份边界如下：
+首次 schema 10→11 迁移的历史备份边界如下；当前服务器已经是 schema 12，未来迁移不得直接复用这些版本断言：
 
-- 备份工具同时识别 schema 10 和 11。迁移前备份必须证明来源仍为 schema 10，并记录 SHA-256、`integrity_check=ok` 和完整核心表计数。
-- 迁移后必须重新生成 schema 11 备份，核对全部新增表、盈利保护列、对账证据列和表计数，再对该副本执行隔离恢复演练。
-- schema 10 的迁移前备份是失败回滚依据，不能被迁移后的同名文件覆盖；只回滚 Git 而继续使用 schema 11 主库不构成安全回滚。
+- 当时备份工具同时识别 schema 10 和 11；迁移前备份必须证明来源仍为 schema 10，并记录 SHA-256、`integrity_check=ok` 和完整核心表计数。
+- 当时迁移后必须重新生成 schema 11 备份，核对全部新增表、盈利保护列、对账证据列和表计数，再对该副本执行隔离恢复演练。2026-08-06 最终部署已继续迁移到 schema 12，并生成完整性为 `ok` 的迁移后在线备份。
+- schema 10 的迁移前备份是当次失败回滚依据，不能被迁移后的同名文件覆盖；只回滚 Git 而继续使用更高 schema 主库不构成安全回滚。未来迁移同理必须保存目标版本对应的迁移前副本。
 - `stock-analysis.env`、Token、Webhook 和私钥不进入交易库备份清单；部署只比较私有配置文件哈希，不输出或改写其内容。
 
 ### 存储治理 Batch A：低风险性能优化

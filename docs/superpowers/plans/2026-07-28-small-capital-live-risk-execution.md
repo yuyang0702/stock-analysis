@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.11+, dataclasses, Decimal, sqlite3, pandas, existing unittest suite and JoinQuant template.
 
-**Status:** Batch A Tasks 1-8 are `implemented（local feature branch; not merged or pushed） / not deployed / not observed / not validated`. Tasks 1-3 are committed on this feature branch; Tasks 4-8 remain uncommitted. The release commit, Linux evidence and every external action require separate authorization.
+**Status (2026-08-06):** Batch A Tasks 1-8 are `implemented / committed / deployed / not observed / not validated`. The integrated release is contained in `5d2c4a2`; Linux full-suite evidence is 1003/1003 and the formal trading store is schema 12 after Batch B. The JoinQuant website template was not changed in this deployment, and the new sizing/exit semantics still require representative trading-day evidence.
 
-**Local evidence (2026-08-01):** Task 1 contracts, Task 2 exact sizing and Task 3 schema/current-state/reconciliation are locally committed on this feature branch. Task 4 has the pure unified decision pipeline. Task 5 adds atomic candidate/result/intent/reservation/READY admission, scoped current broker evidence, fail-closed replay, safe expiry/terminal release, partial-fill adjustment, protected-sell retry boundaries and full-reconciliation-only unknown-submission recovery. Task 6 connects ordinary JoinQuant buys to current quote refresh, exact admission and quantity-only execution; the signal server revalidates current controls and the complete immutable intent before delivery. Task 7 adds ceiling-half `+2R` targets, one-lot next-batch profit protection, causal fill-confirmed stage progression, consistent risk consumers and point-in-time strict-backtest semantics under execution-plan version `2026-08-01.1-small-capital-live-risk`. Task 8 expanded compilation/focused coverage passed `559/559`, including configurable `observe/enforce`; full Windows discovery passed `766/769`, with only the three Linux-script tests unable to start because Windows has no `bash.exe`. Documentation and deployment preparation are synchronized, but Tasks 4-8 are not yet committed. None of this is deployment, JoinQuant website update, trading-session observation or strategy validation evidence.
+**Evidence:** The 2026-08-01 local evidence remains the implementation trail: focused coverage passed 559/559 and Windows discovery passed 766/769, with only three Linux-script cases unavailable on Windows. On 2026-08-06 the integrated Linux suite passed 1003/1003, the code was committed/pushed and deployed, schema 12 `ledger-check` passed, and the private environment hash remained unchanged. None of this is JoinQuant website-template confirmation, trading-session observation or strategy validation evidence.
 
 ## Global Constraints
 
@@ -683,11 +683,11 @@ Local evidence (2026-08-01): full discovery ran `769` tests; `766` passed and on
 
 - [x] **Step 3: Update documents truthfully**
 
-Record schema 11, exact quantity, atomic admission and profit-protection implementation as `implemented / not deployed / not observed / not validated`. Keep old P0 as already deployed but not automatically validated. State that changed sizing/exit semantics require strict backtest and representative JoinQuant trading-day evidence before real money.
+Record schema 11, exact quantity, atomic admission and profit-protection implementation as `implemented / committed / deployed / not observed / not validated`; the structures are now part of final schema 12. Keep old P0 as already deployed but not automatically validated. State that changed sizing/exit semantics require strict backtest and representative JoinQuant trading-day evidence before real money.
 
-Local evidence (2026-08-01): the roadmap, handoff, live execution, read-only observation, storage, ledger/risk/P0/gap bridge documents, integrated design and Linux deployment runbook now separate the local schema 11 checkpoint from the last recorded schema 10 server checkpoint.
+Deployment evidence (2026-08-06): the roadmap, handoff, live execution, read-only observation, storage, ledger/risk/P0/gap bridge documents, integrated design and Linux deployment runbook now record the schema 12 server checkpoint `5d2c4a2`, Linux 1003/1003, verified backup and unchanged private-environment hash. JoinQuant website content and trading-day behavior remain separate observation gates.
 
-- [ ] **Step 4: Commit only after separate authorization**
+- [x] **Step 4: Commit only after separate authorization**
 
 ```bash
 git diff --name-only
@@ -698,8 +698,8 @@ git commit -m "docs: record small-capital execution implementation"
 
 不得直接暂存整个 `docs/superpowers/specs`、`docs/superpowers/plans` 或工作树；并行批次和私有文件必须排除。提交仍需当次单独授权。
 
-## Deployment And Observation Boundary
+## Deployment And Observation Boundary — deployment complete; observation pending
 
-Implementation alone does not authorize deployment. A separately authorized deployment must preserve the private environment hash, create and verify an online schema-10 backup before migration, run Linux focused/full tests against isolated databases, migrate to schema 11, run `ledger-check`, create a post-migration backup, perform an isolated restore and restart only authorized stock services. The JoinQuant website template is deployed only after its actual editor content and reported template version match.
+The separately authorized deployment preserved the private environment hash, ran Linux full tests, migrated through the Batch A structures into final schema 12, ran `ledger-check`, created a verified post-migration backup and restarted only authorized stock services. The JoinQuant website template is not covered by that server deployment and must still be confirmed from its actual editor content and reported template version.
 
 The new sizing and `+2R` behavior become `observed` only after real simulation-session evidence. They become `validated` only after strict historical comparison and representative completed position cycles; tests and a non-trading-day deployment cannot substitute for those facts.

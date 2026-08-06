@@ -6,7 +6,7 @@
 >
 > 主文档：`docs/project_roadmap.md`。
 
-> 2026-08-01 增量边界：`docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md` 的 Batch A 已在本地功能分支实现 schema 11、账户作用域当前券商快照、不可变候选/盘前结果/执行意图、容量预留、精确数量和盈利保护；完整批次尚未形成最终提交，且未部署、未观察、未验证。本文件既有的订单/成交、幂等、对账、交易控制、备份及 schema 6–10 历史基线继续有效。
+> 2026-08-06 增量边界：`docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md` 的 Batch A/B 已随 `5d2c4a2` 部署为 schema 12，包含账户作用域当前券商快照、不可变候选/盘前结果/执行意图、容量预留、精确数量、盈利保护和事务通知 outbox。Linux 1003/1003、`ledger-check`、迁移后备份和环境哈希已核验；新语义仍未观察或验证。本文件既有的订单/成交、幂等、对账、交易控制、备份及 schema 6–10 内容继续作为历史基线。
 
 > 2026-07-15 后续增量见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`：schema 7 将退出等待从即时 `EXIT_INTENT_MISMATCH/ERROR` 改为送达、提交、成交和市场阻塞状态，并仅允许对账所有权下的受限自动恢复买入。该增量已随 `e2ce5b5` 推送并部署服务器，用户报告 JoinQuant 网站模板已手动更新；截至该检查点为 `implemented（已推送） / deployed / not observed / not validated`。本文件下述 schema 6 内容保留为历史基线。
 
@@ -152,7 +152,7 @@ bash run_ubuntu.sh resume-buy --reason "..."
 
 ## 1. 原始基线设计（保留追溯）
 
-本节至第 17 节保留 2026-07-11 的 Batch 1 原始设计和观察口径，用于解释 schema 1 的服务器历史检查点；schema 6 也是后续完整账本的历史基线。当前本地 schema 11 增量、强制模拟盘风险规则、部署顺序和历史回测状态分别以本文顶部增量说明、2026-07-28 整合 spec/Batch A plan、分层退出专项和逐日历史回测 spec/plan 为准。旧基线中的“后续、未实现或观察模式”不得覆盖这些当前文档。
+本节至第 17 节保留 2026-07-11 的 Batch 1 原始设计和观察口径，用于解释 schema 1 的服务器历史检查点；schema 6 也是后续完整账本的历史基线。当前 schema 12 增量、强制模拟盘风险规则、部署顺序和历史回测状态分别以本文顶部增量说明、2026-07-28 整合 spec/Batch A/B plans、分层退出专项和逐日历史回测 spec/plan 为准。旧基线中的“后续、未实现或观察模式”不得覆盖这些当前文档。
 
 ### 1.1 目标与范围
 

@@ -1,8 +1,6 @@
 # 项目接管与新环境恢复说明
 
-> 2026-08-05 本地功能分支检查点：`feature/live-readiness-integration` 已完成 Batch A Tasks 1–8 与 Batch B Tasks 1–7 的本地实现和 Windows 专项验证；Batch B 新增 schema 12 通知 outbox/gap、来源事务生产者、稳定计划/TTL、租约 worker、有限重试、容量控制、CRITICAL 复报、规则影子退役、systemd 路由、详细 `ledger-check` 和带事件键校验的人工解除 CLI。Tasks 尚未合并、推送或部署；当前 Windows 缺少 `bash.exe`，3 个 Linux 脚本测试仍需 Linux 复验，故整体仍为 `implemented（本地） / not deployed / not observed / not validated`。本检查点没有修改配置、Token、服务器、JoinQuant 或 QMT。最后可引用的外部检查点仍是下段 2026-07-26 记录；服务器实时状态必须重新核验。
-
-> 2026-08-06 Batch C ML-7 检查点：Tasks 4–10 已在当前工作树本地实现（strict 五分钟历史导入、成本标签、训练帧/切分、五头模型包、人工治理、校验推理/L0 旁路和维护报告），状态为 `implemented（本地未提交）`；Task 11 本地总验收、文档真值和安全复审正在进行；Task 12 的服务器部署、L0 启用和交易日观察未获授权且未运行。Batch C 整体严格为 `not committed / not deployed / not observed / not validated`。没有真实一年/365 天 strict 数据证据、可信/可批准训练模型、人工审批、活动模型或服务器 L0 证据；本地/synthetic 测试不等于这些外部事实。
+> 2026-08-06 最新接管检查点：Batch A Tasks 1–8、Batch B Tasks 1–7 与 Batch C ML-7 Tasks 4–10 已合并并推送到 `origin/main`，服务器已部署 `5d2c4a2018ca95b9febd6751b4964fec507fe1bc`，正式库 schema 12。服务器 Linux 全量测试 1003/1003、`ledger-check` 健康/可写、迁移后在线备份完整性、环境文件哈希不变、三个核心服务 active、通知 timer active 且路由到 `notification_worker.py --once` 均已核验；outbox 部署后 sent=3、pending/dead/gap=0。Task 11 已完成。Task 12 只完成代码/依赖部署，ML 仍为 `enabled=0 / max_level=0 / dataset_configured=no`，标签、训练和 ML/history 备份 timer 未启用，未形成真实一年 strict 数据、可信/可批准模型、人工审批、活动模型或服务器 L0 证据。当前严格状态为 `implemented / committed / deployed / not observed / not validated`；JoinQuant 网站模板、Token、Webhook、私钥和 `stock-analysis.env` 内容均未在本次任务中修改。
 
 > 2026-07-26 运行证据完整性修复部署检查点：本地、`origin/main` 和服务器均已快进到
 `68d7283da758e7afe8107278a33e245005eee585`，三项核心服务 active，实际/期望
@@ -68,7 +66,7 @@ warning 及以上日志均已核验。当前为
 
 > 上一服务器外部检查点（用户提供）：2026-07-14 20:06，服务器 HEAD 为 `131118213f22bbdaecd5cd8ab89a87db9aaf7f85`，分支与 `origin/main` 一致且干净；SQLite schema 6 完整性/可写检查通过，环境文件哈希未变，三个核心服务均 active。该历史检查点已被本次 `52b3653` 服务器与 JoinQuant 部署证据取代，但仍可用于追溯部署前基线。
 
-> 2026-07-16 ML-7 基础增量（历史）：实施计划 Task 1–3 已实现并推送，包括共享候选评分/严格样本契约、独立有界 `cache/ml/ml.db` schema v1、以及完整五分钟实时候选采集与发布来源审计；Windows 可运行回归 402 项和 Linux 静态测试 2 项通过，最终独立审查无 Critical/Important/Minor。该历史状态随后由 2026-08-06 本地检查点取代；服务器尚无 ML-7 部署或运行证据，`ML_TRAINED_SHADOW_ENABLE` 默认关闭；尚未形成可信/可批准或活动模型。Task 12 以及外部观察仍需单独授权。
+> 2026-07-16 ML-7 基础增量（历史）：实施计划 Task 1–3 已实现并推送，包括共享候选评分/严格样本契约、独立有界 `cache/ml/ml.db` schema v1、以及完整五分钟实时候选采集与发布来源审计；Windows 可运行回归 402 项和 Linux 静态测试 2 项通过，最终独立审查无 Critical/Important/Minor。该历史状态已被 2026-08-06 部署检查点取代：Tasks 4–10 已提交并部署为关闭状态代码，Task 11 已完成；Task 12 仅完成代码/依赖部署，L0 与交易日观察仍需单独授权。当前尚未形成可信/可批准或活动模型。
 
 > 本文件用于新电脑、新Codex对话和跨环境交接，是一个可提交到Git的时间点快照。`docs/project_roadmap.md`仍是唯一主文档；如两者冲突，以主文档为准。服务器、JoinQuant和运行数据状态必须重新验证，不能仅凭本文件认定为当前事实。
 
@@ -101,8 +99,8 @@ Git不能恢复：
 - 每5分钟健康检查、微信异常报警和失败通知重试。
 - SQLite Batch 1策略运行、信号和观察型风控账本。
 - JSON/SQLite信号一致性检查和readiness报告。
-- 信号样本、历史规则影子兼容字段、策略对照和信号级回测；当前本地 Batch B 已退役规则影子活动计算，训练模型尚不存在。
-- ML-7 Tasks 1–3 是既有已推送基础；Tasks 4–10（strict 导入、标签、训练帧、五头模型、治理、L0 旁路和维护）已在本地实现且未提交；默认关闭且尚未部署、观察或验证。
+- 信号样本、历史规则影子兼容字段、策略对照和信号级回测；Batch B 已在服务器退役规则影子活动计算，训练模型尚不存在。
+- ML-7 Tasks 1–10 代码已部署；strict 导入、标签、训练帧、五头模型、治理、L0 旁路和维护入口默认关闭，尚未形成真实数据、活动模型、观察或验证证据。
 - 分层退出、组合风险和可交易性保护，以及自动备份恢复基础。
 - Codex只读观察与阶段评估方案。
 - 数据存储、文件增长与保留规范。
@@ -159,18 +157,18 @@ git ls-remote origin refs/heads/main
 | JoinQuant信号与模拟下单 | deployed | 信号拉取、委托和网站策略状态。 |
 | 订单回报与持仓同步 | deployed | 快照回传、实际成交和持仓一致性。 |
 | 健康检查和微信异常报警 | deployed | timer、报告、告警和失败重试。 |
-| SQLite Batch 1 | deployed（历史基础） | schema 1 双写能力仍包含在后续版本中；服务器最后记录的实际基线已推进到 schema 10。 |
-| SQLite schema 7完整执行账本 | deployed（历史中间版本） | schema 6完整账本曾由 `e2ce5b5` 幂等迁移到7；当前外部基线以 2026-07-26 的 schema 10 记录为准。 |
+| SQLite Batch 1 | deployed（历史基础） | schema 1 双写能力仍包含在后续版本中；服务器当前记录的正式基线已推进到 schema 12。 |
+| SQLite schema 7完整执行账本 | deployed（历史中间版本） | schema 6完整账本曾由 `e2ce5b5` 幂等迁移到7；当前外部基线以 2026-08-06 的 schema 12 记录为准。 |
 | 自动对账、人工解锁与受限自动恢复 | deployed | ERROR停买、CRITICAL熔断、两次不同新鲜快照、CAS 与所有权边界已部署；尚未观察或验证。 |
 | 成交回报幂等与 D+N 全量复盘 | deployed | 新 fill/legacy 增量触发、统一服务器时间、完整行情和分片复盘已随 `52b3653` 部署；尚未观察或验证。 |
 | 完整历史回测 | deployed（框架） | 与信号级回测并存且代码已在服务器；真实 6 个月/1 年 strict 数据尚未导入、运行或人工验证。 |
-| 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板的旧基线） | 旧五项 P0 已部署但未观察/验证；Batch A 的统一强制准入和精确数量只在本地实现，尚未部署。 |
-| ML-7 训练型影子模型 | implemented（Tasks 1–3 已推送；Tasks 4–10 本地未提交） | strict 导入、标签、训练帧、五头模型包、治理、L0 旁路和维护代码已在本地实现；Task 11 本地总验收进行中，Task 12 未授权/未运行。服务器未部署且默认关闭；没有可信/可批准或活动模型，不得写成 deployed/observed/validated。 |
+| 模拟盘买卖强制风控 | deployed（服务器代码；网站模板待核验） | 旧五项 P0 与 Batch A 的统一强制准入、原子容量预留和精确数量代码均已部署；JoinQuant 网站模板未在本次部署中修改，端到端新语义仍未观察/验证。 |
+| ML-7 训练型影子模型 | server code deployed / model not deployed | strict 导入、标签、训练帧、五头模型包、治理、L0 旁路和维护代码及依赖已部署；Task 11 已完成，Task 12 只完成代码/依赖部署。ML 默认关闭且数据集未配置，没有可信/可批准或活动模型，不得写成 model deployed/observed/validated。 |
 | 统一有效止损与交易运行面板 | deployed | schema 8、成交后只收紧校验、manual/trailing/effective stop、认证面板和 OCR 删除已部署；网站模板由用户确认更新，但新快照和真实卖出仍未观察或验证。 |
 | 跳空越价后二次确认入场 | deployed（服务器与网站模板，功能已开启） | schema 9、二次确认、精确一手、部分成交撤余单和机会账本已部署；开关已开启且模板一致，但机会账本为空，未观察、未验证。 |
 | 运行证据完整性修复 | deployed（服务器） | `68d7283`、Linux 457/457、schema 10、迁移后备份及隔离恢复演练、配置哈希和三个服务均已核验；尚未经历部署后的真实交易日观察或验证。 |
-| 小资金真钱前置 Batch A | implemented（本地功能分支，未合并/未推送） | schema 11、统一 `pre_trade_check`、不可变 candidate/result/intent、原子容量预留、普通 BUY 精确 `target_qty` 和离散盈利保护已通过 Windows 验证；未部署、未观察、未验证，服务器仍以最后记录的 schema 10 检查点为准。 |
-| Batch B 通知 outbox | implemented（仅本地，未提交） | Tasks 1–7 已实现：schema 12 合同、来源事务生产者、稳定计划/TTL、租约 worker、有限重试、歧义证据、容量控制、CRITICAL 复报、规则影子退役、systemd 路由、详细 `ledger-check` 和人工解除 CLI；Linux 脚本复验、提交/推送、迁移、部署、观察和验证仍未完成。 |
+| 小资金真钱前置 Batch A | implemented / committed / deployed / not observed / not validated | schema 11 增量已随最终 schema 12 部署；统一 `pre_trade_check`、不可变 candidate/result/intent、原子容量预留、普通 BUY 精确 `target_qty` 和离散盈利保护已通过 Linux 全量回归。网站模板和真实交易日行为仍待核验。 |
+| Batch B 通知 outbox | implemented / committed / deployed / minimally exercised / not validated | schema 12 合同、来源事务生产者、稳定计划/TTL、租约 worker、有限重试、歧义证据、容量控制、CRITICAL 复报、规则影子退役、systemd 路由、详细 `ledger-check` 和人工解除 CLI 已部署；一次真实 worker 消费为 sent=3、pending/dead/gap=0，连续交易日与失败场景仍待验证。 |
 | 半自动参数复核与版本化发布 | planned | 当前只有样本、部分标签、策略对照、信号级回测和参数版本字段；无候选登记、统一准入、人工决定、激活或回滚机制。 |
 
 阶段1仍需连续10个有效交易日验收。SQLite Batch 1部署后的完整交易日双写观察尚需以服务器实际数据确认。专项设计中的20个有效交易日是完整账本加固与策略验证门槛，不得与阶段1基础10日门槛混为同一结论。非交易日 readiness 只构成静态检查证据，不计为有效观察日。
@@ -183,15 +181,15 @@ git ls-remote origin refs/heads/main
 /opt/stock-analysis/cache/trading/trading.db
 ```
 
-最后有外部证据的服务器交易库为 schema 10，已覆盖策略运行、不可变信号、风险决策、订单与事件、逐笔成交、账户/持仓快照、日权益、持仓周期、退出意图、冷却、自动对账、控制审计、执行问题、跳空机会，以及费用/已实现盈亏来源状态。不能再把完整订单、成交、账户、持仓或权益写成“尚未保存”。该外部范围仍需在下一次服务器访问时重新核验。
+最后有外部证据的服务器交易库为 schema 12，已覆盖策略运行、不可变信号、风险决策、订单与事件、逐笔成交、账户/持仓快照、日权益、持仓周期、退出意图、冷却、自动对账、控制审计、执行问题、跳空机会、费用/已实现盈亏来源状态，以及账户作用域、broker 当前态、准入候选/结果/意图、容量预留和事务通知 outbox。不能再把这些能力写成“仅本地”或“尚未保存”。实时交易控制和网站模板仍需在后续服务器/交易日审核中重新核验。
 
-本地 Batch A 把目标升级为 schema 11，并新增：
+Batch A 曾把目标升级为 schema 11，并新增；这些结构现已包含在服务器 schema 12 中：
 
 - `account_scopes` 及按账户原子覆盖的 `broker_snapshot_current`、`broker_position_current`、`broker_order_current`。
 - 长期审计的 `strategy_order_candidates`、`pre_trade_results`、`execution_intents`、`capacity_reservations` 和 `position_capacity_adoptions`。
 - 持仓周期的一手盈利保护时间字段，以及对账所需的账户作用域/快照证据字段。
 
-这些 schema 11 内容只存在于本地功能分支，尚未进入服务器。当前 broker 表是有界当前状态，不是高频追加历史；candidate/result/intent/reservation/adoption 属于订单级长期审计。训练样本、标签、预测和模型登记仍属于独立的 `cache/ml/ml.db`，不得混入交易库；服务器也不得假设已经部署或启用 ML 数据库。任何库都不得保存 Token、Webhook、SSH 私钥或完整券商账号。
+当前 broker 表是有界当前状态，不是高频追加历史；candidate/result/intent/reservation/adoption 属于订单级长期审计。schema 12 另增加事务通知事件、gap、租约和投递状态。训练样本、标签、预测和模型登记仍属于独立的 `cache/ml/ml.db`，不得混入交易库；ML 代码已部署但运行关闭，不能假设服务器已有真实数据集或模型。任何库都不得保存 Token、Webhook、SSH 私钥或完整券商账号。
 
 ## 6. 关键文档读取顺序
 
@@ -408,17 +406,17 @@ stockmonitor
 3. JoinQuant信号拉取、账户快照、委托、成交和持仓同步。
 4. 阶段1有效观察日和连续稳定日。
 5. 健康历史、API事件、快照历史、扫描输出和缓存增长基线。
-6. 当前仅本地代码授权可继续实现 Batch B、C、D；不得据此提交、推送或发布。
-7. 外部发布仍从 Batch A 开始：经单独授权提交/合并/推送，再按 schema 10→11 部署门完成 Linux 全量测试、备份迁移、隔离恢复、代表性 JoinQuant 交易日观察和 strict walk-forward；后续批次分别走独立发布门。
+6. Batch A/B 与 Batch C 服务器代码已发布；下一开发批次是 Batch D BrokerAdapter/QMT，仍须单独设计、实现和授权。
+7. 当前发布轨转为观察与证据：核验 JoinQuant 网站模板，积累 schema 12 代表性交易日；ML 先配置真实 strict 数据、完成 walk-forward、训练与人工审批，再另行授权 L0。
 
 当前推荐顺序仍是：
 
 ```text
-完成 Batch A 本地检查点
-→ 本地代码依序准备 Batch B、C、D（无外部动作）
-→ 另行授权发布 Batch A
-→ schema 10→11 Linux 验证、备份迁移、模拟盘观察与 strict 验证
-→ Batch B、C、D 分别独立发布和观察
+Batch A/B 与 Batch C 服务器代码部署完成
+→ 核验 JoinQuant 网站模板与 schema 12 真实交易日闭环
+→ 导入真实 strict 数据并完成至少 3 段 walk-forward
+→ 训练、登记、人工审批后另行授权 ML L0 旁路观察
+→ 单独实施 Batch D BrokerAdapter/QMT 默认禁单节点
 → 半自动参数复核（自动分析、人工批准、另行授权发布）
 ```
 

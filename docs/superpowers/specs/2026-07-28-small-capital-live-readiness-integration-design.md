@@ -1,25 +1,25 @@
 # 小资金实盘准备、事件通知与训练模型整合设计
 
 日期：2026-07-28
-状态：`Batch A Tasks 1-8 implemented（本地功能分支，未合并/未推送） / not deployed / not observed / not validated`；Batch B Tasks 1–7 schema 12 通知 outbox、生产者、容量控制、CRITICAL 复报、规则影子退役、systemd 路由和审计 CLI 为 `implemented（仅本地，未提交） / not deployed / not observed / not validated`；Batch C ML-7 Tasks 4–10 为 `implemented（本地未提交）`、Task 11 本地总验收进行中、Task 12 未授权/未运行，整体 `not committed / not deployed / not observed / not validated`；Batch D planned。
+状态：Batch A Tasks 1–8、Batch B Tasks 1–7 与 Batch C ML-7 Tasks 4–10 已随 `5d2c4a2` 实现、提交并部署；Task 11 已完成 Linux 1003/1003、文档真值与安全复审。Task 12 仅完成服务器代码/依赖部署，ML 仍关闭且未配置数据集，L0 与交易日观察未运行。Batch A/B/C 当前为 `implemented / committed / deployed / not observed / not validated`；Batch D planned。
 
 > 文档层级：本文件是 `docs/project_roadmap.md` 的专项设计从文档。主文档仍是唯一项目状态依据。
 >
 > 本文件整合小资金实盘前置、企业微信事件化通知、规则型影子评分退役、ML-7 五头表格模型和 QMT 执行节点边界。它引用现有专项文档，不重复定义已经部署的分层退出、五项执行正确性 P0、完整账本、历史回测和 ML-7 Task 1-3。
 >
-> 本设计获用户确认。2026-08-06 时 Batch A Tasks 1-8、Batch B Tasks 1–7 和 Batch C ML-7 Tasks 4–10 已在本地工作树实现；Batch C Task 11 本地总验收、文档真值和安全复审进行中，Task 12 未授权/未运行。Batch B 包含 schema 12 通知基础、来源事务生产者、稳定计划/TTL、租约 worker、有限重试、容量控制、CRITICAL 交易分钟复报、规则影子退役、systemd 路由、详细 `ledger-check` 和带事件键校验的人工解除 CLI。Task 7 已覆盖一手/奇数手离散目标、独立盈利保护、真实回调推进 stage、因果成交时间窗、所有有效止损消费者和 strict 日K反前视回归，执行计划版本为 `2026-08-01.1-small-capital-live-risk`。这些 synthetic 测试不等于真实 strict 数据验证；当前没有真实一年 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。任何本地实现都不代表服务器已部署、JoinQuant 网站模板已更新、真实交易日已观察或真实资金已验证。任何配置修改、Git 提交/推送、服务器部署、服务重启、JoinQuant 更新或 QMT 实盘启用仍需当次单独授权。
+> 本设计获用户确认并于 2026-08-06 完成首轮服务器代码部署。服务器提交为 `5d2c4a2`、正式库 schema 12、Linux 全量 1003/1003，环境哈希不变；通知 timer 已使用 SQLite worker，三个部署后事件成功发送且无 pending/dead/gap。Task 7 的离散目标、盈利保护、真实回调 stage、因果成交时间窗、全部有效止损消费者和 strict 日K反前视回归均已进入服务器代码。部署不等于真实交易日观察：JoinQuant 网站模板未在本次任务中修改，ML 保持 disabled，Batch D/QMT 未实现，任何后续 L0、模板或真实资金动作仍需独立授权。
 
 ## 1. 背景
 
-当前主流程由 Linux 服务器生成策略信号，JoinQuant 模拟盘执行并回传账户、订单和成交。现有系统已经部署分层退出、五项执行正确性 P0、schema 10 交易账本、自动对账和运行证据修复，但这些能力大多仍处于 `deployed / not observed / not validated`。
+当前主流程由 Linux 服务器生成策略信号，JoinQuant 模拟盘执行并回传账户、订单和成交。现有系统已经部署分层退出、五项执行正确性 P0、schema 12 交易账本、统一执行准入、事务通知 outbox、自动对账和运行证据修复；这些能力仍处于 `deployed / not observed / not validated`。
 
 面向后续小资金真实交易，当前还有五类相互关联的缺口：
 
-1. 服务器当前运行入口尚未部署本批统一 `pre_trade_check(..., mode="enforce")`；本地功能分支已经完成纯函数检查、原子准入、容量预留和 JoinQuant 精确数量接线。
-2. 服务器当前运行模板尚未获得本批数量契约；本地模板已移除普通买单金额回退，并按 100 股整数手、最低佣金、双边费用、人民币风险上限和组合容量生成唯一精确数量。
-3. 企业微信通用去重依赖正文哈希和共享 JSON 文件。多进程覆盖、每轮变化的 `run_id` 和实时行情字段会造成重复消息或丢失去重状态。
-4. 当前 `shadow_score.py` 是规则加权，不是训练模型。它增加了盘中展示和周报噪声，却不能证明统计泛化能力。
-5. ML-7 Tasks 4–10 已在本地实现 strict 五分钟历史、成本标签、五头训练、模型治理和 L0 推理代码；Task 11 本地总验收进行中，Task 12 未授权/未运行。QMT 仍只有路线规划，没有适配器或执行节点代码。
+1. 统一 `pre_trade_check(..., mode="enforce")`、原子准入、容量预留和 JoinQuant 精确数量接线已部署，仍需真实交易日验证拒绝与执行语义。
+2. 服务器导出代码已获得精确数量契约；JoinQuant 网站模板未在本次部署中更新，因此端到端新数量执行仍需模板版本核验和真实成交观察。
+3. 企业微信已迁移到 schema 12 事务 outbox/worker；仍需连续交易日验证并发、失败重试、TTL 和 CRITICAL 复报。
+4. 规则型 `shadow_score.py` 活动链路已部署退役；历史字段仅兼容只读，仍需观察线上无旧评分输出。
+5. ML-7 Tasks 4–10 代码已部署，Task 11 已完成；ML 运行关闭、数据集未配置，L0/观察未运行。QMT 仍只有路线规划，没有适配器或执行节点代码。
 
 本设计把这些缺口放在同一条执行链上解决，避免模型、资金分配、风控、通知和券商节点各自维护一套订单语义。
 
@@ -29,13 +29,13 @@
 | --- | --- | --- |
 | 2026-07-14 五项执行正确性 P0 | `implemented / deployed / not observed / not validated` | 保留并增加运行不变量测试，不重复改写既有业务语义。 |
 | 分层退出和统一有效止损 | `implemented / deployed / not observed / not validated` | 保留硬止损、T+1、退出意图和卖出优先；只修正整数手分段语义。 |
-| 通用 `pre_trade_check`、原子准入与 JoinQuant 精确数量 | `implemented（本地功能分支） / not deployed / not observed / not validated` | 双模式检查、不可变意图、容量预留、精确数量导出、服务器二次绑定和模板数量执行已完成本地测试；尚未改变当前服务器交易。QMT 必须使用 `enforce`。 |
-| 通知去重和失败重试 | `implemented / deployed`（历史文件级基线） | Batch B 已在本地迁移到 SQLite 业务事件 outbox；提交、迁移和部署前仍不能把新语义写成服务器现状。 |
-| 规则型影子评分 | `implemented（本地已退役） / not deployed / not observed / not validated` | 从活动运行链路、微信和周报退役；历史字段只读兼容。服务器在部署前仍可能保留旧版本行为。 |
-| ML-7 Task 1-3 | `implemented / not deployed / not observed / not validated` | 保留共享契约、独立 `ml.db` 和候选采集。 |
-| ML-7 Task 4-10 | `implemented（本地未提交） / not deployed / not observed / not validated` | strict 导入、标签、训练、五头模型包、治理、L0 旁路和维护代码已实现；没有真实一年 strict 数据或可信/活动模型。 |
-| ML-7 Task 11 | `in progress（本地总验收）` | Batch E 文档、全量验证和安全复审正在进行；完成前不能声称本地总验收通过。 |
-| ML-7 Task 12 | `not authorized / not started` | 服务器部署、L0 启用和交易日观察仍需另行授权；当前没有服务器 L0 证据。 |
+| 通用 `pre_trade_check`、原子准入与 JoinQuant 精确数量 | `implemented / deployed / not observed / not validated` | 双模式检查、不可变意图、容量预留、精确数量导出和服务器二次绑定已部署；网站模板与真实成交仍待核验。QMT 必须使用 `enforce`。 |
+| 通知去重和失败重试 | `implemented / deployed / minimally exercised / not validated` | schema 12 SQLite outbox/worker 已部署；一次真实消费 sent=3、pending/dead/gap=0，仍缺连续交易日和失败场景证据。 |
+| 规则型影子评分 | `implemented（已部署退役） / not observed / not validated` | 从活动运行链路、微信和周报退役；历史字段只读兼容。 |
+| ML-7 Task 1-3 | `implemented / deployed / disabled / not observed / not validated` | 共享契约、独立 `ml.db` 和候选采集代码已部署，运行关闭。 |
+| ML-7 Task 4-10 | `implemented / committed / server code deployed / not observed / not validated` | strict 导入、标签、训练、五头模型包、治理、L0 旁路和维护代码已部署；没有真实一年 strict 数据或可信/活动模型。 |
+| ML-7 Task 11 | `completed` | Batch E 文档、Linux 1003/1003 和安全复审已完成。 |
+| ML-7 Task 12 | `server code deployed / L0 not started` | 依赖和服务器代码已部署；L0 启用和交易日观察未运行，当前没有服务器 L0 证据。 |
 | QMT 券商接入 | `planned` | 新增平台无关协议、故障模拟器和默认禁单的 Windows 节点；真实账户仍需外部条件。 |
 
 旧 P0 的 `deployed` 不能用来证明新的真钱前置 P0 已完成。新能力必须独立经历 `implemented / deployed / observed / validated` 状态推进。
@@ -780,7 +780,7 @@ filled_downside_yuan = order_notional * conservative_price_downside_rate
 - 不可变模型包、审批/回滚和 L0 推理；
 - 模型数据就绪、训练和对照报告。
 
-当前状态：上述代码已在本地实现但未提交、未部署、未观察或验证；Task 11 本地总验收仍在进行。没有真实一年 strict 数据、可信模型、人工审批、活动模型或服务器 L0 证据。
+当前状态：上述代码已实现、提交并完成服务器代码部署；Task 11 已完成。ML 运行仍关闭且数据集未配置，没有真实一年 strict 数据、可信模型、人工审批、活动模型或服务器 L0 证据，因此仍未观察或验证。
 
 ### Batch D：BrokerAdapter 与 QMT 节点
 
@@ -799,7 +799,7 @@ filled_downside_yuan = order_notional * conservative_price_downside_rate
 - 主文档、实盘执行方案、ML-7、通知和存储文档同步；
 - 输出 implemented 范围与仍需外部验证的事实。
 
-Batch E 对应 ML-7 Task 11，当前正在本地执行；ML-7 Task 12 的服务器部署、L0 启用和交易日观察未获授权，不属于本设计自动授权的实施范围。
+Batch E 对应 ML-7 Task 11，已于 2026-08-06 完成；ML-7 Task 12 只完成服务器代码/依赖部署，L0 启用和交易日观察仍需独立授权与证据。
 
 批次可以在代码层并行准备，但发布顺序固定为 A -> B -> C/D 的只读能力 -> 单独授权部署。QMT 下单启用永远是独立发布任务。
 
@@ -852,11 +852,11 @@ Batch E 对应 ML-7 Task 11，当前正在本地执行；ML-7 Task 12 的服务�
 
 ## 18. 文档取代关系
 
-本节只定义目标设计的取代关系。Batch B 部署前，服务器仍按旧 JSON 冷却/失败队列和持续 ERROR 提醒运行；`docs/project_roadmap.md` 对当前运行状态的描述仍是真实基线，不得提前改写为新行为。
+本节定义目标设计的取代关系并保留部署前历史。Batch B 部署前，服务器曾按旧 JSON 冷却/失败队列和持续 ERROR 提醒运行；当前 schema 12 outbox/worker 已部署，旧 JSON 仅供显式 legacy audit。当前运行状态以 `docs/project_roadmap.md` 的 2026-08-06 检查点为准。
 
 - `docs/superpowers/specs/2026-07-14-notification-review-idempotency-design.md` 的成交事件和 D+N 复盘历史基线继续有效；其“共享 JSON 冷却/失败队列作为长期通知传输方案”由本设计取代。
 - `docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md` 的运行证据、健康口径和当前已部署失败终态继续有效；其中 JSON 失败队列只作为迁移期基线，Batch B 部署后不再是活动通知传输方案。
-- `docs/project_roadmap.md` 中“持续 ERROR 每 30 分钟提醒”和规则影子周五摘要是当前已部署事实；Batch B 完成、部署并核验后，主文档才分别更新为“仅未恢复 CRITICAL 每 180 个 A 股交易分钟复报”和“规则影子 retired”，并分别记录 outbox 核心、失败重试、TTL、CRITICAL reminder 的 `implemented/deployed/observed/validated` 状态。
+- `docs/project_roadmap.md` 已在 Batch B 部署核验后更新为“仅未恢复 CRITICAL 每 180 个 A 股交易分钟复报”和“规则影子 retired”，并分别记录 outbox 核心、失败重试、TTL、CRITICAL reminder 的 `implemented/deployed/observed/validated` 状态；连续交易日与各异常分支仍未观察或验证。
 - `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` 的 Task 1-3 和模型治理基础继续有效；三方对照改为“原规则策略 vs 训练模型”，规则影子不再作为活动 comparator。
 - `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 的五项已部署 P0 继续有效；本设计新增真钱/QMT 前置 P0，不把旧 P0 改写为未实现。
 - `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` 的硬止损、退出意图、T+1 和卖出优先继续有效；本设计只覆盖一手/奇数手首段止盈的离散语义。

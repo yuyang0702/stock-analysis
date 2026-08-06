@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, dataclasses, sqlite3, requests, hashlib/json, existing A-share trading calendar, unittest and systemd timers.
 
-**Status (2026-08-05):** Batch B Tasks 1–7 的代码实现已完成，当前为 `implemented（本地功能分支，未提交） / not deployed / not observed / not validated`。schema 12 基础合同、来源事务内生产者、稳定计划/TTL、容量控制、CRITICAL 180 交易分钟复报、规则影子退役、systemd 路由、`ledger-check` 通知健康字段和带事件键校验的人工解除 CLI 均已在本地实现；专项测试与 Windows 平台无关测试通过，全量 908 项中仅 3 项因当前环境缺少 `bash.exe` 无法启动，Task 7 的 Linux 复验仍待完成。提交、推送、部署、真实通知观察和 20 日验证仍未完成。
+**Status (2026-08-06):** Batch B Tasks 1–7 are `implemented / committed / deployed / minimally exercised / not validated`. Schema 12 contracts, transactional producers, stable plan/TTL, lease worker, bounded retry/capacity, CRITICAL 180-trading-minute reminders, rule-shadow retirement, systemd routing, detailed `ledger-check` fields and event-key-guarded manual resolution are deployed in `5d2c4a2`. Linux full discovery passed 1003/1003; the retry timer runs `notification_worker.py --once`; one post-deployment consumption ended at sent=3, pending/dead/gap=0. Continuous trading-day, retry/TTL and failure-path evidence is still absent.
 
 ## Global Constraints
 
@@ -552,9 +552,9 @@ Expected: old retry and shadow weekly paths are still installed.
 
 Route the five-minute retry unit to `notification_worker.py --once`, add `notify-status`, `notify-legacy-audit`, `notify-compact-dry-run`, `notify-compact-apply` and event-key-guarded `notify-resolve-write-failure` commands, and remove the active rule-shadow weekly timer. The install path must not print/change webhook or Token values. Add ledger/backup/control health counts for pending/leased/dead/gaps/tombstones, dead-detail bounds and unresolved write-failure markers.
 
-Document status per sub-capability. After local completion: core enqueue/claim/send, retry, TTL, CRITICAL reminder and retirement are `implemented（本地功能分支，未提交） / not deployed / not observed / not validated`. Do not rewrite currently deployed behavior until actual server deployment is verified.
+Document status per sub-capability. Core enqueue/claim/send, retry, TTL, CRITICAL reminder and retirement are now deployed. The single post-deployment worker run is only minimal exercise evidence; retry, TTL, ambiguity and CRITICAL reminder behavior remain individually `not observed / not validated` until their own real events occur.
 
-- [ ] **Step 4: Run focused, full and conservation tests**
+- [x] **Step 4: Run focused, full and conservation tests**
 
 ```powershell
 python -m py_compile notification_outbox.py notification_worker.py notifier.py notify_retry.py trading_store.py joinquant_sync.py joinquant_signal_server.py reconciliation.py trading_control.py joinquant_health.py trading_backup.py a_share_strategy.py joinquant_exporter.py holdings_web.py strategy_compare_report.py
@@ -566,17 +566,17 @@ git status --short --branch
 
 Expected: all tests pass and fixture conservation satisfies `source unique events = sent + pending/leased + dead + cancelled + enqueue_gap`.
 
-Local evidence (2026-08-05): Python compilation, focused notification/producer/backup/control/health suites and direct `ledger_check.py` execution pass. Windows full discovery is blocked only by the three Linux-script subprocess tests because this machine has no `bash.exe`; those tests must be rerun on Linux before this step is marked fully validated. No external system was accessed.
+Evidence: 2026-08-05 Python compilation, focused notification/producer/backup/control/health suites and direct `ledger_check.py` execution passed. On 2026-08-06 the Linux full suite passed 1003/1003, including the three script tests unavailable on Windows; schema 12 ledger health and notification conservation fields were verified.
 
-- [ ] **Step 5: Commit only after separate authorization**
+- [x] **Step 5: Commit only after separate authorization**
 
 ```bash
 git add run_ubuntu.sh tests/test_joinquant_linux_script.py docs/project_roadmap.md docs/project_handoff.md docs/live_trading_execution_plan.md docs/codex_simulation_observation_plan.md docs/data_storage_policy.md docs/superpowers/specs linux_deploy.md
 git commit -m "docs: record notification outbox implementation"
 ```
 
-## Deployment And Observation Boundary
+## Deployment And Observation Boundary — deployment complete; observation pending
 
-A separate deployment authorization must cover a pre-migration online backup, schema 11 to 12 migration, Linux full tests, `ledger-check`, post-migration backup/isolated restore, timer installation and authorized service/timer restart while preserving every existing secret. Run the legacy audit once only after inspecting its dry-run counts; do not replay ambiguous history.
+The authorized deployment covered the schema 11 to 12 migration, Linux full tests, `ledger-check`, verified post-migration backup, worker routing and authorized service/timer restart while preserving every existing secret. The legacy JSON path remains explicit audit-only; ambiguous history was not replayed.
 
 Core outbox becomes `observed` only after five valid trading days of source-to-state reconciliation. Retry, TTL cancellation and CRITICAL reminders each remain `not observed` until their own real event exists. Core validation requires 20 valid days of daily conservation, no high-priority dead/gap, retry within SLA and no concurrent duplicate claim/content conflict; none of those states can be inferred from unit tests or deployment alone.

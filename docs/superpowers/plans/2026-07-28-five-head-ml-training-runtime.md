@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, pandas, sqlite3, scikit-learn 1.9.0, joblib, hashlib/json/pathlib, unittest and existing run scripts.
 
-**Status (2026-08-06):** ML-7 Tasks 4–10 are `implemented locally`; ML-7 Task 11 local full verification/document truth/security review is in progress; ML-7 Task 12 server deployment and L0 observation is not authorized and has not started. Overall: `not committed / not deployed / not observed / not validated`.
+**Status (2026-08-06):** ML-7 Tasks 4–10 are `implemented / committed / server code deployed`; ML-7 Task 11 full verification, documentation truth and security review is complete, including Linux 1003/1003. ML-7 Task 12 has completed dependency and server-code deployment only; L0 enablement and trading-day observation have not started. Overall model lifecycle: `model not deployed / not observed / not validated`.
 
 No real one-year/365-day strict dataset evidence, trustworthy or approvable trained model, human approval, active model, or server L0 evidence exists. The task steps below remain as the implementation and verification procedure; their historical checkbox text is preserved and does not override this current status checkpoint.
 
@@ -536,7 +536,7 @@ git add ml_maintenance.py strategy_compare_report.py run_ubuntu.sh config.py tes
 git commit -m "feat: operate ml evidence loop"
 ```
 
-### Task 8: Verify Batch C and align documents (ML-7 Task 11 — in progress locally)
+### Task 8: Verify Batch C and align documents (ML-7 Task 11 — completed 2026-08-06)
 
 **Files:**
 
@@ -549,7 +549,7 @@ git commit -m "feat: operate ml evidence loop"
 - Modify: `docs/superpowers/plans/2026-07-15-trained-shadow-model.md`
 - Modify: `docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md`
 
-- [ ] **Step 1: Run target compilation and focused ML tests**
+- [x] **Step 1: Run target compilation and focused ML tests**
 
 ```powershell
 python -m py_compile historical_data.py historical_strategy.py historical_backtest.py ml_contracts.py ml_store.py ml_dataset.py ml_labels.py ml_training_data.py ml_train.py ml_admin.py ml_runtime.py ml_maintenance.py strategy_compare_report.py a_share_strategy.py joinquant_exporter.py
@@ -558,7 +558,7 @@ python -m unittest tests.test_historical_data tests.test_historical_strategy tes
 
 Expected: all Task 1-10 focused tests pass.
 
-- [ ] **Step 2: Run trading regressions and the complete local suite**
+- [x] **Step 2: Run trading regressions and the complete local suite**
 
 ```powershell
 python -m unittest tests.test_execution_admission tests.test_pre_trade_check tests.test_execution_ledger_integration tests.test_execution_state tests.test_exit_policy tests.test_reconciliation tests.test_trading_control -v
@@ -569,23 +569,23 @@ git status --short --branch
 
 Expected: ML disabled/L0 leaves all rule and trading tests unchanged and the full suite passes.
 
-- [ ] **Step 3: Perform the mandatory security/type/permission review**
+- [x] **Step 3: Perform the mandatory security/type/permission review**
 
 Verify model paths cannot escape `cache/ml/models`, external pickle/joblib cannot be loaded, all hashes/versions match before inference, automated services contain no approval/activation path, environment/account values do not enter samples/reports, function/type names match this plan, and L0 signal equivalence is field-for-field.
 
-- [ ] **Step 4: Update status truthfully**
+- [x] **Step 4: Update status truthfully**
 
-Record Tasks 4-10 as `implemented locally / not committed / not deployed / not observed / not validated`; keep Task 11 `in progress` until the full local verification and security review finish. State separately whether a diagnostic model was produced. Without one year of strict data and all performance gates, no model is `approvable_l0`; without human approval, activation, deployment and live candidates, there is no active model or server L0 evidence.
+Recorded Tasks 4-10 as implemented, committed and deployed server code, while keeping the model lifecycle separate. No diagnostic or approvable model was produced. Without one year of strict data and all performance gates, no model is `approvable_l0`; without human approval, activation and live candidates, there is no active model or server L0 evidence.
 
-- [ ] **Step 5: Commit only after separate authorization**
+- [x] **Step 5: Commit only after separate authorization**
 
 ```bash
 git add docs/project_roadmap.md docs/project_handoff.md docs/live_trading_execution_plan.md docs/codex_simulation_observation_plan.md docs/data_storage_policy.md docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md docs/superpowers/plans/2026-07-15-trained-shadow-model.md docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md
 git commit -m "docs: record five-head ml implementation"
 ```
 
-## Deployment And Observation Boundary (ML-7 Task 12 — not authorized / not started)
+## Deployment And Observation Boundary (ML-7 Task 12 — server code deployed; L0/observation not started)
 
-Code completion does not install scikit-learn, import external strict data, train a credible model or enable L0. A separately authorized Linux deployment must preserve existing private configuration, back up and verify trading/ML/history databases separately, install the pinned dependency, run the Linux full suite, migrate ML/history stores, restore each backup into isolated destinations and restart only authorized services.
+The authorized Linux deployment preserved existing private configuration, installed the pinned dependencies into the existing virtual environment, ran the Linux full suite, migrated the trading store to schema 12 and restarted only the authorized core services. It did not import external strict data, train or approve a credible model, activate a model, enable L0, or enable the label/train/ML-history backup timers. The migration backup and trading-ledger checks passed; ML/history restore automation and live-model evidence remain future work.
 
 L0 activation additionally requires one year/240 days of strict data, all coverage/regime/performance gates, an immutable registered bundle and explicit hash-bound approval. L0 becomes observed only after at least five valid trading days and 500 real predictions with 100% trading equivalence. L1/L2/L3 remain separately authorized and require the full 20/40/60-day evidence gates; no simulated unit test or elapsed calendar time substitutes for them.

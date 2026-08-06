@@ -2,10 +2,9 @@
 
 > 当前项目规划以 `docs/project_roadmap.md` 为准。本文只保留服务器执行步骤。
 
-> 2026-08-01 小资金执行 Batch A 只在本地功能分支实现，目标交易库为 schema 11、JoinQuant 模板版本为 `2026-08-01.1-exact-intent`、执行计划版本为 `2026-08-01.1-small-capital-live-risk`。最后有文档证据的服务器仍运行 schema 10；本批尚未推送、部署、更新网站模板、观察或验证。下述 schema 10→11 流程只是未来 runbook，不授权当前执行。
+> 2026-08-06 最新部署检查点：Batch A Tasks 1–8、Batch B Tasks 1–7 与 Batch C ML-7 Tasks 4–10 已合并、推送并随 `5d2c4a2018ca95b9febd6751b4964fec507fe1bc` 部署到 `/opt/stock-analysis`，正式交易库为 schema 12。服务器 Python 3.12.3 的既有虚拟环境已安装 `scikit-learn==1.9.0` 和 `joblib==1.5.3`；Linux 全量测试 1003/1003、`ledger-check` 健康/可写、迁移后在线备份完整性、环境文件哈希不变、三个核心服务与通知 timer active 均已核验。`stock-notify-retry.timer` 已路由到 SQLite `notification_worker.py --once`，部署后 outbox 为 sent=3、pending/dead/gap=0。
 >
-> 2026-08-05 Batch B Tasks 1–7 已在同一未提交功能分支实现，目标交易库为 schema 12，包含事务通知 outbox/gap、租约 worker、有限重试、容量控制、CRITICAL 交易分钟复报、规则影子退役、详细 `ledger-check` 和人工解除 CLI。Batch B 当前严格为 `implemented（本地功能分支，未提交） / not deployed / not observed / not validated`；服务器仍按最后记录的 schema 10/旧 JSON 通知队列运行。当前没有 schema 11→12 的可执行部署 runbook，禁止把 schema 10→11 快捷流程用于 Batch B，也不得据本地代码推断服务器已切换。
-> 2026-08-06 Batch C ML-7 Tasks 4–10 已在本地工作树实现，状态为 `implemented（本地未提交）`；Task 11 本地总验收进行中；Task 12 的依赖安装、服务器部署、L0 启用和交易日观察未获授权且未运行。Batch C 整体严格为 `not committed / not deployed / not observed / not validated`。当前没有真实一年/365 天 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。本文件不提供可立即执行的 Batch C 部署授权；任何 ML 部署/启用必须另行制定并批准 runbook。
+> 上述证据只支持 `implemented / committed / deployed`。新交易语义仍是 `not observed / not validated`。Batch C Task 11 已完成；Task 12 只完成代码与依赖部署，ML 保持 `enabled=0 / max_level=0 / dataset_configured=no`，标签、训练及 ML/history 备份 timer 未启用。当前没有真实一年/365 天 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。JoinQuant 网站模板未在本次部署中修改。
 
 > 2026-07-15 schema 7/模板 `2026-07-15.1-execution-state-recovery` 增量已随 `e2ce5b5` 推送并部署服务器：schema 6 备份完整性、Linux 324/324 测试、schema 7 `ledger-check`、配置哈希和三个服务状态均通过。用户报告已手动更新 JoinQuant 网站模板；新模板尚待交易日快照观察和验证。下列命令仍是未来部署操作说明，不代表可在没有当次授权时再次执行。
 
@@ -55,7 +54,7 @@ git push
 cd /opt/stock-analysis
 ```
 
-下面的快捷更新只适用于已经确认不含 SQLite schema、JoinQuant 模板、systemd 或配置变化的普通版本；任何这类变化都必须执行对应专项 runbook。schema 10→11 本批禁止使用本快捷路径。
+下面的快捷更新只适用于已经确认不含 SQLite schema、JoinQuant 模板、systemd 或配置变化的普通版本；任何这类变化都必须执行对应专项 runbook。2026-08-06 schema 12 首次部署已经完成，后续文档-only 或普通代码更新可在确认无迁移影响后使用本快捷路径。
 
 经当次授权后更新普通版本：
 
@@ -149,7 +148,7 @@ stock-trading-backup.timer
 stock-trading-backup-drill.timer
 ```
 
-`stock-ml-report.timer` 是旧版复盘单元；新版本安装时会禁用并移除它，改由 `stock-strategy-compare.timer` 生成对照报告。ML 标签、训练、ML/历史库备份和对照报告 timer 只做有界离线维护，不批准、激活、发布或改变交易权限。它们在本次 Batch C 部署前不会因代码拉取自动启用；如需安装/启用，必须另行确认目标单元和维护窗口。
+`stock-ml-report.timer` 是旧版复盘单元；新版本安装时会禁用并移除它，改由 `stock-strategy-compare.timer` 生成对照报告。ML 标签、训练、ML/历史库备份和对照报告 timer 只做有界离线维护，不批准、激活、发布或改变交易权限。2026-08-06 部署后，`stock-strategy-compare.timer` 延续部署前既有 active 状态；`stock-ml-labels.timer`、`stock-ml-train.timer`、`stock-ml-backup.timer` 和 `stock-history-backup.timer` 均未启用。后续启用任何 ML timer 必须另行确认目标单元、数据集和维护窗口。
 
 默认安全模式：
 
@@ -219,7 +218,7 @@ bash run_ubuntu.sh kill-switch-on --reason "人工熔断原因"
 bash run_ubuntu.sh test
 ```
 
-`unlock` 是交互式向导，不是强制解锁：它会执行一次完整对账，要求最近两个全量一致结果来自不同新鲜快照，先确认关闭 `KILL_SWITCH`，再二次确认恢复买入。`kill-switch-off` 不会自动把 `buy_enabled` 改回 1。最后有文档证据的服务器正式库为 schema 10；schema 11/12 仍是本地实现，部署、真实运行和解锁演练均需单独授权与证据。
+`unlock` 是交互式向导，不是强制解锁：它会执行一次完整对账，要求最近两个全量一致结果来自不同新鲜快照，先确认关闭 `KILL_SWITCH`，再二次确认恢复买入。`kill-switch-off` 不会自动把 `buy_enabled` 改回 1。2026-08-06 最后部署证据的服务器正式库为 schema 12；当前部署没有授权或执行新的人工解锁演练，交易控制实时值仍须单独只读核验。
 
 前台调试：
 
@@ -255,7 +254,7 @@ bash run_ubuntu.sh backup-status
 
 `stock-trading-backup.timer` 每天 `16:30 Asia/Shanghai` 使用 SQLite 在线备份 API 生成一致性副本，校验 SHA-256、`PRAGMA integrity_check`、schema 和核心表计数，并按 7 份每日、4 份每周、12 份每月轮转。`stock-trading-backup-drill.timer` 在每季度第一个周日凌晨复制最新有效备份到隔离临时目录进行恢复校验；它不会替换或写入正在使用的主库。
 
-Batch C 的本地代码还提供以下受控维护单元和命令：标签 `16:10`、对照报告 `16:25`、每周五训练 `18:00`、ML/strict 历史库备份 `19:00`。这些单元只能登记 challenger 和生成报告，不能批准、激活、发布或改变买卖权限；`ml-restore-check`、`ml-retention-dry-run` 和 `ml-retention-apply` 仍是人工命令，不能把它们当作自动恢复或自动清理已经上线。
+Batch C 已部署的代码提供以下受控维护单元和命令：标签 `16:10`、对照报告 `16:25`、每周五训练 `18:00`、ML/strict 历史库备份 `19:00`。除延续既有 active 状态的对照报告 timer 外，其余 ML timer 当前均未启用。这些单元只能登记 challenger 和生成报告，不能批准、激活、发布或改变买卖权限；`ml-restore-check`、`ml-retention-dry-run` 和 `ml-retention-apply` 仍是人工命令，不能把它们当作自动恢复或自动清理已经上线。
 
 部署或数据库迁移前先手工执行：
 
@@ -282,7 +281,9 @@ cat output/trading_backup_drill_$(date +%Y)-Q$((($(date +%-m)-1)/3+1)).md
 
 如需改变目录或保留数量，只允许修改 `stock-analysis.env` 中的 `TRADING_BACKUP_DIR`、`TRADING_BACKUP_DAILY_KEEP`、`TRADING_BACKUP_WEEKLY_KEEP` 和 `TRADING_BACKUP_MONTHLY_KEEP`；备份目录必须位于项目外并保证运行 systemd service 的用户可写。任何主库替换仍需停机、人工确认和单独恢复流程，本命令不会自动执行。
 
-## schema 10→11 小资金执行部署 runbook
+## 历史 runbook：schema 10→11 小资金执行部署
+
+> 本节记录 2026-08-06 schema 12 部署前所使用的分阶段迁移门槛，供审计和未来迁移设计参考。当前服务器已经是 schema 12，不得把本节命令重新用于当前正式库；新的 schema 迁移必须按目标版本另行编写并授权。
 
 本节仅在用户当次明确授权目标提交、服务器、备份、测试、迁移和具体服务重启后执行。JoinQuant 网站编辑器更新需要另一项明确授权。部署不得显示私有配置内容、打印 Token/Webhook/私钥等变量值，或修改任何凭据。
 
@@ -485,14 +486,14 @@ bash run_ubuntu.sh health
 cat output/joinquant_health_$(date +%Y%m%d).md
 ```
 
-`stock-joinquant-health.timer` 会每 5 分钟运行一次。它会检查信号文件、账户快照、今日 API 拉取/回传次数、失败订单原因、持仓一致性和稳定性评分；盘中发现信号/快照超时、文件异常、API 异常、持仓不一致或失败订单过多时，会通过企业微信发送去重后的异常报警。非交易时段如果只是信号/快照过期，只写健康报告，不反复推微信。服务器 schema 10 旧基线下，`stock-notify-retry.timer` 重试有界 JSON 队列；Batch B 部署后该兼容 unit 名实际执行 `notification_worker.py --once`，旧 JSON 只允许显式 legacy audit。
+`stock-joinquant-health.timer` 会每 5 分钟运行一次。它会检查信号文件、账户快照、今日 API 拉取/回传次数、失败订单原因、持仓一致性和稳定性评分；盘中发现信号/快照超时、文件异常、API 异常、持仓不一致或失败订单过多时，会通过企业微信发送去重后的异常报警。非交易时段如果只是信号/快照过期，只写健康报告，不反复推微信。当前 schema 12 服务器的 `stock-notify-retry.timer` 实际执行 `notification_worker.py --once` 消费 SQLite outbox；旧 JSON 队列只允许显式 legacy audit。
 
 ML 基础复盘报告：
 ```bash
 cat output/ml_signal_review.md
 ```
 
-最后记录的服务器 ML 基线仍只用于样本采集、基础复盘和信号级回测，不训练模型，也不会影响 JoinQuant 买入、卖出或仓位。当前本地 Batch C 代码已具备 strict 导入、标签、五头训练、治理、L0 旁路和维护命令，但尚未提交、安装依赖、部署或启用；没有可信/活动模型或服务器 L0 证据。未经 Task 12 单独授权，不得在服务器运行这些新入口或修改 ML 配置。
+当前服务器已具备 strict 导入、标签、五头训练、治理、L0 旁路和维护命令，依赖也已安装；但 ML 明确保持关闭、数据集未配置，不训练模型，也不会影响 JoinQuant 买入、卖出或仓位。没有可信/活动模型、人工审批或服务器 L0 证据。未经 Task 12 后续单独授权，不得配置真实数据集、启用 L0、启用训练/标签 timer 或修改 ML 权限。
 
 ML 样本日志：
 ```bash
@@ -532,7 +533,7 @@ nano /opt/stock-analysis/stock-analysis.env
 
 - `cache/joinquant/api_events.jsonl`：JoinQuant 拉信号、访问 latest、回传快照和异常请求日志。
 - `cache/joinquant/health_history.jsonl`：每次健康检查结果，用于连续交易日稳定性观察。
-- `cache/notify_failed_queue.jsonl`：服务器 schema 10 旧基线的有界失败队列；Batch B schema 12 目标改为 SQLite outbox，旧 JSON 只读且仅显式审计。
+- `cache/notify_failed_queue.jsonl`：schema 10 历史基线的有界失败队列；当前 schema 12 使用 SQLite outbox，旧 JSON 只读且仅允许显式审计。
 - `output/joinquant_health_YYYYMMDD.md`：手机可读的健康日报，包含 API 拉取/回传次数、失败原因拆分、持仓一致性和稳定性评分。
 
 常用命令：
@@ -544,6 +545,6 @@ bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh status-all
 ```
 
-`stock-joinquant-health.timer` 每 5 分钟运行健康检查；服务器旧基线的 `stock-notify-retry.timer` 重试 JSON 队列，Batch B 部署后同名 unit 保留但执行 SQLite outbox worker。
+`stock-joinquant-health.timer` 每 5 分钟运行健康检查；当前 `stock-notify-retry.timer` 保留兼容 unit 名，但执行 SQLite outbox worker。
 
 本段是 2026-07-09 的历史 timer 说明。已配置服务器不得用 `bash run_ubuntu.sh install --skip-install` 刷新 systemd：当前脚本会重写环境文件、在未传参数时生成新 Token，并可能改变既有配置。未来 timer 更新必须使用经专项测试、明确保证原样保留私有环境的安全刷新入口，或由当次授权的部署步骤逐个写入并核验 unit；该入口实现前停止操作。
