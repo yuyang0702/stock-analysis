@@ -85,12 +85,24 @@ class ConfigEnvTest(unittest.TestCase):
                 self.assertEqual(reloaded.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT, 80)
                 self.assertTrue(reloaded.JOINQUANT_ALLOW_BUY_DEFAULT)
                 self.assertTrue(reloaded.JOINQUANT_ALLOW_SELL_DEFAULT)
+                self.assertEqual(reloaded.JOINQUANT_EXECUTION_INTENT_TTL_SEC_DEFAULT, 120)
                 self.assertEqual(reloaded.ML_DB_FILE, reloaded.CACHE_DIR / "ml" / "ml.db")
                 self.assertEqual(reloaded.ML_MODEL_DIR, reloaded.CACHE_DIR / "ml" / "models")
                 self.assertEqual(reloaded.ML_DB_MAX_BYTES, 2_000_000_000)
+                self.assertEqual(
+                    reloaded.ML_HISTORY_DB_FILE,
+                    reloaded.CACHE_DIR / "backtest" / "history.db",
+                )
+                self.assertEqual(reloaded.ML_HISTORY_DB_MAX_BYTES, 3_000_000_000)
                 self.assertFalse(reloaded.ML_TRAINED_SHADOW_ENABLE)
                 self.assertEqual(reloaded.ML_PERMISSION_LEVEL_MAX, 0)
                 self.assertEqual(reloaded.ML_INFERENCE_TIMEOUT_SEC, 1.0)
+                self.assertEqual(reloaded.ML_LABEL_SOURCE, "strict_counterfactual_v2")
+                self.assertEqual(reloaded.ML_LABEL_VERSION, "ml-label-v2")
+                self.assertEqual(reloaded.ML_LABEL_LOOKBACK_DAYS, 45)
+                self.assertEqual(reloaded.ML_MAINTENANCE_MAX_ROWS, 500_000)
+                self.assertEqual(reloaded.ML_BACKUP_DAILY_KEEP, 7)
+                self.assertEqual(reloaded.HISTORY_BACKUP_MONTHLY_KEEP, 12)
         finally:
             importlib.reload(config)
 
@@ -98,6 +110,48 @@ class ConfigEnvTest(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"RISK_MODE": "BLOCK"}, clear=True):
                 with self.assertRaisesRegex(ValueError, "Unsupported RISK_MODE"):
+                    importlib.reload(config)
+        finally:
+            importlib.reload(config)
+
+    def test_enforce_risk_mode_is_supported(self) -> None:
+        try:
+            with patch.dict(os.environ, {"RISK_MODE": "ENFORCE"}, clear=True):
+                self.assertEqual(importlib.reload(config).RISK_MODE, "enforce")
+        finally:
+            importlib.reload(config)
+
+    def test_ml_database_hard_caps_cannot_be_raised_by_environment(self) -> None:
+        try:
+            with patch.dict(
+                os.environ,
+                {"ML_DB_MAX_BYTES": "2000000001"},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ValueError, "ML_DB_MAX_BYTES"):
+                    importlib.reload(config)
+            with patch.dict(
+                os.environ,
+                {"ML_HISTORY_DB_MAX_BYTES": "3000000001"},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ValueError, "ML_HISTORY_DB_MAX_BYTES"):
+                    importlib.reload(config)
+        finally:
+            importlib.reload(config)
+
+    def test_database_backup_roots_must_be_distinct(self) -> None:
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "TRADING_BACKUP_DIR": "same-backup-root",
+                    "ML_BACKUP_DIR": "same-backup-root",
+                    "HISTORY_BACKUP_DIR": "history-backup-root",
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ValueError, "must be distinct"):
                     importlib.reload(config)
         finally:
             importlib.reload(config)
@@ -111,6 +165,7 @@ class ConfigEnvTest(unittest.TestCase):
             "DAILY_LOSS_WARN_PCT": "6", "ACCOUNT_DRAWDOWN_WARN_PCT": "16",
             "MAX_CONSECUTIVE_ORDER_FAILURES": "6", "ACCOUNT_SNAPSHOT_MAX_AGE_SEC": "301",
             "SIGNAL_MAX_AGE_SEC": "1201", "RECONCILIATION_POSITION_TOLERANCE": "1.5",
+            "JOINQUANT_EXECUTION_INTENT_TTL_SEC": "180",
             "TRADING_DB_FILE": "custom/trading.db",
             "TRADING_BACKUP_DIR": "custom/backups",
             "TRADING_BACKUP_DAILY_KEEP": "8",
@@ -119,9 +174,29 @@ class ConfigEnvTest(unittest.TestCase):
             "ML_DB_FILE": "custom/ml.db",
             "ML_MODEL_DIR": "custom/models",
             "ML_DB_MAX_BYTES": "123456",
+            "ML_HISTORY_DB_FILE": "custom/history.db",
+            "ML_HISTORY_DB_MAX_BYTES": "234567",
             "ML_TRAINED_SHADOW_ENABLE": "1",
             "ML_PERMISSION_LEVEL_MAX": "2",
             "ML_INFERENCE_TIMEOUT_SEC": "0.75",
+            "ML_HISTORY_DATASET_ID": "strict-2025",
+            "ML_LABEL_SOURCE": "strict",
+            "ML_LABEL_VERSION": "labels-custom",
+            "ML_COST_SHA256": "cost-sha",
+            "ML_POLICY_SHA256": "policy-sha",
+            "ML_TRAINING_START_DATE": "2025-01-01",
+            "ML_TRAINING_END_DATE": "2025-12-31",
+            "ML_FEATURE_ALLOWLIST": "price,turnover,market_regime",
+            "ML_LABEL_LOOKBACK_DAYS": "60",
+            "ML_MAINTENANCE_MAX_ROWS": "600000",
+            "ML_BACKUP_DIR": "custom/ml-backups",
+            "HISTORY_BACKUP_DIR": "custom/history-backups",
+            "ML_BACKUP_DAILY_KEEP": "8",
+            "ML_BACKUP_WEEKLY_KEEP": "5",
+            "ML_BACKUP_MONTHLY_KEEP": "13",
+            "HISTORY_BACKUP_DAILY_KEEP": "9",
+            "HISTORY_BACKUP_WEEKLY_KEEP": "6",
+            "HISTORY_BACKUP_MONTHLY_KEEP": "14",
         }
         old_values = {key: os.environ.get(key) for key in updates}
         try:
@@ -140,6 +215,7 @@ class ConfigEnvTest(unittest.TestCase):
             self.assertEqual(reloaded.MAX_CONSECUTIVE_ORDER_FAILURES, 6)
             self.assertEqual(reloaded.ACCOUNT_SNAPSHOT_MAX_AGE_SEC, 301)
             self.assertEqual(reloaded.SIGNAL_MAX_AGE_SEC, 1201)
+            self.assertEqual(reloaded.JOINQUANT_EXECUTION_INTENT_TTL_SEC_DEFAULT, 180)
             self.assertEqual(reloaded.RECONCILIATION_POSITION_TOLERANCE, 1.5)
             self.assertEqual(reloaded.TRADING_DB_FILE, Path("custom/trading.db"))
             self.assertEqual(reloaded.TRADING_BACKUP_DIR, Path("custom/backups"))
@@ -149,9 +225,34 @@ class ConfigEnvTest(unittest.TestCase):
             self.assertEqual(reloaded.ML_DB_FILE, Path("custom/ml.db"))
             self.assertEqual(reloaded.ML_MODEL_DIR, Path("custom/models"))
             self.assertEqual(reloaded.ML_DB_MAX_BYTES, 123456)
+            self.assertEqual(reloaded.ML_HISTORY_DB_FILE, Path("custom/history.db"))
+            self.assertEqual(reloaded.ML_HISTORY_DB_MAX_BYTES, 234567)
             self.assertTrue(reloaded.ML_TRAINED_SHADOW_ENABLE)
             self.assertEqual(reloaded.ML_PERMISSION_LEVEL_MAX, 2)
             self.assertEqual(reloaded.ML_INFERENCE_TIMEOUT_SEC, 0.75)
+            self.assertEqual(reloaded.ML_HISTORY_DATASET_ID, "strict-2025")
+            self.assertEqual(reloaded.ML_LABEL_SOURCE, "strict")
+            self.assertEqual(reloaded.ML_LABEL_VERSION, "labels-custom")
+            self.assertEqual(reloaded.ML_COST_SHA256, "cost-sha")
+            self.assertEqual(reloaded.ML_POLICY_SHA256, "policy-sha")
+            self.assertEqual(reloaded.ML_TRAINING_START_DATE, "2025-01-01")
+            self.assertEqual(reloaded.ML_TRAINING_END_DATE, "2025-12-31")
+            self.assertEqual(
+                reloaded.ML_FEATURE_ALLOWLIST_TEXT,
+                "price,turnover,market_regime",
+            )
+            self.assertEqual(reloaded.ML_LABEL_LOOKBACK_DAYS, 60)
+            self.assertEqual(reloaded.ML_MAINTENANCE_MAX_ROWS, 600000)
+            self.assertEqual(reloaded.ML_BACKUP_DIR, Path("custom/ml-backups"))
+            self.assertEqual(
+                reloaded.HISTORY_BACKUP_DIR, Path("custom/history-backups")
+            )
+            self.assertEqual(reloaded.ML_BACKUP_DAILY_KEEP, 8)
+            self.assertEqual(reloaded.ML_BACKUP_WEEKLY_KEEP, 5)
+            self.assertEqual(reloaded.ML_BACKUP_MONTHLY_KEEP, 13)
+            self.assertEqual(reloaded.HISTORY_BACKUP_DAILY_KEEP, 9)
+            self.assertEqual(reloaded.HISTORY_BACKUP_WEEKLY_KEEP, 6)
+            self.assertEqual(reloaded.HISTORY_BACKUP_MONTHLY_KEEP, 14)
         finally:
             for key, value in old_values.items():
                 if value is None:

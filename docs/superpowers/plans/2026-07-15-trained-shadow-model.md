@@ -2,25 +2,28 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an auditable five-minute candidate dataset, strict historical training pipeline, versioned multi-head shadow model, manual model governance, and safe L0 runtime that cannot change existing trading behavior.
+**Goal:** Build an auditable five-minute candidate dataset, strict historical training pipeline, versioned multi-head model-observation runtime, manual model governance, and safe L0 runtime that cannot change existing trading behavior.
 
 **Architecture:** Reuse the live candidate frame, historical SQLite, trading ledger, and existing report/backup patterns. Store live ML facts in a separate `cache/ml/ml.db`, store strict historical candidate cohorts in `cache/backtest/history.db`, train small scikit-learn pipelines into immutable model bundles, and route every runtime output through a deterministic permission policy. L0 is the only initially enabled level; higher levels exist behind hash-bound manual approval and remain disabled until their observation gates are met.
 
 **Tech Stack:** Python 3.11+, pandas, SQLite, scikit-learn 1.9.0, joblib, hashlib/json/pathlib, existing unittest suite and `run_ubuntu.sh`.
 
-## Implementation Status (2026-07-16)
+## Implementation Status (2026-08-06)
 
 - Task 1 complete and independently approved: shared candidate scoring and immutable strict-time ML contracts.
 - Task 2 complete and independently approved: bounded independent ML SQLite schema v1, state, backup and integrity primitives.
 - Task 3 complete and independently approved: complete live five-minute cohorts, post-ledger provenance, strict replay refusal and disabled-by-default wiring.
-- Tasks 4–12 remain planned: strict historical imports, labels, training datasets, challenger training, governance, L0 runtime, reports/maintenance, full verification and separately authorized deployment/observation.
-- Current overall state: `partially implemented / not deployed / not observed / not validated`. No trained model exists and ML does not affect trading.
+- Tasks 4–10 are implemented locally in the current worktree: strict historical imports, cost-aware labels, leakage-safe training data, five-head challenger bundles, manual governance, verified L0 runtime, and bounded reports/maintenance.
+- Task 11 local full verification, documentation truth and security review is in progress. Task 12 server deployment, L0 enablement and trading-day observation is not authorized and has not run.
+- Current Batch C delta state: `implemented locally / not committed / not deployed / not observed / not validated`. Tasks 1–3 remain the earlier pushed foundation. No real one-year strict dataset evidence, trustworthy/approvable trained model, human approval, active model or server L0 evidence exists; ML does not affect trading.
+
+The step checkboxes below are retained as the implementation procedure and historical review trail; they do not override this current status snapshot.
 
 ## Global Constraints
 
 - Follow `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` exactly.
 - Preserve `final_score`, current signal selection, buy/sell decisions, target positions, exits and hard risk rules while L0 is active.
-- Keep `shadow_score.py` as a deterministic comparator; do not use `enhanced_score`, `shadow_rank` or `shadow_adjust_score` as first-version model inputs.
+- Batch B retired the former rule-based shadow scorer. Do not recreate or depend on `shadow_score.py`; do not use legacy `enhanced_score`, `shadow_rank` or `shadow_adjust_score` fields as first-version model inputs.
 - Use one new training dependency only: `scikit-learn==1.9.0`; verify Python is at least 3.11 before changing `requirements.txt`.
 - Never write high-frequency ML rows to `cache/trading/trading.db`.
 - `price_core` remains proxy-only and cannot train or approve the final model.
@@ -40,7 +43,7 @@
 - Create `ml_store.py`: independent ML SQLite schema, transactions, bounded queries, model state and backup primitive.
 - Modify `ml_dataset.py`: live candidate conversion, JSONL compatibility and DB-first review reads.
 - Modify `joinquant_exporter.py`: capture every candidate and stable rejection reason without changing exported signals.
-- Modify `a_share_strategy.py`: reuse shared candidate scoring and call shadow runtime after the rule score is complete.
+- Modify `a_share_strategy.py`: reuse shared candidate scoring and call the optional model-observation runtime after the deterministic `final_score` is complete.
 - Modify `historical_data.py`: schema v2 strict five-minute cohort and candidate-price imports.
 - Modify `historical_strategy.py`: exact `decision_at` candidate reads while retaining daily compatibility.
 - Modify `historical_backtest.py`: complete implementation hash and strict candidate-cohort evidence.
@@ -50,7 +53,7 @@
 - Create `ml_admin.py`: hash-bound approve/activate/downgrade/rollback commands and permission state machine.
 - Create `ml_runtime.py`: safe model loading, inference, deterministic score/filter/position mapping and rule fallback.
 - Create `ml_maintenance.py`: ML backup, integrity, retention dry-run/apply and status.
-- Modify `strategy_compare_report.py`: original vs rule-shadow vs trained-shadow comparison from bounded DB queries.
+- Modify `strategy_compare_report.py`: original deterministic rules vs trained-model observation comparison from bounded DB queries.
 - Modify `config.py`, `requirements.txt`, `run_ubuntu.sh`: paths, disabled-by-default gates, CLI routes and bounded timers.
 - Add focused tests named in each task; update current tests only where a contract intentionally changes.
 
@@ -144,7 +147,7 @@ def canonical_hash(value: object) -> str:
 
 - [ ] **Step 4: Run focused and regression tests**
 
-Run: `python -m unittest tests.test_candidate_core tests.test_ml_contracts tests.test_historical_strategy tests.test_shadow_score -v`
+Run: `python -m unittest tests.test_candidate_core tests.test_ml_contracts tests.test_historical_strategy tests.test_strategy_compare_report -v`
 
 Expected: all tests pass and historical candidate order remains deterministic.
 
@@ -532,6 +535,9 @@ FORBIDDEN_MODEL_FEATURES = {
     "shadow_rank", "shadow_rank_change", "shadow_reason",
 }
 
+# The legacy shadow fields remain listed only to reject archived payloads;
+# they are not active features and no rule-shadow module is recreated.
+
 def assign_stock_day_weights(frame: pd.DataFrame) -> pd.Series:
     counts = frame.groupby(["trade_date", "code"])["sample_id"].transform("count")
     return 1.0 / counts.astype(float)
@@ -656,7 +662,7 @@ def test_approve_requires_exact_hash_reason_and_observation_gate(self):
         approve_model(self.store, "m1", self.sha, 1, "", "user")
 
 def test_cas_prevents_stale_activation_and_rollback_is_audited(self):
-    approve_model(self.store, "m1", self.sha, 0, "进入影子", "user")
+    approve_model(self.store, "m1", self.sha, 0, "进入 L0 模型观察", "user")
     activate_model(self.store, "m1", self.sha, None, 0)
     with self.assertRaises(ModelStateConflict):
         activate_model(self.store, "m2", self.sha2, None, 0)
@@ -750,7 +756,7 @@ def deterministic_outputs(expected_ret_5d, downside, fill_probability):
 
 Compute `confidence` deterministically from feature coverage, cross-head/fold disagreement and drift against the training distributions stored in the manifest; clip it to `[0, 1]`. Below the configured confidence threshold, retain raw predictions for audit but set filter/position suggestions to neutral and prohibit any L1-L3 effect. Track consecutive inference/hash/schema/drift failures in ML runtime state; the health evaluator may CAS-downgrade to L0 or disable the active model, but no automated path may upgrade permission, edit trading controls or trigger `kill_switch`.
 
-Verify resolved artifact paths remain under `ML_MODEL_DIR`, the file SHA matches the active DB row, the manifest feature schema matches, and dependency versions match. Add inference after `apply_shadow_scores` and before any optional ML policy. When `ML_TRAINED_SHADOW_ENABLE` is false or maximum permission is 0, only L0 prediction columns and DB prediction rows are allowed; existing sort keys and exported signals remain untouched.
+Verify resolved artifact paths remain under `ML_MODEL_DIR`, the file SHA matches the active DB row, the manifest feature schema matches, and dependency versions match. Add inference after deterministic `final_score` and before any optional ML policy. When `ML_TRAINED_SHADOW_ENABLE` is false or maximum permission is 0, only L0 prediction columns and DB prediction rows are allowed; existing sort keys and exported signals remain untouched.
 
 - [ ] **Step 4: Run runtime and full execution-contract tests**
 
@@ -787,8 +793,8 @@ Expected: clean. Suggested authorized commit: `feat: run trained model in shadow
 def test_report_compares_three_scores_without_claiming_deployment(self):
     report = build_three_way_report(self.fixture_rows)
     self.assertIn("原策略 final_score", report)
-    self.assertIn("规则影子 enhanced_score", report)
-    self.assertIn("训练影子 ml_score", report)
+    self.assertNotIn("规则影子 enhanced_score", report)
+    self.assertIn("训练模型 ml_score", report)
     self.assertIn("planned / not deployed", report)
 
 def test_retention_never_deletes_approved_or_active_models(self):
@@ -817,7 +823,7 @@ stock-ml-train.timer: Fri 18:00
 stock-ml-backup.timer: daily 19:00
 ```
 
-The training service runs only `ml_train.py train`; it cannot invoke `ml_admin.py`. The report must show original/rule-shadow/trained-shadow D+3/D+5/D+10, MAE, fill rate, label coverage, model ID and permission level.
+The training service runs only `ml_train.py train`; it cannot invoke `ml_admin.py`. The report must show original-rules/trained-model D+3/D+5/D+10, MAE, fill rate, label coverage, model ID and permission level.
 
 - [ ] **Step 4: Run ops/report tests**
 
@@ -833,7 +839,7 @@ Expected: clean. Suggested authorized commit: `feat: operate shadow model eviden
 
 ---
 
-### Task 11: Documentation Truth, Full Verification and Security Review
+### Task 11: Documentation Truth, Full Verification and Security Review — in progress locally
 
 **Files:**
 - Modify: `docs/project_roadmap.md`
@@ -898,7 +904,7 @@ Expected: clean. Suggested authorized commit: `docs: record trained shadow model
 
 ---
 
-### Task 12: Separately Authorized Server Deployment and L0 Observation
+### Task 12: Separately Authorized Server Deployment and L0 Observation — not authorized / not started
 
 **Files:**
 - No additional source files unless deployment evidence exposes a defect.

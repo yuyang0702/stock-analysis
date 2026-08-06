@@ -1,7 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from contextlib import closing
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -18,6 +18,7 @@ from tests.test_execution_contracts import (
     make_candidate,
     pre_trade_values,
 )
+from pre_trade_check import AdoptedPositionCapacityEvidence
 from trading_store import (
     SCHEMA_VERSION,
     SCHEMA_V1,
@@ -147,13 +148,53 @@ class TradingStoreTest(unittest.TestCase):
             created_at="2026-07-28T10:00:00+08:00",
         )
 
-    def test_schema_v11_is_idempotent_and_has_scoped_execution_chain(self) -> None:
+    @staticmethod
+    def _insert_local_admission_order(
+        conn: sqlite3.Connection,
+        candidate: object,
+        intent: ExecutionIntent,
+        *,
+        status: str = "ready",
+        submit_count: int = 0,
+        first_submitted_at: str | None = None,
+    ) -> None:
+        payload = {
+            "source": "execution_admission",
+            "client_order_id": intent.client_order_id,
+            "intent_sha256": intent.intent_sha256,
+            "pre_trade_result_id": intent.pre_trade_result_id,
+            "target_qty": intent.target_position_qty,
+            "requested_qty": intent.order_qty,
+        }
+        updated_at = (
+            "2026-07-28T10:00:02+08:00"
+            if status == "not_submitted"
+            else "2026-07-28T10:00:00+08:00"
+        )
+        conn.execute(
+            """INSERT INTO orders(
+               client_order_id, stock_code, action, target_qty,
+               requested_qty, filled_qty, average_fill_price, status,
+               submit_count, reason, first_submitted_at, updated_at,
+               completed_at, raw_json
+               ) VALUES(?,?,?,?,?,0,0,?,?,?,?,?,?,?)""",
+            (
+                intent.client_order_id, candidate.code, candidate.side,
+                intent.target_position_qty, intent.order_qty, status,
+                submit_count, "", first_submitted_at,
+                updated_at,
+                updated_at if status in {"expired", "not_submitted"} else None,
+                trading_store.canonical_json(payload),
+            ),
+        )
+
+    def test_schema_v12_is_idempotent_and_has_scoped_execution_chain(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
             store.initialize()
 
-            self.assertEqual(store.health().schema_version, 11)
+            self.assertEqual(store.health().schema_version, SCHEMA_VERSION)
             with store.connect() as conn:
                 tables = {
                     row[0] for row in conn.execute(
@@ -165,7 +206,20 @@ class TradingStoreTest(unittest.TestCase):
                     "broker_position_current", "broker_order_current",
                     "strategy_order_candidates", "pre_trade_results",
                     "execution_intents", "capacity_reservations",
+                    "position_capacity_adoptions",
+                    "notification_outbox", "notification_enqueue_gaps",
+                    "logical_signal_plans",
                 }.issubset(tables))
+                issue_columns = {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(execution_issue_state)"
+                    )
+                }
+                self.assertTrue({
+                    "incident_id", "transition_seq",
+                    "critical_trading_minutes",
+                    "critical_last_counted_minute", "next_reminder_seq",
+                }.issubset(issue_columns))
                 cycle_columns = {
                     row[1] for row in conn.execute("PRAGMA table_info(position_cycles)")
                 }
@@ -214,6 +268,125 @@ class TradingStoreTest(unittest.TestCase):
                         parent_tables,
                         {"account_scopes", chain_parent},
                     )
+                adoption_parents = {
+                    row[2]
+                    for row in conn.execute(
+                        "PRAGMA foreign_key_list(position_capacity_adoptions)"
+                    )
+                }
+                self.assertEqual(
+                    adoption_parents, {"account_scopes", "position_cycles"},
+                )
+
+    def test_schema_v11_initializes_sell_enabled_without_overwriting_it(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            self.assertEqual(store.get_system_state("sell_enabled"), "1")
+            with store.connect() as conn:
+                store.set_system_state(conn, "sell_enabled", "0", "manual")
+            store.initialize()
+            self.assertEqual(store.get_system_state("sell_enabled"), "0")
+
+    def test_position_capacity_adoption_is_scoped_immutable_and_recoverable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            scope = "scope-adoption"
+            with store.transaction() as conn:
+                conn.execute(
+                    """INSERT INTO account_scopes(
+                       account_scope_id, adapter, scope_alias, created_at
+                       ) VALUES(?, 'joinquant', 'primary', datetime('now'))""",
+                    (scope,),
+                )
+                conn.execute(
+                    """INSERT INTO position_cycles(
+                       position_cycle_id, stock_code, opened_at, status, mode,
+                       initial_qty, current_qty, entry_price, initial_stop_price,
+                       initial_r, atr14, market_state, highest_price,
+                       take_profit_stage, last_snapshot_at, created_at, updated_at
+                       ) VALUES('cycle-adoption','600000',?,'active','legacy_fixed',
+                       100,200,10,9,1,0.5,'normal',10,0,?,?,?)""",
+                    (
+                        "2026-07-28T09:30:00+08:00",
+                        "2026-07-28T10:00:00+08:00",
+                        "2026-07-28T10:00:00+08:00",
+                        "2026-07-28T10:00:00+08:00",
+                    ),
+                )
+                snapshot = self._broker_snapshot(
+                    scope, "adoption-source", qty=200, open_orders=(),
+                )
+                store.replace_current_broker_snapshot(conn, snapshot)
+                evidence = AdoptedPositionCapacityEvidence(
+                    position_cycle_id="cycle-adoption",
+                    account_scope_id=scope,
+                    adapter="joinquant",
+                    code="600000",
+                    industry="technology",
+                    theme="artificial-intelligence",
+                    effective_stop_price=Decimal("9"),
+                    gap_price=Decimal("8.5"),
+                    initial_qty=200,
+                    adopted_at="2026-07-28T10:00:00+08:00",
+                    source_sha256=snapshot.snapshot_sha256,
+                )
+                with self.assertRaisesRegex(ValueError, "source"):
+                    store.insert_position_capacity_adoption(
+                        conn,
+                        AdoptedPositionCapacityEvidence.from_dict({
+                            **evidence.to_dict(), "source_sha256": "b" * 64,
+                        }),
+                    )
+                with self.assertRaisesRegex(ValueError, "broker snapshot"):
+                    store.insert_position_capacity_adoption(
+                        conn,
+                        AdoptedPositionCapacityEvidence.from_dict({
+                            **evidence.to_dict(), "initial_qty": 100,
+                        }),
+                    )
+                self.assertEqual(
+                    store.insert_position_capacity_adoption(conn, evidence),
+                    "cycle-adoption",
+                )
+                self.assertEqual(
+                    store.insert_position_capacity_adoption(conn, evidence),
+                    "cycle-adoption",
+                )
+                payloads = store.list_position_capacity_adoptions(conn, scope)
+                self.assertEqual(
+                    AdoptedPositionCapacityEvidence.from_dict(payloads[0]),
+                    evidence,
+                )
+                conflicting = AdoptedPositionCapacityEvidence.from_dict({
+                    **evidence.to_dict(),
+                    "effective_stop_price": "8.9",
+                })
+                with self.assertRaisesRegex(ValueError, "immutable ID"):
+                    store.insert_position_capacity_adoption(conn, conflicting)
+
+    def test_position_capacity_adoption_rejects_unbound_scope_or_cycle(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            evidence = AdoptedPositionCapacityEvidence(
+                position_cycle_id="missing-cycle",
+                account_scope_id="missing-scope",
+                adapter="joinquant",
+                code="600000",
+                industry="technology",
+                theme="artificial-intelligence",
+                effective_stop_price=Decimal("9"),
+                gap_price=Decimal("8.5"),
+                initial_qty=100,
+                adopted_at="2026-07-28T10:00:00+08:00",
+                source_sha256="a" * 64,
+            )
+            with store.transaction() as conn, self.assertRaisesRegex(
+                ValueError, "account scope",
+            ):
+                store.insert_position_capacity_adoption(conn, evidence)
 
     def test_schema_v11_health_rejects_forbidden_global_unique_key(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -239,7 +412,7 @@ class TradingStoreTest(unittest.TestCase):
                 )
             health = store.health()
             self.assertFalse(health.ok)
-            self.assertEqual(health.schema_version, 11)
+            self.assertEqual(health.schema_version, SCHEMA_VERSION)
             self.assertIn("unique", health.error)
 
     def test_schema_health_rejects_duplicate_unique_signature(self) -> None:
@@ -343,6 +516,8 @@ class TradingStoreTest(unittest.TestCase):
                 store.initialize()
                 with store.connect() as conn:
                     for table in (
+                        "logical_signal_plans", "notification_enqueue_gaps",
+                        "notification_outbox",
                         "capacity_reservations", "execution_intents",
                         "pre_trade_results", "strategy_order_candidates",
                         "broker_position_current", "broker_order_current",
@@ -350,7 +525,7 @@ class TradingStoreTest(unittest.TestCase):
                     ):
                         conn.execute(f"DROP TABLE {table}")
                     conn.execute(
-                        "DELETE FROM schema_migrations WHERE version=11"
+                        "DELETE FROM schema_migrations WHERE version>=11"
                     )
                     conn.execute(corruption)
                 with self.assertRaisesRegex(RuntimeError, expected):
@@ -370,7 +545,7 @@ class TradingStoreTest(unittest.TestCase):
                 finally:
                     conn.close()
 
-    def test_schema_v11_refuses_newer_database_without_mutation(self) -> None:
+    def test_schema_v12_refuses_newer_database_without_mutation(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "trading.db"
             conn = sqlite3.connect(path)
@@ -379,7 +554,7 @@ class TradingStoreTest(unittest.TestCase):
                     "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
                 )
                 conn.execute(
-                    "INSERT INTO schema_migrations VALUES(12, '2026-07-29T00:00:00+08:00')"
+                    "INSERT INTO schema_migrations VALUES(13, '2026-07-29T00:00:00+08:00')"
                 )
                 conn.execute("CREATE TABLE sentinel(value TEXT)")
                 conn.execute("INSERT INTO sentinel VALUES('keep')")
@@ -396,6 +571,37 @@ class TradingStoreTest(unittest.TestCase):
                 ).fetchone())
             finally:
                 conn.close()
+
+    def test_schema_v11_migrates_to_v12_without_rotating_account_scope(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            with patch.object(
+                TradingStore, "_migrate_schema_v12", return_value=None,
+            ):
+                old_store = TradingStore(path)
+                old_store.initialize()
+                with old_store.transaction() as conn:
+                    scope = old_store.get_or_create_account_scope(
+                        conn, "joinquant", "primary",
+                    )
+            with closing(sqlite3.connect(path)) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT MAX(version) FROM schema_migrations"
+                    ).fetchone()[0],
+                    11,
+                )
+
+            store = TradingStore(path)
+            store.initialize()
+            self.assertEqual(store.health().schema_version, 12)
+            with store.transaction() as conn:
+                self.assertEqual(
+                    store.get_or_create_account_scope(
+                        conn, "joinquant", "primary",
+                    ),
+                    scope,
+                )
 
     def test_schema_v11_migration_rolls_back_all_objects_on_failure(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -732,10 +938,12 @@ class TradingStoreTest(unittest.TestCase):
                         },),
                     ),
                 )
-                self.assertTrue(store.adjust_capacity_reservation(
-                    conn, candidate.account_scope_id, "reservation-1",
-                    cumulative_filled_qty=50,
-                ))
+                with localcontext() as context:
+                    context.prec = 2
+                    self.assertTrue(store.adjust_capacity_reservation(
+                        conn, candidate.account_scope_id, "reservation-1",
+                        cumulative_filled_qty=50,
+                    ))
                 adjusted = store.aggregate_active_reservations(
                     conn, candidate.account_scope_id,
                 )
@@ -1470,6 +1678,217 @@ class TradingStoreTest(unittest.TestCase):
                     reason="post-expiry absence confirmed",
                 ))
 
+    def test_expired_local_admission_order_releases_only_if_never_submitted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                self._reserve_intent(
+                    store, conn, candidate, result, intent,
+                    "local-expired-release",
+                )
+                self._insert_local_admission_order(conn, candidate, intent)
+                with self.assertRaisesRegex(ValueError, "transition to EXPIRED"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "local-expired-release",
+                        released_at="2026-07-28T10:01:01+08:00",
+                        reason="still ready",
+                    )
+                store.compare_and_set_execution_intent_status(
+                    conn, candidate.account_scope_id, intent.client_order_id,
+                    expected_status="READY", new_status="EXPIRED",
+                    transitioned_at="2026-07-28T10:01:00+08:00",
+                )
+                conn.execute(
+                    """UPDATE orders SET status='expired', completed_at=?,
+                       updated_at=? WHERE client_order_id=?""",
+                    (
+                        "2026-07-28T10:01:00+08:00",
+                        "2026-07-28T10:01:00+08:00",
+                        intent.client_order_id,
+                    ),
+                )
+                invalid_updates = (
+                    (
+                        "broker id", "order_id='broker-should-not-exist'",
+                        "order_id=NULL", "broker order id",
+                    ),
+                    (
+                        "fill", "filled_qty=1", "filled_qty=0", "fill evidence",
+                    ),
+                    (
+                        "submit count", "submit_count=1", "submit_count=0",
+                        "submission evidence",
+                    ),
+                    (
+                        "submission time",
+                        "first_submitted_at='2026-07-28T10:00:10+08:00'",
+                        "first_submitted_at=NULL", "submission evidence",
+                    ),
+                    (
+                        "quantity", "requested_qty=200", "requested_qty=100",
+                        "execution intent",
+                    ),
+                )
+                for label, invalid, repair, error in invalid_updates:
+                    with self.subTest(label=label):
+                        conn.execute(
+                            f"UPDATE orders SET {invalid} WHERE client_order_id=?",
+                            (intent.client_order_id,),
+                        )
+                        with self.assertRaisesRegex(ValueError, error):
+                            store.release_capacity_reservation(
+                                conn, candidate.account_scope_id,
+                                "local-expired-release",
+                                released_at="2026-07-28T10:01:01+08:00",
+                                reason="invalid local expiry",
+                            )
+                        conn.execute(
+                            f"UPDATE orders SET {repair} WHERE client_order_id=?",
+                            (intent.client_order_id,),
+                        )
+                original_json = conn.execute(
+                    "SELECT raw_json FROM orders WHERE client_order_id=?",
+                    (intent.client_order_id,),
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE orders SET raw_json='{}' WHERE client_order_id=?",
+                    (intent.client_order_id,),
+                )
+                with self.assertRaisesRegex(ValueError, "admission content"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "local-expired-release",
+                        released_at="2026-07-28T10:01:01+08:00",
+                        reason="invalid content",
+                    )
+                conn.execute(
+                    "UPDATE orders SET raw_json=? WHERE client_order_id=?",
+                    (original_json, intent.client_order_id),
+                )
+                with self.assertRaisesRegex(ValueError, "current broker snapshot"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "local-expired-release",
+                        released_at="2026-07-28T10:01:01+08:00",
+                        reason="snapshot still required",
+                    )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "local-expired-empty",
+                        broker_time="2026-07-28T10:01:01+08:00",
+                        generated_at="2026-07-28T10:01:02+08:00",
+                        open_orders=(),
+                    ),
+                )
+                self.assertTrue(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id,
+                    "local-expired-release",
+                    released_at="2026-07-28T10:01:03+08:00",
+                    reason="strict local expiry",
+                ))
+
+    def test_not_submitted_local_order_still_requires_full_reconciliation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            candidate = make_candidate()
+            result = PreTradeResult(**pre_trade_values(candidate))
+            intent = ExecutionIntent(**intent_values(candidate, result))
+            with store.transaction() as conn:
+                self._reserve_intent(
+                    store, conn, candidate, result, intent,
+                    "local-not-submitted-release",
+                )
+                self._insert_local_admission_order(
+                    conn, candidate, intent, status="not_submitted",
+                    submit_count=1,
+                    first_submitted_at="2026-07-28T10:00:01+08:00",
+                )
+                for expected, new, transitioned_at in (
+                    ("READY", "SUBMITTING", "2026-07-28T10:00:00+08:00"),
+                    (
+                        "SUBMITTING", "NOT_SUBMITTED",
+                        "2026-07-28T10:00:02+08:00",
+                    ),
+                ):
+                    store.compare_and_set_execution_intent_status(
+                        conn, candidate.account_scope_id,
+                        intent.client_order_id, expected_status=expected,
+                        new_status=new, transitioned_at=transitioned_at,
+                    )
+                store.replace_current_broker_snapshot(
+                    conn,
+                    self._broker_snapshot(
+                        candidate.account_scope_id, "not-submitted-empty",
+                        broker_time="2026-07-28T10:00:03+08:00",
+                        generated_at="2026-07-28T10:00:04+08:00",
+                        open_orders=(),
+                    ),
+                )
+                self._insert_matched_reconciliation(
+                    conn, "not-submitted-match", candidate.account_scope_id,
+                    broker_time="2026-07-28T10:00:03+08:00",
+                    generated_at="2026-07-28T10:00:04+08:00",
+                    finished_at="2026-07-28T10:00:05+08:00",
+                )
+                with self.assertRaisesRegex(ValueError, "full reconciliation"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "local-not-submitted-release",
+                        released_at="2026-07-28T10:00:06+08:00",
+                        reason="missing reconciliation",
+                        reconciliation_id="missing-reconciliation",
+                    )
+                original_json = conn.execute(
+                    "SELECT raw_json FROM orders WHERE client_order_id=?",
+                    (intent.client_order_id,),
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE orders SET raw_json='{}' WHERE client_order_id=?",
+                    (intent.client_order_id,),
+                )
+                with self.assertRaisesRegex(ValueError, "admission content"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "local-not-submitted-release",
+                        released_at="2026-07-28T10:00:06+08:00",
+                        reason="wrong content",
+                        reconciliation_id="not-submitted-match",
+                    )
+                conn.execute(
+                    "UPDATE orders SET raw_json=? WHERE client_order_id=?",
+                    (original_json, intent.client_order_id),
+                )
+                conn.execute(
+                    """INSERT INTO fills(
+                       fill_id, client_order_id, stock_code, action, qty,
+                       price, filled_at, raw_json
+                       ) VALUES('unexpected-fill',?,'600000','buy',1,10,?,'{}')""",
+                    (intent.client_order_id, "2026-07-28T10:00:01+08:00"),
+                )
+                with self.assertRaisesRegex(ValueError, "fill evidence"):
+                    store.release_capacity_reservation(
+                        conn, candidate.account_scope_id,
+                        "local-not-submitted-release",
+                        released_at="2026-07-28T10:00:06+08:00",
+                        reason="unexpected fill",
+                        reconciliation_id="not-submitted-match",
+                    )
+                conn.execute("DELETE FROM fills WHERE fill_id='unexpected-fill'")
+                self.assertTrue(store.release_capacity_reservation(
+                    conn, candidate.account_scope_id,
+                    "local-not-submitted-release",
+                    released_at="2026-07-28T10:00:06+08:00",
+                    reason="authoritative absence",
+                    reconciliation_id="not-submitted-match",
+                ))
+
     def test_partial_adjustment_binds_broker_order_and_fill_identity(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
@@ -1921,20 +2340,23 @@ class TradingStoreTest(unittest.TestCase):
             path = Path(tmp) / "trading.db"
             store = TradingStore(path)
             with patch.object(
-                TradingStore, "_migrate_schema_v11", return_value=None,
+                TradingStore, "_migrate_schema_v12", return_value=None,
             ):
                 store.initialize()
             with store.transaction() as conn:
-                store.upsert_execution_issue(conn, {
-                    "issue_key": "order:legacy-order",
-                    "object_type": "order",
-                    "object_id": "legacy-order",
-                    "state": "ORDER_MISSING_PLATFORM",
-                    "severity": "ERROR",
-                    "stage_started_at": "2026-07-28 10:00:00",
-                    "seen_at": "2026-07-28 10:00:00",
-                    "details": {},
-                })
+                conn.execute(
+                    """INSERT INTO execution_issue_state(
+                       issue_key, object_type, object_id, state, severity,
+                       first_seen_at, stage_started_at, last_seen_at,
+                       last_transition_at, details_json
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')""",
+                    (
+                        "order:legacy-order", "order", "legacy-order",
+                        "ORDER_MISSING_PLATFORM", "ERROR",
+                        "2026-07-28 10:00:00", "2026-07-28 10:00:00",
+                        "2026-07-28 10:00:00", "2026-07-28 10:00:00",
+                    ),
+                )
             store.initialize()
             with store.transaction() as conn:
                 scope = store.get_or_create_account_scope(
@@ -2303,7 +2725,11 @@ class TradingStoreTest(unittest.TestCase):
                     raise RuntimeError("boom")
             with store.connect() as conn:
                 count = conn.execute("SELECT COUNT(*) FROM system_state").fetchone()[0]
-            self.assertEqual(count, 0)
+                buy_enabled = conn.execute(
+                    "SELECT 1 FROM system_state WHERE key='buy_enabled'"
+                ).fetchone()
+            self.assertEqual(count, 1)
+            self.assertIsNone(buy_enabled)
 
     def test_initialize_is_idempotent(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2484,13 +2910,139 @@ class TradingStoreTest(unittest.TestCase):
                     "code": "600000", "qty": 500, "cost_price": 10,
                     "current_price": 12, "stop_price": 9,
                 }], "2026-07-14 09:31:00")
-            self.assertEqual(store.get_active_position_cycles()["600000"]["take_profit_stage"], 1)
+            self.assertEqual(store.get_active_position_cycles()["600000"]["take_profit_stage"], 0)
+
+    def test_profit_protection_activation_is_atomic_and_idempotent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.get_or_create_account_scope(conn, "joinquant", "primary")
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 100, "cost_price": 10,
+                    "current_price": 12, "stop_price": 9,
+                }], "2026-08-03 09:55:00")
+            cycle = store.get_active_position_cycles()["600000"]
+
+            with store.transaction() as conn:
+                activated = store.activate_profit_protection(
+                    conn,
+                    cycle["position_cycle_id"],
+                    expected_current_qty=100,
+                    batch_at="2026-08-03T10:00:00+08:00",
+                    highest_price=13,
+                )
+            first = store.get_active_position_cycles()["600000"]
+            with store.transaction() as conn:
+                replayed = store.activate_profit_protection(
+                    conn,
+                    cycle["position_cycle_id"],
+                    expected_current_qty=100,
+                    batch_at="2026-08-03T10:05:00+08:00",
+                    highest_price=14,
+                )
+            second = store.get_active_position_cycles()["600000"]
+
+            self.assertTrue(activated)
+            self.assertFalse(replayed)
+            self.assertEqual(
+                first["profit_protection_activated_at"],
+                "2026-08-03T10:00:00+08:00",
+            )
+            self.assertGreater(
+                first["trailing_stop_active_from"],
+                first["profit_protection_activated_at"],
+            )
+            self.assertEqual(
+                second["profit_protection_activated_at"],
+                first["profit_protection_activated_at"],
+            )
+            self.assertEqual(second["highest_price"], 13)
+
+    def test_position_cycle_stage_requires_linked_take_profit_fill(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.get_or_create_account_scope(conn, "joinquant", "primary")
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 300, "cost_price": 10,
+                    "current_price": 12, "stop_price": 9,
+                }], "2026-08-03 09:55:00")
+            cycle = store.get_active_position_cycles()["600000"]
+            signal_id = f"{cycle['position_cycle_id']}-take_profit_1-0"
+            with store.transaction() as conn:
+                store.record_strategy_run(conn, StrategyRunRecord(
+                    "tp-run", "2026-08-03", "2026-08-03 10:00:00",
+                    "test-v1", "test-params-v1",
+                ))
+                store.record_signal(conn, SignalRecord(
+                    signal_id, "tp-run", "2026-08-03", "600000",
+                    "600000.XSHG", "sell", 0,
+                    "2026-08-03 10:00:00", "", "{}",
+                ))
+                store.upsert_exit_intent(
+                    conn, signal_id, "600000", 200, "take_profit_1",
+                    "2026-08-03 10:00:00",
+                )
+                conn.execute(
+                    """INSERT INTO orders(
+                       client_order_id, signal_id, order_id, stock_code, action,
+                       target_qty, requested_qty, filled_qty, status, updated_at,
+                       raw_json
+                       ) VALUES(?, ?, 'tp-order', '600000', 'sell', 200, 100,
+                                100, 'filled', '2026-08-03 15:00:00', '{}')""",
+                    ("tp-client", signal_id),
+                )
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 200, "cost_price": 10,
+                    "current_price": 12, "stop_price": 9,
+                }], "2026-08-03 10:01:00")
+                self.assertEqual(conn.execute(
+                    "SELECT take_profit_stage FROM position_cycles WHERE position_cycle_id=?",
+                    (cycle["position_cycle_id"],),
+                ).fetchone()[0], 0)
+                conn.execute(
+                    "UPDATE orders SET updated_at='2026-08-03 09:50:00' WHERE client_order_id='tp-client'"
+                )
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 200, "cost_price": 10,
+                    "current_price": 12, "stop_price": 9,
+                }], "2026-08-03 10:01:00")
+                self.assertEqual(conn.execute(
+                    "SELECT take_profit_stage FROM position_cycles WHERE position_cycle_id=?",
+                    (cycle["position_cycle_id"],),
+                ).fetchone()[0], 0)
+                conn.execute(
+                    "UPDATE orders SET updated_at='2026-08-03 09:56:00' WHERE client_order_id='tp-client'"
+                )
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 200, "cost_price": 10,
+                    "current_price": 12, "stop_price": 9,
+                }], "2026-08-03 10:01:00")
+                self.assertEqual(conn.execute(
+                    "SELECT take_profit_stage FROM position_cycles WHERE position_cycle_id=?",
+                    (cycle["position_cycle_id"],),
+                ).fetchone()[0], 0)
+                conn.execute(
+                    "UPDATE orders SET updated_at='2026-08-03 10:01:00' WHERE client_order_id='tp-client'"
+                )
+                store.reconcile_position_cycles(conn, [{
+                    "code": "600000", "qty": 200, "cost_price": 10,
+                    "current_price": 12, "stop_price": 9,
+                }], "2026-08-03 10:01:00")
+
+            self.assertEqual(
+                store.get_active_position_cycles()["600000"]["take_profit_stage"],
+                1,
+            )
 
     def test_add_position_updates_weighted_cost_without_lowering_frozen_stop(self) -> None:
         with TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
             with store.transaction() as conn:
+                store.get_or_create_account_scope(conn, "joinquant", "primary")
                 store.reconcile_position_cycles(conn, [{
                     "code": "600000", "qty": 1000, "cost_price": 10,
                     "current_price": 10, "stop_price": 9.2,
@@ -2532,6 +3084,7 @@ class TradingStoreTest(unittest.TestCase):
             store = TradingStore(Path(tmp) / "trading.db")
             store.initialize()
             with store.transaction() as conn:
+                store.get_or_create_account_scope(conn, "joinquant", "primary")
                 store.reconcile_position_cycles(conn, [{
                     "code": "600000", "qty": 100, "cost_price": 10,
                     "current_price": 10, "stop_price": 9.3,
@@ -2684,6 +3237,17 @@ class TradingStoreTest(unittest.TestCase):
             self.assertEqual(store.confirm_market_regime("RISK_OFF"), "NORMAL")
             self.assertEqual(store.confirm_market_regime("RISK_OFF"), "RISK_OFF")
             self.assertEqual(TradingStore(Path(tmp) / "trading.db").confirm_market_regime("NORMAL"), "RISK_OFF")
+            self.assertEqual(store.get_system_state("market_regime"), "RISK_OFF")
+
+    def test_market_regime_persists_directly_when_confirmation_is_disabled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+
+            self.assertEqual(
+                store.confirm_market_regime("CAUTION", enabled=False), "CAUTION",
+            )
+            self.assertEqual(store.get_system_state("market_regime"), "CAUTION")
 
     def test_completed_hard_stop_creates_rebuy_cooldown(self) -> None:
         with TemporaryDirectory() as tmp:

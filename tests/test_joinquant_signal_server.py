@@ -2,9 +2,14 @@ import json
 import tempfile
 import unittest
 import unittest.mock
+from decimal import Decimal
 from pathlib import Path
 
+import pandas as pd
+
+import joinquant_exporter
 import joinquant_signal_server
+from execution_contracts import BrokerSnapshot
 from trading_store import TradingStore
 
 
@@ -35,6 +40,162 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             )
             response = app.test_client().get("/joinquant/signals", headers={"Authorization": "Bearer secret"})
             self.assertEqual(response.status_code, 200)
+
+    @staticmethod
+    def _write_exact_signal(base: Path, store: TradingStore) -> Path:
+        store.initialize()
+        with store.transaction() as conn:
+            scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
+            for key, value in {
+                "buy_enabled": "1", "sell_enabled": "1", "kill_switch": "0",
+                "market_regime": "NORMAL",
+            }.items():
+                store.set_system_state(conn, key, value, "test")
+            store.replace_current_broker_snapshot(conn, BrokerSnapshot.from_values(
+                account_scope_id=scope, trade_date="2099-07-28",
+                broker_time="2099-07-28T09:59:40+08:00",
+                generated_at="2099-07-28T09:59:41+08:00",
+                total_equity=Decimal("100000"), cash=Decimal("100000"),
+                available_cash=Decimal("100000"), frozen_cash=Decimal("0"),
+                positions=(), open_orders=(), fills=(),
+                adapter_version="joinquant-v1", node_version="server-v1",
+                session_id="session-1", capabilities_version="cap-v1",
+                daily_risk_evidence_status="reported", intraday_pnl=Decimal("0"),
+                account_drawdown_pct=Decimal("0"),
+                daily_turnover_fraction=Decimal("0"), consecutive_losses=0,
+            ))
+        row = pd.DataFrame([{
+            "code": "600000", "name": "PF Bank", "price": 10.0,
+            "entry_price": 10.0, "stop_loss": 9.8, "take_profit": 10.4,
+            "position_pct": 5.0, "final_score": 95,
+            "signal_action": "continue",
+            "execution_plan_version": joinquant_exporter.EXECUTION_PLAN_VERSION,
+            "execution_allowed": True, "market_state": "NORMAL",
+            "market_regime": "NORMAL", "board_type": "main_active",
+            "atr14": 0.2, "prev_close": 10.0,
+            "quote_time": "2099-07-28T09:59:50+08:00",
+            "industry": "bank", "theme_label": "dividend",
+        }])
+        with unittest.mock.patch.object(
+            joinquant_exporter,
+            "_execution_now",
+            return_value="2099-07-28T10:00:00+08:00",
+        ):
+            return joinquant_exporter.export_signals(
+                row, run_id="exact-server-filter", trade_date="2099-07-28",
+                output_path=base / "signals.json", store=store,
+                account_total_value=100000, available_cash=100000,
+                enforce_execution_contract=True,
+            )
+
+    def test_signal_pull_rechecks_ready_intent_and_current_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            signal_file = self._write_exact_signal(base, store)
+            payload = json.loads(signal_file.read_text(encoding="utf-8"))
+            payload["signals"].insert(0, {
+                "id": "protective-sell", "action": "sell", "code": "000001",
+                "jq_code": "000001.XSHE", "target_qty": 0,
+            })
+            signal_file.write_text(json.dumps(payload), encoding="utf-8")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, base / "account.json", store=store,
+            )
+            client = app.test_client()
+
+            ready = client.get("/joinquant/signals?token=secret").get_json()
+            self.assertEqual(
+                [item["action"] for item in ready["signals"]], ["sell", "buy"],
+            )
+
+            with store.transaction() as conn:
+                store.set_system_state(conn, "buy_enabled", "0", "test stop")
+            stopped = client.get("/joinquant/signals?token=secret").get_json()
+            self.assertEqual(
+                [item["action"] for item in stopped["signals"]], ["sell"],
+            )
+
+            with store.transaction() as conn:
+                store.set_system_state(conn, "buy_enabled", "1", "test resume")
+                conn.execute("UPDATE orders SET status='rejected' WHERE action='buy'")
+            terminal = client.get("/joinquant/signals?token=secret").get_json()
+            self.assertEqual(
+                [item["action"] for item in terminal["signals"]], ["sell"],
+            )
+
+            with store.transaction() as conn:
+                store.set_system_state(conn, "kill_switch", "1", "test kill")
+            killed = client.get("/joinquant/signals?token=secret").get_json()
+            self.assertEqual(killed["signals"], [])
+
+    def test_signal_pull_fails_closed_for_invalid_control_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            signal_file = self._write_exact_signal(base, store)
+            payload = json.loads(signal_file.read_text(encoding="utf-8"))
+            payload["signals"].insert(0, {
+                "id": "protective-sell", "action": "sell", "code": "000001",
+                "jq_code": "000001.XSHE", "target_qty": 0,
+            })
+            signal_file.write_text(json.dumps(payload), encoding="utf-8")
+            client = joinquant_signal_server.create_app(
+                "secret", signal_file, base / "account.json", store=store,
+            ).test_client()
+
+            with store.transaction() as conn:
+                store.set_system_state(conn, "kill_switch", "corrupt", "test")
+            self.assertEqual(
+                client.get("/joinquant/signals?token=secret").get_json()["signals"],
+                [],
+            )
+
+            with store.transaction() as conn:
+                store.set_system_state(conn, "kill_switch", "0", "test")
+                store.set_system_state(conn, "buy_enabled", "corrupt", "test")
+            self.assertEqual(
+                [item["action"] for item in client.get(
+                    "/joinquant/signals?token=secret"
+                ).get_json()["signals"]],
+                ["sell"],
+            )
+
+            with store.transaction() as conn:
+                store.set_system_state(conn, "buy_enabled", "1", "test")
+                store.set_system_state(conn, "sell_enabled", "corrupt", "test")
+            self.assertEqual(
+                [item["action"] for item in client.get(
+                    "/joinquant/signals?token=secret"
+                ).get_json()["signals"]],
+                ["buy"],
+            )
+
+    def test_signal_pull_rejects_tampered_execution_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            signal_file = self._write_exact_signal(base, store)
+            payload = json.loads(signal_file.read_text(encoding="utf-8"))
+            buy = payload["signals"][0]
+            buy.update({
+                "jq_code": "000001.XSHE",
+                "price_cap": 999,
+                "required_cash_yuan": 1,
+            })
+            payload["signals"].insert(0, {
+                "id": "protective-sell", "action": "sell", "code": "000001",
+                "jq_code": "000001.XSHE", "target_qty": 0,
+            })
+            signal_file.write_text(json.dumps(payload), encoding="utf-8")
+            response = joinquant_signal_server.create_app(
+                "secret", signal_file, base / "account.json", store=store,
+            ).test_client().get("/joinquant/signals?token=secret").get_json()
+
+            self.assertEqual(
+                [item["action"] for item in response["signals"]], ["sell"],
+            )
+            self.assertEqual(response["diagnostics"]["execution_filter_removed"], 1)
 
     @staticmethod
     def _snapshot() -> dict:
@@ -75,7 +236,10 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             account_file = base / "account.json"
             signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
             account_file.write_text(json.dumps({"old": True}), encoding="utf-8")
-            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, account_file, store=store,
+            )
             with unittest.mock.patch(
                 "joinquant_signal_server.ingest_snapshot_payload", side_effect=RuntimeError("database is locked")
             ):
@@ -98,14 +262,9 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             app = joinquant_signal_server.create_app(
                 "secret", signal_file, account_file, store=store,
             )
-            with (
-                unittest.mock.patch(
-                    "joinquant_signal_server.ingest_snapshot_payload",
-                    side_effect=RuntimeError("database is locked"),
-                ),
-                unittest.mock.patch(
-                    "joinquant_signal_server.notify_reconciliation",
-                ),
+            with unittest.mock.patch(
+                "joinquant_signal_server.ingest_snapshot_payload",
+                side_effect=RuntimeError("database is locked"),
             ):
                 response = app.test_client().post(
                     "/joinquant/account_snapshot?token=secret",
@@ -123,9 +282,14 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                 issue_key = conn.execute(
                     """SELECT issue_key FROM execution_issue_state"""
                 ).fetchone()[0]
+                issue_notification = conn.execute(
+                    """SELECT source_fact_id FROM notification_outbox
+                       WHERE object_type='execution_issue'"""
+                ).fetchone()
 
             self.assertEqual(reconciliation_scope, scope)
             self.assertEqual(issue_key, f"scope:{scope}:ledger:sqlite")
+            self.assertIsNotNone(issue_notification)
 
     def test_event_only_failure_is_audited_without_account_control_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,9 +327,6 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             }
             with (
                 unittest.mock.patch(
-                    "joinquant_signal_server.notify_reconciliation"
-                ) as reconcile_notify,
-                unittest.mock.patch(
                     "joinquant_signal_server._notify_execution"
                 ) as execution_notify,
                 unittest.mock.patch("ml_dataset.update_order_labels") as labels,
@@ -175,7 +336,6 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                 )
 
             self.assertEqual(response.status_code, 503)
-            reconcile_notify.assert_not_called()
             execution_notify.assert_not_called()
             labels.assert_not_called()
             self.assertEqual(
@@ -199,13 +359,130 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                     "reconciliation_runs", "reconciliation_items",
                     "execution_issue_state", "control_events", "system_state",
                 ):
+                    expected = 1 if table == "system_state" else 0
                     self.assertEqual(
                         conn.execute(
                             f'SELECT count(*) FROM "{table}"'
                         ).fetchone()[0],
-                        0,
+                        expected,
                         table,
                     )
+
+    def test_event_only_fill_conflict_creates_sticky_critical_control(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "signals": []}),
+                encoding="utf-8",
+            )
+            store = TradingStore(base / "trading.db")
+            client = joinquant_signal_server.create_app(
+                "secret", signal_file, base / "account.json", store=store,
+            ).test_client()
+            payload = {
+                "schema_version": 1,
+                "positions": [],
+                "orders": [{
+                    "order_id": "order-conflict", "action": "buy",
+                    "code": "600000", "amount": 100, "filled": 100,
+                    "avg_price": 10, "status": "filled",
+                    "datetime": "2026-07-14 10:00:00",
+                }],
+                "trades": [{
+                    "trade_id": "fill-conflict", "order_id": "order-conflict",
+                    "action": "buy", "code": "600000", "amount": 100,
+                    "price": 10, "datetime": "2026-07-14 10:00:00",
+                }],
+            }
+            self.assertEqual(client.post(
+                "/joinquant/account_snapshot?token=secret", json=payload,
+            ).status_code, 200)
+            changed = json.loads(json.dumps(payload))
+            changed["trades"][0]["price"] = 11
+
+            response = client.post(
+                "/joinquant/account_snapshot?token=secret", json=changed,
+            )
+
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.get_json()["error"], "immutable_conflict")
+            with store.connect() as conn:
+                issue = conn.execute(
+                    """SELECT state, severity, recovered_at
+                       FROM execution_issue_state"""
+                ).fetchone()
+                controls = {
+                    str(row["key"]): str(row["value"])
+                    for row in conn.execute(
+                        """SELECT key, value FROM system_state
+                           WHERE key IN ('buy_enabled','kill_switch')"""
+                    )
+                }
+                notice_count = conn.execute(
+                    """SELECT COUNT(*) FROM notification_outbox
+                       WHERE object_type IN ('execution_issue','control_event')"""
+                ).fetchone()[0]
+            self.assertEqual(
+                (issue["state"], issue["severity"], issue["recovered_at"]),
+                ("IMMUTABLE_FILL_CONFLICT", "CRITICAL", None),
+            )
+            self.assertEqual(controls, {"buy_enabled": "0", "kill_switch": "1"})
+            self.assertGreaterEqual(notice_count, 3)
+
+    def test_event_only_order_identity_conflict_creates_sticky_critical_control(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "signals": []}),
+                encoding="utf-8",
+            )
+            store = TradingStore(base / "trading.db")
+            client = joinquant_signal_server.create_app(
+                "secret", signal_file, base / "account.json", store=store,
+            ).test_client()
+            payload = {
+                "schema_version": 1,
+                "positions": [],
+                "orders": [{
+                    "client_order_id": "client-a",
+                    "order_id": "broker-same", "action": "buy",
+                    "code": "600000", "amount": 100, "filled": 0,
+                    "status": "submitted",
+                    "datetime": "2026-07-14 10:00:00",
+                }],
+                "trades": [],
+            }
+            self.assertEqual(client.post(
+                "/joinquant/account_snapshot?token=secret", json=payload,
+            ).status_code, 200)
+            changed = json.loads(json.dumps(payload))
+            changed["orders"][0]["client_order_id"] = "client-b"
+
+            response = client.post(
+                "/joinquant/account_snapshot?token=secret", json=changed,
+            )
+
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.get_json()["error"], "immutable_conflict")
+            with store.connect() as conn:
+                issue = conn.execute(
+                    """SELECT state, severity, recovered_at
+                       FROM execution_issue_state"""
+                ).fetchone()
+                controls = {
+                    str(row["key"]): str(row["value"])
+                    for row in conn.execute(
+                        """SELECT key, value FROM system_state
+                           WHERE key IN ('buy_enabled','kill_switch')"""
+                    )
+                }
+            self.assertEqual(
+                (issue["state"], issue["severity"], issue["recovered_at"]),
+                ("LEDGER_INTEGRITY_FAILURE", "CRITICAL", None),
+            )
+            self.assertEqual(controls, {"buy_enabled": "0", "kill_switch": "1"})
 
     def test_snapshot_replay_is_idempotent_in_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +530,7 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                 "available_cash": 1000,
                 "total_value": 2000,
                 "positions": [{"code": "600000", "jq_code": "600000.XSHG", "qty": 100}],
+                "orders": [],
                 "trades": [],
             }
 
@@ -268,7 +546,11 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             account_file = base / "account.json"
             event_file = base / "api_events.jsonl"
             signal_file.write_text(
-                json.dumps({"schema_version": 1, "generated_at": "2026-07-09 09:40:00", "signals": [{"id": "s1"}]}),
+                json.dumps({
+                    "schema_version": 1,
+                    "generated_at": "2026-07-09 09:40:00",
+                    "signals": [{"id": "s1", "action": "sell", "code": "600000"}],
+                }),
                 encoding="utf-8",
             )
             app = joinquant_signal_server.create_app("secret", signal_file, account_file, event_file)
@@ -285,7 +567,7 @@ class JoinQuantSignalServerTest(unittest.TestCase):
 
             rows = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([row["endpoint"] for row in rows], ["signals", "account_snapshot"])
-            self.assertEqual(rows[0]["signal_count"], 1)
+            self.assertEqual(rows[0]["signal_count"], 0)
             self.assertEqual(rows[1]["status_code"], 200)
 
     def test_writes_api_error_event_for_bad_token(self) -> None:
@@ -347,7 +629,10 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             signal_file = base / "signals.json"
             account_file = base / "account.json"
             signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
-            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, account_file, store=store,
+            )
             client = app.test_client()
 
             with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
@@ -358,6 +643,72 @@ class JoinQuantSignalServerTest(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             notify.assert_not_called()
+
+    def test_snapshot_endpoint_uses_full_mode_only_for_complete_account_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "signals": []}),
+                encoding="utf-8",
+            )
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, base / "account.json",
+            )
+            event = {
+                "schema_version": 1,
+                "positions": [],
+                "orders": [{
+                    "order_id": "event-order", "action": "buy",
+                    "code": "600000", "amount": 100, "filled": 0,
+                    "status": "submitted", "datetime": "2026-07-14 10:00:00",
+                }],
+                "trades": [],
+            }
+            with unittest.mock.patch(
+                "joinquant_signal_server.ingest_snapshot_payload",
+                side_effect=(
+                    {"event_only": False},
+                    {"event_only": True},
+                ),
+            ) as ingest:
+                full_response = app.test_client().post(
+                    "/joinquant/account_snapshot?token=secret",
+                    json=self._snapshot(),
+                )
+                event_response = app.test_client().post(
+                    "/joinquant/account_snapshot?token=secret", json=event,
+                )
+
+            self.assertEqual(full_response.status_code, 200)
+            self.assertEqual(event_response.status_code, 200)
+            self.assertEqual(
+                [call.kwargs["mode"] for call in ingest.call_args_list],
+                ["full", "incremental"],
+            )
+
+    def test_complete_account_snapshot_requires_all_three_collections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            signal_file = base / "signals.json"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "signals": []}),
+                encoding="utf-8",
+            )
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, base / "account.json",
+            )
+            for missing in ("positions", "orders", "trades"):
+                with self.subTest(missing=missing), unittest.mock.patch(
+                    "joinquant_signal_server.ingest_snapshot_payload",
+                ) as ingest:
+                    payload = self._snapshot()
+                    payload.pop(missing)
+                    response = app.test_client().post(
+                        "/joinquant/account_snapshot?token=secret", json=payload,
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    ingest.assert_not_called()
 
     def test_event_only_does_not_publish_account_or_run_ml_labels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -373,8 +724,9 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                 json.dumps({"existing": "account"}),
                 encoding="utf-8",
             )
+            store = TradingStore(base / "trading.db")
             app = joinquant_signal_server.create_app(
-                "secret", signal_file, account_file,
+                "secret", signal_file, account_file, store=store,
             )
             payload = {
                 "schema_version": 1,
@@ -389,18 +741,21 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                 }],
                 "trades": [],
             }
-            with (
-                unittest.mock.patch(
-                    "joinquant_signal_server._notify_execution"
-                ) as notify,
-                unittest.mock.patch("ml_dataset.update_order_labels") as labels,
-            ):
+            with unittest.mock.patch(
+                "ml_dataset.update_order_labels"
+            ) as labels:
                 response = app.test_client().post(
                     "/joinquant/account_snapshot?token=secret", json=payload,
                 )
             self.assertEqual(response.status_code, 200)
-            notify.assert_called_once()
             labels.assert_not_called()
+            with store.connect() as conn:
+                event_types = [
+                    str(row[0]) for row in conn.execute(
+                        "SELECT event_type FROM notification_outbox ORDER BY event_type"
+                    )
+                ]
+            self.assertEqual(event_types, ["fill", "order_terminal"])
             self.assertEqual(
                 json.loads(account_file.read_text(encoding="utf-8")),
                 {"existing": "account"},
@@ -460,6 +815,7 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                 "price": 10, "datetime": "2026-07-14 10:00:01",
                 "transport": {"ssh_private_key": "fill-ssh-secret"},
             }]
+            payload["generated_at"] = "2026-07-14 10:00:01"
             response = app.test_client().post(
                 "/joinquant/account_snapshot?token=secret", json=payload,
             )
@@ -564,11 +920,12 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                         "reconciliation_runs", "reconciliation_items",
                         "control_events", "system_state",
                     ):
+                        expected = 1 if table == "system_state" else 0
                         self.assertEqual(
                             conn.execute(
                                 f'SELECT count(*) FROM "{table}"'
                             ).fetchone()[0],
-                            0,
+                            expected,
                             table,
                         )
 
@@ -578,7 +935,10 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             signal_file = base / "signals.json"
             account_file = base / "account.json"
             signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
-            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, account_file, store=store,
+            )
             client = app.test_client()
 
             payload = {
@@ -597,14 +957,23 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                     "price": 52.43, "datetime": "2026-07-14 09:52:10",
                 }],
             }
-            with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
-                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
-                payload["generated_at"] = "2026-07-14 13:40:10"
-                payload["total_value"] = 99482.757
-                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
+            self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
+            payload["generated_at"] = "2026-07-14 13:40:10"
+            payload["total_value"] = 99482.757
+            self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
 
-            notify.assert_called_once()
-            self.assertEqual(notify.call_args.args[1][0]["event_id"], "fill:trade-1783991771")
+            with store.connect() as conn:
+                rows = conn.execute(
+                    """SELECT event_type, object_id FROM notification_outbox
+                       ORDER BY event_type, object_id"""
+                ).fetchall()
+            self.assertEqual(
+                [(row["event_type"], row["object_id"]) for row in rows],
+                [
+                    ("fill", "trade-1783991771"),
+                    ("order_terminal", "manual:1783991771"),
+                ],
+            )
             self.assertFalse(account_file.exists())
 
     def test_second_partial_fill_notifies_only_the_new_trade(self) -> None:
@@ -613,7 +982,10 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             signal_file = base / "signals.json"
             account_file = base / "account.json"
             signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
-            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, account_file, store=store,
+            )
             client = app.test_client()
             first_trade = {
                 "trade_id": "trade-1", "order_id": "order-1", "action": "buy",
@@ -632,24 +1004,33 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                 }],
                 "trades": [first_trade],
             }
-            with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
-                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
-                payload["generated_at"] = "2026-07-14 10:01:10"
-                payload["orders"][0]["filled"] = 100
-                payload["orders"][0]["status"] = "filled"
-                payload["trades"] = [
-                    first_trade,
-                    {
-                        "trade_id": "trade-2", "order_id": "order-1", "action": "buy",
-                        "code": "600000", "amount": 50, "price": 10.1,
-                        "datetime": "2026-07-14 10:01:00",
-                    },
-                ]
-                self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
+            self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
+            payload["generated_at"] = "2026-07-14 10:01:10"
+            payload["orders"][0]["filled"] = 100
+            payload["orders"][0]["status"] = "filled"
+            payload["trades"] = [
+                first_trade,
+                {
+                    "trade_id": "trade-2", "order_id": "order-1", "action": "buy",
+                    "code": "600000", "amount": 50, "price": 10.1,
+                    "datetime": "2026-07-14 10:01:00",
+                },
+            ]
+            self.assertEqual(client.post("/joinquant/account_snapshot?token=secret", json=payload).status_code, 200)
 
-            self.assertEqual(notify.call_count, 2)
-            self.assertEqual([row["event_id"] for row in notify.call_args_list[0].args[1]], ["fill:trade-1"])
-            self.assertEqual([row["event_id"] for row in notify.call_args_list[1].args[1]], ["fill:trade-2"])
+            with store.connect() as conn:
+                fills = [
+                    str(row[0]) for row in conn.execute(
+                        """SELECT object_id FROM notification_outbox
+                           WHERE event_type='fill' ORDER BY object_id"""
+                    )
+                ]
+                terminal_count = conn.execute(
+                    """SELECT COUNT(*) FROM notification_outbox
+                       WHERE event_type='order_terminal'"""
+                ).fetchone()[0]
+            self.assertEqual(fills, ["trade-1", "trade-2"])
+            self.assertEqual(terminal_count, 1)
 
     def test_zero_filled_orders_do_not_notify_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -657,7 +1038,10 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             signal_file = base / "signals.json"
             account_file = base / "account.json"
             signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
-            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, account_file, store=store,
+            )
             client = app.test_client()
 
             payload = {
@@ -682,7 +1066,10 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             signal_file = base / "signals.json"
             account_file = base / "account.json"
             signal_file.write_text(json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8")
-            app = joinquant_signal_server.create_app("secret", signal_file, account_file)
+            store = TradingStore(base / "trading.db")
+            app = joinquant_signal_server.create_app(
+                "secret", signal_file, account_file, store=store,
+            )
             client = app.test_client()
 
             filled_buy = {
@@ -704,13 +1091,18 @@ class JoinQuantSignalServerTest(unittest.TestCase):
                     filled_sell,
                 ],
             }
-            with unittest.mock.patch("joinquant_signal_server._notify_execution") as notify:
-                response = client.post("/joinquant/account_snapshot?token=secret", json=payload)
+            response = client.post("/joinquant/account_snapshot?token=secret", json=payload)
 
             self.assertEqual(response.status_code, 200)
-            notify.assert_called_once()
-            executions = notify.call_args.args[1]
-            self.assertEqual([event["action"] for event in executions], ["buy", "sell"])
+            with store.connect() as conn:
+                fills = conn.execute(
+                    """SELECT payload_json FROM notification_outbox
+                       WHERE event_type='fill' ORDER BY created_at, event_key"""
+                ).fetchall()
+            self.assertEqual(
+                sorted(json.loads(row[0])["action"] for row in fills),
+                ["buy", "sell"],
+            )
             self.assertFalse(account_file.exists())
 
     def test_event_only_invalid_action_fails_without_notification(self) -> None:

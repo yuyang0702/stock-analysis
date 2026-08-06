@@ -357,7 +357,7 @@ class PositionSizingTest(unittest.TestCase):
             context.rounding = ROUND_DOWN
             self.assertEqual(replace(precise), precise)
 
-    def test_rule_target_price_must_pass_instrument_price_rules(self) -> None:
+    def test_future_target_is_not_limited_by_todays_limit_up(self) -> None:
         limited_rules = InstrumentRules.a_share("600000", limit_up_price=D("10.20"))
         result = allocate(
             rules=limited_rules, risk_cap_yuan=D("1000"),
@@ -365,16 +365,8 @@ class PositionSizingTest(unittest.TestCase):
             expected_gross_return=D("0.03"), max_cost_edge_ratio=D("0.5"),
         )
 
-        self.assertEqual(result.reasons, ("ECONOMIC_EDGE_INSUFFICIENT",))
-        with self.assertRaises(ValueError):
-            replace(
-                result,
-                allowed=True,
-                reasons=(),
-                target_qty=result.evaluated_qty,
-                target_rule_valid=True,
-                economic_trade_allowed=True,
-            )
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.rule_target_price, D("10.30"))
 
     def test_missing_fee_schedule_rejects_without_fabricated_costs(self) -> None:
         result = allocate(fees=None)
@@ -609,6 +601,36 @@ class PositionSizingTest(unittest.TestCase):
                 result,
                 reasons=("INVALID_STOP_DISTANCE", "PORTFOLIO_OPEN_RISK_EXCEEDED"),
             )
+
+    def test_economics_can_be_observed_without_changing_hard_risk_search(self) -> None:
+        enforced = allocate(
+            expected_gross_return=D("0.002"),
+            max_cost_edge_ratio=D("0.01"),
+        )
+        observed = allocate(
+            expected_gross_return=D("0.002"),
+            max_cost_edge_ratio=D("0.01"),
+            economic_required=False,
+        )
+
+        self.assertFalse(enforced.allowed)
+        self.assertIn("ECONOMIC_EDGE_INSUFFICIENT", enforced.reasons)
+        self.assertTrue(observed.allowed)
+        self.assertFalse(observed.economic_trade_allowed)
+        self.assertGreater(observed.target_qty, enforced.evaluated_qty)
+
+    def test_future_target_above_todays_limit_is_valid_economic_evidence(self) -> None:
+        rules = InstrumentRules.a_share(
+            "600000", limit_up_price=D("10.50"), limit_down_price=D("9"),
+        )
+        result = allocate(
+            rules=rules,
+            expected_gross_return=D("0.10"),
+            max_cost_edge_ratio=D("0.5"),
+        )
+
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.rule_target_price, D("11.00"))
 
 
 if __name__ == "__main__":

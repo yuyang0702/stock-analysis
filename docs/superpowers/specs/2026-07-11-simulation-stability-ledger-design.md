@@ -6,7 +6,9 @@
 >
 > 主文档：`docs/project_roadmap.md`。
 
-> 2026-07-15 后续增量见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`：schema 7 将退出等待从即时 `EXIT_INTENT_MISMATCH/ERROR` 改为送达、提交、成交和市场阻塞状态，并仅允许对账所有权下的受限自动恢复买入。该增量已随 `e2ce5b5` 推送并部署服务器，用户报告 JoinQuant 网站模板已手动更新；当前为 `implemented（已推送） / deployed / not observed / not validated`。本文件下述 schema 6 内容保留为上一服务器基线。
+> 2026-08-01 增量边界：`docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md` 的 Batch A 已在本地功能分支实现 schema 11、账户作用域当前券商快照、不可变候选/盘前结果/执行意图、容量预留、精确数量和盈利保护；完整批次尚未形成最终提交，且未部署、未观察、未验证。本文件既有的订单/成交、幂等、对账、交易控制、备份及 schema 6–10 历史基线继续有效。
+
+> 2026-07-15 后续增量见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`：schema 7 将退出等待从即时 `EXIT_INTENT_MISMATCH/ERROR` 改为送达、提交、成交和市场阻塞状态，并仅允许对账所有权下的受限自动恢复买入。该增量已随 `e2ce5b5` 推送并部署服务器，用户报告 JoinQuant 网站模板已手动更新；截至该检查点为 `implemented（已推送） / deployed / not observed / not validated`。本文件下述 schema 6 内容保留为历史基线。
 
 > 2026-07-14 执行正确性增量以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为准：它复用 schema 6 的 `signals`、`position_cycles`、`orders` 和 `exit_intents`，不改变本账本设计的存储、对账或保留口径。该增量已随 `52b3653` 推送并部署到服务器和 JoinQuant 模板，当前为 `implemented（已推送） / deployed / not observed / not validated`。
 
@@ -14,13 +16,13 @@
 >
 > 执行从文档：`docs/live_trading_execution_plan.md`。
 >
-> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。原 Batch 1 schema 1 已部署事实保持不变；完整账本与自动对账已随提交 `9f4c12d` 进入 `origin/main`，并包含在服务器当前 `52b3653` 中。当前为 `implemented（已推送） / deployed / not observed / not validated`。
+> 如果项目状态、已实现能力、部署方式或优先级与本文件冲突，以 `docs/project_roadmap.md` 为准。原 Batch 1 schema 1 已部署事实保持不变；完整账本与自动对账已随提交 `9f4c12d` 进入 `origin/main`，并有 `52b3653` 历史部署证据；截至该检查点为 `implemented（已推送） / deployed / not observed / not validated`。
 
 ## 0. 当前增量状态
 
-原 Batch 1 的 schema version 1 部署事实是历史基线。`origin/main` 已包含 schema version 5 基础提交 `8e35d03c90af2592921c81347bddf8b5af41ba94` 和在其上实现 schema version 6 的 `9f4c12d`；服务器当前 `52b3653` 已通过 schema version 6 的 `ledger-check`。`aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1 仅保留为历史检查点。
+原 Batch 1 的 schema version 1 部署事实是历史基线。`origin/main` 已包含 schema version 5 基础提交 `8e35d03c90af2592921c81347bddf8b5af41ba94` 和在其上实现 schema version 6 的 `9f4c12d`；历史服务器检查点 `52b3653` 曾通过 schema version 6 的 `ledger-check`。`aa9acffaf62239e39c076408d83d113dce22b029` / schema version 1 仅保留为更早检查点。
 
-下述“完整账本与自动对账增量”已获用户设计批准并在 `origin/main` 中 `implemented（已推送）`：schema version 6、订单/逐笔成交、账户与持仓检查点、日权益、自动对账、控制审计、企业微信摘要和人工解锁入口均有自动化证据。该增量始于 `9f4c12d` 并包含在服务器当前 `52b3653` 中，状态是 `deployed / not observed / not validated`。
+下述“完整账本与自动对账增量”已获用户设计批准并在 `origin/main` 中 `implemented（已推送）`：schema version 6、订单/逐笔成交、账户与持仓检查点、日权益、自动对账、控制审计、企业微信摘要和人工解锁入口均有自动化证据。该增量始于 `9f4c12d` 并有 `52b3653` 历史部署证据，状态是 `deployed / not observed / not validated`。
 
 ### 0.1 完整账本与自动对账增量
 
@@ -150,7 +152,7 @@ bash run_ubuntu.sh resume-buy --reason "..."
 
 ## 1. 原始基线设计（保留追溯）
 
-本节至第 17 节保留 2026-07-11 的 Batch 1 原始设计和观察口径，用于解释 schema 1 的服务器历史检查点；当前本地 schema 6、强制模拟盘风险规则、部署顺序和历史回测状态分别以第 0 节、分层退出专项 spec/plan、完整账本 plan 和逐日历史回测 spec/plan 为准。旧基线中的“后续、未实现或观察模式”不得覆盖这些当前文档。
+本节至第 17 节保留 2026-07-11 的 Batch 1 原始设计和观察口径，用于解释 schema 1 的服务器历史检查点；schema 6 也是后续完整账本的历史基线。当前本地 schema 11 增量、强制模拟盘风险规则、部署顺序和历史回测状态分别以本文顶部增量说明、2026-07-28 整合 spec/Batch A plan、分层退出专项和逐日历史回测 spec/plan 为准。旧基线中的“后续、未实现或观察模式”不得覆盖这些当前文档。
 
 ### 1.1 目标与范围
 

@@ -2,18 +2,20 @@
 
 更新日期：2026-07-14
 
-> 主文档：`docs/project_roadmap.md`。权威业务设计见 `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md`。本文件只保留当前 Batch A-G 唯一实施顺序；早期分批顺序已被本计划替代并移入归档。
+> 主文档：`docs/project_roadmap.md`。权威业务设计见 `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md`。本文件保留 2026-07-13 分层风险历史基础批次 A-G；2026-07-28 整合设计的 Batch A-D 是后续增量，不与本文件批次重名混用。
+
+> 2026-08-01 增量边界：既有 Batch A-E 的实施历史和风险规则继续有效；新的精确数量、原子准入、schema 11 与一手/奇数手盈利保护按 `docs/superpowers/plans/2026-07-28-small-capital-live-risk-execution.md` 实施。该新 Batch A 已在本地功能分支实现，但完整批次尚未形成最终提交，且未部署、未观察、未验证；本文件下述历史任务不重开、不改写。
 
 ## 状态与实施原则
 
 本项目当前使用 JoinQuant 模拟盘。用户已确认在一次开发周期内补齐买入、卖出和执行闭环，达到统一部署门槛后一次同步模拟盘；观察证据仍按模块拆分，以便分别归因执行、回撤和异常。
 
-当前已知状态：
+截至本计划原实施周期的状态：
 
 - Batch A-E：已随提交 `9f4c12d` 进入 `origin/main` 并完成 `implemented（已推送）`；部署状态待外部核验，尚未观察或验证。
 - Batch F：部署与真实模拟盘观察 `planned`，需要用户当次单独授权。
 - Batch G：半自动参数复核 `planned / not implemented / not deployed / not observed / not validated`。
-- 本地 SQLite schema version 6、自动备份 CLI/轮转/恢复演练和 systemd 模板不代表服务器已升级、timer 已安装或自动证据已形成。
+- 当时的本地 SQLite schema version 6、自动备份 CLI/轮转/恢复演练和 systemd 模板不代表服务器已升级、timer 已安装或自动证据已形成；当前外部/本地目标以顶部增量说明和主文档为准。
 
 统一状态模型：本地代码和测试完成是 `implemented`；服务器及 JoinQuant 同步是 `deployed`；有效交易日产生证据是 `observed`；达到门槛并人工验收是 `validated`。
 
@@ -28,7 +30,7 @@
 - SQLite 保存退出意图、目标数量、委托 ID、状态、成交数量、剩余目标、失败原因和最后对账时间。
 - `submitted / partial / filled / cancelled / rejected / T+1 / suspended / limit_down` 使用明确状态并支持重复回调幂等。
 - 部分成交或撤单后按剩余目标重算；不可卖、停牌、跌停和临时拒单不消费退出意图。
-- 止盈阶段只由确认成交或同步持仓变化推进。
+- 新 Batch A 语义下，止盈阶段只由关联正确且时间窗合法、并减少 broker 持仓的真实部分减仓 fill 推进；同步持仓只辅助核验。
 - 当前价异常、陈旧或偏离可信价超过阈值时暂停新动作并报警。
 
 **验证门槛：** 覆盖不可卖、部分可卖、部分成交、撤单重试、跌停连续重试、已有委托和重复快照；连续 3 个有效模拟交易日无重复有效委托、超量卖出、错误完成和状态串仓。
@@ -102,7 +104,7 @@
 - `docs/superpowers/specs/2026-07-14-semi-automatic-parameter-review-design.md`
 - `docs/superpowers/plans/2026-07-14-semi-automatic-parameter-review.md`
 
-## 唯一实施顺序
+## 2026-07-13 历史实施顺序
 
 ```text
 Batch A 执行安全与成交对账
@@ -114,4 +116,4 @@ Batch A 执行安全与成交对账
 → Batch G 数据就绪后的半自动参数复核
 ```
 
-Batch A-E 不能因本地测试通过而标为 `deployed / observed / validated`。Batch F 的提交、推送、服务器操作、网站模板更新和服务重启仍需要用户当次分别授权；Batch G 依赖真实数据，不能在开发阶段伪造完成。
+这是既有分层退出能力的历史实施顺序，不再覆盖 2026-07-28 小资金实盘准备的 Batch A-D 当前代码轨与发布轨。历史上 Batch A-E 不能因本地测试通过而标为 `deployed / observed / validated`；Batch F 的提交、推送、服务器操作、网站模板更新和服务重启仍需要用户当次分别授权；Batch G 依赖真实数据，不能在开发阶段伪造完成。

@@ -11,6 +11,20 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _explicit_client_order_id(event: dict[str, object]) -> str | None:
+    value = event.get("client_order_id")
+    if value in (None, ""):
+        return None
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError("client_order_id must be a non-empty clean string")
+    return value
+
+
 def _int(value: Any) -> int:
     try:
         return abs(int(float(value or 0)))
@@ -62,6 +76,9 @@ def _reported_number(event: dict[str, object], key: str) -> bool:
 
 
 def client_order_id(event: dict[str, object], trade_date: str, strategy_version: str) -> str:
+    explicit = _explicit_client_order_id(event)
+    if explicit is not None:
+        return explicit
     signal_id = _text(event.get("id") or event.get("signal_id"))
     order_id = _text(event.get("order_id"))
     if not signal_id or signal_id.startswith("jq-order-"):
@@ -112,9 +129,17 @@ def normalize_order(
         "partial_filled": "partial",
         "partially_filled": "partial",
     }.get(status, status)
+    not_submitted_reason = status if status in {
+        "suspended", "limit_up", "limit_down", "t_plus_one",
+        "insufficient_cash", "price_moved", "gap_reentry_price_moved",
+        "dry_run",
+    } else ""
+    if not_submitted_reason:
+        status = "not_submitted"
     allowed_qty = requested_qty if requested_qty > 0 else int(target_qty or 0)
     terminal = {
-        "filled", "cancelled", "rejected", "risk_rejected", "failed", "skipped",
+        "filled", "cancelled", "rejected", "risk_rejected", "failed",
+        "skipped", "not_submitted", "expired",
     }
     if filled_qty > allowed_qty:
         raise ValueError("order filled quantity exceeds order quantity")
@@ -130,6 +155,18 @@ def normalize_order(
         elif status == "partial":
             status = "submitted"
     updated_at = _text(event.get("datetime") or event.get("updated_at"))
+    submit_count = (
+        _quantity_alias(event, ("submit_count",), "submit count")
+        if event.get("submit_count") not in (None, "")
+        else (0 if status == "not_submitted" else 1)
+    )
+    first_submitted_at = _text(event.get("first_submitted_at"))
+    if submit_count == 0 and first_submitted_at:
+        raise ValueError(
+            "order first_submitted_at conflicts with zero submit_count"
+        )
+    if submit_count > 0 and not first_submitted_at:
+        first_submitted_at = updated_at
     return {
         "client_order_id": client_order_id(event, trade_date, strategy_version),
         "signal_id": signal_id or None,
@@ -141,9 +178,9 @@ def normalize_order(
         "filled_qty": filled_qty,
         "average_fill_price": _float(event.get("avg_price") or event.get("price")),
         "status": status,
-        "submit_count": max(1, _int(event.get("submit_count"))),
-        "reason": _text(event.get("reason")),
-        "first_submitted_at": updated_at or None,
+        "submit_count": submit_count,
+        "reason": _text(event.get("reason")) or not_submitted_reason,
+        "first_submitted_at": first_submitted_at or None,
         "updated_at": updated_at,
         "completed_at": updated_at if status in terminal else None,
         "raw_json": canonical_json(event),
@@ -156,11 +193,19 @@ def normalize_fill(
     qty = _quantity_alias(trade, ("amount", "qty"), "fill quantity")
     order_id = _text(trade.get("order_id"))
     order = orders.get(order_id, {})
+    explicit_client_id = _explicit_client_order_id(trade)
+    linked_client_id = order.get("client_order_id")
+    if (
+        explicit_client_id is not None
+        and linked_client_id
+        and explicit_client_id != linked_client_id
+    ):
+        raise ValueError("fill client_order_id conflicts with linked order")
     fee_fields = ("commission", "stamp_tax", "other_fee")
     source_fee_status = _text(trade.get("fee_data_status")).lower()
     return {
         "fill_id": fill_id(trade),
-        "client_order_id": order.get("client_order_id"),
+        "client_order_id": explicit_client_id or linked_client_id,
         "order_id": order_id or None,
         "signal_id": order.get("signal_id") or _text(trade.get("signal_id")) or None,
         "stock_code": _text(trade.get("code") or trade.get("jq_code"))[:6],

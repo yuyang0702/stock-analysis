@@ -1,7 +1,11 @@
 # 运行证据完整性修复设计
 
-日期：2026-07-26  
-状态：`implemented（已推送） / deployed（服务器） / not observed / not validated`
+日期：2026-07-26；状态复核：2026-08-05
+历史专项状态：`implemented（已推送） / deployed（服务器） / not observed / not validated`
+
+当前工作树增量状态：Batch B 对通知 outbox、容量/失败证据、影子评分退役及运维入口的后续修改为
+`implemented（本地功能分支，未提交） / not deployed / not observed / not validated`，不能回写成
+服务器已运行状态。
 
 部署证据：实现提交 `0731ac5` 与文档提交已进入 `origin/main`，服务器于 2026-07-26
 快进到 `68d7283`。部署前 schema 9 在线备份完整性通过；Linux 全量 457/457、目标模块
@@ -10,6 +14,8 @@
 `observed` 或 `validated`。
 
 ## 1. 背景与目标
+
+> 迁移注记：本专项正文中的“100 项/30 天、最多 5 次、`errcode=40058` 转 dead 的文件队列”仅描述已部署 schema 10 历史基线。Batch B 本地目标已改为 schema 12 SQLite outbox 的普通/高优先级/死信容量、tombstone、enqueue gap、有限重试和显式 legacy audit；这些后续语义尚未部署服务器。
 
 服务器在 2026-07-12 至 2026-07-26 已产生两周运行证据，但现有账本和健康报告不能完整回答“每一轮是否成功、当天是否有效、收益是否包含费用、通知失败是否已经终止重试”。
 
@@ -190,4 +196,5 @@ schema 10 采用增加状态列而不是重建金额列：
 目标专项 142 项通过；Windows 全量发现 457 项，其中 454 项完成通过。另有 3 项
 `test_joinquant_linux_script` 因当前 Windows 环境没有 Bash 而无法启动，不属于业务断言失败，
 需在 Linux 部署前运行全量测试补齐。目标模块 `py_compile` 和 `git diff --check` 通过。
-当前没有推送、部署、迁移正式库或重启服务，因此不得标记 deployed/observed/validated。
+上述 2026-07-26 历史专项的服务器部署证据仍有效；但当前工作树的后续增量尚未推送、部署、迁移正式库或重启服务，
+因此这些增量不得标记 `deployed/observed/validated`。

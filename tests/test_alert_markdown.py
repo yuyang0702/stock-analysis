@@ -1,4 +1,7 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -6,6 +9,29 @@ import a_share_strategy
 
 
 class AlertMarkdownTest(unittest.TestCase):
+    def test_saved_live_report_omits_legacy_rule_shadow_columns(self) -> None:
+        rows = pd.DataFrame([{
+            "code": "600000", "name": "PF Bank", "industry": "银行",
+            "pct_chg": 1.2, "amount": 100_000_000, "final_score": 82,
+            "enhanced_score": 99, "shadow_rank": 1, "shadow_reason": "旧字段",
+            "buy_state": "临近买点", "history_replay": "", "exit_plan": "",
+        }])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            a_share_strategy, "OUTPUT_DIR", Path(tmp),
+        ):
+            csv_path, md_path = a_share_strategy.save_outputs(
+                rows,
+                {"state": "震荡", "sh_price": 3000, "sh_pct": 0.1},
+                "中性",
+            )
+
+            csv_header = csv_path.read_text(encoding="utf-8-sig").splitlines()[0]
+            markdown = md_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("enhanced_score", csv_header)
+        self.assertNotIn("shadow_rank", csv_header)
+        self.assertNotIn("影子", markdown)
+
     def test_buy_alert_shows_current_price_and_suggested_entry_separately(self) -> None:
         row = pd.Series(
             {
@@ -103,10 +129,11 @@ class AlertMarkdownTest(unittest.TestCase):
 
         self.assertIn("止盈 无有效空间", md)
         self.assertIn("上方空间不足", md)
-        self.assertIn("原分 82.0 | 影子 88.5 | 调整 +6.5 | 排名 3->1 | 变化 +2", md)
+        self.assertIn("规则分 82.0", md)
+        self.assertNotIn("影子", md)
         self.assertNotIn("止盈 10.00", md)
 
-    def test_buy_alert_shows_original_and_shadow_scores(self) -> None:
+    def test_buy_alert_ignores_legacy_rule_shadow_fields(self) -> None:
         row = pd.Series(
             {
                 "code": "600000",
@@ -134,10 +161,8 @@ class AlertMarkdownTest(unittest.TestCase):
         md = a_share_strategy.build_alert_markdown(row, "买点", {"state": "强势进攻"}, "无", "intraday")
 
         self.assertIn("原策略分：82.0", md)
-        self.assertIn("影子评分：88.5（仅观察，不参与下单）", md)
-        self.assertIn("影子调整：+6.5", md)
-        self.assertIn("排名变化：3 -> 1 (+2)", md)
-        self.assertIn("影子依据：消息+3.2；题材+4.0；市场+3.0", md)
+        self.assertNotIn("影子", md)
+        self.assertNotIn("88.5", md)
 
     def test_intraday_buy_rows_exclude_limit_up_candidates(self) -> None:
         rows = pd.DataFrame(

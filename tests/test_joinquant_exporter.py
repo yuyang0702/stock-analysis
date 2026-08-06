@@ -3,8 +3,10 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import contextmanager
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -12,8 +14,9 @@ import pandas as pd
 import a_share_strategy
 import exit_policy
 import joinquant_exporter
-from execution_contracts import scenario_loss_yuan
+from execution_contracts import BrokerPosition, BrokerSnapshot, scenario_loss_yuan
 from ml_store import MlCapacityError, MlStore
+from notification_outbox import NotificationCapacityError
 from trading_store import TradingStore
 
 
@@ -28,6 +31,71 @@ class JoinQuantExporterTest(unittest.TestCase):
         )
         self._db_patch.start()
         self.addCleanup(self._db_patch.stop)
+
+    @staticmethod
+    def _strict_buy_row(**changes) -> dict:
+        row = {
+            "code": "600000",
+            "name": "PF Bank",
+            "price": 10.0,
+            "entry_price": 10.0,
+            "stop_loss": 9.5,
+            "take_profit": 11.0,
+            "position_pct": 10.0,
+            "final_score": 95,
+            "signal_action": "continue",
+            "execution_plan_version": exit_policy.EXECUTION_PLAN_VERSION,
+            "execution_allowed": True,
+            "market_state": "NORMAL",
+            "market_regime": "NORMAL",
+            "board_type": "main_active",
+            "atr14": 0.2,
+            "prev_close": 10.0,
+            "quote_time": "2026-07-28T09:59:50+08:00",
+            "industry": "bank",
+            "theme_label": "dividend",
+        }
+        row.update(changes)
+        return row
+
+    @staticmethod
+    def _seed_exact_account(store: TradingStore, **snapshot_changes) -> str:
+        with store.transaction() as conn:
+            scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
+            for key, value in {
+                "buy_enabled": "1",
+                "sell_enabled": "1",
+                "kill_switch": "0",
+                "market_regime": "NORMAL",
+            }.items():
+                store.set_system_state(conn, key, value, "test")
+            values = {
+                "account_scope_id": scope,
+                "trade_date": "2026-07-28",
+                "broker_time": "2026-07-28T09:59:40+08:00",
+                "generated_at": "2026-07-28T09:59:41+08:00",
+                "total_equity": Decimal("100000"),
+                "cash": Decimal("100000"),
+                "available_cash": Decimal("100000"),
+                "frozen_cash": Decimal("0"),
+                "positions": (),
+                "open_orders": (),
+                "fills": (),
+                "adapter_version": "joinquant-v1",
+                "node_version": "server-v1",
+                "session_id": "session-1",
+                "capabilities_version": "cap-v1",
+                "daily_risk_evidence_status": "reported",
+                "intraday_pnl": Decimal("0"),
+                "account_drawdown_pct": Decimal("0"),
+                "daily_turnover_fraction": Decimal("0"),
+                "consecutive_losses": 0,
+            }
+            values.update(snapshot_changes)
+            store.replace_current_broker_snapshot(
+                conn, BrokerSnapshot.from_values(**values),
+            )
+        return scope
 
     def test_confirmed_gap_reentry_creates_new_signal(self) -> None:
         row = pd.Series({
@@ -789,6 +857,59 @@ class JoinQuantExporterTest(unittest.TestCase):
             store = MlStore(Path(tmp) / "ml.db")
             self.assertEqual(store.counts()["ml_candidate_samples"], 1)
 
+    def test_l0_observation_records_out_of_band_without_changing_signal_json(self) -> None:
+        rows = pd.DataFrame([{
+            "code": "600000", "price": 10, "entry_price": 10,
+            "stop_loss": 9.5, "take_profit": 11, "position_pct": 5,
+            "final_score": 90,
+        }])
+        fixed = {
+            "schema_version": 1,
+            "trade_date": "2026-08-06",
+            "generated_at": "2026-08-06 10:05:00",
+            "run_id": "l0-equivalence",
+            "source": "a_share_strategy",
+            "dry_run": False,
+            "signals": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            joinquant_exporter,
+            "_base_payload",
+            side_effect=lambda *args: dict(fixed, signals=[]),
+        ):
+            base = Path(tmp)
+            with patch.object(
+                joinquant_exporter.app_config,
+                "ML_TRAINED_SHADOW_ENABLE",
+                False,
+            ):
+                disabled = joinquant_exporter.export_signals(
+                    rows,
+                    run_id="l0-equivalence",
+                    output_path=base / "disabled.json",
+                    store=TradingStore(base / "disabled-trading.db"),
+                ).read_bytes()
+            ml_store = MlStore(base / "ml.db")
+            with patch.object(
+                joinquant_exporter.app_config,
+                "ML_TRAINED_SHADOW_ENABLE",
+                True,
+            ), patch.object(
+                joinquant_exporter,
+                "observe_candidate_samples",
+                return_value=SimpleNamespace(status="observed_l0", reasons=()),
+            ) as observe:
+                enabled = joinquant_exporter.export_signals(
+                    rows,
+                    run_id="l0-equivalence",
+                    output_path=base / "enabled.json",
+                    store=TradingStore(base / "enabled-trading.db"),
+                    ml_store=ml_store,
+                ).read_bytes()
+            self.assertEqual(enabled, disabled)
+            observe.assert_called_once()
+            self.assertEqual(ml_store.counts()["ml_candidate_samples"], 1)
+
     def test_unknown_rejection_code_skips_ml_without_changing_rule_export(self) -> None:
         class RecordingMlStore:
             initialized = False
@@ -900,7 +1021,7 @@ class JoinQuantExporterTest(unittest.TestCase):
             payload = json.loads(result.read_text(encoding="utf-8"))
             self.assertEqual(
                 [item["id"] for item in payload["signals"]],
-                ["run-1-600000-buy-0000", "run-1-000001-sell-0001"],
+                ["run-1-000001-sell-0001", "run-1-600000-buy-0000"],
             )
             with store.connect() as conn:
                 db_ids = [row[0] for row in conn.execute("SELECT signal_id FROM signals ORDER BY signal_id")]
@@ -1085,10 +1206,10 @@ class JoinQuantExporterTest(unittest.TestCase):
             payload = json.loads(result.read_text(encoding="utf-8"))
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["run_id"], "run-1")
-            self.assertEqual([item["action"] for item in payload["signals"]], ["buy", "sell"])
-            self.assertEqual(payload["signals"][0]["jq_code"], "600000.XSHG")
-            self.assertEqual(payload["signals"][0]["enhanced_score"], 94)
-            self.assertEqual(payload["signals"][1]["jq_code"], "000001.XSHE")
+            self.assertEqual([item["action"] for item in payload["signals"]], ["sell", "buy"])
+            self.assertEqual(payload["signals"][0]["jq_code"], "000001.XSHE")
+            self.assertEqual(payload["signals"][1]["jq_code"], "600000.XSHG")
+            self.assertNotIn("enhanced_score", payload["signals"][1])
             for signal in payload["signals"]:
                 self.assertTrue(signal["created_at"])
                 self.assertEqual(signal["validated_at"], payload["generated_at"])
@@ -1294,9 +1415,9 @@ class JoinQuantExporterTest(unittest.TestCase):
             self.assertEqual(samples[0]["signal"]["action"], "buy")
             self.assertEqual(samples[0]["signal"]["id"], "run-ml-600000-buy-0000")
             self.assertEqual(samples[0]["features"]["final_score"], 90.0)
-            self.assertEqual(samples[0]["features"]["enhanced_score"], 94.0)
-            self.assertEqual(samples[0]["features"]["shadow_rank"], 1)
-            self.assertEqual(samples[0]["features"]["shadow_reason"], "消息+3.2；题材+4.0")
+            self.assertNotIn("enhanced_score", samples[0]["features"])
+            self.assertNotIn("shadow_rank", samples[0]["features"])
+            self.assertNotIn("shadow_reason", samples[0]["features"])
             self.assertEqual(samples[0]["features"]["market_state"], "强势进攻")
             self.assertEqual(samples[0]["features"]["ma5"], 9.8)
             self.assertEqual(samples[0]["labels"]["order_status"], "")
@@ -1528,6 +1649,709 @@ class JoinQuantExporterTest(unittest.TestCase):
                 payload["diagnostics"]["reject_reasons"]["buy_execution_plan_invalid"], 1,
             )
 
+    def test_strict_buy_is_backed_by_admitted_exact_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            scope = self._seed_exact_account(store)
+
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+                create=True,
+            ):
+                output = joinquant_exporter.export_signals(
+                    pd.DataFrame([self._strict_buy_row()]),
+                    run_id="exact-run",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=100000,
+                    available_cash=100000,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["signals"]), 1)
+            buy = payload["signals"][0]
+            self.assertEqual(buy["action"], "buy")
+            self.assertEqual(buy["target_qty"] % 100, 0)
+            self.assertEqual(buy["target_qty"], buy["target_position"])
+            self.assertEqual(
+                buy["target_qty"], buy["expected_current_qty"] + buy["order_qty"],
+            )
+            for field in (
+                "client_order_id", "execution_intent_sha256", "pre_trade_result_id",
+                "broker_snapshot_id", "broker_snapshot_sha256", "quote_snapshot_id",
+                "quote_snapshot_sha256", "instrument_rules_sha256", "expires_at",
+                "price_cap", "required_cash_yuan", "account_scope_id", "trade_date",
+                "logical_signal_id", "plan_version", "buy_plan_event_key",
+            ):
+                self.assertTrue(buy.get(field), field)
+
+            with store.connect() as conn:
+                intent = conn.execute(
+                    "SELECT * FROM execution_intents WHERE account_scope_id=?",
+                    (scope,),
+                ).fetchone()
+                order = conn.execute(
+                    "SELECT * FROM orders WHERE client_order_id=?",
+                    (buy["client_order_id"],),
+                ).fetchone()
+                reservation_count = conn.execute(
+                    "SELECT count(*) FROM capacity_reservations WHERE account_scope_id=?",
+                    (scope,),
+                ).fetchone()[0]
+                buy_plan = conn.execute(
+                    """SELECT * FROM notification_outbox
+                       WHERE event_key=? AND event_type='buy-plan'""",
+                    (buy["buy_plan_event_key"],),
+                ).fetchone()
+            self.assertIsNotNone(intent)
+            self.assertEqual(intent["intent_sha256"], buy["execution_intent_sha256"])
+            self.assertEqual(order["status"], "ready")
+            self.assertEqual(order["signal_id"], buy["id"])
+            self.assertEqual(order["requested_qty"], buy["order_qty"])
+            self.assertEqual(order["target_qty"], buy["target_qty"])
+            self.assertEqual(reservation_count, 1)
+            self.assertIsNotNone(buy_plan)
+            self.assertEqual(buy_plan["priority"], "normal")
+            self.assertEqual(buy_plan["state"], "pending")
+
+    def test_strict_gap_reentry_keeps_the_approved_one_lot_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(
+                store,
+                total_equity=Decimal("99999.99"),
+                cash=Decimal("99999.99"),
+                available_cash=Decimal("99999.99"),
+            )
+            row = self._strict_buy_row(
+                code="002432", name="Gap Reentry", price=10.0,
+                entry_price=10.0, stop_loss=9.9, take_profit=10.2,
+                position_pct=0.5, atr14=0.3, prev_close=10.0,
+                entry_path="gap_reentry", gap_reentry_state="OPEN_CONFIRMED",
+                parent_signal_id="parent-1", reentry_cap_price=10.05,
+            )
+
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+            ), patch.object(
+                joinquant_exporter.app_config,
+                "GAP_REENTRY_ENABLE_DEFAULT",
+                True,
+            ):
+                output = joinquant_exporter.export_signals(
+                    pd.DataFrame([row]),
+                    run_id="exact-gap-one-lot",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=99999.99,
+                    available_cash=99999.99,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["signals"]), 1)
+            self.assertEqual(payload["signals"][0]["target_qty"], 100)
+            self.assertEqual(payload["signals"][0]["order_qty"], 100)
+
+    def test_strict_buy_without_current_snapshot_fails_closed_but_sell_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            rows = pd.DataFrame([
+                self._strict_buy_row(),
+                {
+                    "code": "600001", "name": "Exit", "price": 9.0,
+                    "signal_action": "hard_stop", "has_holding": True,
+                    "exit_signal_id": "exit-1", "target_qty": 0,
+                },
+            ])
+
+            output = joinquant_exporter.export_signals(
+                rows,
+                run_id="missing-snapshot",
+                trade_date="2026-07-28",
+                output_path=base / "signals.json",
+                store=store,
+                account_total_value=100000,
+                available_cash=100000,
+                enforce_execution_contract=True,
+            )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
+            self.assertTrue(payload["diagnostics"]["buy_publication_blocked"])
+            with store.connect() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM execution_intents").fetchone()[0], 0,
+                )
+
+    def test_admission_failure_blocks_all_buys_without_blocking_sell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(store)
+            rows = pd.DataFrame([
+                self._strict_buy_row(),
+                {
+                    "code": "600001", "name": "Exit", "price": 9.0,
+                    "signal_action": "hard_stop", "has_holding": True,
+                    "exit_signal_id": "exit-1", "target_qty": 0,
+                },
+            ])
+
+            with patch.object(
+                joinquant_exporter,
+                "admit_candidate",
+                side_effect=RuntimeError("admission unavailable"),
+                create=True,
+            ), patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+                create=True,
+            ):
+                output = joinquant_exporter.export_signals(
+                    rows,
+                    run_id="admission-failure",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=100000,
+                    available_cash=100000,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
+            self.assertIn("admission unavailable", payload["diagnostics"]["ledger_error"])
+
+    def test_intent_binding_failure_blocks_buy_without_blocking_sell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(store)
+            rows = pd.DataFrame([
+                self._strict_buy_row(),
+                {
+                    "code": "600001", "name": "Exit", "price": 9.0,
+                    "signal_action": "hard_stop", "has_holding": True,
+                    "exit_signal_id": "exit-1", "target_qty": 0,
+                },
+            ])
+
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+            ), patch.object(
+                store,
+                "bind_execution_intent_signal",
+                side_effect=ValueError("intent binding conflict"),
+            ):
+                output = joinquant_exporter.export_signals(
+                    rows,
+                    run_id="binding-failure",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=100000,
+                    available_cash=100000,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([item["action"] for item in payload["signals"]], ["sell"])
+            self.assertIn("intent binding conflict", payload["diagnostics"]["ledger_error"])
+            self.assertTrue(payload["diagnostics"]["buy_publication_blocked"])
+
+    def test_stale_current_snapshot_rejects_strict_buy_without_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(
+                store,
+                broker_time="2026-07-28T09:50:00+08:00",
+                generated_at="2026-07-28T09:50:01+08:00",
+            )
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+            ):
+                output = joinquant_exporter.export_signals(
+                    pd.DataFrame([self._strict_buy_row()]),
+                    run_id="stale-snapshot",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=100000,
+                    available_cash=100000,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"][
+                    "admission_account_snapshot_stale"
+                ],
+                1,
+            )
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM execution_intents"
+                ).fetchone()[0], 0)
+
+    def test_gap_state_failure_blocks_only_buy_and_replaces_old_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            output_path = base / "signals.json"
+            output_path.write_text(json.dumps({
+                "schema_version": 1,
+                "signals": [{"id": "old-buy", "action": "buy"}],
+            }), encoding="utf-8")
+            rows = pd.DataFrame([
+                self._strict_buy_row(),
+                {
+                    "code": "600001", "name": "Exit", "price": 9.0,
+                    "signal_action": "hard_stop", "has_holding": True,
+                    "exit_signal_id": "exit-1", "target_qty": 0,
+                },
+            ])
+
+            with patch.object(
+                joinquant_exporter,
+                "_prepare_gap_reentry_row",
+                side_effect=sqlite3.OperationalError("gap ledger unavailable"),
+            ), patch.object(
+                joinquant_exporter.app_config,
+                "GAP_REENTRY_ENABLE_DEFAULT",
+                True,
+            ):
+                output = joinquant_exporter.export_signals(
+                    rows,
+                    run_id="gap-store-failure",
+                    trade_date="2026-07-28",
+                    output_path=output_path,
+                    store=TradingStore(base / "trading.db"),
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [signal["action"] for signal in payload["signals"]], ["sell"],
+            )
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"][
+                    "gap_reentry_state_unavailable"
+                ],
+                1,
+            )
+            self.assertNotIn("old-buy", output.read_text(encoding="utf-8"))
+
+    def test_stale_quote_rejects_strict_buy_without_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(store)
+            row = self._strict_buy_row()
+            row["quote_time"] = "2026-07-28T09:57:00+08:00"
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+            ):
+                output = joinquant_exporter.export_signals(
+                    pd.DataFrame([row]),
+                    run_id="stale-quote",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=100000,
+                    available_cash=100000,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"]["admission_quote_stale"],
+                1,
+            )
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM execution_intents"
+                ).fetchone()[0], 0)
+
+    def test_existing_holding_rejects_strict_buy_without_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(store, positions=(
+                BrokerPosition.from_values(
+                    code="600000", total_qty=100, sellable_qty=100,
+                    average_cost="9.80", last_price="10.00", market_value="1000",
+                ),
+            ))
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+            ):
+                output = joinquant_exporter.export_signals(
+                    pd.DataFrame([self._strict_buy_row(has_holding=True)]),
+                    run_id="already-holding",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=100000,
+                    available_cash=99000,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["signals"], [])
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"][
+                    "admission_reservation_evidence_incomplete"
+                ],
+                1,
+            )
+            with store.connect() as conn:
+                result = conn.execute(
+                    "SELECT payload_json FROM pre_trade_results"
+                ).fetchone()
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM execution_intents"
+                ).fetchone()[0], 0)
+            self.assertIn(
+                "POSITION_ALREADY_HELD",
+                json.loads(result["payload_json"])["hard_blocks"],
+            )
+
+    def test_strict_buy_replay_keeps_one_intent_and_client_order_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(store)
+            kwargs = {
+                "run_id": "exact-replay",
+                "trade_date": "2026-07-28",
+                "store": store,
+                "account_total_value": 100000,
+                "available_cash": 100000,
+                "enforce_execution_contract": True,
+            }
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+            ):
+                first = joinquant_exporter.export_signals(
+                    pd.DataFrame([self._strict_buy_row()]),
+                    output_path=base / "first.json",
+                    **kwargs,
+                )
+                second = joinquant_exporter.export_signals(
+                    pd.DataFrame([self._strict_buy_row()]),
+                    output_path=base / "second.json",
+                    **kwargs,
+                )
+
+            first_buy = json.loads(first.read_text(encoding="utf-8"))["signals"][0]
+            second_buy = json.loads(second.read_text(encoding="utf-8"))["signals"][0]
+            self.assertEqual(first_buy["client_order_id"], second_buy["client_order_id"])
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM execution_intents"
+                ).fetchone()[0], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM capacity_reservations"
+                ).fetchone()[0], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM orders"
+                ).fetchone()[0], 1)
+
+    def test_buy_plan_identity_freezes_expiry_and_ignores_run_quote_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            scope = self._seed_exact_account(store)
+            first_row = pd.Series(self._strict_buy_row(price=10.001))
+            second_row = pd.Series(self._strict_buy_row(
+                price=10.004,
+                quote_time="2026-07-28T10:04:50+08:00",
+            ))
+            first_signal = joinquant_exporter._buy_signal(first_row, "run-1", 0)
+            second_signal = joinquant_exporter._buy_signal(second_row, "run-2", 0)
+            first = joinquant_exporter._exact_candidate(
+                first_row,
+                first_signal,
+                account_scope_id=scope,
+                trade_date="2026-07-28",
+                run_id="run-1",
+                parameter_version="parameters-v1",
+                account_equity=Decimal("100000"),
+            )
+            second = joinquant_exporter._exact_candidate(
+                second_row,
+                second_signal,
+                account_scope_id=scope,
+                trade_date="2026-07-28",
+                run_id="run-2",
+                parameter_version="parameters-v1",
+                account_equity=Decimal("100000"),
+            )
+            self.assertNotEqual(first.source_signal_id, second.source_signal_id)
+            self.assertEqual(first.logical_signal_id, second.logical_signal_id)
+            self.assertNotEqual(first.frozen_valid_until, second.frozen_valid_until)
+
+            with store.transaction() as conn:
+                store.upsert_logical_signal_plan(
+                    conn,
+                    scope,
+                    "2026-07-28",
+                    first.logical_signal_id,
+                    first.frozen_valid_until,
+                    "initial-plan",
+                    first.signal_time,
+                )
+            frozen = joinquant_exporter._freeze_candidate_valid_until(
+                store, second, "2026-07-28",
+            )
+            self.assertEqual(
+                datetime.fromisoformat(frozen.frozen_valid_until),
+                datetime.fromisoformat(first.frozen_valid_until),
+            )
+
+    def test_buy_plan_is_quiet_until_material_change_then_replaces_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+            base = {
+                "id": "run-1-600000-buy-0000",
+                "action": "buy",
+                "code": "600000",
+                "name": "PF Bank",
+                "logical_signal_id": "logical-buy-1",
+                "order_qty": 300,
+                "target_position": 300,
+                "limit_price": None,
+                "price_cap": 10.001,
+                "stop_loss": 9.499,
+                "frozen_valid_until": "2026-07-28T15:30:00+08:00",
+                "signal_time": "2026-07-28T10:00:00+08:00",
+                "strategy_version": "strategy-v1",
+                "parameter_version": "parameters-v1",
+            }
+            with store.transaction() as conn:
+                joinquant_exporter._enqueue_buy_plan_notification(
+                    store, conn, scope, "2026-07-28", base,
+                )
+            first_key = base["buy_plan_event_key"]
+            first_version = base["plan_version"]
+
+            unchanged = dict(base)
+            unchanged.update({
+                "id": "run-2-600000-buy-0000",
+                "price_cap": 10.004,
+                "frozen_valid_until": "2026-07-28T15:45:00+08:00",
+                "signal_time": "2026-07-28T10:05:00+08:00",
+            })
+            with store.transaction() as conn:
+                joinquant_exporter._enqueue_buy_plan_notification(
+                    store, conn, scope, "2026-07-28", unchanged,
+                )
+            self.assertEqual(unchanged["plan_version"], first_version)
+            self.assertEqual(unchanged["buy_plan_event_key"], first_key)
+
+            with store.transaction() as conn:
+                conn.execute(
+                    """UPDATE notification_outbox
+                       SET state='leased', lease_owner='worker-1',
+                           lease_until='2026-07-28T03:00:00+00:00'
+                       WHERE event_key=?""",
+                    (first_key,),
+                )
+            changed = dict(unchanged)
+            changed.update({
+                "id": "run-3-600000-buy-0000",
+                "order_qty": 400,
+                "target_position": 400,
+                "signal_time": "2026-07-28T10:06:00+08:00",
+            })
+            with store.transaction() as conn:
+                joinquant_exporter._enqueue_buy_plan_notification(
+                    store, conn, scope, "2026-07-28", changed,
+                )
+
+            with store.connect() as conn:
+                plan = conn.execute(
+                    "SELECT * FROM logical_signal_plans"
+                ).fetchone()
+                events = conn.execute(
+                    """SELECT event_key, priority, state, cancel_requested_at,
+                              expires_at, payload_json, sent_at
+                       FROM notification_outbox ORDER BY created_at, event_key"""
+                ).fetchall()
+            self.assertEqual(len(events), 2)
+            old = next(row for row in events if row["event_key"] == first_key)
+            new = next(row for row in events if row["event_key"] != first_key)
+            self.assertIsNotNone(old["cancel_requested_at"])
+            self.assertEqual(new["priority"], "normal")
+            self.assertEqual(new["state"], "pending")
+            self.assertEqual(
+                datetime.fromisoformat(new["expires_at"]),
+                datetime.fromisoformat("2026-07-28T15:00:00+08:00"),
+            )
+            self.assertEqual(plan["current_plan_version"], changed["plan_version"])
+            self.assertEqual(
+                datetime.fromisoformat(plan["frozen_valid_until"]),
+                datetime.fromisoformat("2026-07-28T15:30:00+08:00"),
+            )
+            event_payload = json.loads(new["payload_json"])
+            self.assertFalse({"run_id", "sent_at", "generated_at"} & event_payload.keys())
+            self.assertIsNone(new["sent_at"])
+            for field in (
+                "account_scope_id", "trade_date", "logical_signal_id",
+                "plan_version", "buy_plan_event_key",
+            ):
+                self.assertTrue(changed[field], field)
+
+            sell = {"action": "sell", "id": "sell-1"}
+            with store.transaction() as conn:
+                self.assertIsNone(joinquant_exporter._enqueue_buy_plan_notification(
+                    store, conn, scope, "2026-07-28", sell,
+                ))
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM notification_outbox"
+                ).fetchone()[0], 2)
+
+    def test_buy_plan_replacement_after_normal_capacity_drop_stays_gap_free(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+            base = {
+                "id": "run-1-600000-buy-0000",
+                "action": "buy",
+                "code": "600000",
+                "name": "PF Bank",
+                "logical_signal_id": "logical-gap",
+                "order_qty": 300,
+                "target_position": 300,
+                "limit_price": 10.0,
+                "stop_loss": 9.5,
+                "frozen_valid_until": "2026-07-28T10:20:00+08:00",
+                "signal_time": "2026-07-28T10:00:00+08:00",
+                "strategy_version": "strategy-v1",
+                "parameter_version": "parameters-v1",
+            }
+            with patch.object(
+                store,
+                "enqueue_notification",
+                side_effect=NotificationCapacityError("normal full"),
+            ):
+                with store.transaction() as conn:
+                    joinquant_exporter._enqueue_buy_plan_notification(
+                        store, conn, scope, "2026-07-28", base,
+                    )
+            old_key = base["buy_plan_event_key"]
+
+            changed = {**base, "order_qty": 400, "target_position": 400}
+            with store.transaction() as conn:
+                joinquant_exporter._enqueue_buy_plan_notification(
+                    store, conn, scope, "2026-07-28", changed,
+                )
+
+            with store.connect() as conn:
+                old_event = conn.execute(
+                    "SELECT state FROM notification_outbox WHERE event_key=?",
+                    (old_key,),
+                ).fetchone()
+                new_event = conn.execute(
+                    "SELECT state FROM notification_outbox WHERE event_key=?",
+                    (changed["buy_plan_event_key"],),
+                ).fetchone()
+                unresolved_normal_gaps = conn.execute(
+                    """SELECT count(*) FROM notification_enqueue_gaps
+                       WHERE priority='normal' AND resolved_at IS NULL"""
+                ).fetchone()[0]
+                plan = conn.execute(
+                    """SELECT current_plan_version FROM logical_signal_plans
+                       WHERE account_scope_id=? AND trade_date=?
+                         AND logical_signal_id=?""",
+                    (scope, "2026-07-28", "logical-gap"),
+                ).fetchone()
+            self.assertIsNone(old_event)
+            self.assertEqual(unresolved_normal_gaps, 0)
+            self.assertEqual(new_event["state"], "pending")
+            self.assertEqual(plan["current_plan_version"], changed["plan_version"])
+
+    def test_exact_batch_reserves_cash_in_score_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = TradingStore(base / "trading.db")
+            store.initialize()
+            self._seed_exact_account(
+                store,
+                cash=Decimal("7000"),
+                available_cash=Decimal("7000"),
+            )
+            rows = pd.DataFrame([
+                self._strict_buy_row(code="600001", final_score=90),
+                self._strict_buy_row(code="600002", final_score=99),
+            ])
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-28T10:00:00+08:00",
+            ):
+                output = joinquant_exporter.export_signals(
+                    rows,
+                    run_id="cash-order",
+                    trade_date="2026-07-28",
+                    output_path=base / "signals.json",
+                    store=store,
+                    account_total_value=100000,
+                    available_cash=100000,
+                    enforce_execution_contract=True,
+                )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([item["code"] for item in payload["signals"]], ["600002"])
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM execution_intents"
+                ).fetchone()[0], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM pre_trade_results"
+                ).fetchone()[0], 2)
+
     def test_final_plan_matches_scan_json_and_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -1549,6 +2373,7 @@ class JoinQuantExporterTest(unittest.TestCase):
                 "signal_state": "fresh",
                 "signal_first_seen": "2026-07-14",
                 "has_holding": False,
+                "quote_time": "2026-07-14T09:59:50+08:00",
             })
             bundle = a_share_strategy.build_risk_bundle(row, {"state": "NORMAL"}, "")
             for key, value in bundle.items():
@@ -1560,15 +2385,27 @@ class JoinQuantExporterTest(unittest.TestCase):
             for key, value in anchor.items():
                 row[key] = value
             store = TradingStore(base / "trading.db")
-
-            output = joinquant_exporter.export_signals(
-                pd.DataFrame([row]),
-                run_id="contract-equality",
+            store.initialize()
+            self._seed_exact_account(
+                store,
                 trade_date="2026-07-14",
-                output_path=base / "signals.json",
-                enforce_execution_contract=True,
-                store=store,
+                broker_time="2026-07-14T09:59:40+08:00",
+                generated_at="2026-07-14T09:59:41+08:00",
             )
+
+            with patch.object(
+                joinquant_exporter,
+                "_execution_now",
+                return_value="2026-07-14T10:00:00+08:00",
+            ):
+                output = joinquant_exporter.export_signals(
+                    pd.DataFrame([row]),
+                    run_id="contract-equality",
+                    trade_date="2026-07-14",
+                    output_path=base / "signals.json",
+                    enforce_execution_contract=True,
+                    store=store,
+                )
 
             signal = json.loads(output.read_text(encoding="utf-8"))["signals"][0]
             with store.connect() as conn:

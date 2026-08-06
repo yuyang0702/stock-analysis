@@ -126,6 +126,7 @@ class SizingDecision:
     max_cost_edge_ratio: Decimal
     target_rule_valid: bool
     economic_trade_allowed: bool
+    economic_required: bool
     fee_schedule_version: str
     fee_schedule_sha256: str
     available_cash_yuan: Decimal
@@ -145,6 +146,7 @@ class SizingDecision:
             type(self.allowed) is not bool
             or type(self.target_rule_valid) is not bool
             or type(self.economic_trade_allowed) is not bool
+            or type(self.economic_required) is not bool
         ):
             raise ValueError("decision statuses must be boolean")
         if type(self.fee_schedule_version) is not str or type(self.fee_schedule_sha256) is not str:
@@ -242,6 +244,7 @@ class SizingDecision:
             ),
             percentage_risk=self.percentage_risk_yuan,
             target_price=self.rule_target_price,
+            economic_required=self.economic_required,
         )
         replay_evaluated_qty = replay_evidence.qty if replay_evidence is not None else 0
         replay_target_qty = replay_evaluated_qty if replay_allowed else 0
@@ -255,7 +258,7 @@ class SizingDecision:
         if self.allowed:
             if self.reasons or self.target_qty <= 0 or self.target_qty != self.evaluated_qty:
                 raise ValueError("allowed decision quantity and reasons are inconsistent")
-            if not self.economic_trade_allowed:
+            if self.economic_required and not self.economic_trade_allowed:
                 raise ValueError("allowed decision must pass economics")
             if (
                 self.target_qty < minimum_valid_qty
@@ -416,11 +419,8 @@ class SizingDecision:
             or self.cost_to_expected_edge_ratio != ZERO
         ):
             raise ValueError("non-positive target cannot carry target-cost economics")
-        expected_target_rule_valid = bool(
-            self.rule_target_price > ZERO
-            and not self.instrument_rules.validate_order(
-                "buy", self.evaluated_qty, self.rule_target_price,
-            )
+        expected_target_rule_valid = _target_price_valid(
+            self.instrument_rules, self.rule_target_price,
         )
         if self.target_rule_valid != expected_target_rule_valid:
             raise ValueError("target rule status does not match frozen instrument rules")
@@ -432,7 +432,8 @@ class SizingDecision:
         )
         if (
             self.economic_trade_allowed != expected_economic
-            or ("ECONOMIC_EDGE_INSUFFICIENT" in self.reasons) == expected_economic
+            or ("ECONOMIC_EDGE_INSUFFICIENT" in self.reasons)
+            != (self.economic_required and not expected_economic)
         ):
             raise ValueError("economic status and rejection reason are not reproducible")
 
@@ -458,6 +459,11 @@ class _Evidence:
     economic_allowed: bool
 
 
+def _target_price_valid(rules: InstrumentRules, price: Decimal) -> bool:
+    """A future exit target needs a valid tick, not today's trading limits."""
+    return bool(price > ZERO and price % rules.price_tick == ZERO)
+
+
 def _solve_quantity(
     *,
     entry: Decimal,
@@ -470,6 +476,7 @@ def _solve_quantity(
     capacity: CapacityBudget,
     percentage_risk: Decimal,
     target_price: Decimal,
+    economic_required: bool,
 ) -> tuple[bool, tuple[str, ...], _Evidence | None]:
     loss_prices_valid = ZERO < stop < entry and ZERO < gap < entry
     minimum_valid_qty = (
@@ -512,10 +519,7 @@ def _solve_quantity(
         target_cost = None
         net_pnl = ZERO
         erosion = edge_ratio = ZERO.quantize(RATIO_QUANTUM)
-        target_rule_valid = bool(
-            target_price > ZERO
-            and not rules.validate_order("buy", qty, target_price)
-        )
+        target_rule_valid = _target_price_valid(rules, target_price)
         if target_price > ZERO:
             target_cost = fees.estimate_round_trip(entry, target_price, qty)
             net_pnl = gross_edge - target_cost.total_yuan
@@ -544,7 +548,9 @@ def _solve_quantity(
                 and item.worst_loss > capacity.remaining_open_risk_yuan
             ),
             "CASH_CAPACITY_EXCEEDED": item.cash_required > cash,
-            "ECONOMIC_EDGE_INSUFFICIENT": not item.economic_allowed,
+            "ECONOMIC_EDGE_INSUFFICIENT": (
+                economic_required and not item.economic_allowed
+            ),
         }
 
     if not any(base.values()):
@@ -572,6 +578,7 @@ def _empty_decision(
     stop_price: Decimal,
     gap_price: Decimal,
     equity: Decimal,
+    economic_required: bool,
 ) -> SizingDecision:
     return SizingDecision(
         allowed=False,
@@ -599,6 +606,7 @@ def _empty_decision(
         max_cost_edge_ratio=policy.max_cost_edge_ratio,
         target_rule_valid=False,
         economic_trade_allowed=False,
+        economic_required=economic_required,
         fee_schedule_version="",
         fee_schedule_sha256="",
         available_cash_yuan=available_cash,
@@ -628,6 +636,7 @@ def _decision(
     stop_price: Decimal,
     gap_price: Decimal,
     equity: Decimal,
+    economic_required: bool,
 ) -> SizingDecision:
     return SizingDecision(
         allowed=allowed,
@@ -655,6 +664,7 @@ def _decision(
         max_cost_edge_ratio=policy.max_cost_edge_ratio,
         target_rule_valid=evidence.target_rule_valid,
         economic_trade_allowed=evidence.economic_allowed,
+        economic_required=economic_required,
         fee_schedule_version=fees.version,
         fee_schedule_sha256=fees.contract_sha256,
         available_cash_yuan=available_cash,
@@ -685,11 +695,14 @@ def allocate_buy_quantity(
     capacity: CapacityBudget,
     expected_gross_return: Decimal,
     max_cost_edge_ratio: Decimal,
+    economic_required: bool = True,
 ) -> SizingDecision:
     if not isinstance(rules, InstrumentRules):
         raise ValueError("rules must be InstrumentRules")
     if not isinstance(capacity, CapacityBudget):
         raise ValueError("capacity must be CapacityBudget")
+    if type(economic_required) is not bool:
+        raise ValueError("economic_required must be a boolean")
     entry = _decimal(entry_price, "entry_price")
     if entry <= ZERO:
         raise ValueError("entry_price must be positive")
@@ -718,13 +731,16 @@ def allocate_buy_quantity(
         capacity=capacity,
         percentage_risk=percentage_risk,
         target_price=target_price,
+        economic_required=economic_required,
     )
     if evidence is None:
         return _empty_decision(
             reasons, policy, capacity, percentage_risk, target_price, cash, rules,
             entry, stop, gap, equity_amount,
+            economic_required,
         )
     return _decision(
         allowed, reasons, evidence, policy, capacity, percentage_risk, fees, cash, rules,
         entry, stop, gap, equity_amount,
+        economic_required,
     )

@@ -1,5 +1,9 @@
 # Codex 模拟盘只读观察与阶段评估方案
 
+> 2026-08-05 本地 Batch A/B 检查点：schema 11 执行准入与 schema 12 事务通知 outbox、租约 worker、有限重试、容量控制、CRITICAL 复报、规则影子退役和详细 `ledger-check` 已在功能分支完成，但未提交、合并、推送或部署，状态为 `implemented（本地） / not deployed / not observed / not validated`。当前 Windows 缺少 `bash.exe`，3 个 Linux 脚本测试须在 Linux 复验。服务器最后记录的外部基线仍为 schema 10。schema 11/12 部署前，服务器缺少新表或仍回传旧模板是“尚未部署”，不能据此报系统异常；部署后才按本文新增证据只读审核。
+
+> 2026-08-06 Batch C ML-7 检查点：Tasks 4–10 已在本地实现，状态为 `implemented（本地未提交）`；Task 11 本地总验收、文档真值和安全复审正在进行；Task 12 服务器部署、L0 启用和交易日观察未获授权且未运行。Batch C 整体为 `not committed / not deployed / not observed / not validated`。没有真实一年/365 天 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。Codex 只能在未来部署并获观察授权后只读审核，不能把本地代码或 synthetic 测试写成 observed/validated。
+
 > 主文档：`docs/project_roadmap.md`。本文是模拟盘观察、阶段判断和优化建议的专项执行说明；如状态或业务口径与主文档冲突，以主文档为准。
 
 > 2026-07-15 schema 7 执行问题状态和自动恢复所有权读数已随 `e2ce5b5` 推送并部署服务器；用户报告 JoinQuant 网站模板已手动更新，新快照仍待交易日验证。Codex 定时审核员可只读查看这些字段，但不得运行对账、改变 `buy_enabled`/`kill_switch`、触发自动恢复或部署模板。当前状态为 `implemented（已推送） / deployed / not observed / not validated`。
@@ -48,6 +52,7 @@ Codex 不可以：
 - 导入历史数据、启动历史回测/比较、固定或清理历史运行、批准参数，或用自动审核任务生成新的回测证据。
 - 创建参数候选、写入批准/拒绝决定、激活或回滚参数版本。
 - 批准、发布、替换或回滚机器学习模型。
+- 调用候选准入、意图过期、容量释放、未知提交恢复或任何会改变交易/控制状态的入口。
 
 任何优化建议只有在用户另行明确授权后，才进入独立的设计或实施任务。
 
@@ -64,11 +69,11 @@ Codex 不可以：
 - `cache/joinquant/api_events.jsonl` 保存信号拉取、latest、快照回传和 API 异常事件。
 - `cache/joinquant/signals.json` 保存当前 JoinQuant 信号计划。
 - JoinQuant 账户快照和持仓同步数据保存实际账户、持仓和订单回报。
-- `cache/trading/trading.db` 保存 Batch 1 策略运行、信号和观察型风控账本。
+- `cache/trading/trading.db` 最后记录的服务器基线为 schema 10，保存策略运行、信号、风险、订单/成交、快照、权益、对账、控制和来源可信度；本地 schema 11 增量尚未部署。
 - 企业微信负责交易通知、成交回报和严重健康异常报警。
 - 通知失败队列和 timer 负责企业微信失败重试。
 
-`origin/main` 中的 `trading_backup.py`、7/4/12 轮转、隔离恢复演练和 systemd 模板已 `implemented（已推送）`，服务器当前代码 `52b3653` 已包含这些能力；timer 是否安装及其连续运行证据仍待只读核验。Codex 只能读取备份状态、manifest、报告和 timer 证据；不得因具备服务器只读 SSH 权限而执行备份或恢复命令。
+`origin/main` 中的 `trading_backup.py`、7/4/12 轮转、隔离恢复演练和 systemd 模板已 `implemented（已推送）`；2026-07-26 文档检查点的服务器代码已包含这些能力，但实时 SHA、timer 是否安装及其连续运行证据仍待只读核验。Codex 只能读取备份状态、manifest、报告和 timer 证据；不得因具备服务器只读 SSH 权限而执行备份或恢复命令。
 
 Codex 的新增价值不是“发现有没有 stale”，而是把已有证据转化为：
 
@@ -138,8 +143,8 @@ Codex 的新增价值不是“发现有没有 stale”，而是把已有证据�
 | 订单执行回报和持仓同步 | deployed | 服务器当前链路已包含新 fill 幂等回报，仍需真实成交观察。 |
 | 成交回报幂等、统一时间和 D+N 全量复盘 | deployed | 已随服务器 `52b3653` 部署；仍为 `not observed / not validated`。 |
 | 健康检查和微信异常报警 | deployed | 每 5 分钟运行，需在真实异常中验证及时性。 |
-| SQLite Batch 1 | deployed | 已部署，待交易日 JSON/SQLite 双写观察。 |
-| SQLite schema 7完整执行账本 | deployed | schema 6完整账本由 `e2ce5b5` 幂等迁移到7，新增生命周期和当前执行问题状态；服务器健康/可写检查通过，尚未观察或验证。 |
+| SQLite Batch 1 | deployed（历史基础） | schema 1 双写能力仍包含在后续版本中；当前外部基线不再停留在 schema 1。 |
+| SQLite schema 7完整执行账本 | deployed（历史中间版本） | 该迁移证据仍可追溯；最后记录的服务器实际基线已推进到 schema 10。 |
 | 服务器 `e2ce5b5` 部署检查点 | deployed | 部署前备份完整性通过，部署后 Linux 324/324、编译、schema 7 `ledger-check` 和环境校验通过，三个核心服务 active；不等于真实交易日 `observed / validated`。 |
 | 自动对账、人工解锁与受限自动恢复 | deployed | ERROR停买、CRITICAL熔断、两次不同新鲜快照、CAS 和所有权边界已随 `e2ce5b5` 部署，尚未观察或验证。 |
 | schema 7 受限自动恢复增量 | deployed（服务器；JoinQuant 网站由用户确认已更新） | `e2ce5b5`、schema 7、Linux 324/324 测试、配置哈希和三个服务已核验。仅 ERROR 对账自己实际停买可在严格门槛下自动恢复；CRITICAL 与任何人工控制必须人工恢复。尚未观察或验证，Codex 定时审核不得执行恢复。 |
@@ -148,6 +153,8 @@ Codex 的新增价值不是“发现有没有 stale”，而是把已有证据�
 | 模拟盘买卖强制风控 | deployed（服务器与 JoinQuant 模板） | 已同步 `52b3653` 与模板 `2026-07-14.2-p0-execution-contract`，尚未观察或验证；真实资金级风控仍为planned。 |
 | 跳空越价后二次确认入场 | deployed（功能已开启） | schema 9、有界机会状态、精确一手和部分成交撤余单已部署，模板一致；机会账本为空，尚未观察或验证。自动审核无权切换开关或补单。 |
 | 运行证据完整性修复 | deployed（服务器） | `68d7283`、Linux 457/457、schema 10、迁移后备份及隔离恢复演练、配置哈希和三个服务均已核验；应按新口径审核，但尚无真实交易日 observed/validated 证据。 |
+| 小资金真钱前置 Batch A | implemented（本地功能分支） | schema 11、精确数量、统一准入、原子预留和盈利保护已通过本地测试；未合并、未推送、未部署、未观察、未验证。部署前不得在服务器期待其表、模板或行为。 |
+| Batch C ML-7 Tasks 4–10 | implemented（本地未提交） | 训练、治理、L0 旁路和维护代码已实现；Task 11 本地总验收进行中，Task 12 未授权/未运行。没有真实一年 strict 数据、可信/活动模型、人工审批或服务器 L0 证据，Codex 尚无可执行的线上模型审核职责。 |
 
 ## 5. 定时分析任务
 
@@ -237,7 +244,7 @@ P0/P1 问题：……
 - 有效观察日和连续稳定日。
 - 信号、委托、成交、失败和成交率趋势。
 - D+1/D+3/D+5、最大浮盈、最大回撤、胜率和盈亏比。
-- 原策略与影子评分对照。
+- 原规则策略与训练模型对照（仅在训练模型代码部署并产生真实候选后）；当前没有可信或活动训练模型，规则型影子评分已在本地 Batch B 退役。
 - 不同市场状态、行业和题材分组表现。
 - API、快照、持仓、SQLite 和通知异常趋势。
 - 本周新增、持续和已关闭问题。
@@ -262,7 +269,9 @@ P0/P1 问题：……
 
 ### 7.1 2026-07-13 新退出策略观察项
 
-Codex 自动审查仍为只读审核员，不得运行完整对账、执行 `trading_control.py`、进入解锁向导、修改控制状态，也不得修改代码、配置、数据库、JoinQuant 策略、委托或服务状态。新版本部署后可以只读查询 schema version 7、最新对账摘要、差异原因码、控制状态和恢复资格，并继续核对同股唯一动作、稳定退出ID、`target_qty`、可卖数量、部分成交、止盈阶段、硬止损不下移、组合开放风险、集中度、追价过滤和市场状态滞后。报告必须分别展示 `implemented / deployed / observed / validated`；`e2ce5b5` 的服务器部署证据和用户确认的网站模板更新可作为 `deployed` 依据，真实交易日行为及任何未被新证据覆盖的外部状态仍只能报告“待观察/待验证”。
+Codex 自动审查仍为只读审核员，不得运行完整对账、执行 `trading_control.py`、进入解锁向导、修改控制状态，也不得修改代码、配置、数据库、JoinQuant 策略、委托或服务状态。当前可按最后记录的 schema 10 查询对账摘要、差异原因码、控制状态和恢复资格，并继续核对同股唯一动作、稳定退出ID、`target_qty`、可卖数量、部分成交、止盈阶段、硬止损不下移、组合开放风险、集中度、追价过滤和市场状态滞后。历史 `e2ce5b5` / schema 7 仅是中间部署证据；报告必须分别展示 `implemented / deployed / observed / validated`，任何未被新证据覆盖的外部状态只能写“待重新核验”。
+
+Batch A 经另行授权部署后，Codex 才可只读核对：账户 scope 与 full/current broker 快照是否新鲜且同源；candidate→pre-trade result→execution intent→capacity reservation→READY 是否完整且哈希/数量一致；普通 BUY 是否只使用精确 `target_qty`；终态、部分成交、未知提交和容量释放是否有同账户完整对账证据；100 股达到 `+2R` 是否只在下一批次激活盈利保护而不卖出，300/500 股是否分别降到 200/300 股；`take_profit_stage` 是否仅由关联 cycle/signal/intent 且时间窗合法的真实减仓 fill 推进。实际网站模板内容和回传版本也必须同时匹配，测试或非交易日静态检查不能替代 observed/validated。
 本门槛用于阶段 1 基础系统稳定性验收。`docs/superpowers/specs/2026-07-11-simulation-stability-ledger-design.md` 中的 20 个有效交易日用于完整账本加固与策略验证；10 日通过不等于 20 日专项完成。非交易日 readiness 结论仅表示静态结构检查，不构成有效观察日、阶段放行或实盘准入证据。
 
 ### 7.2 必须满足
@@ -303,7 +312,7 @@ Codex 自动审查仍为只读审核员，不得运行完整对账、执行 `tra
 - 最大浮盈、最大回撤、胜率和盈亏比。
 - 止盈、止损和未入场比例。
 - 不同市场状态、行业和题材表现。
-- 原策略 TopN 与影子评分 TopN 对照。
+- 原规则策略 TopN 与训练模型 TopN 对照（模型未部署时写“未启用/证据不足”）。
 
 样本不足时必须明确写“证据不足”，不得用少量交易推导稳定收益结论。
 
@@ -398,9 +407,9 @@ Codex审核员同时承担只读的数据存储治理职责，但不执行归档
 
 只有业务计数、健康语义、非交易时段静默规则和交易闭环保持一致，且存储性能达到预期时，Codex才建议继续下一批优化。Codex无权自行回滚、继续部署或扩大改动范围。
 
-### 9.3 训练型影子模型审核（planned）
+### 9.3 训练型影子模型审核（本地代码已实现，部署后才可观察）
 
-此职责只有在 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` 对应代码部署后才生效；当前只有规则型 `shadow_score.py`，没有可供审核的训练模型或模型权限状态。
+此职责只有在 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` 对应训练代码完成 Task 12 的单独授权部署并产生真实候选后才生效。当前本地已有 Tasks 4–10 的训练、治理、L0 旁路和维护代码，但没有真实一年 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。规则型 `shadow_score.py` 已在本地 Batch B 从活动链路退役，服务器在后续部署前仍可能保留旧版本，不能据此把服务器状态写成已退役。
 
 届时 Codex 可以只读核对：
 

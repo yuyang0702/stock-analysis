@@ -4,24 +4,26 @@ import argparse
 import hashlib
 import json
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, abort, g, jsonify, request
 
 import config as app_config
+from execution_contracts import ExecutionIntent
 from joinquant_sync import (
     ingest_snapshot_payload,
     is_joinquant_event_only_payload,
     sanitize_joinquant_payload,
 )
-from notifier import WeComNotifier
+from notification_outbox import NotificationConflict
 from reconciliation import (
-    ReconciliationDifference, ReconciliationResult, notify_reconciliation,
+    ReconciliationDifference, ReconciliationResult,
     persist_issue_transitions,
 )
 from trading_control import apply_reconciliation_control
-from trading_store import TradingStore
+from trading_store import FillConflictError, OrderConflictError, TradingStore
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -39,6 +41,185 @@ def _read_json(path: Path) -> dict[str, Any]:
     except Exception:
         return {"schema_version": 1, "signals": [], "stale": True, "error": "invalid_json"}
     return raw if isinstance(raw, dict) else {"schema_version": 1, "signals": [], "stale": True}
+
+
+def _aware_instant(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _jq_code(code: str) -> str:
+    if code.startswith("6"):
+        return f"{code}.XSHG"
+    if code.startswith(("4", "8")):
+        return f"{code}.XBJG"
+    return f"{code}.XSHE"
+
+
+def _signal_decimal(value: Any) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a decimal")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("invalid decimal") from exc
+    if not result.is_finite():
+        raise ValueError("non-finite decimal")
+    return result
+
+
+def _matches_execution_intent(signal: dict[str, Any], payload_json: str) -> bool:
+    try:
+        intent = ExecutionIntent.from_dict(json.loads(payload_json))
+        candidate = intent.pre_trade_result.candidate
+        fee = intent.pre_trade_result.execution_fee
+        if intent.side != "buy" or fee is None:
+            return False
+        required_cash = fee.notional_yuan + fee.total_yuan
+        text_fields = {
+            "id": intent.source_signal_id,
+            "action": "buy",
+            "code": intent.code,
+            "jq_code": _jq_code(intent.code),
+            "account_scope_id": intent.account_scope_id,
+            "client_order_id": intent.client_order_id,
+            "logical_signal_id": intent.logical_signal_id,
+            "execution_intent_sha256": intent.intent_sha256,
+            "pre_trade_result_id": intent.pre_trade_result_id,
+            "pre_trade_result_sha256": intent.pre_trade_result_sha256,
+            "broker_snapshot_id": intent.broker_snapshot_id,
+            "broker_snapshot_sha256": intent.broker_snapshot_sha256,
+            "quote_snapshot_id": intent.quote_snapshot_id,
+            "quote_snapshot_sha256": intent.quote_snapshot_sha256,
+            "instrument_rules_sha256": intent.instrument_rules_sha256,
+            "fee_schedule_version": intent.fee_schedule_version,
+            "fee_schedule_sha256": intent.fee_schedule_sha256,
+            "parameter_version": intent.parameter_version,
+            "model_version": intent.model_version,
+            "expires_at": intent.expires_at,
+        }
+        if any(str(signal.get(key) or "") != value for key, value in text_fields.items()):
+            return False
+        if intent.strategy_version != (
+            "a_share_strategy:" + str(signal.get("execution_plan_version") or "")
+        ):
+            return False
+        integer_fields = {
+            "target_qty": intent.target_position_qty,
+            "target_position": intent.target_position_qty,
+            "order_qty": intent.order_qty,
+            "expected_current_qty": intent.expected_current_qty,
+        }
+        if any(
+            isinstance(signal.get(key), bool)
+            or not isinstance(signal.get(key), int)
+            or signal[key] != value
+            for key, value in integer_fields.items()
+        ):
+            return False
+        decimal_fields = {
+            "entry_price": candidate.suggested_entry_price,
+            "stop_loss": intent.stop_price,
+            "take_profit": candidate.target_price,
+            "price_cap": intent.price_cap,
+            "limit_price": intent.limit_price,
+            "required_cash_yuan": required_cash,
+        }
+        for key, expected in decimal_fields.items():
+            actual = signal.get(key)
+            if expected is None:
+                if actual is not None:
+                    return False
+            elif _signal_decimal(actual) != expected:
+                return False
+        return True
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _filter_executable_signals(
+    payload: dict[str, Any], store: TradingStore, *, now: datetime | None = None,
+) -> dict[str, Any]:
+    result = dict(payload)
+    raw_signals = payload.get("signals")
+    signals = raw_signals if isinstance(raw_signals, list) else []
+    diagnostics = dict(payload.get("diagnostics") or {})
+    current = now or datetime.now().astimezone()
+    try:
+        store.initialize()
+        with store.connect() as conn:
+            controls = {
+                str(row["key"]): str(row["value"])
+                for row in conn.execute(
+                    """SELECT key, value FROM system_state
+                       WHERE key IN ('buy_enabled', 'sell_enabled', 'kill_switch')"""
+                ).fetchall()
+            }
+            if controls.get("kill_switch") != "0":
+                filtered: list[dict[str, Any]] = []
+            else:
+                filtered = []
+                for signal in signals:
+                    if not isinstance(signal, dict):
+                        continue
+                    action = str(signal.get("action") or "").strip().lower()
+                    if action == "sell":
+                        if controls.get("sell_enabled") == "1":
+                            filtered.append(signal)
+                        continue
+                    if action != "buy" or controls.get("buy_enabled") != "1":
+                        continue
+                    scope = str(signal.get("account_scope_id") or "").strip()
+                    client_order_id = str(signal.get("client_order_id") or "").strip()
+                    if not scope or not client_order_id:
+                        continue
+                    row = conn.execute(
+                        """SELECT o.status AS order_status, o.signal_id, o.action,
+                                  o.stock_code, o.requested_qty, o.target_qty,
+                                  i.status AS intent_status, i.expires_at,
+                                  i.intent_sha256, i.payload_json AS intent_payload
+                           FROM orders AS o
+                           JOIN execution_intents AS i
+                             ON i.client_order_id=o.client_order_id
+                           WHERE i.account_scope_id=? AND o.client_order_id=?""",
+                        (scope, client_order_id),
+                    ).fetchone()
+                    expires_at = _aware_instant(row["expires_at"]) if row else None
+                    if (
+                        row is None
+                        or str(row["order_status"]).lower() != "ready"
+                        or str(row["intent_status"]).upper() != "READY"
+                        or str(row["signal_id"] or "") != str(signal.get("id") or "")
+                        or str(row["action"]).lower() != "buy"
+                        or str(row["stock_code"]) != str(signal.get("code") or "")
+                        or int(row["requested_qty"]) != signal.get("order_qty")
+                        or int(row["target_qty"]) != signal.get("target_qty")
+                        or str(row["intent_sha256"]) != str(
+                            signal.get("execution_intent_sha256") or ""
+                        )
+                        or not _matches_execution_intent(
+                            signal, str(row["intent_payload"])
+                        )
+                        or expires_at is None
+                        or current.astimezone(expires_at.tzinfo) >= expires_at
+                    ):
+                        continue
+                    filtered.append(signal)
+        diagnostics["execution_filter_status"] = "ok"
+    except Exception:
+        filtered = [
+            signal for signal in signals
+            if isinstance(signal, dict)
+            and str(signal.get("action") or "").strip().lower() == "sell"
+        ]
+        diagnostics["execution_filter_status"] = "ledger_unavailable"
+    diagnostics["execution_filter_removed"] = len(signals) - len(filtered)
+    result["signals"] = filtered
+    result["diagnostics"] = diagnostics
+    return result
 
 
 def _append_api_event(path: Path, endpoint: str, status_code: int, **extra: Any) -> None:
@@ -75,6 +256,18 @@ def _validate_snapshot(payload: Any) -> dict[str, Any]:
         abort(400, description="payload must be an object")
     if payload.get("schema_version") != 1:
         abort(400, description="schema_version must be 1")
+    account_fields = ("cash", "available_cash", "total_value")
+    if all(payload.get(name) not in (None, "") for name in account_fields):
+        missing = [
+            name for name in ("positions", "orders", "trades")
+            if name not in payload
+        ]
+        if missing:
+            abort(
+                400,
+                description="complete snapshot missing collections: "
+                + ",".join(missing),
+            )
     if not isinstance(payload.get("positions", []), list):
         abort(400, description="positions must be a list")
     if not isinstance(payload.get("trades", []), list):
@@ -134,27 +327,8 @@ def build_execution_markdown(
 
 
 def _notify_execution(payload: dict[str, Any], executions: list[dict[str, Any]]) -> None:
-    if not app_config.WECOM_WEBHOOK_URL or not executions:
-        return
-    md = build_execution_markdown(payload, executions)
-    identity = "|".join(sorted(str(item["event_id"]) for item in executions))
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    notifier = WeComNotifier(
-        webhook_url=app_config.WECOM_WEBHOOK_URL,
-        state_file=app_config.CACHE_DIR / "wecom_notify_state.json",
-        cooldown_sec=app_config.NOTIFY_COOLDOWN_SEC_DEFAULT,
-        timeout_sec=app_config.WECOM_TIMEOUT_SEC,
-    )
-    notifier.send_markdown("JoinQuant 模拟盘执行回报", md, dedupe_key=f"joinquant-exec:{digest}")
-
-
-def _reconciliation_notifier() -> WeComNotifier:
-    return WeComNotifier(
-        webhook_url=app_config.WECOM_WEBHOOK_URL,
-        state_file=app_config.CACHE_DIR / "wecom_notify_state.json",
-        cooldown_sec=app_config.NOTIFY_COOLDOWN_SEC_DEFAULT,
-        timeout_sec=app_config.WECOM_TIMEOUT_SEC,
-    )
+    """Deprecated compatibility hook; execution facts enqueue in SQLite."""
+    del payload, executions
 
 
 def create_app(
@@ -183,7 +357,7 @@ def create_app(
     @app.get("/joinquant/signals")
     def signals():
         _check_token(expected_token)
-        payload = _read_json(signal_path)
+        payload = _filter_executable_signals(_read_json(signal_path), ledger_store)
         signal_count = len(payload.get("signals", [])) if isinstance(payload.get("signals"), list) else 0
         _append_api_event(event_path, "signals", 200, signal_count=signal_count)
         return jsonify(payload)
@@ -191,7 +365,7 @@ def create_app(
     @app.get("/joinquant/latest")
     def latest():
         _check_token(expected_token)
-        payload = _read_json(signal_path)
+        payload = _filter_executable_signals(_read_json(signal_path), ledger_store)
         signal_count = len(payload.get("signals", [])) if isinstance(payload.get("signals"), list) else 0
         _append_api_event(event_path, "latest", 200, signal_count=signal_count)
         return jsonify(
@@ -214,23 +388,38 @@ def create_app(
         event_only = is_joinquant_event_only_payload(payload)
         try:
             ledger_result = ingest_snapshot_payload(
-                payload, ledger_store, str(payload.get("received_at")), mode="incremental"
+                payload,
+                ledger_store,
+                str(payload.get("received_at")),
+                mode="incremental" if event_only else "full",
             )
         except Exception as exc:
             _append_api_event(
                 event_path, "account_snapshot", 503,
                 error_type=type(exc).__name__, error=str(exc)[:160],
             )
-            if event_only:
+            immutable_code = (
+                "IMMUTABLE_FILL_CONFLICT"
+                if isinstance(exc, FillConflictError)
+                else "LEDGER_INTEGRITY_FAILURE"
+                if isinstance(exc, (NotificationConflict, OrderConflictError))
+                else ""
+            )
+            if event_only and not immutable_code:
                 return jsonify({
                     "ok": False,
                     "error": "execution_event_unavailable",
                 }), 503
+            reason_code = immutable_code or "LEDGER_INTEGRITY_FAILURE"
+            category = "fill" if reason_code == "IMMUTABLE_FILL_CONFLICT" else "ledger"
+            object_id = "callback" if immutable_code else "sqlite"
             failure = ReconciliationResult(
                 hashlib.sha256(f"ledger:{type(exc).__name__}".encode("utf-8")).hexdigest()[:32],
                 "mismatch", "CRITICAL", [ReconciliationDifference(
-                    "ledger", "sqlite", "LEDGER_INTEGRITY_FAILURE", "unavailable", "callback", 0,
-                    "CRITICAL", {},
+                    category, object_id, reason_code,
+                    "immutable" if immutable_code else "unavailable",
+                    "callback", 0, "CRITICAL",
+                    {"error_code": type(exc).__name__},
                 )], "", None,
             )
             try:
@@ -241,7 +430,7 @@ def create_app(
                     )
                     failure.reconciliation_id = hashlib.sha256(
                         (
-                            f"ledger:{type(exc).__name__}:"
+                            f"ledger:{reason_code}:{type(exc).__name__}:"
                             f"{account_scope_id}"
                         ).encode("utf-8")
                     ).hexdigest()[:32]
@@ -262,9 +451,17 @@ def create_app(
                             """INSERT INTO reconciliation_items(
                                reconciliation_id, category, object_id, reason_code, local_value,
                                platform_value, tolerance, severity, details_json
-                               ) VALUES (?, 'ledger', 'sqlite', 'LEDGER_INTEGRITY_FAILURE',
-                               'unavailable', 'callback', 0, 'CRITICAL', '{}')""",
-                            (failure.reconciliation_id,),
+                               ) VALUES (?, ?, ?, ?, ?, 'callback', 0,
+                                         'CRITICAL', ?)""",
+                            (
+                                failure.reconciliation_id, category, object_id,
+                                reason_code,
+                                "immutable" if immutable_code else "unavailable",
+                                json.dumps(
+                                    {"error_code": type(exc).__name__},
+                                    sort_keys=True,
+                                ),
+                            ),
                         )
                     persist_issue_transitions(
                         ledger_store, conn, failure,
@@ -273,21 +470,10 @@ def create_app(
                     apply_reconciliation_control(ledger_store, conn, failure)
             except Exception:
                 pass
-            try:
-                failure_controls = {
-                    "buy_enabled": ledger_store.get_system_state("buy_enabled", "0"),
-                    "kill_switch": ledger_store.get_system_state("kill_switch", "0"),
-                }
-            except Exception:
-                failure_controls = {"buy_enabled": "0", "kill_switch": "0"}
-            notify_reconciliation(
-                failure,
-                failure_controls,
-                notifier=_reconciliation_notifier(),
-                store=ledger_store,
-                now=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            return jsonify({"ok": False, "error": "ledger_unavailable"}), 503
+            return jsonify({
+                "ok": False,
+                "error": "immutable_conflict" if immutable_code else "ledger_unavailable",
+            }), 503
         if not ledger_result.get("event_only"):
             _write_json(account_path, payload)
             history_path = account_path.parent / "account_snapshot_history.jsonl"
@@ -302,21 +488,6 @@ def create_app(
                 update_order_labels(app_config.ML_SIGNAL_SAMPLE_FILE, payload)
             except Exception as exc:
                 print(f"ML order label update skipped: {exc}", flush=True)
-        new_executions = list(ledger_result.get("new_executions") or [])
-        if new_executions:
-            _notify_execution(payload, new_executions)
-        reconciliation = ledger_result.get("reconciliation")
-        if reconciliation is not None and reconciliation.transitions:
-            notify_reconciliation(
-                reconciliation,
-                {
-                    "buy_enabled": ledger_store.get_system_state("buy_enabled", "1"),
-                    "kill_switch": ledger_store.get_system_state("kill_switch", "0"),
-                },
-                notifier=_reconciliation_notifier(),
-                store=ledger_store,
-                now=str(payload.get("received_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            )
         _append_api_event(
             event_path,
             "account_snapshot",

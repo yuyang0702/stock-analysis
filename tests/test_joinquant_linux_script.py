@@ -77,7 +77,9 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn("joinquant_signal_server.py", text)
         self.assertIn("joinquant_sync.py", text)
         self.assertIn("joinquant_health.py", text)
-        self.assertIn("notify_retry.py", text)
+        self.assertIn("notification_worker.py --once", text)
+        self.assertNotIn("notify_retry.py", text)
+        self.assertIn("Description=Deliver transactional WeCom notifications", text)
         self.assertIn("ml_dataset.py", text)
         self.assertIn("--sector-context-only", text)
         self.assertIn("backtest_engine.py", text)
@@ -89,6 +91,23 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn("OnCalendar=Sun *-01,04,07,10-01..07 03:30:00 Asia/Shanghai", text)
         self.assertIn("health)", text)
         self.assertIn("notify-retry)", text)
+        self.assertIn("notify-status)", text)
+        self.assertIn("notify-legacy-audit)", text)
+        self.assertIn("notify-compact-dry-run)", text)
+        self.assertIn("notify-compact-apply)", text)
+        self.assertIn("notify-resolve-write-failure)", text)
+        self.assertNotIn("strategy-compare-weekly)", text)
+        self.assertNotIn("strategy_compare_report.py --notify --weekly", text)
+        self.assertNotIn('SYNC_TOKEN   = ${token}', text)
+        self.assertIn('token="$(env_value JOINQUANT_SYNC_TOKEN "")"', text)
+        self.assertIn('webhook="$(env_value WECOM_WEBHOOK_URL "")"', text)
+        for field in (
+            "pending=", "leased=", "sent=", "dead=", "cancelled=",
+            "gaps=", "high_gaps=", "dead_detail_rows=", "dead_detail_bytes=",
+            "high_dead=", "tombstones=", "write_failure_marker=",
+            "write_failure_requires_manual_resolution=",
+        ):
+            self.assertIn(field, text)
         self.assertIn("生成 JoinQuant 健康检查", text)
         self.assertIn("ml-report)", text)
         self.assertIn("sector-context)", text)
@@ -112,6 +131,57 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertIn("交易控制与自动对账", text)
         self.assertIn("执行完整对账", text)
         self.assertIn("交易解锁向导", text)
+
+    def test_ml_maintenance_commands_and_automation_are_safe(self) -> None:
+        text = Path("run_ubuntu.sh").read_text(encoding="utf-8")
+
+        for command in (
+            "ml-labels",
+            "ml-train",
+            "ml-model-status",
+            "ml-backup",
+            "ml-restore-check",
+            "ml-retention-dry-run",
+            "ml-retention-apply",
+        ):
+            self.assertIn(f"{command})", text)
+
+        self.assertIn("ml_maintenance.py", text)
+        self.assertIn("stock-ml-labels.timer", text)
+        self.assertIn("stock-ml-train.timer", text)
+        self.assertIn("stock-ml-backup.timer", text)
+        self.assertIn("stock-history-backup.timer", text)
+        self.assertIn(
+            "ml_maintenance.py labels --allow-unconfigured",
+            text,
+        )
+        self.assertIn(
+            "ml_maintenance.py train --allow-unconfigured",
+            text,
+        )
+        self.assertIn("ml_maintenance.py backup --kind ml", text)
+        self.assertIn("ml_maintenance.py backup --kind history", text)
+        self.assertIn("OnCalendar=Mon..Fri *-*-* 16:10:00 Asia/Shanghai", text)
+        self.assertIn("OnCalendar=Fri *-*-* 18:00:00 Asia/Shanghai", text)
+        self.assertGreaterEqual(
+            text.count("OnCalendar=*-*-* 19:00:00 Asia/Shanghai"), 2
+        )
+        self.assertIn(
+            'set_env_default "ML_BACKUP_DIR" "/opt/stock-analysis-backups/ml"',
+            text,
+        )
+        self.assertIn(
+            'set_env_default "HISTORY_BACKUP_DIR" "/opt/stock-analysis-backups/history"',
+            text,
+        )
+        self.assertNotIn("ml_admin.py approve", text)
+        self.assertNotIn("ml_admin.py activate", text)
+        self.assertNotIn("ml_maintenance.py approve", text)
+        self.assertNotIn("ml_maintenance.py activate", text)
+        self.assertNotIn(
+            "ExecStart=${py} ${APP_DIR}/ml_maintenance.py retention-apply",
+            text,
+        )
 
     def test_old_linux_entrypoints_are_removed(self) -> None:
         self.assertFalse(Path("install_ubuntu.sh").exists())

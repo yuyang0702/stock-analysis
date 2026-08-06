@@ -4,6 +4,12 @@ import exit_policy
 
 
 class ExitPolicyTest(unittest.TestCase):
+    def test_execution_plan_version_distinguishes_small_capital_semantics(self) -> None:
+        self.assertEqual(
+            exit_policy.EXECUTION_PLAN_VERSION,
+            "2026-08-01.1-small-capital-live-risk",
+        )
+
     def test_fill_validated_stop_never_loosens_signal_or_board_guard(self) -> None:
         self.assertEqual(
             exit_policy.validated_initial_stop_price("301379", 37.49, 26.62, 0),
@@ -60,16 +66,61 @@ class ExitPolicyTest(unittest.TestCase):
         self.assertEqual(decision.action, "hard_stop")
         self.assertEqual(decision.target_qty, 0)
 
-    def test_two_r_sells_half_by_board_lot(self) -> None:
+    def test_hard_stop_wins_when_gap_crosses_trailing_stop_too(self) -> None:
+        decision = exit_policy.evaluate_exit(
+            self.state(current_qty=500, highest_price=13.0, take_profit_stage=1),
+            8.9,
+            "NORMAL",
+        )
+        self.assertEqual(decision.action, "hard_stop")
+        self.assertEqual(decision.target_qty, 0)
+
+    def test_two_r_reduces_even_lot_position_to_half(self) -> None:
         decision = exit_policy.evaluate_exit(self.state(), 12.0, "NORMAL")
         self.assertEqual(decision.action, "take_profit_1")
         self.assertEqual(decision.target_qty, 500)
 
-    def test_one_board_lot_is_fully_sold_at_first_take_profit(self) -> None:
+    def test_first_take_profit_preserves_at_least_half_by_board_lot(self) -> None:
+        self.assertEqual(exit_policy.first_take_profit_target_qty(100, 100), 100)
+        self.assertEqual(exit_policy.first_take_profit_target_qty(300, 100), 200)
+        self.assertEqual(exit_policy.first_take_profit_target_qty(500, 100), 300)
+
+        decision = exit_policy.evaluate_exit(
+            self.state(initial_qty=300, current_qty=300), 12.0, "NORMAL"
+        )
+        self.assertIn("计划卖出100股", decision.reason)
+        self.assertIn("33.3%", decision.reason)
+        self.assertNotIn("一半", decision.reason)
+        self.assertEqual(exit_policy.normalize_exit_action(decision.reason), "take_profit_1")
+
+    def test_one_board_lot_activates_profit_protection_without_selling(self) -> None:
         decision = exit_policy.evaluate_exit(
             self.state(initial_qty=100, current_qty=100), 12.0, "NORMAL"
         )
-        self.assertEqual(decision.target_qty, 0)
+        self.assertEqual(decision.action, "activate_profit_protection")
+        self.assertIsNone(decision.target_qty)
+
+    def test_one_lot_trailing_stop_starts_after_the_activation_batch(self) -> None:
+        state = self.state(
+            initial_qty=100, current_qty=100, highest_price=13.0,
+            profit_protection_activated_at="2026-08-03T10:00:00+08:00",
+            trailing_stop_active_from="2026-08-03T10:00:00.000001+08:00",
+            decision_batch_at="2026-08-03T10:00:00+08:00",
+        )
+        same_batch = exit_policy.evaluate_exit(state, 12.1, "NORMAL")
+        next_batch = exit_policy.evaluate_exit(
+            self.state(
+                initial_qty=100, current_qty=100, highest_price=13.0,
+                profit_protection_activated_at="2026-08-03T10:00:00+08:00",
+                trailing_stop_active_from="2026-08-03T10:00:00.000001+08:00",
+                decision_batch_at="2026-08-03T10:05:00+08:00",
+            ),
+            12.1,
+            "NORMAL",
+        )
+
+        self.assertEqual(same_batch.action, "hold")
+        self.assertEqual(next_batch.action, "trailing_stop")
 
     def test_trailing_stop_only_applies_after_first_take_profit(self) -> None:
         state = self.state(current_qty=500, highest_price=13.0, take_profit_stage=1)

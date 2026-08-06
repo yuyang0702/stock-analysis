@@ -1,13 +1,13 @@
 # 小资金实盘准备、事件通知与训练模型整合设计
 
 日期：2026-07-28
-状态：`planned / not implemented / not deployed / not observed / not validated`
+状态：`Batch A Tasks 1-8 implemented（本地功能分支，未合并/未推送） / not deployed / not observed / not validated`；Batch B Tasks 1–7 schema 12 通知 outbox、生产者、容量控制、CRITICAL 复报、规则影子退役、systemd 路由和审计 CLI 为 `implemented（仅本地，未提交） / not deployed / not observed / not validated`；Batch C ML-7 Tasks 4–10 为 `implemented（本地未提交）`、Task 11 本地总验收进行中、Task 12 未授权/未运行，整体 `not committed / not deployed / not observed / not validated`；Batch D planned。
 
 > 文档层级：本文件是 `docs/project_roadmap.md` 的专项设计从文档。主文档仍是唯一项目状态依据。
 >
 > 本文件整合小资金实盘前置、企业微信事件化通知、规则型影子评分退役、ML-7 五头表格模型和 QMT 执行节点边界。它引用现有专项文档，不重复定义已经部署的分层退出、五项执行正确性 P0、完整账本、历史回测和 ML-7 Task 1-3。
 >
-> 本设计获用户确认，不代表代码已实现、服务器已部署、真实交易日已观察或真实资金已验证。任何配置修改、Git 提交/推送、服务器部署、服务重启、JoinQuant 更新或 QMT 实盘启用仍需当次单独授权。
+> 本设计获用户确认。2026-08-06 时 Batch A Tasks 1-8、Batch B Tasks 1–7 和 Batch C ML-7 Tasks 4–10 已在本地工作树实现；Batch C Task 11 本地总验收、文档真值和安全复审进行中，Task 12 未授权/未运行。Batch B 包含 schema 12 通知基础、来源事务生产者、稳定计划/TTL、租约 worker、有限重试、容量控制、CRITICAL 交易分钟复报、规则影子退役、systemd 路由、详细 `ledger-check` 和带事件键校验的人工解除 CLI。Task 7 已覆盖一手/奇数手离散目标、独立盈利保护、真实回调推进 stage、因果成交时间窗、所有有效止损消费者和 strict 日K反前视回归，执行计划版本为 `2026-08-01.1-small-capital-live-risk`。这些 synthetic 测试不等于真实 strict 数据验证；当前没有真实一年 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。任何本地实现都不代表服务器已部署、JoinQuant 网站模板已更新、真实交易日已观察或真实资金已验证。任何配置修改、Git 提交/推送、服务器部署、服务重启、JoinQuant 更新或 QMT 实盘启用仍需当次单独授权。
 
 ## 1. 背景
 
@@ -15,11 +15,11 @@
 
 面向后续小资金真实交易，当前还有五类相互关联的缺口：
 
-1. 通用 `pre_trade_check` 仍是观察模式。真钱前的强制规则散落在 JoinQuant 导出器和网站模板，尚未形成平台无关的统一执行门。
-2. 普通买单仍可能按目标金额下单，100 股整数手、最低佣金、双边费用、人民币风险上限和组合容量没有统一为一个数量分配契约。
+1. 服务器当前运行入口尚未部署本批统一 `pre_trade_check(..., mode="enforce")`；本地功能分支已经完成纯函数检查、原子准入、容量预留和 JoinQuant 精确数量接线。
+2. 服务器当前运行模板尚未获得本批数量契约；本地模板已移除普通买单金额回退，并按 100 股整数手、最低佣金、双边费用、人民币风险上限和组合容量生成唯一精确数量。
 3. 企业微信通用去重依赖正文哈希和共享 JSON 文件。多进程覆盖、每轮变化的 `run_id` 和实时行情字段会造成重复消息或丢失去重状态。
 4. 当前 `shadow_score.py` 是规则加权，不是训练模型。它增加了盘中展示和周报噪声，却不能证明统计泛化能力。
-5. ML-7 只完成 Task 1-3；strict 五分钟历史、成本标签、五头训练、模型治理和 L0 推理仍未实现。QMT 也只有路线规划，没有适配器或执行节点代码。
+5. ML-7 Tasks 4–10 已在本地实现 strict 五分钟历史、成本标签、五头训练、模型治理和 L0 推理代码；Task 11 本地总验收进行中，Task 12 未授权/未运行。QMT 仍只有路线规划，没有适配器或执行节点代码。
 
 本设计把这些缺口放在同一条执行链上解决，避免模型、资金分配、风控、通知和券商节点各自维护一套订单语义。
 
@@ -29,11 +29,13 @@
 | --- | --- | --- |
 | 2026-07-14 五项执行正确性 P0 | `implemented / deployed / not observed / not validated` | 保留并增加运行不变量测试，不重复改写既有业务语义。 |
 | 分层退出和统一有效止损 | `implemented / deployed / not observed / not validated` | 保留硬止损、T+1、退出意图和卖出优先；只修正整数手分段语义。 |
-| 通用 `pre_trade_check` | `implemented（observe only） / not live-ready` | 扩展为 `observe/enforce` 双模式，QMT 必须使用 `enforce`。 |
-| 通知去重和失败重试 | `implemented / deployed`，但仅文件级冷却 | 迁移到 SQLite 业务事件 outbox。 |
-| 规则型影子评分 | `implemented / deployed`，仅观察 | 从活动运行链路、微信和周报退役；历史字段只读兼容。 |
+| 通用 `pre_trade_check`、原子准入与 JoinQuant 精确数量 | `implemented（本地功能分支） / not deployed / not observed / not validated` | 双模式检查、不可变意图、容量预留、精确数量导出、服务器二次绑定和模板数量执行已完成本地测试；尚未改变当前服务器交易。QMT 必须使用 `enforce`。 |
+| 通知去重和失败重试 | `implemented / deployed`（历史文件级基线） | Batch B 已在本地迁移到 SQLite 业务事件 outbox；提交、迁移和部署前仍不能把新语义写成服务器现状。 |
+| 规则型影子评分 | `implemented（本地已退役） / not deployed / not observed / not validated` | 从活动运行链路、微信和周报退役；历史字段只读兼容。服务器在部署前仍可能保留旧版本行为。 |
 | ML-7 Task 1-3 | `implemented / not deployed / not observed / not validated` | 保留共享契约、独立 `ml.db` 和候选采集。 |
-| ML-7 Task 4-12 | `planned` | 本设计冻结 Task 4-10 的代码边界；Task 11 纳入 Batch E 文档、全量验证和安全复审，Task 12 仍是另行授权的部署与观察。 |
+| ML-7 Task 4-10 | `implemented（本地未提交） / not deployed / not observed / not validated` | strict 导入、标签、训练、五头模型包、治理、L0 旁路和维护代码已实现；没有真实一年 strict 数据或可信/活动模型。 |
+| ML-7 Task 11 | `in progress（本地总验收）` | Batch E 文档、全量验证和安全复审正在进行；完成前不能声称本地总验收通过。 |
+| ML-7 Task 12 | `not authorized / not started` | 服务器部署、L0 启用和交易日观察仍需另行授权；当前没有服务器 L0 证据。 |
 | QMT 券商接入 | `planned` | 新增平台无关协议、故障模拟器和默认禁单的 Windows 节点；真实账户仍需外部条件。 |
 
 旧 P0 的 `deployed` 不能用来证明新的真钱前置 P0 已完成。新能力必须独立经历 `implemented / deployed / observed / validated` 状态推进。
@@ -146,9 +148,10 @@ JoinQuant 保持当前模拟执行职责。新增执行契约应逐步由 JoinQu
 - 印花税；
 - 过户费、经手费和其他可配置费用；
 - 买卖侧滑点；
-- 生效日期和 `fee_schedule_version`。
+- 生效日期和 `fee_schedule_version`；
+- 契约版本及 `execution_scope=simulation/live/both`。
 
-禁止在 `backtest_engine.py`、`historical_backtest.py`、标签代码和实盘分配器中保留互相矛盾的默认税费。真实券商成交费用以 `reported` 回报为最终事实；预测和下单前使用冻结版本的估算费用。
+禁止在 `backtest_engine.py`、`historical_backtest.py`、标签代码和实盘分配器中保留互相矛盾的默认税费。真实券商成交费用以 `reported` 回报为最终事实；预测和下单前使用冻结版本的估算费用。QMT 新买入只接受 `live/both` 费用契约；`simulation` 契约不能通过改名获得实盘权限。旧费用载荷按 v1 原哈希只读兼容，不得重新解释为实盘费用。
 
 ### 6.2 `InstrumentRules`
 
@@ -174,6 +177,8 @@ QMT 实盘缺少证券规则或规则陈旧时禁止新买入。不得只用股�
 - 适配器、节点、会话和能力版本。
 
 快照只保存必要账户事实，不在日志、通知或模型库中暴露完整账号和凭据。
+
+完整快照必须显式包含持仓、订单和成交集合，缺失集合不得解释为空集合。`daily_risk_evidence_status=reported` 时必须显式提供日内盈亏和账户回撤；缺失任一字段只能标记为 `unknown`，并禁止新买入。旧 v1 快照保持原规范化载荷和哈希，不得重新解释账户适配器或风险证据状态。
 
 ### 6.4 `StrategyOrderCandidate` 与 `ExecutionIntent`
 
@@ -207,11 +212,14 @@ pre_trade_check(candidate, broker_snapshot, quote, instrument_rules,
 - 预计现金、单票/总仓位、行业/题材和开放风险；
 - 单笔人民币风险、百分比风险、往返费用和费用侵蚀；
 - 所用快照和策略版本；
-- `checked_at`、`valid_until` 和结果哈希。
+- `checked_at`、`valid_until` 和结果哈希；
+- 风险策略、容量视图和系统控制状态的独立哈希。
 
 `RISK_MODE` 扩展为 `observe` 和 `enforce`，但只控制本设计新增的资金经济性和迁移期策略软门。既有风险拒绝、`buy_enabled/kill_switch`、陈旧信号/快照、重复订单、唯一执行计划、T+1、可交易性、5 只/80% 和分类暴露等不可变安全块在两种模式下都必须硬阻断。JoinQuant 只可在明确迁移阶段观察新增软门；任何 QMT 真实账户适配器必须对全部门使用 `enforce`，否则拒绝启动交易。
 
 买入检查适用全部资金、容量、经济性和系统控制门。卖出检查只验证意图所有权、当前可卖量、T+1、停牌/跌停、价格保护和快照新鲜度；`buy_enabled=0`、买入容量不足或买入经济性不成立不得阻断合法止损、止盈和减仓。
+
+容量视图逐仓绑定证据。新执行链持仓引用完整签名买入意图，并持续使用签名止损/跳空场景中更严格的开放风险；迁移前已有持仓使用独立 `adopted_legacy` 证据，绑定账户、适配器、持仓周期、初始数量、收养时间、来源哈希、有效止损和冻结跳空价，不伪造历史 `ExecutionIntent`。其开放风险按券商平均成本和当前剩余数量重新应用完整往返费用。两类证据都必须与同一账户、适配器和完整券商快照一致，否则新买入失败关闭。
 
 ### 6.6 原子容量预留与提交权
 
@@ -222,12 +230,16 @@ pre_trade_check(candidate, broker_snapshot, quote, instrument_rules,
 -> 汇总已有持仓、未完成订单和活动预留
 -> 对 StrategyOrderCandidate 执行 pre_trade_check
 -> 写入完整风险决定
--> 冻结现金/仓位/行业/题材/开放风险容量
 -> 根据允许结果生成 ExecutionIntent
+-> 写入引用该 ExecutionIntent 的现金/仓位/行业/题材/开放风险预留
 -> 以 client_order_id 创建唯一 READY 订单
 ```
 
-禁止使用 `PortfolioState.empty()` 或不含真实账户/挂单的空状态生成实盘审计证据。两个并发买单不能分别看到同一份剩余容量并同时通过。风险拒绝只写候选和 `PreTradeResult`，不创建订单或预留。QMT 节点领取 READY 订单使用带租约的 CAS。从未进入 `SUBMITTING` 的 READY 意图可以在无有效租约（包括租约安全回收后）且到期时转为 `EXPIRED` 并释放预留；已经提交的订单只有在 `NOT_SUBMITTED/REJECTED/CANCELLED/FILLED` 终态及对应对账完成后，才能释放适用的剩余预留。`SUBMITTING/SUBMIT_UNKNOWN/SUBMITTED/PARTIALLY_FILLED` 不得因意图时间到期释放。部分成交按实际成交和未完成数量调整预留。卖出按目标持仓和活动退出意图占用唯一执行权，避免同一股票出现重复减仓。
+禁止使用 `PortfolioState.empty()` 或不含真实账户/挂单的空状态生成实盘审计证据。两个并发买单不能分别看到同一份剩余容量并同时通过。风险拒绝只写候选和 `PreTradeResult`，不创建订单、意图或预留。QMT 节点领取 READY 订单使用带租约的 CAS。从未进入 `SUBMITTING` 的 READY 意图可以在无有效租约（包括租约安全回收后）且到期时转为 `EXPIRED` 并释放预留；已经提交的订单只有在 `NOT_SUBMITTED/REJECTED/CANCELLED/FILLED` 终态及对应对账完成后，才能释放适用的剩余预留。终态但尚待对账的预留继续占用剩余容量；`SUBMITTING/SUBMIT_UNKNOWN/SUBMITTED/PARTIALLY_FILLED` 不得因意图时间到期释放。部分成交按实际成交和未完成数量、与账本一致的向上分币规则调整预留。终态买入预留不得阻断已有持仓的保护性卖出；READY、提交中、未知、部分成交或待撤的同股买单必须先完成撤单确认，未确认前不得并发卖出。卖出按目标持仓和活动退出意图占用唯一执行权，避免同一股票出现重复减仓。
+
+同一候选只有在意图仍为 `READY`、预留仍活动、订单从未提交、未过期且当前券商订单/成交/事件不存在任何提交证据时才可幂等返回原准入结果。`SUBMIT_UNKNOWN` 不得由增量快照关闭；明确未受理也必须等同账户全量订单/成交对账一致后才能转 `NOT_SUBMITTED` 并释放预留。自动恢复买入沿用两份不同、停单后、同账户 `matched` 快照的既有规则，增量或全量均可计数；但任何活动的未知或终态待对账预留都会继续阻断恢复，因此未知提交至少先经过一次 `full + matched + 0 difference` 才可能解除。
+
+新买单在 `NOT_SUBMITTED` 后不得按同一 `logical_signal_id` 自动重发，未来只能由带审计控制事件的人工重发入口创建新尝试。保护性卖出为避免退出死锁，可在原尝试已成为 `EXPIRED/CANCELLED/REJECTED`、预留经合法证据释放、同一退出 owner/target 仍活动且没有任何活动/未知券商订单时，用新的 candidate/client order ID 重试；`NOT_SUBMITTED` 仍不自动重发。
 
 ## 7. 小资金数量与风险
 
@@ -427,7 +439,7 @@ Webhook 无服务端幂等键。HTTP 已送达但响应丢失时仍可能重复�
 
 - `OPENED / CHANGED / ESCALATED / RECOVERED` 立即发送。
 - 普通 ERROR 只在进入、变化、升级和恢复时发送，不周期复报。
-- 仅持续未恢复的 CRITICAL 在累计第 180、360、540... 个 A 股交易分钟各生成一个 reminder。
+- 仅持续未恢复的 CRITICAL 在累计第 180、360、540... 个 A 股交易分钟生成 reminder。进程在线时逐边界生成；停机或长阻塞跨过多个边界后恢复时只补当前最高 `reminder_seq`，并取消同 incident 更低序号的未发送 reminder，避免恢复瞬间连续推送。既有 `sent/dead` 历史保持不变。
 - 午休、盘后、周末和配置节假日不计时，reminder 只能在交易时段发送。
 - 恢复时取消未发送 reminder，并立即发送恢复事件。
 - reminder 序号等于 `floor(critical_trading_minutes / 180)`；一次提醒失败只重试原行，不能每五分钟创建新 reminder。发送成功、重试失败或进入 `dead` 都不重置交易分钟，下一条仍在下一个 180 分钟边界生成。
@@ -768,6 +780,8 @@ filled_downside_yuan = order_notional * conservative_price_downside_rate
 - 不可变模型包、审批/回滚和 L0 推理；
 - 模型数据就绪、训练和对照报告。
 
+当前状态：上述代码已在本地实现但未提交、未部署、未观察或验证；Task 11 本地总验收仍在进行。没有真实一年 strict 数据、可信模型、人工审批、活动模型或服务器 L0 证据。
+
 ### Batch D：BrokerAdapter 与 QMT 节点
 
 实施计划：`docs/superpowers/plans/2026-07-28-broker-adapter-qmt-node.md`
@@ -776,6 +790,7 @@ filled_downside_yuan = order_notional * conservative_price_downside_rate
 - 内存/SQLite 故障模拟适配器；
 - 默认禁单的 Windows QMT 节点和可选 XtQuant 绑定；
 - 只读账户/持仓/订单/成交同步与重连对账。
+- schema 13 必须先把当前仍按股票全局唯一的 `position_cycles/exit_intents` 迁移为账户作用域，并让 READY 到期扫描只处理调用账户；完成前 Task 5 只证明单一 JoinQuant 账户，不能宣称 JoinQuant/QMT 双账户隔离。
 
 ### Batch E：总验收与文档同步
 
@@ -784,7 +799,7 @@ filled_downside_yuan = order_notional * conservative_price_downside_rate
 - 主文档、实盘执行方案、ML-7、通知和存储文档同步；
 - 输出 implemented 范围与仍需外部验证的事实。
 
-Batch E 对应 ML-7 Task 11；ML-7 Task 12 的服务器部署、L0 启用和交易日观察不属于本设计自动授权的实施范围。
+Batch E 对应 ML-7 Task 11，当前正在本地执行；ML-7 Task 12 的服务器部署、L0 启用和交易日观察未获授权，不属于本设计自动授权的实施范围。
 
 批次可以在代码层并行准备，但发布顺序固定为 A -> B -> C/D 的只读能力 -> 单独授权部署。QMT 下单启用永远是独立发布任务。
 

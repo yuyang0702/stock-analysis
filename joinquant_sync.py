@@ -4,18 +4,29 @@ import argparse
 import hashlib
 import json
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import config as app_config
 from execution_contracts import BrokerPosition, BrokerSnapshot
+from notification_outbox import (
+    NotificationEvent,
+    notification_event_key,
+    redact_secret_text,
+)
 from order_ledger import normalize_fill, normalize_order
 from reconciliation import persist_issue_transitions, reconcile_snapshot
 from trading_control import apply_automatic_buy_recovery, apply_reconciliation_control
-from trading_store import TradingStore, canonical_json, order_allowed_quantity
+from trading_store import (
+    OrderConflictError, TradingStore, canonical_json, order_allowed_quantity,
+)
 from exit_policy import PositionExitState, resolve_effective_stop
+from execution_admission import (
+    expire_ready_intents_in_transaction,
+    synchronize_execution_lifecycle,
+)
 
 
 _SNAPSHOT_FIELDS = {
@@ -32,13 +43,13 @@ _POSITION_FIELDS = {
     "position_ratio",
 }
 _ORDER_FIELDS = {
-    "id", "signal_id", "order_id", "code", "jq_code", "action", "amount",
+    "id", "signal_id", "client_order_id", "order_id", "code", "jq_code", "action", "amount",
     "requested_qty", "target_qty", "filled", "filled_qty", "avg_price",
     "price", "status", "reason", "datetime", "updated_at", "submit_count",
     "first_submitted_at", "completed_at", "name", "target_pct",
 }
 _TRADE_FIELDS = {
-    "id", "trade_id", "fill_id", "order_id", "signal_id", "code", "jq_code",
+    "id", "trade_id", "fill_id", "client_order_id", "order_id", "signal_id", "code", "jq_code",
     "action", "amount", "qty", "price", "commission", "stamp_tax",
     "other_fee", "fee_data_status", "datetime", "filled_at",
 }
@@ -48,7 +59,13 @@ def _sanitized_record(value: Any, fields: set[str]) -> Any:
     if not isinstance(value, dict):
         return value
     return {
-        key: item if not isinstance(item, (dict, list)) else None
+        key: (
+            redact_secret_text(item)
+            if key == "reason"
+            else item
+            if key == "client_order_id" or not isinstance(item, (dict, list))
+            else None
+        )
         for key, item in value.items()
         if key in fields
     }
@@ -157,8 +174,12 @@ def _position(item: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_cycle_risk_fields(
-    positions: list[dict[str, Any]], cycles: dict[str, dict[str, Any]]
+    positions: list[dict[str, Any]], cycles: dict[str, dict[str, Any]],
+    decision_batch_at: str | None = None,
 ) -> list[dict[str, Any]]:
+    decision_batch_at = decision_batch_at or datetime.now(
+        ZoneInfo("Asia/Shanghai")
+    ).isoformat(timespec="microseconds")
     for item in positions:
         cycle = cycles.get(item["code"])
         if not cycle:
@@ -172,6 +193,11 @@ def apply_cycle_risk_fields(
             atr14=float(cycle.get("atr14") or 0),
             take_profit_stage=int(cycle.get("take_profit_stage") or 0), holding_trade_days=0,
             manual_stop_price=float(cycle.get("manual_stop_price") or 0),
+            profit_protection_activated_at=str(
+                cycle.get("profit_protection_activated_at") or ""
+            ),
+            trailing_stop_active_from=str(cycle.get("trailing_stop_active_from") or ""),
+            decision_batch_at=decision_batch_at,
         ), str(cycle.get("market_state") or "NORMAL"))
         item.update({
             "initial_stop_price": resolved.initial_stop_price,
@@ -196,9 +222,13 @@ def _snapshot_state(snapshot: dict[str, Any]) -> dict[str, Any]:
         "code", "jq_code", "qty", "closeable_amount", "locked_amount", "today_amount",
         "avg_cost", "price", "market_value", "pnl",
     )
-    order_keys = ("order_id", "id", "code", "jq_code", "action", "amount", "filled", "avg_price", "status")
+    order_keys = (
+        "client_order_id", "order_id", "id", "code", "jq_code", "action",
+        "amount", "filled", "avg_price", "status",
+    )
     trade_keys = (
-        "trade_id", "fill_id", "id", "order_id", "code", "jq_code", "action", "amount",
+        "trade_id", "fill_id", "client_order_id", "id", "order_id", "code",
+        "jq_code", "action", "amount",
         "qty", "price", "commission", "stamp_tax", "other_fee", "fee_data_status",
     )
 
@@ -322,14 +352,23 @@ def _legacy_order(
     if (
         str(previous.get("stock_code") or "") != str(order["stock_code"])
         or str(previous.get("action") or "") != str(order["action"])
+        or (
+            event.get("client_order_id") not in (None, "")
+            and str(previous.get("client_order_id") or "")
+            != str(order["client_order_id"])
+        )
         or (old_signal and new_signal and old_signal != new_signal)
         or (old_qty > 0 and new_qty > 0 and old_qty != new_qty)
     ):
-        raise ValueError("order identity conflict")
+        raise OrderConflictError("order identity conflict")
     order["client_order_id"] = previous["client_order_id"]
     if old_signal and not new_signal:
         raw = json.loads(str(order["raw_json"]))
         raw["signal_id"] = old_signal
+        order["raw_json"] = canonical_json(raw)
+    if event.get("client_order_id") in (None, ""):
+        raw = json.loads(str(order["raw_json"]))
+        raw["client_order_id"] = previous["client_order_id"]
         order["raw_json"] = canonical_json(raw)
     return order
 
@@ -349,7 +388,7 @@ def _persisted_broker_orders(
             "SELECT * FROM orders WHERE order_id=?", (order_id,),
         ).fetchall()
         if len(rows) > 1:
-            raise ValueError("order identity resolves to multiple ledger rows")
+            raise OrderConflictError("order identity resolves to multiple ledger rows")
         if rows:
             result[order_id] = dict(rows[0])
     return result
@@ -371,6 +410,18 @@ def _legacy_broker_snapshot(
             "complete JoinQuant snapshot missing account fields: "
             + ",".join(missing_account_fields)
         )
+    required_collections = ("positions", "orders", "trades")
+    missing_collections = [
+        name for name in required_collections if name not in snapshot
+    ]
+    if missing_collections:
+        raise ValueError(
+            "complete JoinQuant snapshot missing collections: "
+            + ",".join(missing_collections)
+        )
+    for name in required_collections:
+        if not isinstance(snapshot[name], list):
+            raise ValueError(f"complete JoinQuant snapshot {name} must be a list")
     generated_at = _shanghai_timestamp(
         snapshot.get("generated_at") or snapshot.get("received_at") or received_at,
         "generated_at",
@@ -383,6 +434,54 @@ def _legacy_broker_snapshot(
     if available_cash > cash:
         raise ValueError("available_cash exceeds cash")
     total_equity = _strict_decimal(snapshot.get("total_value"), "total_value")
+    intraday_raw = snapshot.get("intraday_pnl")
+    daily_pnl_pct_raw = snapshot.get("daily_pnl_pct")
+    drawdown_raw = snapshot.get("account_drawdown_pct")
+    turnover_raw = snapshot.get("daily_turnover_pct")
+    consecutive_losses_raw = snapshot.get("consecutive_losses")
+    daily_risk_evidence_status = (
+        "reported"
+        if (
+            (intraday_raw not in (None, "") or daily_pnl_pct_raw not in (None, ""))
+            and drawdown_raw not in (None, "")
+            and turnover_raw not in (None, "")
+            and consecutive_losses_raw not in (None, "")
+        )
+        else "unknown"
+    )
+    if intraday_raw not in (None, ""):
+        intraday_pnl = _strict_signed_decimal(
+            intraday_raw, "intraday_pnl"
+        )
+    elif daily_pnl_pct_raw not in (None, ""):
+        daily_pnl_pct = _strict_signed_decimal(
+            daily_pnl_pct_raw, "daily_pnl_pct"
+        )
+        denominator = Decimal("100") + daily_pnl_pct
+        if denominator <= 0:
+            raise ValueError("daily_pnl_pct must be greater than -100")
+        with localcontext() as context:
+            context.prec = 50
+            context.rounding = ROUND_HALF_UP
+            intraday_pnl = (
+                total_equity
+                - total_equity * Decimal("100") / denominator
+            )
+    else:
+        intraday_pnl = Decimal("0")
+    account_drawdown_pct = _strict_signed_decimal(
+        drawdown_raw, "account_drawdown_pct", default=0,
+    )
+    daily_turnover_pct = _strict_decimal(
+        turnover_raw, "daily_turnover_pct", default=0,
+    )
+    with localcontext() as context:
+        context.prec = 50
+        context.rounding = ROUND_HALF_UP
+        daily_turnover_fraction = daily_turnover_pct / Decimal("100")
+    consecutive_losses = _strict_quantity(
+        consecutive_losses_raw, "consecutive_losses", default=0,
+    )
     positions: list[BrokerPosition] = []
     for item in snapshot.get("positions", []):
         if not isinstance(item, dict):
@@ -423,8 +522,11 @@ def _legacy_broker_snapshot(
     )
     normalized_orders: dict[str, dict[str, object]] = {}
     open_orders: list[dict[str, object]] = []
+    merged_orders: list[dict[str, object]] = []
+    order_indexes: dict[str, int] = {}
     terminal = {
-        "filled", "cancelled", "rejected", "risk_rejected", "failed", "skipped",
+        "filled", "cancelled", "rejected", "risk_rejected", "failed",
+        "skipped", "not_submitted", "expired",
     }
     status_map = {
         "submitted": "submitted",
@@ -440,10 +542,64 @@ def _legacy_broker_snapshot(
     for item in snapshot.get("orders", []):
         if not isinstance(item, dict):
             raise ValueError("order must be an object")
+        explicit_client_id = str(item.get("client_order_id") or "").strip()
         order = _legacy_order(
             item, trade_date=trade_date, strategy_version=strategy_version,
             persisted_orders=persisted_orders,
         )
+        order["_explicit_client_order_id"] = explicit_client_id
+        order_updated_at = _event_not_after(
+            _strict_event_timestamp(
+                order.get("updated_at") or generated_at, "order.updated_at",
+            ),
+            generated_at,
+            "order.updated_at",
+        )
+        order["updated_at"] = order_updated_at
+        broker_order_id = str(order.get("order_id") or "")
+        client_id = str(order["client_order_id"])
+        keys = [f"client:{client_id}"]
+        if broker_order_id:
+            keys.append(f"broker:{broker_order_id}")
+        indexes = {order_indexes[key] for key in keys if key in order_indexes}
+        if len(indexes) > 1:
+            raise OrderConflictError(
+                "order identity resolves to multiple snapshot rows"
+            )
+        if indexes:
+            index = indexes.pop()
+            previous = merged_orders[index]
+            old_qty = _order_allowed_quantity(previous)
+            new_qty = _order_allowed_quantity(order)
+            if (
+                str(previous["stock_code"]) != str(order["stock_code"])
+                or str(previous["action"]) != str(order["action"])
+                or (
+                    previous.get("_explicit_client_order_id")
+                    and explicit_client_id
+                    and str(previous["_explicit_client_order_id"])
+                    != explicit_client_id
+                )
+                or (
+                    previous.get("order_id") and order.get("order_id")
+                    and str(previous["order_id"]) != str(order["order_id"])
+                )
+                or (old_qty > 0 and new_qty > 0 and old_qty != new_qty)
+                or int(order["filled_qty"] or 0)
+                < int(previous["filled_qty"] or 0)
+            ):
+                raise OrderConflictError("duplicate snapshot order conflict")
+            if not order.get("order_id") and previous.get("order_id"):
+                order["order_id"] = previous["order_id"]
+            merged_orders[index] = order
+        else:
+            index = len(merged_orders)
+            merged_orders.append(order)
+        order_indexes[f"client:{client_id}"] = index
+        if order.get("order_id"):
+            order_indexes[f"broker:{order['order_id']}"] = index
+
+    for order in merged_orders:
         filled_qty = int(order["filled_qty"])
         broker_order_id = str(order.get("order_id") or "")
         if broker_order_id:
@@ -471,9 +627,7 @@ def _legacy_broker_snapshot(
             "target_qty": target_qty,
             "filled_qty": filled_qty,
             "status": mapped_status,
-            "updated_at": _shanghai_timestamp(
-                order.get("updated_at") or generated_at, "order.updated_at",
-            ),
+            "updated_at": order["updated_at"],
         })
 
     fills: list[dict[str, object]] = []
@@ -509,8 +663,12 @@ def _legacy_broker_snapshot(
                 item.get("other_fee"), "fill.other_fee", default=0,
             ),
             "fee_data_status": fill["fee_data_status"],
-            "filled_at": _strict_event_timestamp(
-                fill.get("filled_at") or generated_at, "fill.filled_at",
+            "filled_at": _event_not_after(
+                _strict_event_timestamp(
+                    fill.get("filled_at") or generated_at, "fill.filled_at",
+                ),
+                generated_at,
+                "fill.filled_at",
             ),
         })
 
@@ -532,12 +690,12 @@ def _legacy_broker_snapshot(
         node_version=f"{compatibility}-node",
         session_id=f"{compatibility}-session",
         capabilities_version=f"{compatibility}-capabilities",
-        intraday_pnl=_strict_signed_decimal(
-            snapshot.get("intraday_pnl"), "intraday_pnl", default=0,
-        ),
-        account_drawdown_pct=_strict_signed_decimal(
-            snapshot.get("account_drawdown_pct"), "account_drawdown_pct", default=0,
-        ),
+        adapter="joinquant",
+        daily_risk_evidence_status=daily_risk_evidence_status,
+        intraday_pnl=intraday_pnl,
+        account_drawdown_pct=account_drawdown_pct,
+        daily_turnover_fraction=daily_turnover_fraction,
+        consecutive_losses=consecutive_losses,
     )
 
 
@@ -561,6 +719,12 @@ def _strict_event_timestamp(value: object, name: str) -> str:
     if len(text) < 16 or text[10:11] not in {" ", "T"} or text[13:14] != ":":
         raise ValueError(f"{name} is not a valid timestamp")
     return _shanghai_timestamp(text, name)
+
+
+def _event_not_after(timestamp: str, cutoff: str, name: str) -> str:
+    if datetime.fromisoformat(timestamp) > datetime.fromisoformat(cutoff):
+        raise ValueError(f"{name} follows snapshot generated_at")
+    return timestamp
 
 
 def _validate_event_only_quantities(snapshot: dict[str, Any]) -> None:
@@ -603,16 +767,273 @@ def _order_allowed_quantity(order: dict[str, object]) -> int:
     )
 
 
+_ORDER_TERMINAL_STATUS = {
+    "filled": "FILLED",
+    "cancelled": "CANCELLED",
+    "rejected": "REJECTED",
+    "risk_rejected": "REJECTED",
+    "failed": "REJECTED",
+    "skipped": "REJECTED",
+    "not_submitted": "NOT_SUBMITTED",
+    "expired": "EXPIRED",
+}
+
+_TERMINAL_REASON_CODES = {
+    "suspended", "limit_up", "limit_down", "t_plus_one",
+    "insufficient_cash", "price_moved", "gap_reentry_price_moved",
+    "dry_run", "not_submitted", "suspended_or_rejected",
+    "gap_reentry_partial_fill_complete",
+    "gap_reentry_resealed_or_price_moved", "user_cancel",
+}
+
+
+def _terminal_reason_code(status: str, reason: object) -> str:
+    normalized = str(reason or "").strip().lower()
+    return normalized.upper() if normalized in _TERMINAL_REASON_CODES else status
+
+
+def _enqueue_fill_notification(
+    store: TradingStore,
+    conn: Any,
+    account_scope_id: str,
+    execution: dict[str, object],
+    source_fact_id: str,
+) -> None:
+    fill_identity = str(source_fact_id)
+    occurred_at = _shanghai_timestamp(
+        execution.get("filled_at"), "fill notification time",
+    )
+    action = str(execution.get("action") or "").lower()
+    side = "买入" if action == "buy" else "卖出"
+    code = str(execution.get("stock_code") or "")
+    qty = int(execution.get("qty") or 0)
+    price = float(execution.get("price") or 0)
+    event = NotificationEvent(
+        event_key=notification_event_key(
+            "joinquant", account_scope_id, "fill", fill_id=fill_identity,
+        ),
+        account_scope_id=account_scope_id,
+        adapter="joinquant",
+        event_type="fill",
+        object_type="fill",
+        object_id=fill_identity,
+        source_fact_id=fill_identity,
+        priority="high",
+        payload_version=1,
+        occurred_at=occurred_at,
+        expires_at=None,
+        title="JoinQuant 模拟盘成交回报",
+        body=(
+            f"> {side} {code} | 本次 {qty}股 @ {price:.2f}\n"
+            f"> 累计 {int(execution.get('cumulative_qty') or qty)}股 | "
+            f"状态 {execution.get('status') or '-'}\n"
+            f"> 成交时间：{occurred_at}"
+        ),
+        payload={
+            "fill_id": fill_identity,
+            "client_order_id": str(execution.get("client_order_id") or ""),
+            "order_id": str(execution.get("order_id") or ""),
+            "stock_code": code,
+            "action": action,
+            "qty": qty,
+            "cumulative_qty": int(execution.get("cumulative_qty") or qty),
+            "price": price,
+            "status": str(execution.get("status") or ""),
+        },
+        metadata={"renderer": "fill-v1"},
+    )
+    store.enqueue_notification_or_gap(conn, event, occurred_at)
+
+
+def _enqueue_order_terminal_notification(
+    store: TradingStore,
+    conn: Any,
+    account_scope_id: str,
+    order: dict[str, object],
+) -> None:
+    source_status = str(order.get("status") or "").lower()
+    status = _ORDER_TERMINAL_STATUS.get(source_status)
+    if status is None:
+        return
+    client_order_id = str(order.get("client_order_id") or "").strip()
+    if not client_order_id:
+        raise ValueError("terminal order client_order_id is required")
+    reason_code = _terminal_reason_code(status, order.get("reason"))
+    occurred_at = _shanghai_timestamp(
+        order.get("completed_at") or order.get("updated_at"),
+        "order terminal time",
+    )
+    source_fact_id, fact = _insert_order_terminal_fact(
+        conn, account_scope_id, order, status, reason_code, occurred_at,
+    )
+    occurred_at = str(fact["occurred_at"])
+    event = NotificationEvent(
+        event_key=notification_event_key(
+            "joinquant",
+            account_scope_id,
+            "order-terminal",
+            client_order_id=client_order_id,
+            status=status,
+            reason_code=reason_code,
+        ),
+        account_scope_id=account_scope_id,
+        adapter="joinquant",
+        event_type="order_terminal",
+        object_type="order",
+        object_id=client_order_id,
+        source_fact_id=source_fact_id,
+        priority="high",
+        payload_version=1,
+        occurred_at=occurred_at,
+        expires_at=None,
+        title="JoinQuant 订单终态",
+        body=(
+            f"> {fact.get('action') or '-'} {fact.get('stock_code') or '-'}"
+            f" | {status} | {reason_code}\n"
+            f"> 委托 {int(fact['requested_qty'])}股 | "
+            f"成交 {int(fact['filled_qty'])}股\n"
+            f"> 业务时间：{occurred_at}"
+        ),
+        payload={
+            "client_order_id": client_order_id,
+            "order_id": str(fact.get("order_id") or ""),
+            "stock_code": str(fact.get("stock_code") or ""),
+            "action": str(fact.get("action") or ""),
+            "status": status,
+            "reason_code": reason_code,
+            "requested_qty": int(fact["requested_qty"]),
+            "filled_qty": int(fact["filled_qty"]),
+        },
+        metadata={"renderer": "order-terminal-v1"},
+    )
+    store.enqueue_notification_or_gap(conn, event, occurred_at)
+
+
+def _insert_order_terminal_fact(
+    conn: Any,
+    account_scope_id: str,
+    order: dict[str, object],
+    status: str,
+    reason_code: str,
+    occurred_at: str,
+) -> tuple[str, dict[str, object]]:
+    fact = {
+        "account_scope_id": account_scope_id,
+        "client_order_id": str(order.get("client_order_id") or ""),
+        "order_id": str(order.get("order_id") or ""),
+        "stock_code": str(order.get("stock_code") or ""),
+        "action": str(order.get("action") or ""),
+        "status": status,
+        "reason_code": reason_code,
+        "requested_qty": int(_order_allowed_quantity(order)),
+        "filled_qty": int(order.get("filled_qty") or 0),
+        "occurred_at": occurred_at,
+    }
+    raw_json = canonical_json(fact)
+    identity = canonical_json({
+        "account_scope_id": account_scope_id,
+        "client_order_id": fact["client_order_id"],
+        "status": status,
+        "reason_code": reason_code,
+    })
+    event_key = "terminal:" + hashlib.sha256(
+        identity.encode("utf-8")
+    ).hexdigest()
+    existing = conn.execute(
+        "SELECT raw_json FROM order_events WHERE event_key=?", (event_key,),
+    ).fetchone()
+    if existing is not None:
+        try:
+            frozen = json.loads(str(existing["raw_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("terminal order fact is invalid") from exc
+        if not isinstance(frozen, dict) or any(
+            str(frozen.get(key) or "") != str(value)
+            for key, value in {
+                "account_scope_id": account_scope_id,
+                "client_order_id": fact["client_order_id"],
+                "status": status,
+                "reason_code": reason_code,
+            }.items()
+        ):
+            raise ValueError("terminal order immutable fact conflict")
+        return event_key, frozen
+    conn.execute(
+        """INSERT INTO order_events(
+           event_key, signal_id, order_id, stock_code, action, target_qty,
+           requested_qty, filled_qty, status, reason, event_at, snapshot_at,
+           raw_json
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            event_key,
+            str(order.get("signal_id") or ""),
+            str(order.get("order_id") or "") or None,
+            str(order.get("stock_code") or ""),
+            str(order.get("action") or ""),
+            int(order.get("target_qty") or 0),
+            int(_order_allowed_quantity(order)),
+            int(order.get("filled_qty") or 0),
+            status.lower(),
+            reason_code,
+            occurred_at,
+            occurred_at,
+            raw_json,
+        ),
+    )
+    return event_key, fact
+
+
+def _insert_legacy_progress_fact(
+    conn: Any,
+    execution: dict[str, object],
+) -> bool:
+    event_key = str(execution["event_id"])
+    payload = canonical_json(execution)
+    existing = conn.execute(
+        "SELECT raw_json FROM order_events WHERE event_key=?", (event_key,),
+    ).fetchone()
+    if existing is not None:
+        if str(existing["raw_json"]) != payload:
+            raise ValueError("legacy order progress immutable fact conflict")
+        return False
+    conn.execute(
+        """INSERT INTO order_events(
+           event_key, signal_id, order_id, stock_code, action, target_qty,
+           requested_qty, filled_qty, status, reason, event_at, snapshot_at,
+           raw_json
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            event_key,
+            str(execution.get("signal_id") or ""),
+            str(execution.get("order_id") or "") or None,
+            str(execution.get("stock_code") or ""),
+            str(execution.get("action") or ""),
+            None,
+            int(execution.get("cumulative_qty") or 0),
+            int(execution.get("cumulative_qty") or 0),
+            str(execution.get("status") or "unknown"),
+            "legacy_order_progress",
+            str(execution.get("filled_at") or ""),
+            str(execution.get("filled_at") or ""),
+            payload,
+        ),
+    )
+    return True
+
+
 def persist_execution_events(
     store: TradingStore,
     conn: Any,
     snapshot: dict[str, Any],
     received_at: str,
     *,
+    account_scope_id: str,
     allow_persisted_orders: bool,
     persisted_orders: dict[str, dict[str, object]],
 ) -> dict[str, Any]:
-    generated_at = str(snapshot.get("generated_at") or received_at)
+    generated_at = _shanghai_timestamp(
+        snapshot.get("generated_at") or received_at, "generated_at",
+    )
     trade_date = str(snapshot.get("trade_date") or generated_at[:10])[:10]
     strategy_version = str(
         snapshot.get("strategy_template_version") or snapshot.get("template_version")
@@ -621,12 +1042,16 @@ def persist_execution_events(
     trade_events = [
         event for event in snapshot.get("trades", []) if isinstance(event, dict)
     ]
+    # Old JoinQuant snapshots may report cumulative order progress without
+    # individual trade rows. Per-order trade evidence still takes precedence.
+    allow_legacy_progress = True
     trade_order_ids = {
         str(event.get("order_id") or "").strip()
         for event in trade_events
         if str(event.get("order_id") or "").strip()
     }
     new_executions: list[dict[str, object]] = []
+    inserted_fill_count = 0
     orders_by_id: dict[str, dict[str, object]] = {}
     for event in snapshot.get("orders", []):
         if not isinstance(event, dict):
@@ -640,12 +1065,30 @@ def persist_execution_events(
             event, trade_date=trade_date, strategy_version=strategy_version,
             persisted_orders=persisted_orders,
         )
+        if (
+            not order.get("order_id")
+            and str(order.get("status") or "").lower() in {
+                "new", "open", "held", "submitted", "partial",
+                "partially_filled", "pending_cancel",
+            }
+        ):
+            order["status"] = "submit_unknown"
         order_timestamp = _strict_event_timestamp(
             order.get("updated_at") or generated_at, "order.updated_at",
         )
+        _event_not_after(order_timestamp, generated_at, "order.updated_at")
         order["updated_at"] = order_timestamp
         if order.get("first_submitted_at"):
-            order["first_submitted_at"] = order_timestamp
+            first_submitted_at = _strict_event_timestamp(
+                order["first_submitted_at"], "order.first_submitted_at",
+            )
+            if datetime.fromisoformat(first_submitted_at) > datetime.fromisoformat(
+                order_timestamp
+            ):
+                raise ValueError(
+                    "order.first_submitted_at follows order.updated_at"
+                )
+            order["first_submitted_at"] = first_submitted_at
         if order.get("completed_at"):
             order["completed_at"] = order_timestamp
         previous = conn.execute(
@@ -665,7 +1108,7 @@ def persist_execution_events(
             order.get("order_id")
             and str(order["order_id"]) in trade_order_ids
         )
-        if not has_linked_trade and current_filled > 0:
+        if allow_legacy_progress and not has_linked_trade and current_filled > 0:
             average_fill_price = _strict_decimal(
                 event.get("avg_price")
                 if event.get("avg_price") not in (None, "")
@@ -689,13 +1132,15 @@ def persist_execution_events(
             orders_by_id[order_id] = order
             persisted_orders[order_id] = order
         if (
-            not has_linked_trade
+            allow_legacy_progress
+            and not has_linked_trade
             and order.get("action") in {"buy", "sell"}
             and current_filled > previous_filled
         ):
-            new_executions.append({
+            execution = {
                 "event_id": f"legacy:{order['client_order_id']}:{current_filled}",
                 "source": "legacy_order_progress",
+                "client_order_id": order["client_order_id"],
                 "order_id": order.get("order_id"),
                 "signal_id": order.get("signal_id"),
                 "stock_code": order.get("stock_code"),
@@ -705,7 +1150,20 @@ def persist_execution_events(
                 "price": order.get("average_fill_price"),
                 "status": order.get("status"),
                 "filled_at": order.get("updated_at") or generated_at,
-            })
+            }
+            if _insert_legacy_progress_fact(conn, execution):
+                _enqueue_fill_notification(
+                    store,
+                    conn,
+                    account_scope_id,
+                    execution,
+                    str(execution["event_id"]),
+                )
+                new_executions.append(execution)
+        if not has_linked_trade:
+            _enqueue_order_terminal_notification(
+                store, conn, account_scope_id, order,
+            )
     for event in trade_events:
         order_id = str(event.get("order_id") or "").strip()
         order = orders_by_id.get(order_id)
@@ -735,6 +1193,7 @@ def persist_execution_events(
             event.get("datetime") or event.get("filled_at"),
             "fill.filled_at",
         )
+        _event_not_after(filled_at, generated_at, "fill.filled_at")
         for fee_name in ("commission", "stamp_tax", "other_fee"):
             if fee_name in event and event.get(fee_name) not in (None, ""):
                 _strict_decimal(event[fee_name], f"fill.{fee_name}")
@@ -746,6 +1205,7 @@ def persist_execution_events(
         current_status = str(order.get("status") or "unknown")
         if current_status in {
             "rejected", "failed", "skipped", "risk_rejected",
+            "not_submitted", "expired",
         }:
             raise ValueError("fill conflicts with terminal order")
         existing_fill = conn.execute(
@@ -768,6 +1228,7 @@ def persist_execution_events(
             ):
                 raise ValueError("fill conflicts with cancelled terminal order")
         inserted = store.insert_fill(conn, fill)
+        inserted_fill_count += int(inserted)
         fill_totals = conn.execute(
             """SELECT COALESCE(SUM(qty), 0),
                       COALESCE(SUM(qty * price), 0)
@@ -810,25 +1271,52 @@ def persist_execution_events(
         order["filled_qty"] = cumulative_qty
         order["average_fill_price"] = average_fill_price
         order["status"] = status
+        if status == "filled":
+            order["completed_at"] = order.get("completed_at") or filled_at
         if not inserted:
             continue
-        new_executions.append({
+        legacy_prefix = f"legacy:{order['client_order_id']}:"
+        legacy_covered_qty = int(conn.execute(
+            """SELECT COALESCE(MAX(filled_qty), 0)
+               FROM order_events
+               WHERE reason='legacy_order_progress'
+                 AND (order_id=? OR substr(event_key, 1, ?)=?)""",
+            (order_id, len(legacy_prefix), legacy_prefix),
+        ).fetchone()[0] or 0)
+        covered_remaining = max(0, legacy_covered_qty - prior_fill_qty)
+        notification_qty = max(0, qty - covered_remaining)
+        if notification_qty == 0:
+            continue
+        execution = {
             "event_id": f"fill:{fill['fill_id']}",
             "source": "fill",
+            "client_order_id": fill.get("client_order_id"),
             "order_id": fill.get("order_id"),
             "signal_id": fill.get("signal_id"),
             "stock_code": fill.get("stock_code"),
             "action": fill.get("action"),
-            "qty": fill.get("qty"),
+            "qty": notification_qty,
             "cumulative_qty": cumulative_qty,
             "price": fill.get("price"),
             "status": status,
             "filled_at": fill.get("filled_at"),
-        })
+        }
+        _enqueue_fill_notification(
+            store,
+            conn,
+            account_scope_id,
+            execution,
+            str(fill["fill_id"]),
+        )
+        new_executions.append(execution)
+    for order_id in sorted(trade_order_ids):
+        order = orders_by_id.get(order_id)
+        if order is not None:
+            _enqueue_order_terminal_notification(
+                store, conn, account_scope_id, order,
+            )
     return {
-        "inserted_fills": sum(
-            event["source"] == "fill" for event in new_executions
-        ),
+        "inserted_fills": inserted_fill_count,
         "new_executions": new_executions,
     }
 
@@ -839,6 +1327,7 @@ def persist_account_snapshot(
     snapshot: dict[str, Any],
     received_at: str,
     persisted_orders: dict[str, dict[str, object]],
+    account_scope_id: str,
 ) -> dict[str, Any]:
     sid = snapshot_id(snapshot)
     state_hash = hashlib.sha256(canonical_json(_snapshot_state(snapshot)).encode("utf-8")).hexdigest()
@@ -889,6 +1378,7 @@ def persist_account_snapshot(
     execution_result = persist_execution_events(
         store, conn, snapshot, received_at, allow_persisted_orders=False,
         persisted_orders=persisted_orders,
+        account_scope_id=account_scope_id,
     )
     new_executions = execution_result["new_executions"]
 
@@ -951,8 +1441,12 @@ def ingest_snapshot_payload(
         _validate_event_only_quantities(snapshot)
         with store.transaction() as conn:
             persisted_orders = _persisted_broker_orders(conn, snapshot)
+            account_scope_id = store.get_or_create_account_scope(
+                conn, "joinquant", "primary",
+            )
             execution_result = persist_execution_events(
                 store, conn, snapshot, received_at,
+                account_scope_id=account_scope_id,
                 allow_persisted_orders=True,
                 persisted_orders=persisted_orders,
             )
@@ -976,6 +1470,7 @@ def ingest_snapshot_payload(
         )
         result = persist_account_snapshot(
             store, conn, snapshot, received_at, persisted_orders,
+            account_scope_id,
         )
         store.replace_current_broker_snapshot(conn, broker_snapshot)
         store.reconcile_position_cycles(conn, positions, snapshot_at)
@@ -984,6 +1479,22 @@ def ingest_snapshot_payload(
         reconciliation = reconcile_snapshot(
             store, conn, snapshot, snapshot_id=result["snapshot_id"],
             broker_snapshot=broker_snapshot, mode=mode, now=received_at,
+        )
+        lifecycle = synchronize_execution_lifecycle(
+            store,
+            conn,
+            account_scope_id,
+            now=_shanghai_timestamp(received_at, "received_at"),
+            reconciliation_id=(
+                reconciliation.reconciliation_id
+                if mode == "full"
+                and reconciliation.result == "matched"
+                and not reconciliation.differences
+                else None
+            ),
+        )
+        expired_ready_intents = expire_ready_intents_in_transaction(
+            store, conn, _shanghai_timestamp(received_at, "received_at"),
         )
         persist_issue_transitions(store, conn, reconciliation, received_at)
         actions = apply_reconciliation_control(store, conn, reconciliation)
@@ -1002,6 +1513,8 @@ def ingest_snapshot_payload(
                     "transitioned": True, "transition": "RECOVERED",
                 })
         result["reconciliation"] = reconciliation
+        result["execution_lifecycle"] = lifecycle
+        result["expired_ready_intents"] = expired_ready_intents
         result["control_actions"] = actions
         result["automatic_recovery"] = automatic_recovery
         today = received_at[:10]

@@ -41,7 +41,9 @@ def _decimal(
 
 
 def _money(value: Decimal) -> Decimal:
-    return value.quantize(CENT, rounding=ROUND_HALF_UP)
+    with localcontext() as context:
+        context.prec = 50
+        return value.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
 def _ratio(numerator: Decimal, denominator: Decimal, name: str) -> Decimal:
@@ -578,10 +580,25 @@ class FeeSchedule:
     other_fee_rate: Decimal
     buy_slippage_rate: Decimal
     sell_slippage_rate: Decimal
+    contract_version: int = 2
+    execution_scope: str = "simulation"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "version", _text(self.version, "version"))
         object.__setattr__(self, "effective_from", _date_text(self.effective_from, "effective_from"))
+        object.__setattr__(
+            self,
+            "contract_version",
+            _qty(self.contract_version, "contract_version", positive=True),
+        )
+        if self.contract_version not in {1, 2}:
+            raise ValueError("unsupported fee schedule contract_version")
+        scope = _text(self.execution_scope, "execution_scope").lower()
+        if scope not in {"simulation", "live", "both"}:
+            raise ValueError("execution_scope must be simulation, live or both")
+        if self.contract_version == 1 and scope != "simulation":
+            raise ValueError("legacy fee schedule cannot be approved for live execution")
+        object.__setattr__(self, "execution_scope", scope)
         for name in (
             "buy_commission_rate",
             "sell_commission_rate",
@@ -685,7 +702,11 @@ class FeeSchedule:
         return {**self._content_dict(), "contract_sha256": self.contract_sha256}
 
     def _content_dict(self) -> dict[str, object]:
-        return _record_dict(self)
+        content = _record_dict(self)
+        if self.contract_version == 1:
+            content.pop("contract_version")
+            content.pop("execution_scope")
+        return content
 
     @property
     def contract_sha256(self) -> str:
@@ -703,6 +724,9 @@ class FeeSchedule:
     def from_dict(cls, value: Mapping[str, object]) -> FeeSchedule:
         values = dict(value)
         expected = _sha256_text(values.pop("contract_sha256", None), "contract_sha256")
+        if "contract_version" not in values:
+            values["contract_version"] = 1
+            values.setdefault("execution_scope", "simulation")
         legacy_minimum = values.pop("minimum_commission_yuan", None)
         if legacy_minimum is not None:
             if "buy_minimum_commission_yuan" in values or "sell_minimum_commission_yuan" in values:
@@ -942,8 +966,13 @@ class BrokerSnapshot:
     node_version: str
     session_id: str
     capabilities_version: str
-    intraday_pnl: Decimal = ZERO
-    account_drawdown_pct: Decimal = ZERO
+    contract_version: int = 2
+    adapter: str = "joinquant"
+    daily_risk_evidence_status: str = "unknown"
+    intraday_pnl: Decimal | None = None
+    account_drawdown_pct: Decimal | None = None
+    daily_turnover_fraction: Decimal | None = None
+    consecutive_losses: int | None = None
     snapshot_sha256: str = ""
 
     def __post_init__(self) -> None:
@@ -957,6 +986,48 @@ class BrokerSnapshot:
             "capabilities_version",
         ):
             object.__setattr__(self, name, _text(getattr(self, name), name))
+        object.__setattr__(
+            self,
+            "contract_version",
+            _qty(self.contract_version, "contract_version", positive=True),
+        )
+        if self.contract_version not in {1, 2}:
+            raise ValueError("unsupported broker snapshot contract_version")
+        adapter = _text(self.adapter, "adapter").lower()
+        if adapter not in {"joinquant", "qmt"}:
+            raise ValueError("adapter must be joinquant or qmt")
+        object.__setattr__(self, "adapter", adapter)
+        daily_status = _text(
+            self.daily_risk_evidence_status,
+            "daily_risk_evidence_status",
+        ).lower()
+        if daily_status not in {"reported", "unknown"}:
+            raise ValueError(
+                "daily_risk_evidence_status must be reported or unknown"
+            )
+        object.__setattr__(
+            self, "daily_risk_evidence_status", daily_status
+        )
+        if daily_status == "reported":
+            for name in (
+                "intraday_pnl",
+                "account_drawdown_pct",
+                "daily_turnover_fraction",
+                "consecutive_losses",
+            ):
+                if getattr(self, name) is None:
+                    raise ValueError(
+                        f"reported daily risk evidence requires {name}"
+                    )
+        if self.contract_version == 1 and (
+            adapter != "joinquant"
+            or daily_status != "unknown"
+            or self.daily_turnover_fraction is not None
+            or self.consecutive_losses is not None
+        ):
+            raise ValueError(
+                "legacy broker snapshot cannot reinterpret adapter or daily risk evidence"
+            )
         object.__setattr__(self, "trade_date", _date_text(self.trade_date, "trade_date"))
         object.__setattr__(self, "broker_time", _timestamp(self.broker_time, "broker_time"))
         object.__setattr__(self, "generated_at", _timestamp(self.generated_at, "generated_at"))
@@ -970,12 +1041,39 @@ class BrokerSnapshot:
         object.__setattr__(
             self,
             "account_drawdown_pct",
-            _decimal(self.account_drawdown_pct, "account_drawdown_pct", signed=True),
+            _decimal(
+                ZERO if self.account_drawdown_pct is None else self.account_drawdown_pct,
+                "account_drawdown_pct",
+                signed=True,
+            ),
         )
-        intraday = self.intraday_pnl if isinstance(self.intraday_pnl, Decimal) else Decimal(str(self.intraday_pnl))
-        if not intraday.is_finite():
-            raise ValueError("intraday_pnl must be finite")
-        object.__setattr__(self, "intraday_pnl", intraday)
+        object.__setattr__(
+            self,
+            "intraday_pnl",
+            _decimal(
+                ZERO if self.intraday_pnl is None else self.intraday_pnl,
+                "intraday_pnl",
+                signed=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "daily_turnover_fraction",
+            _decimal(
+                ZERO
+                if self.daily_turnover_fraction is None
+                else self.daily_turnover_fraction,
+                "daily_turnover_fraction",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "consecutive_losses",
+            _qty(
+                0 if self.consecutive_losses is None else self.consecutive_losses,
+                "consecutive_losses",
+            ),
+        )
         if self.available_cash + self.frozen_cash > self.cash:
             raise ValueError("available_cash plus frozen_cash exceeds cash")
         positions = tuple(
@@ -1004,8 +1102,7 @@ class BrokerSnapshot:
             raise ValueError("duplicate broker fill ID")
         object.__setattr__(self, "open_orders", open_orders)
         object.__setattr__(self, "fills", fills)
-        content = _record_dict(self)
-        content.pop("snapshot_sha256")
+        content = self._content_dict()
         actual = canonical_sha256(content)
         _verify_hash(supplied_hash, actual, "broker snapshot")
         object.__setattr__(self, "snapshot_sha256", actual)
@@ -1031,15 +1128,35 @@ class BrokerSnapshot:
         return cls(snapshot_id=snapshot_id, generated_at=generated_at, **values)
 
     def to_dict(self) -> dict[str, object]:
-        return _record_dict(self)
+        return {**self._content_dict(), "snapshot_sha256": self.snapshot_sha256}
+
+    def _content_dict(self) -> dict[str, object]:
+        content = _record_dict(self)
+        content.pop("snapshot_sha256")
+        if self.contract_version == 1:
+            for name in (
+                "contract_version",
+                "adapter",
+                "daily_risk_evidence_status",
+                "daily_turnover_fraction",
+                "consecutive_losses",
+            ):
+                content.pop(name)
+        return content
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> BrokerSnapshot:
         values = dict(value)
+        if "positions" not in values:
+            raise ValueError("broker snapshot positions are required")
+        if "contract_version" not in values:
+            values["contract_version"] = 1
+            values.setdefault("adapter", "joinquant")
+            values.setdefault("daily_risk_evidence_status", "unknown")
         values["snapshot_sha256"] = _sha256_text(
             values.get("snapshot_sha256"), "snapshot_sha256"
         )
-        values["positions"] = tuple(BrokerPosition.from_dict(item) for item in values.get("positions", ()))
+        values["positions"] = tuple(BrokerPosition.from_dict(item) for item in values["positions"])
         return cls(**values)
 
 
@@ -1074,6 +1191,7 @@ class StrategyOrderCandidate:
     exit_priority: int | None
     sell_limit_price: Decimal | None
     sell_price_floor: Decimal | None
+    rule_position_cap_fraction: Decimal | None = None
     payload_sha256: str = ""
 
     def __post_init__(self) -> None:
@@ -1116,6 +1234,21 @@ class StrategyOrderCandidate:
                 name,
                 _decimal(getattr(self, name), name, positive=True, optional=True),
             )
+        object.__setattr__(
+            self,
+            "rule_position_cap_fraction",
+            _decimal(
+                self.rule_position_cap_fraction,
+                "rule_position_cap_fraction",
+                positive=True,
+                optional=True,
+            ),
+        )
+        if (
+            self.rule_position_cap_fraction is not None
+            and self.rule_position_cap_fraction > Decimal("1")
+        ):
+            raise ValueError("rule_position_cap_fraction must not exceed 1")
         if self.requested_target_position_qty is not None:
             object.__setattr__(
                 self,
@@ -1158,6 +1291,10 @@ class StrategyOrderCandidate:
             ):
                 raise ValueError("buy candidate contains side-inapplicable sell fields")
         else:
+            if self.rule_position_cap_fraction is not None:
+                raise ValueError(
+                    "sell candidate contains side-inapplicable rule position cap"
+                )
             if self.buy_gap_price is not None or self.buy_price_cap is not None:
                 raise ValueError("sell candidate contains side-inapplicable buy fields")
             if self.requested_target_position_qty is None:
@@ -1181,14 +1318,20 @@ class StrategyOrderCandidate:
         )
         if datetime.fromisoformat(self.frozen_valid_until) < datetime.fromisoformat(self.signal_time):
             raise ValueError("frozen_valid_until must not precede signal_time")
-        content = _record_dict(self)
-        content.pop("payload_sha256")
+        content = self._content_dict()
         actual = canonical_sha256(content)
         _verify_hash(supplied_hash, actual, "strategy candidate")
         object.__setattr__(self, "payload_sha256", actual)
 
+    def _content_dict(self) -> dict[str, object]:
+        content = _record_dict(self)
+        content.pop("payload_sha256")
+        if self.rule_position_cap_fraction is None:
+            content.pop("rule_position_cap_fraction")
+        return content
+
     def to_dict(self) -> dict[str, object]:
-        return _record_dict(self)
+        return {**self._content_dict(), "payload_sha256": self.payload_sha256}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> StrategyOrderCandidate:
@@ -1242,10 +1385,21 @@ class PreTradeResult:
     quote_snapshot_sha256: str = "not-applicable"
     instrument_rules_sha256: str = "not-applicable"
     strategy_version: str = "not-applicable"
+    contract_version: int = 2
+    risk_policy_sha256: str = "not-applicable"
+    reservation_view_sha256: str = "not-applicable"
+    system_state_sha256: str = "not-applicable"
     result_sha256: str = ""
 
     def __post_init__(self) -> None:
         supplied_hash = self.result_sha256
+        object.__setattr__(
+            self,
+            "contract_version",
+            _qty(self.contract_version, "contract_version", positive=True),
+        )
+        if self.contract_version not in {1, 2}:
+            raise ValueError("unsupported pre-trade contract_version")
         for name in (
             "pre_trade_result_id",
             "candidate_id",
@@ -1289,6 +1443,19 @@ class PreTradeResult:
                 name,
                 "not-applicable" if value.lower() == "not-applicable" else _sha256_text(value, name),
             )
+        for name in (
+            "risk_policy_sha256",
+            "reservation_view_sha256",
+            "system_state_sha256",
+        ):
+            value = _text(getattr(self, name), name)
+            object.__setattr__(
+                self,
+                name,
+                "not-applicable"
+                if value.lower() == "not-applicable"
+                else _sha256_text(value, name),
+            )
         object.__setattr__(
             self,
             "instrument_rules_sha256",
@@ -1306,6 +1473,16 @@ class PreTradeResult:
         )
         if candidate.candidate_id != self.candidate_id:
             raise ValueError("candidate_id does not match normalized candidate")
+        if self.contract_version >= 2:
+            for name in (
+                "risk_policy_sha256",
+                "reservation_view_sha256",
+                "system_state_sha256",
+            ):
+                if getattr(self, name) == "not-applicable":
+                    raise ValueError(
+                        f"new pre-trade result requires {name}"
+                    )
         if (
             self.fee_evidence_status == "available"
             and candidate.fee_schedule_version != self.fee_schedule_version
@@ -1370,7 +1547,7 @@ class PreTradeResult:
         frozen_valid_until = datetime.fromisoformat(candidate.frozen_valid_until)
         if valid_until < checked_at:
             raise ValueError("valid_until must not precede checked_at")
-        if checked_at < signal_time:
+        if self.allowed and checked_at < signal_time:
             raise ValueError("checked_at must not precede candidate signal_time")
         if self.allowed and (checked_at > frozen_valid_until or valid_until > frozen_valid_until):
             raise ValueError("allowed result must remain within candidate frozen_valid_until")
@@ -1656,6 +1833,15 @@ class PreTradeResult:
     def _content_dict(self) -> dict[str, object]:
         content = _record_dict(self)
         content.pop("result_sha256")
+        if self.contract_version == 1:
+            content.pop("contract_version")
+        for name in (
+            "risk_policy_sha256",
+            "reservation_view_sha256",
+            "system_state_sha256",
+        ):
+            if content[name] == "not-applicable":
+                content.pop(name)
         if self.execution_fee is not None:
             content["execution_fee"] = self.execution_fee.to_dict()
         if self.round_trip_cost is not None:
@@ -1672,8 +1858,16 @@ class PreTradeResult:
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> PreTradeResult:
         values = dict(value)
-        if set(values) != {field.name for field in fields(cls)}:
+        expected = {field.name for field in fields(cls)}
+        optional_legacy = {
+            "contract_version",
+            "risk_policy_sha256",
+            "reservation_view_sha256",
+            "system_state_sha256",
+        }
+        if not set(values) <= expected or not expected - optional_legacy <= set(values):
             raise ValueError("pre-trade result fields do not match the signed contract")
+        values.setdefault("contract_version", 1)
         values["result_sha256"] = _sha256_text(
             values.get("result_sha256"), "result_sha256"
         )

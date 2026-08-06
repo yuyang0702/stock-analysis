@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 
 from candidate_core import score_candidate_frame
 from exit_policy import board_type, initial_stop_price, market_regime, risk_position_pct
 from historical_data import HistoricalDataValidationError, HistoricalStore, STRICT_FEATURES
+from ml_contracts import CandidateSample
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,51 @@ class Candidate:
     industry: str
     theme: str
     evidence: dict[str, Any]
+
+
+def fetch_live_quotes(*_args: object, **_kwargs: object) -> None:
+    """Explicit guard retained so tests prove strict replay never reaches live data."""
+    raise HistoricalDataValidationError("HISTORICAL_LIVE_DATA_FORBIDDEN")
+
+
+def generate_candidates_at(
+    store: HistoricalStore,
+    dataset_id: str,
+    decision_at: str,
+    strategy_config: Mapping[str, object],
+) -> list[CandidateSample]:
+    """Replay one immutable imported five-minute cohort without recomputation."""
+    if not isinstance(strategy_config, Mapping):
+        raise HistoricalDataValidationError("STRICT_STRATEGY_CONFIG_REQUIRED")
+    version_fields = (
+        "strategy_version",
+        "parameter_version",
+        "feature_schema_version",
+        "market_data_version",
+        "code_hash",
+        "generator_hash",
+    )
+    missing = [
+        field
+        for field in version_fields
+        if not str(strategy_config.get(field) or "").strip()
+    ]
+    if missing:
+        raise HistoricalDataValidationError(
+            "STRICT_STRATEGY_CONFIG_INCOMPLETE: " + ",".join(missing)
+        )
+    samples = store.candidate_cohort(dataset_id, decision_at)
+    if not samples:
+        raise HistoricalDataValidationError("STRICT_COHORT_NOT_FOUND")
+    for field in version_fields:
+        expected = str(strategy_config[field])
+        if any(str(getattr(sample, field)) != expected for sample in samples):
+            raise HistoricalDataValidationError(f"STRICT_COHORT_VERSION_MISMATCH: {field}")
+    if any(sample.dataset_id != str(dataset_id) for sample in samples):
+        raise HistoricalDataValidationError("STRICT_COHORT_DATASET_MISMATCH")
+    if any(sample.source != "strict_history" for sample in samples):
+        raise HistoricalDataValidationError("STRICT_HISTORY_SOURCE_REQUIRED")
+    return samples
 
 
 def generate_daily_candidates(

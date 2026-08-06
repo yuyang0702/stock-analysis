@@ -10,6 +10,7 @@ Only use https:// after adding an HTTPS reverse proxy such as Nginx.
 
 from datetime import datetime, timedelta
 import json
+import math
 import urllib.request
 
 
@@ -22,7 +23,7 @@ MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_POSITIONS = 5
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-07-18.1-gap-reentry"
+STRATEGY_TEMPLATE_VERSION = "2026-08-01.1-exact-intent"
 
 
 def _ensure_runtime_state(context):
@@ -34,6 +35,8 @@ def _ensure_runtime_state(context):
         g.order_events = []
     if not isinstance(getattr(g, "order_signal_ids", None), dict):
         g.order_signal_ids = {}
+    if not isinstance(getattr(g, "order_client_order_ids", None), dict):
+        g.order_client_order_ids = {}
     if not isinstance(getattr(g, "gap_reentry_orders", None), dict):
         g.gap_reentry_orders = {}
     total = float(context.portfolio.total_value or 0)
@@ -55,6 +58,7 @@ def initialize(context):
     g.executed_signal_ids = set()
     g.order_events = []
     g.order_signal_ids = {}
+    g.order_client_order_ids = {}
     g.gap_reentry_orders = {}
     g.metrics_trade_date = datetime.now().strftime("%Y-%m-%d")
     g.day_start_value = float(context.portfolio.total_value or 0)
@@ -127,12 +131,81 @@ def _signal_is_fresh(signal):
     )
     try:
         generated_at = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        max_age_min = int(signal.get("max_age_min") or MAX_SIGNAL_AGE_MIN)
+        if max_age_min <= 0:
+            return False
+        age = datetime.now() - generated_at
+        return timedelta(0) <= age <= timedelta(minutes=max_age_min)
     except Exception:
         return False
-    age = datetime.now() - generated_at
-    return timedelta(0) <= age <= timedelta(
-        minutes=int(signal.get("max_age_min") or MAX_SIGNAL_AGE_MIN)
+
+
+def _intent_is_fresh(signal):
+    text = str(signal.get("expires_at") or "").strip()
+    if not text:
+        return False
+    try:
+        normalized = text.replace("Z", "+0000")
+        if len(normalized) >= 6 and normalized[-3] == ":":
+            normalized = normalized[:-3] + normalized[-2:]
+        expires_at = datetime.strptime(normalized, "%Y-%m-%dT%H:%M:%S%z")
+        return datetime.now(expires_at.tzinfo) < expires_at
+    except Exception:
+        return False
+
+
+def _exact_buy_values(signal):
+    required_text = (
+        "account_scope_id", "client_order_id", "execution_intent_sha256",
+        "pre_trade_result_id", "pre_trade_result_sha256",
+        "broker_snapshot_id", "broker_snapshot_sha256",
+        "quote_snapshot_id", "quote_snapshot_sha256",
+        "instrument_rules_sha256", "expires_at",
     )
+    if any(not isinstance(signal.get(key), str) or not signal.get(key).strip() for key in required_text):
+        return None, "missing_execution_intent"
+    for key in (
+        "execution_intent_sha256", "pre_trade_result_sha256",
+        "broker_snapshot_sha256", "quote_snapshot_sha256",
+        "instrument_rules_sha256",
+    ):
+        digest = signal[key].strip().lower()
+        try:
+            valid_digest = len(digest) == 64 and int(digest, 16) >= 0
+        except Exception:
+            valid_digest = False
+        if not valid_digest:
+            return None, "invalid_execution_intent"
+    values = {}
+    for key in ("target_qty", "target_position", "order_qty", "expected_current_qty"):
+        value = signal.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None, "invalid_execution_intent"
+        values[key] = value
+    if (
+        values["target_qty"] <= 0
+        or values["order_qty"] <= 0
+        or values["expected_current_qty"] < 0
+        or values["target_position"] != values["target_qty"]
+        or values["target_qty"]
+        != values["expected_current_qty"] + values["order_qty"]
+    ):
+        return None, "invalid_execution_intent"
+    try:
+        values["price_cap"] = float(signal.get("price_cap"))
+        values["required_cash_yuan"] = float(signal.get("required_cash_yuan"))
+    except Exception:
+        return None, "invalid_execution_intent"
+    if (
+        not math.isfinite(values["price_cap"])
+        or values["price_cap"] <= 0
+        or not math.isfinite(values["required_cash_yuan"])
+        or values["required_cash_yuan"] <= 0
+    ):
+        return None, "invalid_execution_intent"
+    if not _intent_is_fresh(signal):
+        return None, "intent_expired"
+    return values, ""
 
 
 def _can_execute(context, signal):
@@ -141,22 +214,27 @@ def _can_execute(context, signal):
         return False, "duplicate"
     if not _signal_is_fresh(signal):
         return False, "stale"
-    if float(signal.get("final_score") or 0) < MIN_SCORE and signal.get("action") == "buy":
-        return False, "low_score"
-    if float(signal.get("position_pct") or 0) <= 0 and signal.get("action") == "buy":
-        return False, "bad_position"
-    if float(signal.get("position_pct") or 0) > MAX_TOTAL_POSITION_PCT:
-        return False, "position_limit"
     if signal.get("action") == "buy":
+        try:
+            final_score = float(signal.get("final_score"))
+            position_pct = float(signal.get("position_pct"))
+        except Exception:
+            return False, "invalid_signal_numbers"
+        if not math.isfinite(final_score) or not math.isfinite(position_pct):
+            return False, "invalid_signal_numbers"
+        if final_score < MIN_SCORE:
+            return False, "low_score"
+        if position_pct <= 0:
+            return False, "bad_position"
+        if position_pct > MAX_TOTAL_POSITION_PCT:
+            return False, "position_limit"
+    exact = None
+    if signal.get("action") == "buy":
+        exact, reason = _exact_buy_values(signal)
+        if exact is None:
+            return False, reason
         if len(context.portfolio.positions) >= MAX_POSITIONS:
             return False, "max_positions"
-        total_value = float(context.portfolio.total_value or 0)
-        current_position_pct = (
-            sum(float(_position_attr(position, "value", 0) or 0) for position in context.portfolio.positions.values())
-            / total_value * 100 if total_value > 0 else 0
-        )
-        if current_position_pct + float(signal.get("position_pct") or 0) > MAX_TOTAL_POSITION_PCT:
-            return False, "total_position_limit"
     jq_code = signal.get("jq_code")
     if not jq_code:
         return False, "missing_code"
@@ -165,41 +243,66 @@ def _can_execute(context, signal):
         current_price = float(_order_attr(quote, "last_price", 0) or 0)
         if bool(_order_attr(quote, "paused", False)):
             return False, "suspended"
-        if current_price <= 0:
+        if not math.isfinite(current_price) or current_price <= 0:
             return False, "price_invalid"
         if signal.get("action") == "sell" and current_price <= float(_order_attr(quote, "low_limit", 0) or 0):
             return False, "limit_down"
         if signal.get("action") == "buy":
-            if current_price >= float(_order_attr(quote, "high_limit", float("inf")) or float("inf")):
+            position = context.portfolio.positions.get(jq_code)
+            current_qty = int(_position_attr(position, "total_amount", 0) or 0)
+            if current_qty > 0:
+                return False, "already_holding"
+            if current_qty != exact["expected_current_qty"]:
+                return False, "position_mismatch"
+            high_limit = float(_order_attr(quote, "high_limit", 0) or 0)
+            if not math.isfinite(high_limit) or high_limit <= 0:
+                return False, "price_limit_unavailable"
+            if current_price >= high_limit:
                 return False, "limit_up"
             if signal.get("entry_path") == "gap_reentry":
                 cap = float(signal.get("reentry_cap_price") or 0)
                 if cap <= 0 or current_price > cap:
                     return False, "gap_reentry_price_moved"
-            target_qty = int(signal.get("target_qty") or 0)
-            target_value = (
-                current_price * target_qty * 1.001
-                if target_qty > 0 else
-                context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
-            )
-            if target_value > float(_position_attr(context.portfolio, "available_cash", context.portfolio.cash) or 0):
-                return False, "insufficient_cash"
-            entry = float(signal.get("entry_price") or signal.get("price") or 0)
-            atr = float(signal.get("atr14") or 0)
-            max_move = min(0.02, 0.5 * atr / entry if entry > 0 and atr > 0 else 0.02)
-            if entry > 0 and current_price > entry * (1 + max_move):
+            if current_price > exact["price_cap"]:
                 return False, "price_moved"
+            available_cash = float(
+                _position_attr(context.portfolio, "available_cash", context.portfolio.cash) or 0
+            )
+            if not math.isfinite(available_cash) or exact["required_cash_yuan"] > available_cash:
+                return False, "insufficient_cash"
+            total_value = float(context.portfolio.total_value or 0)
+            position_values = [
+                float(_position_attr(position, "value", 0) or 0)
+                for position in context.portfolio.positions.values()
+            ]
+            if not math.isfinite(total_value) or any(
+                not math.isfinite(value) for value in position_values
+            ):
+                return False, "portfolio_value_invalid"
+            current_value = sum(position_values)
+            projected_value = current_value + exact["price_cap"] * exact["order_qty"]
+            if total_value <= 0 or projected_value / total_value * 100 > MAX_TOTAL_POSITION_PCT:
+                return False, "total_position_limit"
     except Exception:
         return False, "quote_unavailable"
     try:
         open_orders = get_open_orders()
+        order_securities = []
+        for order in open_orders.values():
+            security = str(_order_attr(order, "security", "") or "")
+            parts = security.split(".")
+            if (
+                len(parts) != 2
+                or len(parts[0]) != 6
+                or not parts[0].isdigit()
+                or parts[1] not in {"XSHG", "XSHE", "XBJG"}
+            ):
+                return False, "open_orders_unavailable"
+            order_securities.append(security)
     except Exception:
-        open_orders = {}
-    for order in open_orders.values():
-        if str(_order_attr(order, "security", "")) == jq_code:
-            return False, "pending_order"
-    if signal.get("action") == "buy" and jq_code in context.portfolio.positions:
-        return False, "already_holding"
+        return False, "open_orders_unavailable"
+    if jq_code in order_securities:
+        return False, "pending_order"
     if signal.get("action") == "sell" and jq_code not in context.portfolio.positions:
         return False, "not_holding"
     return True, ""
@@ -250,34 +353,40 @@ def _cancel_invalid_gap_reentry_orders():
     except Exception:
         return
     for order in list(orders.values()):
-        order_id = str(_order_attr(order, "order_id", "") or "")
-        meta = getattr(g, "gap_reentry_orders", {}).get(order_id)
-        if not meta:
-            continue
-        jq_code = str(meta.get("jq_code") or "")
-        quote = quotes[jq_code]
-        price = float(_order_attr(quote, "last_price", 0) or 0)
-        high_limit = float(_order_attr(quote, "high_limit", float("inf")) or float("inf"))
-        cap = float(meta.get("reentry_cap_price") or 0)
-        amount = abs(float(_order_attr(order, "amount", 0) or 0))
-        filled = abs(float(_order_attr(order, "filled", 0) or 0))
-        partial_fill = 0 < filled < amount
-        if partial_fill or price >= high_limit or cap <= 0 or price > cap:
-            cancel_order(order)
-            reason = (
-                "gap_reentry_partial_fill_complete"
-                if partial_fill else "gap_reentry_resealed_or_price_moved"
-            )
-            _record_order(meta, "cancelled", reason, order)
-            g.gap_reentry_orders.pop(order_id, None)
+        try:
+            order_id = str(_order_attr(order, "order_id", "") or "")
+            meta = getattr(g, "gap_reentry_orders", {}).get(order_id)
+            if not meta:
+                continue
+            jq_code = str(meta.get("jq_code") or "")
+            quote = quotes[jq_code]
+            price = float(_order_attr(quote, "last_price", 0) or 0)
+            high_limit = float(_order_attr(quote, "high_limit", float("inf")) or float("inf"))
+            cap = float(meta.get("reentry_cap_price") or 0)
+            amount = abs(float(_order_attr(order, "amount", 0) or 0))
+            filled = abs(float(_order_attr(order, "filled", 0) or 0))
+            partial_fill = 0 < filled < amount
+            if partial_fill or price >= high_limit or cap <= 0 or price > cap:
+                cancel_order(order)
+                reason = (
+                    "gap_reentry_partial_fill_complete"
+                    if partial_fill else "gap_reentry_resealed_or_price_moved"
+                )
+                _record_order(meta, "cancelled", reason, order)
+                g.gap_reentry_orders.pop(order_id, None)
+        except Exception as exc:
+            log.warn("gap reentry cleanup skipped: %s" % exc)
 
 def _record_order(signal, status, reason="", order=None):
     if not isinstance(getattr(g, "order_events", None), list):
         g.order_events = []
     if not isinstance(getattr(g, "order_signal_ids", None), dict):
         g.order_signal_ids = {}
+    if not isinstance(getattr(g, "order_client_order_ids", None), dict):
+        g.order_client_order_ids = {}
     event = {
         "id": signal.get("id"),
+        "client_order_id": signal.get("client_order_id"),
         "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": signal.get("action"),
         "code": signal.get("code"),
@@ -295,6 +404,8 @@ def _record_order(signal, status, reason="", order=None):
     g.order_events.append(event)
     if event.get("order_id"):
         g.order_signal_ids[str(event["order_id"])] = signal.get("id")
+        if signal.get("client_order_id"):
+            g.order_client_order_ids[str(event["order_id"])] = signal.get("client_order_id")
     log.info(
         "record order %s %s status=%s filled=%s amount=%s reason=%s"
         % (
@@ -333,12 +444,8 @@ def execute_signals(context):
             _record_order(signal, "dry_run", "not_submitted")
         elif action == "buy":
             try:
-                target_qty = int(signal.get("target_qty") or 0)
-                if target_qty > 0:
-                    order = order_target(jq_code, target_qty)
-                else:
-                    target_value = context.portfolio.total_value * float(signal.get("position_pct") or 0) / 100.0
-                    order = order_target_value(jq_code, target_value)
+                target_qty = signal["target_qty"]
+                order = order_target(jq_code, target_qty)
                 if order is None:
                     _record_order(signal, "failed", "limit_up_or_suspended_or_rejected")
                 else:
@@ -388,8 +495,13 @@ def post_account_snapshot(context):
                 "pnl": pos.value - pos.avg_cost * pos.total_amount,
             }
         )
-    metrics = _account_metrics(context)
-    order_events = list(getattr(g, "order_events", [])) + _platform_order_events()
+    try:
+        metrics = _account_metrics(context)
+        order_events = list(getattr(g, "order_events", [])) + _platform_order_events()
+        trade_events = _platform_trade_events()
+    except Exception as exc:
+        log.warn("snapshot collection failed; full snapshot not posted: %s" % exc)
+        return
     payload = {
         "schema_version": 1,
         "trade_date": datetime.now().strftime("%Y-%m-%d"),
@@ -407,7 +519,7 @@ def post_account_snapshot(context):
         "pending_buy_risk_pct": metrics["pending_buy_risk_pct"],
         "positions": positions,
         "orders": order_events,
-        "trades": _platform_trade_events(),
+        "trades": trade_events,
     }
     try:
         _post_json(SNAPSHOT_URL, payload)
@@ -418,13 +530,7 @@ def post_account_snapshot(context):
 
 
 def _platform_order_events():
-    try:
-        orders = get_orders().values()
-    except Exception:
-        try:
-            orders = get_open_orders().values()
-        except Exception:
-            return []
+    orders = get_orders().values()
     events = []
     for order in orders:
         order_id = str(_order_attr(order, "order_id", "") or "")
@@ -439,6 +545,7 @@ def _platform_order_events():
             status = "filled"
         events.append({
             "id": getattr(g, "order_signal_ids", {}).get(order_id) or "jq-order-" + order_id,
+            "client_order_id": getattr(g, "order_client_order_ids", {}).get(order_id),
             "datetime": str(_order_attr(order, "add_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
             "action": "buy" if is_buy else "sell",
             "code": security[:6],
@@ -454,14 +561,11 @@ def _platform_order_events():
 
 
 def _platform_trade_events():
-    try:
-        trades = get_trades().values()
-    except Exception:
-        return []
-    try:
-        orders = {str(_order_attr(order, "order_id", "") or ""): order for order in get_orders().values()}
-    except Exception:
-        orders = {}
+    trades = get_trades().values()
+    orders = {
+        str(_order_attr(order, "order_id", "") or ""): order
+        for order in get_orders().values()
+    }
     events = []
     for trade in trades:
         order_id = str(_order_attr(trade, "order_id", "") or "")
@@ -473,6 +577,7 @@ def _platform_trade_events():
             "trade_id": trade_id,
             "order_id": order_id,
             "signal_id": getattr(g, "order_signal_ids", {}).get(order_id),
+            "client_order_id": getattr(g, "order_client_order_ids", {}).get(order_id),
             "datetime": str(_order_attr(trade, "time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))),
             "action": "buy" if is_buy else "sell",
             "code": security[:6],
@@ -501,23 +606,17 @@ def _account_metrics(context):
     g.last_total_value = total_value
     g.peak_value = max(float(getattr(g, "peak_value", total_value) or total_value), total_value)
     start_value = float(getattr(g, "day_start_value", total_value) or total_value)
-    try:
-        turnover_value = sum(
-            abs(float(_order_attr(trade, "amount", 0) or 0) * float(_order_attr(trade, "price", 0) or 0))
-            for trade in get_trades().values()
-            if str(_order_attr(trade, "time", ""))[:10] == today
-        )
-    except Exception:
-        turnover_value = 0
+    turnover_value = sum(
+        abs(float(_order_attr(trade, "amount", 0) or 0) * float(_order_attr(trade, "price", 0) or 0))
+        for trade in get_trades().values()
+        if str(_order_attr(trade, "time", ""))[:10] == today
+    )
     pending_buy_value = 0
-    try:
-        for order in get_open_orders().values():
-            if not bool(_order_attr(order, "is_buy", False)):
-                continue
-            remaining = max(0, float(_order_attr(order, "amount", 0) or 0) - float(_order_attr(order, "filled", 0) or 0))
-            pending_buy_value += remaining * float(_order_attr(order, "price", 0) or 0)
-    except Exception:
-        pending_buy_value = 0
+    for order in get_open_orders().values():
+        if not bool(_order_attr(order, "is_buy", False)):
+            continue
+        remaining = max(0, float(_order_attr(order, "amount", 0) or 0) - float(_order_attr(order, "filled", 0) or 0))
+        pending_buy_value += remaining * float(_order_attr(order, "price", 0) or 0)
     return {
         "daily_turnover_pct": turnover_value / start_value * 100 if start_value > 0 else 0,
         "daily_pnl_pct": (total_value / start_value - 1) * 100 if start_value > 0 else 0,

@@ -8,7 +8,9 @@
 
 **Tech Stack:** Python 3.11+, pandas, sqlite3, scikit-learn 1.9.0, joblib, hashlib/json/pathlib, unittest and existing run scripts.
 
-**Status:** `planned / not implemented / not deployed / not observed / not validated`.
+**Status (2026-08-06):** ML-7 Tasks 4–10 are `implemented locally`; ML-7 Task 11 local full verification/document truth/security review is in progress; ML-7 Task 12 server deployment and L0 observation is not authorized and has not started. Overall: `not committed / not deployed / not observed / not validated`.
+
+No real one-year/365-day strict dataset evidence, trustworthy or approvable trained model, human approval, active model, or server L0 evidence exists. The task steps below remain as the implementation and verification procedure; their historical checkbox text is preserved and does not override this current status checkpoint.
 
 ## Global Constraints
 
@@ -534,7 +536,7 @@ git add ml_maintenance.py strategy_compare_report.py run_ubuntu.sh config.py tes
 git commit -m "feat: operate ml evidence loop"
 ```
 
-### Task 8: Verify Batch C and align documents
+### Task 8: Verify Batch C and align documents (ML-7 Task 11 — in progress locally)
 
 **Files:**
 
@@ -573,7 +575,7 @@ Verify model paths cannot escape `cache/ml/models`, external pickle/joblib canno
 
 - [ ] **Step 4: Update status truthfully**
 
-Record Tasks 4-10 as `implemented / not deployed / not observed / not validated` only after the tests pass. State separately whether a diagnostic model was produced. Without one year of strict data and all performance gates, no model is `approvable_l0`; without deployment and live candidates, L0 is not observed.
+Record Tasks 4-10 as `implemented locally / not committed / not deployed / not observed / not validated`; keep Task 11 `in progress` until the full local verification and security review finish. State separately whether a diagnostic model was produced. Without one year of strict data and all performance gates, no model is `approvable_l0`; without human approval, activation, deployment and live candidates, there is no active model or server L0 evidence.
 
 - [ ] **Step 5: Commit only after separate authorization**
 
@@ -582,7 +584,7 @@ git add docs/project_roadmap.md docs/project_handoff.md docs/live_trading_execut
 git commit -m "docs: record five-head ml implementation"
 ```
 
-## Deployment And Observation Boundary
+## Deployment And Observation Boundary (ML-7 Task 12 — not authorized / not started)
 
 Code completion does not install scikit-learn, import external strict data, train a credible model or enable L0. A separately authorized Linux deployment must preserve existing private configuration, back up and verify trading/ML/history databases separately, install the pinned dependency, run the Linux full suite, migrate ML/history stores, restore each backup into isolated destinations and restart only authorized services.
 

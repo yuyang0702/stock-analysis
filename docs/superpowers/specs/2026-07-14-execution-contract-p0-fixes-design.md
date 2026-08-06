@@ -4,9 +4,11 @@
 
 > 主文档：`docs/project_roadmap.md`。本文是风险准入、最终买入计划、退出意图续执行、JoinQuant 组合上限和持仓分类暴露的专项设计。
 >
+> 2026-08-01 增量边界：本文五项 P0 仍是已部署基线；小资金实盘准备 Batch A 只在其上增加 schema 11、精确数量、不可变执行意图和原子容量准入，不把旧 P0 改写为未实现。新增量已在本地功能分支实现，但完整批次尚未形成最终提交，且未部署、未观察、未验证；当前执行版本和取代范围以 `docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md` 为准。
+>
 > 当前状态：`implemented（已推送） / deployed（服务器与 JoinQuant 模板） / not observed / not validated`。代码已随 `52b3653` 推送并部署到服务器 `/opt/stock-analysis`；专项测试 123/123、Python 编译和 `ledger-check` 通过，SQLite 仍为 schema version 6，三个核心服务 active。JoinQuant “AI” 策略已持久化模板版本 `2026-07-14.2-p0-execution-contract`，并保留原 URL、token 和运行配置。真实模拟盘交易日尚无本版本证据。
 >
-> 2026-07-15 调度、信号时效、退出状态对账和自动恢复的本地后续修复见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`；它不改变本文五项买卖策略规则，且尚未部署。
+> 2026-07-15 调度、信号时效、退出状态对账和自动恢复的后续修复见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`；它不改变本文五项买卖策略规则，且后续已部署。本文保留当时的历史边界。
 
 ## 1. 目标
 

@@ -20,20 +20,28 @@ NOTIFY_RETRY_SERVICE="stock-notify-retry.service"
 NOTIFY_RETRY_TIMER="stock-notify-retry.timer"
 ML_REPORT_SERVICE="stock-ml-report.service"
 ML_REPORT_TIMER="stock-ml-report.timer"
+ML_LABELS_SERVICE="stock-ml-labels.service"
+ML_LABELS_TIMER="stock-ml-labels.timer"
+ML_TRAIN_SERVICE="stock-ml-train.service"
+ML_TRAIN_TIMER="stock-ml-train.timer"
+ML_DB_BACKUP_SERVICE="stock-ml-backup.service"
+ML_DB_BACKUP_TIMER="stock-ml-backup.timer"
+HISTORY_DB_BACKUP_SERVICE="stock-history-backup.service"
+HISTORY_DB_BACKUP_TIMER="stock-history-backup.timer"
 GLOBAL_CONTEXT_SERVICE="stock-global-context.service"
 GLOBAL_CONTEXT_TIMER="stock-global-context.timer"
 SECTOR_CONTEXT_SERVICE="stock-sector-context.service"
 SECTOR_CONTEXT_TIMER="stock-sector-context.timer"
 STRATEGY_COMPARE_SERVICE="stock-strategy-compare.service"
 STRATEGY_COMPARE_TIMER="stock-strategy-compare.timer"
-STRATEGY_COMPARE_WEEKLY_SERVICE="stock-strategy-compare-weekly.service"
-STRATEGY_COMPARE_WEEKLY_TIMER="stock-strategy-compare-weekly.timer"
+LEGACY_STRATEGY_COMPARE_WEEKLY_SERVICE="stock-strategy-compare-weekly.service"
+LEGACY_STRATEGY_COMPARE_WEEKLY_TIMER="stock-strategy-compare-weekly.timer"
 TRADING_BACKUP_SERVICE="stock-trading-backup.service"
 TRADING_BACKUP_TIMER="stock-trading-backup.timer"
 TRADING_BACKUP_DRILL_SERVICE="stock-trading-backup-drill.service"
 TRADING_BACKUP_DRILL_TIMER="stock-trading-backup-drill.timer"
 ALL_SERVICES=("${STRATEGY_SERVICE}" "${WEB_SERVICE}" "${JQ_SIGNAL_SERVICE}")
-ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_REPORT_TIMER}" "${GLOBAL_CONTEXT_TIMER}" "${SECTOR_CONTEXT_TIMER}" "${STRATEGY_COMPARE_TIMER}" "${STRATEGY_COMPARE_WEEKLY_TIMER}" "${TRADING_BACKUP_TIMER}" "${TRADING_BACKUP_DRILL_TIMER}")
+ALL_TIMERS=("${JQ_SYNC_TIMER}" "${JQ_HEALTH_TIMER}" "${NOTIFY_RETRY_TIMER}" "${JQ_READINESS_TIMER}" "${ML_LABELS_TIMER}" "${ML_TRAIN_TIMER}" "${ML_DB_BACKUP_TIMER}" "${HISTORY_DB_BACKUP_TIMER}" "${GLOBAL_CONTEXT_TIMER}" "${SECTOR_CONTEXT_TIMER}" "${STRATEGY_COMPARE_TIMER}" "${TRADING_BACKUP_TIMER}" "${TRADING_BACKUP_DRILL_TIMER}")
 
 log() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -46,7 +54,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|readiness|ml-report|global-context|sector-context|strategy-compare|strategy-compare-weekly|backtest|historical-backtest|historical-backtest-validate|backup|backup-drill|backup-status|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|notify-status|notify-legacy-audit|notify-compact-dry-run|notify-compact-apply|notify-resolve-write-failure|readiness|ml-report|ml-labels|ml-train|ml-model-status|ml-backup|ml-restore-check|ml-retention-dry-run|ml-retention-apply|global-context|sector-context|strategy-compare|backtest|historical-backtest|historical-backtest-validate|backup|backup-drill|backup-status|test|show-env
   bash run_ubuntu.sh trading-status|reconcile|unlock|stop-buy|resume-buy|kill-switch-on|kill-switch-off [options]
 
 First deploy:
@@ -70,12 +78,12 @@ show_menu() {
   8) 前台启动 JoinQuant API
   9) 同步 JoinQuant 持仓
  10) 生成 JoinQuant 健康检查
- 11) 重试失败微信推送
+ 11) 处理通知 outbox
  12) 生成 readiness 报告
  13) 生成 ML 复盘报告
  14) 更新美日韩市场上下文
  15) 生成策略对照复盘
- 16) 推送策略对照周报
+ 16) 查看通知 outbox 状态
  17) 运行本地信号回测
  18) 查看当前配置
  19) 运行测试
@@ -174,7 +182,7 @@ menu_loop() {
       13) handle_command ml-report ;;
       14) handle_command global-context ;;
       15) handle_command strategy-compare ;;
-      16) handle_command strategy-compare-weekly ;;
+      16) handle_command notify-status ;;
       17) handle_command backtest ;;
       18) handle_command show-env ;;
       19) handle_command test ;;
@@ -234,6 +242,15 @@ set_env() {
   fi
 }
 
+set_env_default() {
+  local key="$1"
+  local value="$2"
+  if [[ -f "${ENV_FILE}" ]] && grep -q "^${key}=" "${ENV_FILE}"; then
+    return
+  fi
+  set_env "${key}" "${value}"
+}
+
 env_value() {
   local key="$1"
   local fallback="$2"
@@ -248,8 +265,8 @@ env_value() {
 require_project_files() {
   for file in \
     a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
-    joinquant_health.py notify_retry.py backtest_engine.py historical_backtest.py trading_backup.py trading_control.py \
-    joinquant_readiness_report.py ml_dataset.py global_market_context.py strategy_compare_report.py requirements.txt; do
+    joinquant_health.py notification_worker.py ledger_check.py backtest_engine.py historical_backtest.py trading_backup.py trading_control.py \
+    joinquant_readiness_report.py ml_dataset.py ml_maintenance.py global_market_context.py strategy_compare_report.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
   done
 }
@@ -352,6 +369,32 @@ write_env_file() {
   set_env "TRADING_BACKUP_MONTHLY_KEEP" "12"
   set_env "ML_SIGNAL_SAMPLE_FILE" "${APP_DIR}/cache/ml/signal_samples.jsonl"
   set_env "ML_REVIEW_REPORT_FILE" "${APP_DIR}/output/ml_signal_review.md"
+  set_env_default "ML_DB_FILE" "${APP_DIR}/cache/ml/ml.db"
+  set_env_default "ML_MODEL_DIR" "${APP_DIR}/cache/ml/models"
+  set_env_default "ML_DB_MAX_BYTES" "2000000000"
+  set_env_default "ML_HISTORY_DB_FILE" "${APP_DIR}/cache/backtest/history.db"
+  set_env_default "ML_HISTORY_DB_MAX_BYTES" "3000000000"
+  set_env_default "ML_TRAINED_SHADOW_ENABLE" "0"
+  set_env_default "ML_PERMISSION_LEVEL_MAX" "0"
+  set_env_default "ML_INFERENCE_TIMEOUT_SEC" "1.0"
+  set_env_default "ML_HISTORY_DATASET_ID" ""
+  set_env_default "ML_LABEL_SOURCE" "strict_counterfactual_v2"
+  set_env_default "ML_LABEL_VERSION" "ml-label-v2"
+  set_env_default "ML_COST_SHA256" ""
+  set_env_default "ML_POLICY_SHA256" ""
+  set_env_default "ML_TRAINING_START_DATE" ""
+  set_env_default "ML_TRAINING_END_DATE" ""
+  set_env_default "ML_FEATURE_ALLOWLIST" ""
+  set_env_default "ML_LABEL_LOOKBACK_DAYS" "45"
+  set_env_default "ML_MAINTENANCE_MAX_ROWS" "500000"
+  set_env_default "ML_BACKUP_DIR" "/opt/stock-analysis-backups/ml"
+  set_env_default "HISTORY_BACKUP_DIR" "/opt/stock-analysis-backups/history"
+  set_env_default "ML_BACKUP_DAILY_KEEP" "7"
+  set_env_default "ML_BACKUP_WEEKLY_KEEP" "4"
+  set_env_default "ML_BACKUP_MONTHLY_KEEP" "12"
+  set_env_default "HISTORY_BACKUP_DAILY_KEEP" "7"
+  set_env_default "HISTORY_BACKUP_WEEKLY_KEEP" "4"
+  set_env_default "HISTORY_BACKUP_MONTHLY_KEEP" "12"
   set_env "GLOBAL_MARKET_CONTEXT_FILE" "${APP_DIR}/cache/market/global_context.json"
   set_env "STRATEGY_COMPARE_REPORT_FILE" "${APP_DIR}/output/strategy_compare_report.md"
   set_env "ENABLE_AI" "0"
@@ -484,18 +527,18 @@ EOF
 
   sudo tee "${SYSTEMD_DIR}/${NOTIFY_RETRY_SERVICE}" >/dev/null <<EOF
 [Unit]
-Description=Retry failed WeCom notifications
+Description=Deliver transactional WeCom notifications
 
 [Service]
 Type=oneshot
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${py} ${APP_DIR}/notify_retry.py
+ExecStart=${py} ${APP_DIR}/notification_worker.py --once
 EOF
 
   sudo tee "${SYSTEMD_DIR}/${NOTIFY_RETRY_TIMER}" >/dev/null <<EOF
 [Unit]
-Description=Retry failed WeCom notifications every five minutes
+Description=Deliver transactional WeCom notifications every five minutes
 
 [Timer]
 OnBootSec=3min
@@ -520,25 +563,113 @@ Unit=${JQ_READINESS_SERVICE}
 WantedBy=timers.target
 EOF
 
-  sudo tee "${SYSTEMD_DIR}/${ML_REPORT_SERVICE}" >/dev/null <<EOF
+  sudo tee "${SYSTEMD_DIR}/${ML_LABELS_SERVICE}" >/dev/null <<EOF
 [Unit]
-Description=Build ML signal sample review report
+Description=Mature strict ML labels without changing model permissions
 
 [Service]
 Type=oneshot
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${py} ${APP_DIR}/ml_dataset.py
+ExecCondition=/bin/bash -c 'test -f "\$ML_HISTORY_DB_FILE" -a -f "\$ML_DB_FILE"'
+ExecStart=${py} ${APP_DIR}/ml_maintenance.py labels --allow-unconfigured
+Nice=10
+UMask=0077
 EOF
 
-  sudo tee "${SYSTEMD_DIR}/${ML_REPORT_TIMER}" >/dev/null <<EOF
+  sudo tee "${SYSTEMD_DIR}/${ML_LABELS_TIMER}" >/dev/null <<EOF
 [Unit]
-Description=Build ML signal sample review report after market close
+Description=Mature available strict ML labels after each trading day
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 15:25:00
+OnCalendar=Mon..Fri *-*-* 16:10:00 Asia/Shanghai
 Persistent=true
-Unit=${ML_REPORT_SERVICE}
+Unit=${ML_LABELS_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${ML_TRAIN_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Train and register an ML challenger without approval or activation
+After=${ML_LABELS_SERVICE}
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecCondition=/bin/bash -c 'test -f "\$ML_HISTORY_DB_FILE" -a -f "\$ML_DB_FILE"'
+ExecStart=${py} ${APP_DIR}/ml_maintenance.py train --allow-unconfigured
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=6h
+UMask=0077
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${ML_TRAIN_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Train and register the weekly ML challenger after Friday close
+
+[Timer]
+OnCalendar=Fri *-*-* 18:00:00 Asia/Shanghai
+Persistent=true
+Unit=${ML_TRAIN_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${ML_DB_BACKUP_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Create verified independent ML SQLite backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecCondition=/bin/bash -c 'test -f "\$ML_DB_FILE"'
+ExecStart=${py} ${APP_DIR}/ml_maintenance.py backup --kind ml
+Nice=10
+UMask=0077
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${ML_DB_BACKUP_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Back up the independent ML SQLite database daily
+
+[Timer]
+OnCalendar=*-*-* 19:00:00 Asia/Shanghai
+Persistent=true
+Unit=${ML_DB_BACKUP_SERVICE}
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${HISTORY_DB_BACKUP_SERVICE}" >/dev/null <<EOF
+[Unit]
+Description=Create verified independent strict-history SQLite backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=-${ENV_FILE}
+ExecCondition=/bin/bash -c 'test -f "\$ML_HISTORY_DB_FILE"'
+ExecStart=${py} ${APP_DIR}/ml_maintenance.py backup --kind history
+Nice=10
+UMask=0077
+EOF
+
+  sudo tee "${SYSTEMD_DIR}/${HISTORY_DB_BACKUP_TIMER}" >/dev/null <<EOF
+[Unit]
+Description=Back up the independent strict-history SQLite database daily
+
+[Timer]
+OnCalendar=*-*-* 19:00:00 Asia/Shanghai
+Persistent=true
+Unit=${HISTORY_DB_BACKUP_SERVICE}
 
 [Install]
 WantedBy=timers.target
@@ -601,7 +732,8 @@ EOF
 
   sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_SERVICE}" >/dev/null <<EOF
 [Unit]
-Description=Build original vs shadow strategy compare report
+Description=Build original rules vs trained model compare report
+After=${ML_LABELS_SERVICE}
 
 [Service]
 Type=oneshot
@@ -615,33 +747,9 @@ EOF
 Description=Build strategy compare report after market close
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 15:35:00
+OnCalendar=Mon..Fri *-*-* 16:25:00 Asia/Shanghai
 Persistent=true
 Unit=${STRATEGY_COMPARE_SERVICE}
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_WEEKLY_SERVICE}" >/dev/null <<EOF
-[Unit]
-Description=Send weekly original vs shadow strategy compare report
-
-[Service]
-Type=oneshot
-WorkingDirectory=${APP_DIR}
-EnvironmentFile=-${ENV_FILE}
-ExecStart=${py} ${APP_DIR}/strategy_compare_report.py --notify --weekly
-EOF
-
-  sudo tee "${SYSTEMD_DIR}/${STRATEGY_COMPARE_WEEKLY_TIMER}" >/dev/null <<EOF
-[Unit]
-Description=Send weekly strategy compare report after Friday close
-
-[Timer]
-OnCalendar=Fri *-*-* 15:45:00
-Persistent=true
-Unit=${STRATEGY_COMPARE_WEEKLY_SERVICE}
 
 [Install]
 WantedBy=timers.target
@@ -696,6 +804,14 @@ WantedBy=timers.target
 EOF
 
   sudo systemctl daemon-reload
+  sudo systemctl disable --now "${LEGACY_STRATEGY_COMPARE_WEEKLY_TIMER}" >/dev/null 2>&1 || true
+  sudo systemctl disable --now "${ML_REPORT_TIMER}" >/dev/null 2>&1 || true
+  sudo rm -f \
+    "${SYSTEMD_DIR}/${ML_REPORT_TIMER}" \
+    "${SYSTEMD_DIR}/${ML_REPORT_SERVICE}" \
+    "${SYSTEMD_DIR}/${LEGACY_STRATEGY_COMPARE_WEEKLY_TIMER}" \
+    "${SYSTEMD_DIR}/${LEGACY_STRATEGY_COMPARE_WEEKLY_SERVICE}"
+  sudo systemctl daemon-reload
   sudo systemctl enable "${ALL_SERVICES[@]}" "${ALL_TIMERS[@]}"
 }
 
@@ -722,8 +838,13 @@ install_all() {
   done
 
   require_project_files
-  mkdir -p "${APP_DIR}/cache/trading"
-  sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "/opt/stock-analysis-backups"
+  mkdir -p "${APP_DIR}/cache/trading" "${APP_DIR}/cache/ml/models" "${APP_DIR}/cache/backtest"
+  sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" \
+    "/opt/stock-analysis-backups" \
+    "/opt/stock-analysis-backups/ml" \
+    "/opt/stock-analysis-backups/history"
+  [[ -n "${webhook}" ]] || webhook="$(env_value WECOM_WEBHOOK_URL "")"
+  [[ -n "${token}" ]] || token="$(env_value JOINQUANT_SYNC_TOKEN "")"
   [[ -n "${token}" ]] || token="$(generate_token)"
   if [[ "${skip_install}" == "no" ]]; then
     install_system_packages
@@ -745,7 +866,7 @@ Env file:
 JoinQuant strategy values:
   SIGNAL_URL   = http://SERVER_IP:${signal_port}/joinquant/signals
   SNAPSHOT_URL = http://SERVER_IP:${signal_port}/joinquant/account_snapshot
-  SYNC_TOKEN   = ${token}
+  SYNC_TOKEN   = preserved in ${ENV_FILE}
   DRY_RUN      = False
 
 Holdings web:
@@ -778,12 +899,17 @@ JoinQuant: $(env_value JOINQUANT_ENABLE 0), dry_run=$(env_value JOINQUANT_DRY_RU
 JoinQuant health: signal_max_age=$(env_value JOINQUANT_HEALTH_SIGNAL_MAX_AGE_MIN 30)m, snapshot_max_age=$(env_value JOINQUANT_HEALTH_SNAPSHOT_MAX_AGE_MIN 15)m
 ML samples: $(env_value ML_SIGNAL_SAMPLE_FILE "${APP_DIR}/cache/ml/signal_samples.jsonl")
 ML report: $(env_value ML_REVIEW_REPORT_FILE "${APP_DIR}/output/ml_signal_review.md")
+ML database: $(env_value ML_DB_FILE "${APP_DIR}/cache/ml/ml.db"), limit=$(env_value ML_DB_MAX_BYTES 2000000000)
+Strict history: $(env_value ML_HISTORY_DB_FILE "${APP_DIR}/cache/backtest/history.db"), limit=$(env_value ML_HISTORY_DB_MAX_BYTES 3000000000)
+ML runtime: enabled=$(env_value ML_TRAINED_SHADOW_ENABLE 0), max_level=$(env_value ML_PERMISSION_LEVEL_MAX 0), dataset_configured=$(if [[ -n "$(env_value ML_HISTORY_DATASET_ID "")" ]]; then echo yes; else echo no; fi)
+ML backup: $(env_value ML_BACKUP_DIR /opt/stock-analysis-backups/ml), keep=$(env_value ML_BACKUP_DAILY_KEEP 7)/$(env_value ML_BACKUP_WEEKLY_KEEP 4)/$(env_value ML_BACKUP_MONTHLY_KEEP 12)
+History backup: $(env_value HISTORY_BACKUP_DIR /opt/stock-analysis-backups/history), keep=$(env_value HISTORY_BACKUP_DAILY_KEEP 7)/$(env_value HISTORY_BACKUP_WEEKLY_KEEP 4)/$(env_value HISTORY_BACKUP_MONTHLY_KEEP 12)
 Global context: $(env_value GLOBAL_MARKET_CONTEXT_FILE "${APP_DIR}/cache/market/global_context.json")
 Sector context: ${APP_DIR}/cache/market/sector_context.json
 Strategy compare: $(env_value STRATEGY_COMPARE_REPORT_FILE "${APP_DIR}/output/strategy_compare_report.md")
 Backtest report: ${APP_DIR}/output/backtest_report.md
 SQLite backup: $(env_value TRADING_BACKUP_DIR /opt/stock-analysis-backups), keep=$(env_value TRADING_BACKUP_DAILY_KEEP 7)/$(env_value TRADING_BACKUP_WEEKLY_KEEP 4)/$(env_value TRADING_BACKUP_MONTHLY_KEEP 12)
-Notify retry queue: ${APP_DIR}/cache/notify_failed_queue.jsonl
+Notification outbox: $(env_value TRADING_DB_FILE "${APP_DIR}/cache/trading/trading.db")
 Holdings web port: $(env_value PORTFOLIO_WEB_PORT 8000)
 EOF
 }
@@ -799,7 +925,17 @@ run_foreground() {
 ledger_check() {
   load_env
   cd "${APP_DIR}"
-  "$(python_bin)" -c 'import config, uuid; from trading_store import SCHEMA_VERSION, TradingStore; store = TradingStore(config.TRADING_DB_FILE); store.initialize(); health = store.health(); assert health.ok and health.schema_version == SCHEMA_VERSION, health; probe = f"ledger_check_probe_{uuid.uuid4().hex}"; exec("with store.transaction() as conn:\n store.set_system_state(conn, probe, \"ok\", \"deployment writable probe\")\n conn.execute(\"DELETE FROM system_state WHERE key = ?\", (probe,))"); print(f"schema_version={health.schema_version} health=ok writable_probe=ok")'
+  "$(python_bin)" -c 'import config, uuid; from trading_store import SCHEMA_VERSION, TradingStore; store = TradingStore(config.TRADING_DB_FILE); store.initialize(); health = store.health(); assert health.ok and health.schema_version == SCHEMA_VERSION, health; probe = f"ledger_check_probe_{uuid.uuid4().hex}"; exec("with store.transaction() as conn:\n store.set_system_state(conn, probe, \"ok\", \"deployment writable probe\")\n conn.execute(\"DELETE FROM system_state WHERE key = ?\", (probe,))"); conn = store.connect(); states = {str(row[0]): int(row[1]) for row in conn.execute("SELECT state, COUNT(*) FROM notification_outbox GROUP BY state")}; capacity = store.notification_capacity(conn); conn.close(); print(f"schema_version={health.schema_version} health=ok writable_probe=ok pending={states.get('"'"'pending'"'"', 0)} leased={states.get('"'"'leased'"'"', 0)} dead={states.get('"'"'dead'"'"', 0)} gaps={capacity.unresolved_gap_rows} tombstones={capacity.tombstone_rows}")'
+}
+
+# Keep the detailed implementation in Python so the same ledger-check contract
+# is directly testable on Windows and Linux.  This definition intentionally
+# overrides the legacy one-line fallback above.
+# Ledger summary fields include pending= leased= sent= dead= cancelled= gaps=
+# high_gaps= dead_detail_rows= dead_detail_bytes= high_dead= tombstones=
+# write_failure_marker= write_failure_requires_manual_resolution=.
+ledger_check() {
+  run_foreground ledger_check.py
 }
 
 handle_command() {
@@ -833,13 +969,24 @@ handle_command() {
     sync-joinquant) run_foreground joinquant_sync.py ;;
     ledger-check) ledger_check ;;
     health) run_foreground joinquant_health.py ;;
-    notify-retry) run_foreground notify_retry.py ;;
+    notify-retry) run_foreground notification_worker.py --once ;;
+    notify-status) run_foreground notification_worker.py --status ;;
+    notify-legacy-audit) shift; run_foreground notification_worker.py --legacy-audit "$@" ;;
+    notify-compact-dry-run) run_foreground notification_worker.py --compact-dry-run ;;
+    notify-compact-apply) run_foreground notification_worker.py --compact-apply ;;
+    notify-resolve-write-failure) shift; run_foreground notification_worker.py --resolve-write-failure "$@" ;;
     readiness) run_foreground joinquant_readiness_report.py ;;
-    ml-report) run_foreground ml_dataset.py ;;
+    ml-report) run_foreground strategy_compare_report.py ;;
+    ml-labels) shift; run_foreground ml_maintenance.py labels "$@" ;;
+    ml-train) shift; run_foreground ml_maintenance.py train "$@" ;;
+    ml-model-status) shift; run_foreground ml_maintenance.py model-status "$@" ;;
+    ml-backup) shift; run_foreground ml_maintenance.py backup "$@" ;;
+    ml-restore-check) shift; run_foreground ml_maintenance.py restore-check "$@" ;;
+    ml-retention-dry-run) shift; run_foreground ml_maintenance.py retention-dry-run "$@" ;;
+    ml-retention-apply) shift; run_foreground ml_maintenance.py retention-apply "$@" ;;
     global-context) run_foreground global_market_context.py ;;
     sector-context) run_foreground a_share_strategy.py --sector-context-only ;;
     strategy-compare) run_foreground strategy_compare_report.py ;;
-    strategy-compare-weekly) run_foreground strategy_compare_report.py --notify --weekly ;;
     backtest) run_foreground backtest_engine.py ;;
     historical-backtest) shift; run_foreground historical_backtest.py run "$@" ;;
     historical-backtest-validate) shift; run_foreground historical_backtest.py validate "$@" ;;

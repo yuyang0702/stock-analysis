@@ -1,6 +1,6 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-07-26
+更新日期：2026-08-06
 
 本文档是当前项目规划的唯一主说明，合并已有能力、JoinQuant 接入方案、服务器部署流程，以及后续机器学习优化路线。其他早期设计文档只作为历史参考；如果口径冲突，以本文档为准。
 
@@ -16,7 +16,7 @@
 | `docs/data_storage_policy.md` | 数据分类、增长、保留、轮转、备份恢复和敏感信息 | 任何新增或修改持久化数据时必读。 |
 | `docs/superpowers/specs/2026-07-11-simulation-stability-ledger-design.md` | SQLite 账本、幂等、对账、安全和 20 日验证 | 涉及账本、订单/成交、对账或稳定性门槛时读取；Batch 1 与后续目标状态必须分开。 |
 | `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` | 当前买入、卖出、持仓周期、组合风险和安全降级规则 | 修改策略、交易、仓位、止盈止损或风险逻辑前必读。 |
-| `docs/superpowers/plans/2026-07-13-layered-exit-risk-management.md` | 当前 Batch A-G 唯一实施、部署和观察顺序 | 执行或部署本地已实现风险能力时读取。 |
+| `docs/superpowers/plans/2026-07-13-layered-exit-risk-management.md` | 2026-07-13 分层退出历史 Batch A-G 实施与观察证据 | 追溯既有风险能力时读取；当前新增实施顺序以 2026-07-28 四批计划为准。 |
 | `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` | 版本化买入执行契约、退出意图续执行、JoinQuant 5只/80%边界和分类暴露 | 修改或核验这五项 P0 时必读；当前为 `implemented（已推送） / deployed（服务器与 JoinQuant 模板） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-14-execution-contract-p0-fixes.md` | 五项 P0 的测试驱动实施与验收步骤 | Tasks 1–6 和部署已完成；后续用于真实交易日观察与验收。 |
 | `docs/superpowers/specs/2026-07-14-sqlite-backup-recovery-design.md` | SQLite 自动备份、7/4/12 轮转、恢复演练、告警和状态门槛 | 实现、部署或审核交易账本备份恢复时读取；当前为 `implemented（已推送）`，服务器代码和一次人工备份/校验已由用户输出确认，timer 连续证据仍待核验。 |
@@ -28,8 +28,8 @@
 | `docs/superpowers/plans/2026-07-14-point-in-time-historical-backtest.md` | 独立历史库、候选生成、逐日撮合、指标、CLI和验证任务 | 实现或核验完整历史回测时读取；框架已进入 `origin/main`，真实严格数据运行尚未观察或验证。 |
 | `docs/superpowers/specs/2026-07-14-semi-automatic-parameter-review-design.md` | 参数候选、准入、人工批准、版本和回滚治理 | 设计参数复核或机器学习与参数边界时读取；当前为 `planned`。 |
 | `docs/superpowers/plans/2026-07-14-semi-automatic-parameter-review.md` | 半自动参数复核未来实施任务 | 数据与前置门槛满足后执行；当前为 `planned`。 |
-| `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` | ML-7 五分钟候选样本、训练型影子模型、walk-forward、模型治理和逐层放权 | 设计或实现训练模型、模型存储、影子观察或模型权限时读取；Task 1–3 已实现并推送，Task 4–12 planned，整体未部署、未观察、未验证。 |
-| `docs/superpowers/plans/2026-07-15-trained-shadow-model.md` | ML-7 训练型影子模型的测试驱动实施、验证、部署与观察顺序 | 执行训练模型代码或核验实施范围时读取；Task 1–3 已实现，Task 4–12 尚未完成，整体为 partially implemented 且未部署。 |
+| `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md` | ML-7 五分钟候选样本、训练型影子模型、walk-forward、模型治理和逐层放权 | 设计或实现训练模型、模型存储、影子观察或模型权限时读取；Tasks 1–3 为既有已推送基础，Tasks 4–10 已在本地实现，Task 11 本地总验收进行中，Task 12 未授权/未运行；Batch C 增量未提交、未部署、未观察、未验证。 |
+| `docs/superpowers/plans/2026-07-15-trained-shadow-model.md` | ML-7 训练型影子模型的测试驱动实施、验证、部署与观察顺序 | 执行训练模型代码或核验实施范围时读取；Tasks 4–10 已在本地实现，Task 11 本地总验收进行中，Task 12 仍需单独授权；整体未提交、未部署、未观察、未验证。 |
 | `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` | 调度边界、信号生命周期、退出执行状态、告警转换和安全自动恢复 | 修改扫描调度、信号时效、自动对账或买入恢复时必读；当前为 `implemented（已推送） / deployed（服务器；JoinQuant 网站由用户确认已手动更新） / not observed / not validated`。 |
 | `docs/superpowers/plans/2026-07-15-execution-timing-reconciliation-recovery.md` | schema 7 与执行状态修复的测试驱动实施及部署证据 | Tasks 1–10、Linux 324/324 测试、服务器 schema 7 迁移和服务重启已完成；后续用于真实交易日观察与验收。 |
 | `docs/superpowers/specs/2026-07-16-unified-effective-stop-trading-dashboard-design.md` | 成交后初始止损校验、四类止损唯一事实源、交易运行面板、网页安全和可观测性增强 | 修改止损、持仓网页或止损迁移时必读；基础能力和可观测性增强均为 `implemented（已推送） / deployed（服务器） / not observed / not validated`；JoinQuant 网站仍以用户此前确认的模板状态为准。 |
@@ -39,13 +39,32 @@
 | `docs/superpowers/specs/2026-07-23-pandas-holding-series-health-fix-design.md` | 持仓候选触发扫描失败的根因、最小修复和验证边界 | 当前为 `implemented（已推送） / deployed（服务器） / observed / not validated`；部署或核验该扫描健康事故时读取。 |
 | `docs/superpowers/plans/2026-07-23-pandas-holding-series-health-fix.md` | 持仓 Series 布尔歧义的测试驱动修复与发布检查 | 代码、测试、推送、Linux 验证、服务器部署和首轮真实扫描观察已完成；连续稳定性验证尚未完成。 |
 | `docs/superpowers/specs/2026-07-26-runtime-evidence-integrity-repair-design.md` | 扫描运行账本、信号结构化字段、费用/盈亏可信度、交易时段健康口径、通知失败终态和登录异常 | 当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`；未改变任何交易策略或控制语义。 |
-| `docs/superpowers/plans/2026-07-26-runtime-evidence-integrity-repair.md` | 上述修复的测试驱动实施、验证、文档、发布与隔离恢复演练步骤 | Tasks 1–7 本地实现与 Windows 验证已完成；Linux 全量、合并、推送、部署和恢复演练尚未完成。 |
+| `docs/superpowers/plans/2026-07-26-runtime-evidence-integrity-repair.md` | 上述修复的测试驱动实施、验证、文档、发布与隔离恢复演练步骤 | Tasks 1–7、Linux 全量、合并、推送、schema 10 部署和恢复演练已完成；真实交易日观察与验证尚未完成。 |
+| `docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md` | 小资金真钱前置、通知、五头表格模型和 QMT 节点的整合边界 | 当前总设计；Batch A/B 已在本地实现，Batch C Tasks 4–10 已在本地实现且 Task 11 总验收进行中；各批外部发布与观察仍需独立授权。 |
+| `docs/superpowers/plans/2026-07-28-small-capital-live-risk-execution.md` | Batch A 精确数量、统一准入、schema 11 与盈利保护的唯一实施计划 | Tasks 1–8 已在本地功能分支完成；最终提交、Linux 验证、部署和交易日观察均需另行授权。 |
+| `docs/superpowers/plans/2026-07-28-transactional-notification-outbox.md` | Batch B SQLite 事务通知 outbox 与规则影子评分退役 | Tasks 1–7 已在本地未提交功能分支实现；Linux 脚本复验、提交/推送、schema 迁移、部署、观察和验证仍未完成。 |
+| `docs/superpowers/plans/2026-07-28-five-head-ml-training-runtime.md` | Batch C 五头表格模型训练、治理和 L0 推理 | Tasks 4–10 为 `implemented（本地未提交）`；Task 11 本地总验收进行中；Task 12 未授权/未运行。Batch C 整体 `not committed / not deployed / not observed / not validated`。 |
+| `docs/superpowers/plans/2026-07-28-broker-adapter-qmt-node.md` | Batch D BrokerAdapter 与默认禁单的 Windows QMT 节点 | `planned / not implemented / not deployed / not observed / not validated`；vn.py 仅保留为后续第二适配器。 |
 
 归档索引见 `docs/archive/README.md`。归档文档不得覆盖本表中的活跃文档，也不作为开始任务的默认必读资料。
 
+## 2026-08-01 Batch A 本地实现检查点
+
+`feature/live-readiness-integration` 已完成 Batch A Tasks 1–8 的本地代码、测试和文档收口。Tasks 1–3 已在该功能分支提交，Tasks 4–8 仍是未提交工作树；整个 Batch A 尚未合并或推送。新增能力包括 schema 11 的账户作用域与 broker 当前快照、不可变 candidate/result/intent、原子容量预留、纯函数统一 `pre_trade_check`、普通买单精确 `target_qty` 执行，以及执行计划版本 `2026-08-01.1-small-capital-live-risk`、期望 JoinQuant 模板 `2026-08-01.1-exact-intent` 下的一手/奇数手 `+2R` 盈利保护。100 股达到 `+2R` 不卖出，只从下一决策批次启用盈利保护；300 股目标降至 200 股，500 股目标降至 300 股，止盈阶段只由因果一致的真实减仓成交推进。当前实现只证明单一 JoinQuant 账户；`position_cycles`/`exit_intents` 仍按股票全局唯一，JoinQuant 与 QMT 双账户隔离必须等待 Batch D/schema 13。
+
+Windows 专项与平台无关测试已通过，3 个 Linux 脚本测试仍必须在未来获准部署前于 Linux 复验；精确计数以 Batch A 实施计划和交接快照为准。当前状态严格为 `implemented（本地功能分支，未合并、未推送） / not deployed / not observed / not validated`。最后有文档证据的服务器仍为 `68d7283` / schema 10 / 模板 `2026-07-18.1-gap-reentry`；这只是 2026-07-26 外部检查点，实时 SHA、schema、配置、服务和网站模板仍需重新核验。schema 11、新模板与新执行计划版本均不得写成服务器或 JoinQuant 已部署；本轮没有修改配置、Token 或外部系统。
+
+## 2026-08-05 Batch B Tasks 1–7 本地检查点
+
+在同一未提交工作树上，通知专项 Tasks 1–7 已把本地目标 schema 从 11 升到 12，新增稳定 `NotificationEvent`、来源事实同事务 outbox/gap、逻辑计划/TTL、UTC 租约 worker、有限重试、粘性 ambiguity 证据、容量控制、CRITICAL 180 交易分钟复报、规则影子退役、systemd 路由、schema 12 备份/外键恢复校验、详细 `ledger-check` 和带事件键校验的人工解除 CLI。Focused notification/producer/backup/control/health suites 通过；当前 Windows 环境无法启动 3 个依赖 Linux `bash.exe` 的脚本测试，必须在 Linux 复验。因此 Batch B 状态为 `implemented（本地功能分支，未提交） / not deployed / not observed / not validated`，不是 deployed、observed 或 validated。服务器仍是上段带日期的 schema 10 外部检查点；本轮未访问或修改任何外部系统。
+
+## 2026-08-06 Batch C ML-7 本地实现检查点
+
+ML-7 Tasks 4–10 已在当前工作树本地实现：strict 五分钟历史导入、成本感知标签、无泄漏训练帧与时间切分、五头模型/不可变模型包、人工治理与回滚、校验推理与 L0 旁路接线、维护/备份/对照报告。Tasks 4–10 为 `implemented（本地未提交）`；Task 11（本地总验收、文档真值和安全复审）正在进行；Task 12（单独授权的服务器部署、L0 启用和交易日观察）尚未授权且未运行。Batch C 整体严格为 `not committed / not deployed / not observed / not validated`。当前没有真实一年/365 天 strict 数据证据、可信或可批准的训练模型、人工审批、活动模型或服务器 L0 证据；本地/synthetic 测试不能替代这些外部事实。
+
 ## 2026-07-26 两周运行审核与证据完整性修复
 
-服务器只读审核区间为 2026-07-12 至 2026-07-26。当前本地、`origin/main` 和服务器均为
+服务器只读审核区间为 2026-07-12 至 2026-07-26。审核开始时本地、`origin/main` 和服务器均为
 `979d327e383212d8da0d8387c1eb9579d40536c3`，三个核心服务 active，实际 JoinQuant
 模板与期望版本均为 `2026-07-18.1-gap-reentry`，`GAP_REENTRY_ENABLE=1`。这取代本文
 此前“功能关闭、网站模板未确认”的旧状态，但跳空二次入场机会账本仍为空，因此该路径
@@ -64,7 +83,7 @@ Pandas 持仓 Series 布尔歧义，修复后只有 2026-07-24 一个完整交�
 运行证据、数据可信度、健康口径、通知终态和登录健壮性，不改变买卖、止盈止损、仓位、
 对账控制或 JoinQuant 执行语义。稳定观察时钟应从修复部署后的首个完整有效交易日重新累计。
 
-本地实现已把正式交易库目标升级为 schema 10：只增加成交费用、日费用和日已实现盈亏
+该修复已把正式交易库升级为 schema 10：只增加成交费用、日费用和日已实现盈亏
 三个来源状态列，历史值标记 `unknown`，明确来源值标记 `reported`；没有重建表或猜测收益。
 扫描生命周期、信号结构化列、四维健康状态、有界通知 dead/pending 队列和 Unicode 登录
 修复均已通过目标专项 142 项。Windows 全量发现457项，其中454项完成通过；服务器 Linux
@@ -98,19 +117,17 @@ Pandas 持仓 Series 布尔歧义，修复后只有 2026-07-24 一个完整交�
 
 本地代码已经把网页和卖出引擎收敛到同一个有效止损解析器：`initial_stop_price` 是按真实持仓成本和板块最大亏损边界只收紧校验后的冻结止损；`manual_stop_price` 默认空，只允许用户明确上调或清除并写 `control_events`；`trailing_stop_price` 只在首段止盈后派生；`effective_stop_price=max(initial, manual, activated trailing)` 是唯一卖出阈值。JoinQuant 快照不再按成本价自动生成 3.5% 网页止损，活动旧周期只允许上调修复且不把旧网页显示值伪装成人工指令。
 
-统一止损增量当时把 SQLite 升至 schema version 8，只给 `position_cycles` 增加可空 `manual_stop_price`，不持久化重复有效止损；当前本地 `main` 因跳空机会账本已把目标升至 schema 9，服务器仍以已部署版本为准。手机网页已改为认证后的交易运行面板，展示运行状态、活动异常、持仓四类止损与执行轨迹；手工区只维护人工止损，不提供直接买卖。截图上传、OCR、确认和文件访问路由及 Tesseract 依赖已删除，历史上传文件保留。JoinQuant API/模板改为优先使用 Authorization bearer，服务器暂时保留 query token 兼容并对有效 query 凭据做访问日志脱敏。
+统一止损增量当时把 SQLite 升至 schema version 8，只给 `position_cycles` 增加可空 `manual_stop_price`，不持久化重复有效止损；2026-07-19 的跳空增量随后把目标升至 schema 9，之后又由 schema 10 检查点取代。手机网页已改为认证后的交易运行面板，展示运行状态、活动异常、持仓四类止损与执行轨迹；手工区只维护人工止损，不提供直接买卖。截图上传、OCR、确认和文件访问路由及 Tesseract 依赖已删除，历史上传文件保留。JoinQuant API/模板改为优先使用 Authorization bearer，服务器暂时保留 query token 兼容并对有效 query 凭据做访问日志脱敏。
 
 2026-07-19 已确认在原交易运行面板内增加三分区可观测性：今日运行补充各数据源时效、
 版本确认、异常影响和待执行原因；交易与持仓补充风险倍数、入场依据和完整交易链路；
 研究与验证严格区分 planned / implemented / deployed / observed / validated。该增强
 复用现有 SQLite 有界查询，不新增持久化或直接交易、自动解锁、参数修改和模型启用
-入口。代码与测试已在隔离分支实现，当前严格为
-`implemented / not deployed / not observed / not validated`；部署前不得把本地页面结果
-视为服务器或 JoinQuant 运行证据。
+入口。代码与测试最初在隔离分支实现；这是部署前历史状态，已被下段部署检查点取代。
 
 实现提交 `8db92bf6448466827a50560ae2fb8c7fde142c72` 已推送到 `origin/main` 并部署服务器。服务器到 GitHub 两次超时后，使用本地和服务器均通过 `git bundle verify` 的 `0e246c2 → 8db92bf` 增量 bundle 做 fast-forward，并把服务器 `origin/main` 跟踪引用同步到同一提交。部署前 schema 7 正式账本在线备份成功且 `integrity_check=ok`；Linux 全量 414/414、目标模块编译、schema 8 `ledger-check` 健康/可写、环境文件哈希不变、三个核心服务 active。部署后手工运行一次持仓同步成功刷新2个 JoinQuant 持仓；网页未认证请求返回302登录跳转，信号 API 未认证请求返回403，重启后五分钟三个服务无 ERROR 日志。用户随后确认已在 JoinQuant 网站手工更新模板 `2026-07-16.1-unified-effective-stop`，但尚无新交易日快照回传证明网站实际运行版本。
 
-当前严格状态为 `implemented（已推送） / deployed（服务器；JoinQuant 网站为用户确认） / not observed / not validated`。Windows 可运行全量409项、专项85/85和服务器 Linux全量414/414均通过；部署和非交易时段同步不能替代新模板交易日回传、止损触发/受阻/成交闭环与连续观察验收。
+截至该次检查点的严格状态为 `implemented（已推送） / deployed（服务器；JoinQuant 网站为用户确认） / not observed / not validated`。Windows 可运行全量409项、专项85/85和服务器 Linux全量414/414均通过；部署和非交易时段同步不能替代新模板交易日回传、止损触发/受阻/成交闭环与连续观察验收。
 
 ## 2026-07-18 跳空越价后二次确认入场规划
 
@@ -124,7 +141,7 @@ Pandas 持仓 Series 布尔歧义，修复后只有 2026-07-24 一个完整交�
 
 2026-07-15 成交对账日期范围修复当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`：完整对账只把当前 `account_snapshots.trade_date` 的 SQLite 成交与 JoinQuant 当日 `get_trades()` 比较，历史成交继续保留但不再被误报为平台缺失；同日缺失仍为 `FILL_MISSING_PLATFORM / WARNING`，平台成交未入本地账本仍为 `FILL_MISSING_LOCAL / ERROR`。代码提交 `cd83f26` 已部署；部署前 SQLite 备份完整性为 `ok`，Linux全量326/326、Python编译、schema 7健康/可写、配置未变、三个服务active和重启后ERROR日志为空均已核验。仍需新交易日快照才能标记 observed，连续代表性证据和恢复闭环完成前不得标记 validated。
 
-当前已部署版本实现 schema version 7、00:00–09:14 `closed` 阶段、09:15 单次盘前运行和阶段边界对齐休眠；信号增加 `created_at`、`validated_at`、`published_at`，JoinQuant 模板期望版本升级为 `2026-07-15.1-execution-state-recovery` 并可自愈旧进程缺失的运行全局变量。退出对账按有效交易分钟区分送达、陈旧、提交、部分成交、T+1/停牌/跌停和目标完成；执行问题按对象保存当前状态，企业微信按状态变化、恢复和受限 ERROR 提醒发送。只有 `ERROR` 对账自己实际关闭的 `buy_enabled` 才能在两个不同新鲜快照连续一致、无未决 ERROR/CRITICAL、无 `submit_unknown`、模板健康且 `kill_switch=0` 时通过 CAS 自动恢复；`CRITICAL` 不建立或保留自动恢复所有权，必须人工检查并恢复。任何人工买入或 kill-switch 操作、账户风控和 `RISK_OFF` 都优先且永不由该机制自动解除。
+2026-07-15 的 schema 7 部署检查点实现 00:00–09:14 `closed` 阶段、09:15 单次盘前运行和阶段边界对齐休眠；信号增加 `created_at`、`validated_at`、`published_at`，JoinQuant 模板期望版本升级为 `2026-07-15.1-execution-state-recovery` 并可自愈旧进程缺失的运行全局变量。退出对账按有效交易分钟区分送达、陈旧、提交、部分成交、T+1/停牌/跌停和目标完成；执行问题按对象保存当前状态，企业微信按状态变化、恢复和受限 ERROR 提醒发送。只有 `ERROR` 对账自己实际关闭的 `buy_enabled` 才能在两个不同新鲜快照连续一致、无未决 ERROR/CRITICAL、无 `submit_unknown`、模板健康且 `kill_switch=0` 时通过 CAS 自动恢复；`CRITICAL` 不建立或保留自动恢复所有权，必须人工检查并恢复。任何人工买入或 kill-switch 操作、账户风控和 `RISK_OFF` 都优先且永不由该机制自动解除。
 
 2026-07-15 复审修正已补齐：无 `order_id` 的 T+1/停牌/跌停/陈旧证据进入退出分类；提交和部分成交阶段计时不被重复快照重置；同对象按最高严重度保存；普通已解决问题可独立恢复而不可变成交/账本 CRITICAL 保持粘性；告警去重包含严重度，成功通知时间写回 SQLite，并支持每30分钟一次的持续 ERROR 提醒。人工 `resume-buy` 在既有资格检查和非空原因下可确认粘性 CRITICAL 已人工处理，但不会同时关闭 `kill_switch`。
 
@@ -138,11 +155,11 @@ Pandas 持仓 Series 布尔歧义，修复后只有 2026-07-24 一个完整交�
 
 ## 2026-07-14 Git 实现基线
 
-提交 `9f4c12d` 已进入 `origin/main`，包含下列 `implemented（已推送）` 能力：全 JoinQuant 持仓硬止损覆盖、板块/ATR 初始止损、账户风险定仓、+2R 按100股单位降至初始半仓、首段止盈后的移动止盈、短线3个/中线10个交易日时间止损，以及 `CAUTION` 减半风险仓位和 `RISK_OFF` 禁止新买入。卖出动作使用稳定持仓周期 ID，且优先覆盖同股买入。该提交已包含在服务器当前 `52b3653` 和已同步的 JoinQuant 模板中，状态为 `deployed / not observed / not validated`。
+提交 `9f4c12d` 已进入 `origin/main`，包含下列 `implemented（已推送）` 历史基线：全 JoinQuant 持仓硬止损覆盖、板块/ATR 初始止损、账户风险定仓、旧版 +2R 首段止盈、首段止盈后的移动止盈、短线3个/中线10个交易日时间止损，以及 `CAUTION` 减半风险仓位和 `RISK_OFF` 禁止新买入。卖出动作使用稳定持仓周期 ID，且优先覆盖同股买入。该提交已包含在服务器部署历史中，状态为 `deployed / not observed / not validated`；本地 Batch A 已用离散 100/300/500 股语义取代“统一卖一半”，但尚未部署。
 
-SQLite schema 6 是完整账本基线：除 schema 5 的持仓周期、委托事件、退出意图和冷却外，新增正式订单、不可变逐笔成交、账户摘要、压缩持仓检查点、日权益、对账批次/差异项和控制审计。回调先事务入账和自动对账，成功后才发布兼容 JSON；`ERROR` 停止新买入，`CRITICAL` 追加 `KILL_SWITCH`。该基线始于 `9f4c12d`，已包含在当前服务器 `e2ce5b5` 中，并由上节 schema 7 增量继续扩展；当前服务器完整性、健康和可写检查通过，状态为 `implemented（已推送） / deployed / not observed / not validated`。
+SQLite schema 6 是完整账本历史基线：除 schema 5 的持仓周期、委托事件、退出意图和冷却外，新增正式订单、不可变逐笔成交、账户摘要、压缩持仓检查点、日权益、对账批次/差异项和控制审计。回调先事务入账和自动对账，成功后才发布兼容 JSON；`ERROR` 停止新买入，`CRITICAL` 追加 `KILL_SWITCH`。该基线始于 `9f4c12d`，曾包含在 `e2ce5b5` / schema 7 检查点中，之后继续被 schema 10 扩展；状态为 `implemented（已推送） / deployed / not observed / not validated`。
 
-JoinQuant 信号 JSON 继续使用兼容的 schema version 1，并增加可选 `target_qty`、回传 `get_trades()` 逐笔成交。`52b3653` / schema 6 / 模板 `2026-07-14.2-p0-execution-contract` 是上一部署检查点；当前服务器为 `e2ce5b5` / schema 7，用户报告网站模板已手动更新为 `2026-07-15.1-execution-state-recovery`，但新快照尚待验证。旧服务器 `aa9acffaf62239e39c076408d83d113dce22b029`、SQLite schema version 1 和模板 `2026-07-14.1-ledger-v6` 仅是更早历史检查点。当前外部状态为 `deployed / not observed / not validated`。
+JoinQuant 信号 JSON 继续使用兼容的 schema version 1，并增加可选 `target_qty`、回传 `get_trades()` 逐笔成交。`52b3653` / schema 6 和 `e2ce5b5` / schema 7 都是历史部署检查点；它们后来被本文顶部记录的 schema 10 检查点取代。旧服务器 `aa9acffaf62239e39c076408d83d113dce22b029`、SQLite schema version 1 和模板 `2026-07-14.1-ledger-v6` 仅用于追溯。外部状态仍是 `deployed / not observed / not validated`，实时值需重新核验。
 
 历史外部检查点（来自用户粘贴的服务器命令输出）：2026-07-14 20:06，服务器 `/opt/stock-analysis` 为 `131118213f22bbdaecd5cd8ab89a87db9aaf7f85`，`main...origin/main` 且工作区干净；备份 `PRAGMA integrity_check=ok`、SQLite schema version 6、`ledger-check` 健康且可写，`stock-analysis.env` 哈希校验未变化，扫描、持仓 Web、JoinQuant 信号三个服务均为 `active`。该检查点已被后续 `52b3653` 部署证据取代，仅用于追溯部署前基线。
 
@@ -189,9 +206,9 @@ flowchart LR
 | JoinQuant 策略模板 | 已实现 | JoinQuant 平台运行 `joinquant_strategy.py`，默认使用模拟盘真实下单模式，不是 dry-run。 |
 | JoinQuant 执行回报 | 已实现 | 执行回报只由 SQLite 首次入账的新 fill 或无 trades 旧快照的累计成交增量触发；周期快照不会重复推送历史成交，零成交、失败和跳过不推送。 |
 | JoinQuant 持仓同步 | 已实现 | 本地持仓展示读取 JoinQuant 回传结果，作为模拟盘主数据来源。 |
-| 全持仓硬止损信号 | 已实现 | 每轮使用全市场实时价检查全部 JoinQuant 同步持仓；持仓即使未进入候选池，跌破既有止损价也会生成卖出信号。本地代码和测试已完成，服务器部署及真实交易日卖出证据仍待确认。 |
+| 全持仓硬止损信号 | 已部署基线 | 每轮使用全市场实时价检查全部 JoinQuant 同步持仓；持仓即使未进入候选池，跌破既有止损价也会生成卖出信号。服务器已有部署证据，真实交易日代表性卖出仍待观察和验证。 |
 | JoinQuant 健康检查与异常报警 | 已实现 | `joinquant_health.py` 会检查信号文件、账户快照、API 拉取/回传次数、失败原因、持仓一致性、JoinQuant 网站模板版本和稳定性评分，生成 `output/joinquant_health_YYYYMMDD.md`；非交易时段的信号/快照过期只记录报告，不刷微信报警。 |
-| 企业微信失败重试 | 已实现 | 推送失败会进入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 会定时重试。 |
+| 企业微信失败重试 | 双轨：服务器旧基线已部署；Batch B 本地已实现 | 服务器 schema 10 仍使用有界 `cache/notify_failed_queue.jsonl` 兼容队列；本地 Batch B 改为 schema 12 SQLite outbox/worker，旧 JSON 只允许显式一次性审计。Batch B 尚未提交、迁移或部署。 |
 | 节假日推送静默 | 已实现 | 非 A 股交易日默认不推普通扫描、买点提醒和 JoinQuant 空计划；可用 `NOTIFY_NON_TRADING_DAY=1` 临时打开联调。 |
 | 盘后信号追踪复盘 | 已实现 | 对成功推送的买点按 D+0/D+1/D+3/D+5/D+10 交易日批次完整复盘；使用全量行情、固定分片，掉出候选池或行情缺失都不丢样本，风险提醒不混入买点统计。 |
 | 本地信号级回测 | 已实现第一版 | `backtest_engine.py` 可读取 `cache/ml/signal_samples.jsonl` 或 `cache/joinquant/signals.json`，模拟信号买卖、手续费、印花税、T+1、止盈止损和仓位限制，输出 `output/backtest_report.md` 与 `output/backtest_trades.csv`。 |
@@ -211,10 +228,12 @@ flowchart LR
 | 4. 微信区分推送 | 已实现 | 当前主推 JoinQuant 模拟盘和执行回报；本地模拟盘标记只为废弃功能保留，默认不会推送。 |
 | 5. 手机微信展示优化 | 已实现 | 执行结果按短段落、状态、原因、数量、价格展示，适配手机阅读。 |
 | 6. 服务器完整部署 | 部分实现 | 核心扫描、JoinQuant 信号、持仓 Web 服务及现有定时器已部署；公网 HTTPS、反向代理、HMAC、防重放等生产安全加固仍未确认或待实现。 |
-| 7. 线上稳定性观察 | 观察中 | 旧版 JoinQuant 拉取与快照链路已有真实交易日证据；当前 SHA 的 SQLite Batch 1 尚未经历部署后的首个有效交易日双写观察，阶段 1 尚未 validated。 |
-| 8. 实盘前检查清单 | 部分实现 | 已有 readiness 报告和健康检查报告；后续需要加入实盘级风控、交易适配层和审计清单。 |
+| 7. 线上稳定性观察 | 观察中 | 旧版 JoinQuant 拉取与快照链路已有真实交易日证据；最后部署的 schema 10 修复尚未形成足够连续有效交易日，阶段 1 尚未 validated。 |
+| 8. 实盘前检查清单 | 部分实现 | readiness/健康报告已部署；统一强制准入、精确数量和 schema 11 在本地 Batch A 已实现但尚未部署，BrokerAdapter/QMT 仍为 planned。 |
 
 ## JoinQuant 可执行信号规则
+
+下列规则先描述最后已部署的 schema 10/旧模板基线。本地 Batch A 在不改变 SELL 与旧事件兼容的前提下，把普通 BUY 收敛为：新鲜 broker/quote 证据通过统一强制准入，同一事务形成完整不可变 READY 意图和容量预留，JoinQuant 只按签名 `target_qty` 精确执行且不再使用金额回退。该增量尚未部署。
 
 - 买入信号只在 A 股交易日交易时间内导出给 JoinQuant 执行，非交易时间只作为观察和微信提醒，不进入模拟盘下单。
 - 当前可执行交易时间按连续竞价口径处理：`09:30-11:30`、`13:00-15:00`。`09:15-09:29` 属于盘前/集合竞价观察，不再标记为盘中，也不会导出买入下单。
@@ -281,15 +300,15 @@ flowchart LR
 
 当前 `origin/main` 已实现独立 `cache/backtest/history.db`、JoinQuant/AkShare CSV 映射、幂等冲突检查、`strict`/`price_core` 质量门、T 收盘决策与 T+1 开盘撮合、复权连续性、费用/滑点/涨跌停/停牌、分层退出、绩效分组、三个 walk-forward 窗口、参数比较契约、CLI、原子报告和手动 Linux 入口。现有 `backtest_engine.py` 信号级回测保持独立兼容。
 
-状态必须保持为：框架已随提交 `9f4c12d` 进入 `origin/main` 并包含在服务器当前 `52b3653` 中，为 `implemented（已推送） / deployed（框架）`。没有真实 6 个月/1 年数据集通过严格质量门并重复运行，所以仍是 `not observed / not validated`。`price_core` 固定标记 `proxy_only=true`，只能验证价格、撮合和退出机制，不能满足 Batch G 的完整历史回测准入。
+状态必须保持为：框架已随提交 `9f4c12d` 进入 `origin/main`，并有服务器部署历史，为 `implemented（已推送） / deployed（框架）`。没有真实 6 个月/1 年数据集通过严格质量门并重复运行，所以仍是 `not observed / not validated`。`price_core` 固定标记 `proxy_only=true`，只能验证价格、撮合和退出机制，不能满足 Batch G 的完整历史回测准入。
 
 ## 当前部署原则
 
 - 服务器只部署本项目，不需要把 JoinQuant 网站部署到服务器。
 - `joinquant_strategy.py` 复制到 JoinQuant 网站的策略编辑器中运行。
 - 服务器通过 `run_ubuntu.sh` 启动本地扫描、Web、JoinQuant 信号服务和定时任务。
-- 企业微信 webhook 和自定义 token 统一通过 `run_ubuntu.sh install --webhook ... --token ...` 写入服务器配置。
-- 代码统一托管在 GitHub：`https://github.com/yuyang0702/stock-analysis.git`。后续本地改完代码后先 `git add .`、`git commit`、`git push`；服务器进入 `/opt/stock-analysis` 后执行 `git pull origin main`，再用 `run_ubuntu.sh` 菜单重启服务。
+- 企业微信 webhook、Token 和其他私有配置只在首次安装或明确授权的配置任务中写入；已配置服务器不得用 `install` 刷新版本或 systemd。
+- 代码统一托管在 GitHub；提交、推送、服务器 `git pull --ff-only` 和服务重启都需要当次授权，并按变更对应的备份、迁移、测试和分阶段启动 runbook 执行。
 - 服务器目录固定为 `/opt/stock-analysis`；如果首次切换到 GitHub 版本，先把旧目录备份成 `stock-analysis.bak.YYYYMMDD-HHMMSS`，再 `git clone` 到新的 `stock-analysis` 目录。
 - `stock-analysis.env` 和 `cache/` 不上传 GitHub，分别保存服务器私有配置和运行数据；重新 clone 时需要从备份目录复制回来，日常 `git pull` 不会覆盖它们。
 - 本地模拟盘已废弃并默认关闭，避免和 JoinQuant 模拟盘产生双账户混淆。
@@ -298,13 +317,13 @@ flowchart LR
 
 目标：基于每次策略信号、JoinQuant 实际成交结果、持仓收益表现，逐步评估选股排序、买卖过滤和仓位建议。机器学习模型与固定策略参数分开治理：模型路线负责预测、排序和过滤，Batch G 负责在预设安全区间内复核确定性策略参数。
 
-第一阶段不让机器学习直接自动交易，只做影子评分和复盘报告。未来训练模型即使通过离线评价，也必须先登记模型版本、进入影子观察、经用户人工批准，并在单独授权的任务中发布；不能因为定时训练或报告通过而自动接入仓位、信号过滤或下单。
+第一阶段不让机器学习直接自动交易，只做模型观察和复盘报告。规则型影子评分已在当前本地 Batch B 从活动计算、展示和周报退役；未来训练模型即使通过离线评价，也必须先登记模型版本、进入 L0 旁路观察、经用户人工批准，并在单独授权的任务中发布；不能因为定时训练或报告通过而自动接入仓位、信号过滤或下单。
 
-ML-7 的训练型影子模型设计已经确认，详细契约见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`。该设计采用真实一年 strict 五分钟候选历史作为主训练数据、JoinQuant 模拟盘作为现实校准和影子观察，主目标为 D+5 扣费收益，辅以 D+3/D+10、下行风险和成交概率；采用多个小型表格模型、线性基准和确定性输出层。2026-07-16 已完成实施计划 Task 1–3：共享候选评分/严格样本契约、独立有界 `cache/ml/ml.db`、以及不改变交易输出的完整五分钟候选采集。严格状态为 `partially implemented（基础能力已推送） / not deployed / not observed / not validated`；历史五分钟导入、标签、训练、治理和 L0 推理仍为 `planned`。
+ML-7 的训练型模型设计已经确认，详细契约见 `docs/superpowers/specs/2026-07-15-trained-shadow-model-design.md`。该设计采用真实一年 strict 五分钟候选历史作为主训练数据、JoinQuant 模拟盘作为现实校准和模型旁路观察，主目标为 D+5 扣费收益，辅以 D+3/D+10、下行风险和成交概率；采用多个小型表格模型、线性基准和确定性输出层。Tasks 1–3 是既有已推送基础，Tasks 4–10 已在当前本地工作树实现；Task 11 本地总验收进行中，Task 12 仍未授权/未运行。Batch C 增量严格状态为 `implemented（本地，未提交） / not committed / not deployed / not observed / not validated`；真实一年 strict 数据、可信模型、人工审批、活动模型和服务器 L0 证据均不存在。
 
 ### 机器学习与参数复核的关系
 
-- ML-1 至 ML-7 是模型数据、训练、影子观察和策略辅助路线；当前只有数据与规则型影子评分，没有训练模型。
+- ML-1 至 ML-7 是模型数据、训练、L0 旁路观察和策略辅助路线；当前代码已包含 Tasks 4–10 的训练/治理/旁路运行能力，但当前没有可信或活动训练模型。规则型影子评分只作为历史兼容字段，本地 Batch B 已退役其活动运行链路，尚未部署到服务器。
 - ML-8/Batch G 是参数治理路线，首版使用确定性、有界候选搜索和时间切分评价，不要求也不等于机器学习训练。
 - 将来模型可以只读提出参数候选或排序建议，但不能写入批准、激活、部署或回滚状态。
 - 模型版本和参数版本必须分别记录；任何信号都要能追溯当时的代码版本、模型版本和参数版本。
@@ -312,42 +331,41 @@ ML-7 的训练型影子模型设计已经确认，详细契约见 `docs/superpow
 
 ### 当前进度快照
 
-当前机器学习模块处在“严格数据底座已实现、历史数据与模型训练尚未实现”阶段，没有训练模型，也没有让模型影响买入、卖出、仓位或 JoinQuant 下单。
+当前机器学习模块处在“训练/治理代码已在本地实现、外部证据尚未形成”阶段：没有真实一年 strict 数据、可信/可批准训练模型、人工审批、活动模型或服务器 L0 证据，也没有让模型影响买入、卖出、仓位或 JoinQuant 下单。规则型影子评分在本地 Batch B 已从活动链路退役；服务器在后续部署前仍可能保留旧版本行为，不能混写为当前本地代码状态。
 
 已完成：
 
 - 生成 JoinQuant 信号时，会把信号样本追加到 `cache/ml/signal_samples.jsonl`。
 - 已新增共享 `candidate_core.py` 和不可变 `ml_contracts.py`，线上与 strict 历史路径使用同一候选评分契约；所有特征要求 `available_at <= decision_at`，样本绑定股票池、行情、参数、代码和生成器哈希。
-- 已新增独立 schema v1 `cache/ml/ml.db`：候选、标签、预测、模型登记、不可变模型事件和运行权限状态与正式 `trading.db` 物理隔离；具备 WAL-aware 只读、容量预留、schema 指纹、冲突拒绝、在线备份和完整性检查。该能力尚未部署或创建服务器实际库。
+- 本地 `cache/ml/ml.db` 已由既有 schema v1 基础增量到 schema v2：候选、分期限标签、预测、模型登记、不可变模型事件和运行权限状态与正式 `trading.db` 物理隔离；具备 WAL-aware 只读、容量预留、schema 指纹、冲突拒绝、在线备份和完整性检查。该增量尚未提交、部署或创建服务器实际库。
 - JoinQuant 导出代码已能记录每个五分钟批次的全部入选/拒绝候选，区分规则 `selected` 与账本控制后的 `final_action`；卖出和控制拦截只审计不训练，账本失败整批跳过 ML，重复 `run_id` 不用后来行情回填旧样本。默认 `ML_TRAINED_SHADOW_ENABLE=False`。
-- `shadow_score.py` 会基于原策略分、消息催化、题材热度、板块位置、市场情绪、交易质量和海外风险生成 `enhanced_score`、`shadow_adjust_score`、`original_rank`、`shadow_rank`、`shadow_rank_change` 和 `shadow_reason`，只用于对照复盘。
+- 历史样本仍可在显式兼容解析中读取 `enhanced_score`、`shadow_rank` 等旧字段；当前本地 Batch B 不再计算、展示、导出或发送这些规则影子字段，`shadow_score.py` 已删除。该退役尚未部署服务器，不能据本地代码声称线上已切换。
 - 板块行情改为独立低频刷新：`a_share_strategy.py --sector-context-only` 或 `bash run_ubuntu.sh sector-context` 会通过 AkShare 东方财富行业/概念板块行情刷新 `cache/market/sector_context.json`；日常扫描只读取该缓存，不在每轮扫描时主动请求板块接口。刷新失败时优先保留最近成功缓存，没有缓存才按板块中性处理并在依据里提示失败原因。
 - `global_market_context.py` 会通过 AkShare 东方财富主源抓取美股、日本、韩国主要指数并写入 `cache/market/global_context.json`；主源失败时切到 Sina 备用源，备用源也失败时优先复用 24 小时内最近一次成功缓存，仍不可用才按海外风险中性处理，不阻塞扫描。
-- 日常微信扫描汇总、单票提醒和 JoinQuant 下单计划会显示原策略分、影子分、影子调整和原排名到影子排名的变化；影子分不是百分制，允许超过 100，只用于观察，不参与下单。
+- 当前活动微信扫描汇总、单票提醒和 JoinQuant 下单计划只使用确定性 `final_score` 与规则字段；本地 Batch B 不再显示规则影子分。未来训练模型观察必须使用独立模型版本与合同，并保持旁路不下单。
 - JoinQuant 执行链路已增加可成交性与健康保护：买入信号导出前按账户总资产、目标仓位和入场价检查是否至少够买 100 股，不够一手时记录 `buy_too_small_for_board_lot` 并不下单；订单状态在快照回传前统一转成字符串，避免 `OrderStatus` JSON 序列化失败；普通 `skipped` 仍保留在原因明细中但不计入硬失败阈值；`JOINQUANT_ENFORCE_HEALTH_GATE=1` 时健康准入不通过只禁止新买单，卖出仍允许。
 - JoinQuant 网站模板会在交易时间每次 `handle_data` 执行后回传账户快照，因此成交后的现金、总资产和持仓通常会在下一分钟快照中更新；服务器每 60 秒同步该快照到本地持仓。执行回报只消费本次 SQLite 事务首次插入的新 fill；无 trades 的兼容快照只报告累计成交增量，周期快照不会再次推送历史成交。
 - JoinQuant 回传订单后，会把订单状态、失败原因、订单号、数量、成交量和价格回填到样本中。
-- `ml_dataset.py` 可生成 `output/ml_signal_review.md`，用于查看样本数、买卖数量、订单状态、原策略分布和影子评分分布。
-- `strategy_compare_report.py` 会补充 D+1/D+3/D+5、最大浮盈、最大回撤、止盈止损触发标签，生成 `output/strategy_compare_report.md`；每日盘后生成本地报告，每周五推送策略对照微信摘要。
+- `ml_dataset.py` 可生成 `output/ml_signal_review.md`，用于查看样本数、买卖数量、订单状态和确定性规则分布；旧影子字段只在兼容样本中只读统计。
+- `strategy_compare_report.py` 会补充 D+1/D+3/D+5、最大浮盈、最大回撤、止盈止损触发标签，生成 `output/strategy_compare_report.md`；规则影子周报已在本地 Batch B 退役，后续由“原规则策略 vs 训练模型”报告替代。
 - `backtest_engine.py` 可用已积累的信号样本做信号级回测，形成后续模型训练前的基线。
 
-尚未完成：
+尚未完成或尚无外部证据：
 
-- strict 历史五分钟候选和下一可成交价格导入尚未实现；真实 6 个月/1 年 strict 数据尚未导入。
-- D+10、组合级回撤、完整盈亏比等长期标签仍待补齐。
-- 完整历史回测框架已经实现，但还没有真实 strict 数据集运行、重复性证据和人工验证；信号级回测仍只覆盖已经生成过的信号。
-- 还没有训练任何机器学习模型，也没有 `ml_score` 参与排序、过滤、仓位或下单。
-- 还没有半自动参数复核与版本化发布；现有统计不会生成可批准候选，也不会自动改变参数。后续必须先通过数据就绪、时间切分回测、模拟盘对照和人工批准。
+- 真实一年/365 天 strict 数据尚未导入、运行或重复验证；完整历史回测仍缺真实 strict 数据、重复性证据和人工复算。
+- 虽然训练、治理和 L0 旁路代码已在本地实现，但当前没有可信或可批准的训练模型、人工审批、活动模型或服务器 L0 证据；`ml_score` 不参与排序、过滤、仓位或下单。
+- Task 11 的本地总验收、全量回归和安全复审仍在进行；Task 12 的服务器部署、L0 启用和交易日观察未授权且未运行。
+- 半自动参数复核与版本化发布仍是独立路线；任何候选、模型或参数都不能自动批准、激活、部署或改变交易。
 
 | 阶段 | 状态 | 说明 |
 | --- | --- | --- |
 | ML-1 样本采集 | implemented（基础代码已推送，未部署） | 保留兼容 JSONL；新增独立 `ml.db` 完整五分钟候选批次、严格时点、版本/来源哈希、规则选择与最终发布动作。默认关闭，服务器尚未部署或观察。 |
-| ML-2 成交与收益标注 | 部分实现 | 订单执行标签已回填；`strategy_compare_report.py` 会补 D+1/D+3/D+5、最大浮盈、最大回撤、止盈止损触发；D+10 和组合级标签待补齐。 |
-| ML-3 复盘报表 | 已实现 | 可生成 `output/ml_signal_review.md` 和 `output/strategy_compare_report.md`，统计样本、订单状态、原策略分布、影子评分分布和策略对照结果；不训练模型、不参与下单。 |
+| ML-2 成交与收益标注 | implemented（Batch C 本地未提交） | 既有订单标签继续保留；本地 ML 标签路径已增加 D+3/D+5/D+10 扣费收益、下行风险、成交概率、成熟度和质量原因。真实一年 strict 标签覆盖和表现尚未观察或验证。 |
+| ML-3 复盘报表 | 已实现 | 可生成 `output/ml_signal_review.md` 和 `output/strategy_compare_report.md`，统计样本、订单状态、确定性规则分布和历史兼容字段；不训练模型、不参与下单。 |
 | ML-4 信号回测 | 已实现第一版 | 基于已生成信号输出收益、回撤、胜率和交易明细，为后续模型训练提供对照基线；与 ML-5 的逐日历史框架保持独立。 |
-| ML-5 完整历史回测 | deployed（框架） | 独立历史库、strict/price_core 双轨、逐日撮合、walk-forward、指标、CLI和报告已进入 `origin/main` 和服务器 `52b3653`；真实 6 个月/1 年严格数据尚未导入，故尚未观察或验证。 |
-| ML-6 影子模型 | 已实现第一版 | 当前不是训练模型，而是规则型影子评分；已纳入消息催化、题材热度、板块位置缓存、市场情绪、交易质量和海外风险；`enhanced_score = final_score + shadow_adjust_score`，不再按 100 封顶，并输出原排名、影子排名和排名变化；板块位置由独立 timer 低频刷新，扫描只读最近成功缓存；不影响真实下单，用来和原策略做对照。 |
-| ML-7 训练模型与策略辅助 | partially implemented（Task 1–3） | 共享评分/样本契约、独立 ML 账本和完整实时候选采集已实现并推送；Task 4–12（strict 历史导入、标签、训练、治理、L0 推理、维护、总验收和单独授权部署）仍待实现。整体未部署、未观察、未验证，没有训练模型。 |
+| ML-5 完整历史回测 | deployed（框架历史） | 独立历史库、strict/price_core 双轨、逐日撮合、walk-forward、指标、CLI和报告已有服务器部署历史；最后可引用外部检查点为 `68d7283` / schema 10。真实 6 个月/1 年严格数据尚未导入，故尚未观察或验证。 |
+| ML-6 影子模型 | 规则型影子评分已退役 | 当前没有可信或活动训练模型；规则型影子评分已从本地活动计算、网页/JoinQuant 展示、微信周报和 systemd 路由退役，旧字段仅历史兼容只读。该退役尚未部署、观察或验证服务器行为。 |
+| ML-7 训练模型与策略辅助 | implemented（Tasks 1–3 已推送；Tasks 4–10 本地未提交） | strict 导入、标签、训练帧、五头模型包、治理、L0 旁路和维护代码均已在本地实现；Task 11 本地总验收进行中，Task 12 未授权/未运行。Batch C 增量 `not committed / not deployed / not observed / not validated`，没有可信或活动模型。 |
 | ML-8 半自动参数复核 | 待实现 | 这是与训练模型分离的参数治理能力。自动任务只生成有界候选、时间切分评价和准入报告；候选必须绑定版本与哈希，由用户明确批准并在独立授权任务中发布到 JoinQuant 模拟盘。禁止自动批准、自动改参、自动部署或进入真实资金；详细门槛见 2026-07-14 专项设计。 |
 
 ### 计划采集的特征
@@ -355,7 +373,7 @@ ML-7 的训练型影子模型设计已经确认，详细契约见 `docs/superpow
 信号生成时记录以下数据，形成后续训练样本：
 
 - 股票代码、信号日期、动作类型、目标仓位、当前持仓比例。
-- 综合分、影子增强分、交易分、新闻分、风险收益比、压力位距离。
+- 综合分、交易分、新闻分、风险收益比、压力位距离；规则影子增强分只允许作为历史兼容字段，不进入新活动样本特征。
 - 涨跌幅、成交额、换手率、均线、ATR、波动率等技术指标。
 - 市场状态、题材热度、行业或概念标签、海外风险分。
 - 策略给出的买入价、止损价、止盈价、仓位建议。
@@ -376,7 +394,7 @@ JoinQuant 回传后补充以下标签：
 - 禁止使用未来数据训练当前信号，训练集和验证集必须按时间切分。
 - 样本不足时只生成统计报告，不上线模型。
 - 机器学习不能绕过硬风控：单票仓位上限、总仓位上限、止损规则必须保留。
-- 新模型先进入影子模式，至少观察多个交易周期后再影响下单。
+- 新训练模型先进入 L0 旁路观察，至少观察多个交易周期后再考虑影响下单。
 - 模型更新需要记录不可变版本、训练代码版本、特征版本、训练时间、样本范围、时间切分和验证/保留集结果。
 - 模型训练、评价或定时报告通过不能自动发布；模型批准、发布、回滚和状态升级与参数版本一样需要显式人工动作。
 - 模型输出只能在批准的作用域内参与排序、过滤或小幅仓位调整，不得控制硬止损、卖出安全和绝对风险上限。
@@ -384,24 +402,28 @@ JoinQuant 回传后补充以下标签：
 - 参数复核候选每次最多改变一个参数族，必须使用按时间切分的验证/保留集，并证明结果不由少数离群交易驱动。
 - 自动分析最多把候选推进到 `approvable`；批准、发布、回滚和 `validated` 状态均需要显式人工动作，硬风险边界永远不由学习器控制。
 
-## 后续优先级
+## 当前代码轨与发布轨
+
+实盘化专项优先级以 `docs/live_trading_execution_plan.md` 为准。Batch A 与 Batch B 代码和本地 Windows 验证已经完成；当前“仅本地代码”授权下 Batch C Tasks 4–10 已实现，Task 11 本地总验收进行中，Batch D BrokerAdapter/QMT 默认禁单节点仍 planned，且不授权任何外部发布。发布轨固定先从 Batch A 开始：另行授权提交、合并和推送，再按 schema 10→11 安全部署门执行 Linux 全量测试、备份迁移、恢复演练与代表性 JoinQuant 交易日观察；Batch B 必须在随后单独完成 schema 11→12 部署门，Batch C Task 12 还需单独完成依赖、ML 库、模型证据、服务器 L0 和交易日观察门，不能把本地代码写成服务器已部署。新定仓和退出语义还必须使用真实 6 个月/1 年 strict 数据完成至少 3 段 walk-forward；后续批次只有在各自门槛满足后才可独立发布，真实资金启用始终需要独立授权和验收。
+
+## 运行观察与研究积压
+
+下列事项不覆盖上述代码轨与发布轨：
 
 1. 在线服务器完整跑通并连续观察 JoinQuant 模拟盘闭环：信号拉取、模拟下单、订单回报、微信通知、本地持仓同步和健康检查报警。
 2. 观察 `output/joinquant_health_YYYYMMDD.md`、`cache/ml/signal_samples.jsonl` 和 `output/ml_signal_review.md` 是否每天稳定生成。
 3. 观察 `output/backtest_report.md` 和 `output/backtest_trades.csv` 是否能稳定反映历史信号表现。
-4. 观察 `output/strategy_compare_report.md` 和每周五策略对照微信摘要，确认原策略 Top5 与影子评分 Top5 的 D+3/D+5、胜率和回撤。
+4. 训练模型部署并产生真实候选后才观察 `output/strategy_compare_report.md` 中原规则策略与模型观察 Top5 的 D+3/D+5/D+10、胜率和回撤；当前没有可信或活动训练模型，规则影子周报已在本地退役。
 5. 按信号分数、市场状态、题材热度统计收益质量。
 6. 为完整历史回测导入真实 strict 时点数据，完成 6 个月/1 年、至少 3 个 walk-forward 窗口的重复运行和人工复算。
-7. 继续执行 ML-7 Task 4–12：先实现 strict 历史五分钟候选/价格导入和成本标签，再构造时间切分训练集、训练 challenger、完成人工治理与 L0 旁路推理；完成总验收后，部署仍需单独授权。L0 不参与模拟盘下单。
+7. 完成 ML-7 Task 11 的本地总验收、全量回归和安全复审；Task 12 的部署、L0 启用和交易日观察仍需单独授权。即使部署，L0 也只允许旁路观察且不参与模拟盘下单。
 8. 当训练型影子模型连续优于原策略、完成模型登记并经人工批准后，再在独立授权任务中考虑让它参与排序、过滤或仓位微调。
 9. 完整账本、自动备份恢复和数据门槛满足后，再按 Batch G 实施半自动参数复核；先生成只读报告，再实现人工批准和模拟盘版本化发布。
-
-实盘化专项优先级以 `docs/live_trading_execution_plan.md` 为准。当前阶段 1 代码功能已补齐，先进行连续交易日线上观察；后续推荐顺序是：部署并观察本地风险与账本能力、导入 strict 历史数据并验证回测、实盘级 `pre_trade_check`、交易适配层、审计日志和小资金灰度。
 
 ## 暂缓事项
 
 - 不急于接入强化学习。当前样本量、交易成本、市场噪声都不适合一开始就做强化学习。
-- 不让机器学习直接覆盖买卖规则或自行发布模型。先做版本化影子评分和复盘，达到门槛并经人工批准后再扩大有限权限。
+- 不让机器学习直接覆盖买卖规则或自行发布模型。先做版本化模型观察和复盘，达到门槛并经人工批准后再扩大有限权限。
 - 不恢复本地模拟盘。当前主模拟盘以 JoinQuant 为准，方便在 JoinQuant 网站查看具体操作。
 
 ## 2026-07-09 阶段 1 补齐状态
@@ -412,9 +434,9 @@ JoinQuant 回传后补充以下标签：
 - `joinquant_health.py` 会生成 `output/joinquant_health_YYYYMMDD.md`，统计信号新鲜度、账户快照新鲜度、今日信号拉取次数、今日快照回传次数、API 异常次数、失败/跳过订单数、失败原因拆分、持仓一致性和稳定性评分。
 - `joinquant_strategy.py` 会在账户快照中回传 `strategy_template_version`；`joinquant_health.py` 会和服务器期望版本对比，发现 JoinQuant 网站仍使用旧模板时标记 `template_version_mismatch`。
 - `joinquant_health.py` 会追加 `cache/joinquant/health_history.jsonl`，用于后续观察连续交易日稳定性。
-- `notifier.py` 已加入失败推送队列；企业微信发送失败会写入 `cache/notify_failed_queue.jsonl`，`notify_retry.py` 和 `stock-notify-retry.timer` 会定时重试。
+- 服务器 schema 10 旧基线仍有 `cache/notify_failed_queue.jsonl` 兼容队列；本地 Batch B 已改为 schema 12 SQLite outbox/worker，`stock-notify-retry.timer` 只在新部署后作为兼容 unit 名运行 worker，旧 JSON 仅显式一次性审计。当前 Batch B 尚未提交、迁移或部署。
 - `run_ubuntu.sh` 是统一入口，新增 `notify-retry` 菜单和命令；安装时会统一写入健康检查和微信重试的 systemd timer。
 
 阶段 1 的实盘前观察标准：连续 10 个交易日稳定运行，`joinquant_health` 报告无 critical，信号拉取和快照回传稳定，失败订单原因可解释，微信异常通知可以收到或被重试补发。本地模拟盘仍为废弃功能，不作为当前模拟交易依据。
 
-非交易日生成的 readiness 结论只表示静态文件、schema 和配置检查结果，不构成有效观察日、阶段放行或实盘准入证据。当前运行数据治理仍为部分实现：SQLite 自动备份与恢复演练代码已在 `origin/main` 和服务器 `52b3653` 中 `deployed`，但 timer 连续运行和恢复演练尚未观察或验证；健康/API 单文件 JSONL 月度轮转、盘中扫描文件保留和统一归档仍待实施。
+非交易日生成的 readiness 结论只表示静态文件、schema 和配置检查结果，不构成有效观察日、阶段放行或实盘准入证据。当前运行数据治理仍为部分实现：SQLite 自动备份与恢复演练代码已有服务器部署历史，最后可引用外部检查点为 `68d7283` / schema 10；timer 连续运行和恢复演练尚未观察或验证。Batch B 的 outbox 容量/恢复语义仍仅在本地实现。

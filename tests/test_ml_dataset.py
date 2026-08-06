@@ -31,7 +31,10 @@ class MlDatasetTest(unittest.TestCase):
 
     def test_builds_complete_candidate_samples_with_strict_runtime_time(self) -> None:
         rows = pd.DataFrame([
-            {"code": "600000", "price": 10.0, "final_score": 90.0},
+            {
+                "code": "600000", "price": 10.0, "final_score": 90.0,
+                "enhanced_score": 99.0, "news_catalyst_score": 8.0,
+            },
             {"code": "000001", "price": 12.0, "final_score": 70.0},
         ])
         decisions = [
@@ -49,6 +52,8 @@ class MlDatasetTest(unittest.TestCase):
         self.assertEqual(samples[0].features["cohort_mode"].value, "intraday")
         self.assertEqual(samples[0].final_action, "buy_published")
         self.assertEqual(samples[1].final_action, "rule_rejected")
+        self.assertNotIn("enhanced_score", samples[0].features)
+        self.assertNotIn("news_catalyst_score", samples[0].features)
 
     def test_non_intraday_candidate_is_auditable_but_not_training_eligible(self) -> None:
         samples = ml_dataset.build_candidate_samples(
@@ -174,9 +179,25 @@ class MlDatasetTest(unittest.TestCase):
             self.assertIn("买入 1", md)
             self.assertIn("成交/提交 1", md)
             self.assertIn("失败/跳过 1", md)
-            self.assertIn("## 影子评分分布", md)
+            self.assertIn("## 规则分分布", md)
+            self.assertNotIn("影子", md)
             self.assertIn("90+: 1", md)
             self.assertTrue(report_path.exists())
+
+    def test_legacy_sample_parser_preserves_archived_fields_read_only(self) -> None:
+        source = {
+            "features": {
+                "final_score": 90,
+                "enhanced_score": 95,
+                "shadow_rank": 1,
+                "shadow_reason": "历史归档",
+            }
+        }
+
+        parsed = ml_dataset.parse_legacy_signal_sample(source)
+
+        self.assertEqual(parsed["features"], source["features"])
+        self.assertIsNot(parsed["features"], source["features"])
 
 
 if __name__ == "__main__":

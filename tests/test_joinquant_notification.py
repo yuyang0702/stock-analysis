@@ -1,7 +1,12 @@
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 import a_share_strategy
 import paper_trading
+from trading_store import TradingStore
 
 
 class JoinQuantNotificationTest(unittest.TestCase):
@@ -42,7 +47,8 @@ class JoinQuantNotificationTest(unittest.TestCase):
         self.assertIn("计划卖出", md)
         self.assertIn("600000.XSHG", md)
         self.assertIn("分数 88", md)
-        self.assertIn("影子 91.5", md)
+        self.assertNotIn("影子", md)
+        self.assertNotIn("91.5", md)
 
     def test_local_paper_markdown_has_distinct_marker(self) -> None:
         account = paper_trading.new_account(100_000)
@@ -76,6 +82,93 @@ class JoinQuantNotificationTest(unittest.TestCase):
         self.assertIn("非交易时间禁止买入 2", md)
         self.assertIn("最小一手同时超过单笔和组合风险 1", md)
         self.assertIn("未持仓不卖出 1", md)
+
+    def test_pre_close_and_weekly_events_have_stable_keys_and_calendar_ttls(self) -> None:
+        shanghai = timezone(timedelta(hours=8))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = TradingStore(Path(tmpdir) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
+
+            pre_now = datetime(2026, 7, 31, 9, 16, tzinfo=shanghai)
+            pre_key = a_share_strategy.enqueue_scan_notification(
+                store, "pre", "【盘前】扫描汇总", "第一版盘前摘要", pre_now,
+            )
+            repeated_key = a_share_strategy.enqueue_scan_notification(
+                store, "pre", "【盘前】扫描汇总", "五分钟后的不同报价", pre_now.replace(minute=21),
+            )
+            close_key = a_share_strategy.enqueue_scan_notification(
+                store, "close", "【盘后】盘后复盘", "盘后摘要", pre_now.replace(hour=15, minute=10),
+            )
+            weekly_key = a_share_strategy.enqueue_scan_notification(
+                store, "weekly", "周度复盘", "本周摘要", pre_now.replace(hour=15, minute=11),
+            )
+
+            self.assertEqual(pre_key, repeated_key)
+            self.assertEqual(pre_key, f"joinquant:{scope}:pre:2026-07-31")
+            self.assertEqual(close_key, f"joinquant:{scope}:close:2026-07-31")
+            self.assertEqual(weekly_key, f"joinquant:{scope}:weekly:2026-W31")
+            pre = store.get_notification(pre_key)
+            close = store.get_notification(close_key)
+            weekly = store.get_notification(weekly_key)
+            self.assertEqual(pre.body, "第一版盘前摘要")
+            self.assertEqual(
+                datetime.fromisoformat(pre.expires_at).astimezone(shanghai),
+                datetime(2026, 7, 31, 9, 30, tzinfo=shanghai),
+            )
+            self.assertEqual(
+                datetime.fromisoformat(close.expires_at).astimezone(shanghai),
+                datetime(2026, 8, 3, 9, 15, tzinfo=shanghai),
+            )
+            self.assertEqual(close.expires_at, weekly.expires_at)
+
+    def test_scan_notification_is_silent_for_empty_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = TradingStore(Path(tmpdir) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.get_or_create_account_scope(conn, "joinquant", "primary")
+
+            for event_type in ("pre", "close", "weekly"):
+                with self.subTest(event_type=event_type):
+                    key = a_share_strategy.enqueue_scan_notification(
+                        store,
+                        event_type,
+                        "空摘要",
+                        "   ",
+                        datetime(2026, 7, 31, 9, 16, tzinfo=timezone(timedelta(hours=8))),
+                    )
+                    self.assertIsNone(key)
+            with store.connect() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0]
+            self.assertEqual(count, 0)
+
+    def test_close_ttl_skips_configured_holiday(self) -> None:
+        shanghai = timezone(timedelta(hours=8))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = TradingStore(Path(tmpdir) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                store.get_or_create_account_scope(conn, "joinquant", "primary")
+            with patch.object(
+                a_share_strategy.app_config,
+                "A_SHARE_HOLIDAYS_DEFAULT",
+                {"2026-08-03"},
+            ):
+                key = a_share_strategy.enqueue_scan_notification(
+                    store,
+                    "close",
+                    "【盘后】盘后复盘",
+                    "摘要",
+                    datetime(2026, 7, 31, 15, 10, tzinfo=shanghai),
+                )
+
+            event = store.get_notification(key)
+            self.assertEqual(
+                datetime.fromisoformat(event.expires_at).astimezone(shanghai),
+                datetime(2026, 8, 4, 9, 15, tzinfo=shanghai),
+            )
 
 
 if __name__ == "__main__":

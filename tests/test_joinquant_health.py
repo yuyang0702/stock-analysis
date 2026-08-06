@@ -10,6 +10,51 @@ from trading_store import TradingStore
 
 
 class JoinQuantHealthTest(unittest.TestCase):
+    def test_execution_metrics_expose_notification_capacity_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_file = Path(tmp) / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                conn.execute(
+                    """INSERT INTO notification_outbox(
+                       event_key, account_scope_id, adapter, event_type,
+                       object_type, object_id, source_fact_id, priority,
+                       payload_version, payload_sha256, payload_json, state,
+                       attempt_count, occurred_at, created_at, terminal_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"joinquant:{scope}:control:dead", scope, "joinquant",
+                        "control", "control", "dead", "dead", "high", 1,
+                        "a" * 64, "{}", "dead", 0,
+                        "2026-07-28T02:00:00+00:00",
+                        "2026-07-28T02:00:00+00:00",
+                        "2026-07-28T02:00:00+00:00",
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO notification_enqueue_gaps(
+                       event_key, account_scope_id, adapter, payload_sha256,
+                       source_fact_id, priority, reason, occurred_at, created_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        f"joinquant:{scope}:control:gap", scope, "joinquant",
+                        "b" * 64, "gap", "high", "capacity",
+                        "2026-07-28T02:00:00+00:00",
+                        "2026-07-28T02:00:00+00:00",
+                    ),
+                )
+
+            metrics = joinquant_health._execution_ledger_metrics(db_file)
+
+            self.assertEqual(metrics["notification_high_dead_rows"], 1)
+            self.assertEqual(metrics["notification_dead_detail_rows"], 1)
+            self.assertEqual(metrics["notification_unresolved_gap_rows"], 1)
+            self.assertEqual(metrics["notification_high_unresolved_gap_rows"], 1)
+
     def test_reports_bounded_execution_ledger_metrics_and_controls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -614,5 +659,142 @@ class JoinQuantHealthTest(unittest.TestCase):
             self.assertEqual(result["failed_orders_today"], 1)
             self.assertEqual(result["failed_order_breakdown"]["buy:limit_up_or_suspended"], 1)
             self.assertEqual(result["failed_order_breakdown"]["sell:t_plus_1"], 1)
+
+    def test_health_issues_enqueue_once_and_recover_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_file = Path(tmp) / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+            first = {
+                "issue_codes": ["snapshot_stale", "template_version_mismatch"],
+                "issues": ["snapshot stale", "template mismatch"],
+                "fresh_executable_buy": False,
+                "strategy_template_version": "old",
+                "expected_template_version": "current",
+            }
+            self.assertEqual(
+                joinquant_health.persist_health_issue_transitions(
+                    first, db_file, datetime(2026, 7, 9, 10, 0),
+                ),
+                "",
+            )
+            self.assertEqual(
+                joinquant_health.persist_health_issue_transitions(
+                    first, db_file, datetime(2026, 7, 9, 10, 1),
+                ),
+                "",
+            )
+            second = {
+                "issue_codes": ["snapshot_stale"],
+                "issues": ["snapshot stale"],
+                "fresh_executable_buy": False,
+            }
+            self.assertEqual(
+                joinquant_health.persist_health_issue_transitions(
+                    second, db_file, datetime(2026, 7, 9, 10, 2),
+                ),
+                "",
+            )
+            with store.connect() as conn:
+                issues = conn.execute(
+                    """SELECT object_id, recovered_at, transition_seq
+                       FROM execution_issue_state WHERE object_type='health'
+                       ORDER BY object_id"""
+                ).fetchall()
+                events = conn.execute(
+                    """SELECT object_id, state, cancel_requested_at
+                       FROM notification_outbox
+                       WHERE object_type='execution_issue'
+                       ORDER BY created_at, event_key"""
+                ).fetchall()
+            self.assertEqual(
+                [(row["object_id"], row["recovered_at"] is not None, row["transition_seq"])
+                 for row in issues],
+                [("snapshot_stale", False, 1), ("template_version_mismatch", True, 2)],
+            )
+            self.assertEqual(len(events), 3)
+            self.assertTrue(any(row["cancel_requested_at"] for row in events))
+            self.assertTrue(all(str(row["object_id"]).startswith(f"scope:{scope}:") for row in events))
+
+    def test_health_persistence_does_not_create_missing_database_or_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            missing = base / "missing.db"
+            result = {
+                "issue_codes": ["template_version_mismatch"],
+                "issues": ["template mismatch"],
+                "fresh_executable_buy": False,
+                "alert_required": True,
+            }
+            self.assertTrue(
+                joinquant_health.persist_health_issue_transitions(
+                    result, missing, datetime(2026, 7, 9, 10, 0),
+                )
+            )
+            self.assertFalse(missing.exists())
+
+            db_file = base / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            self.assertEqual(
+                joinquant_health.persist_health_issue_transitions(
+                    result, db_file, datetime(2026, 7, 9, 10, 0),
+                ),
+                "account scope is not registered",
+            )
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM account_scopes"
+                ).fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM notification_outbox"
+                ).fetchone()[0], 0)
+
+    def test_build_health_report_persists_enabled_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db_file = base / "trading.db"
+            store = TradingStore(db_file)
+            store.initialize()
+            with store.transaction() as conn:
+                store.get_or_create_account_scope(conn, "joinquant", "primary")
+            signal_file = base / "signals.json"
+            snapshot_file = base / "account.json"
+            positions_file = base / "positions.json"
+            signal_file.write_text(json.dumps({
+                "schema_version": 1,
+                "generated_at": "2026-07-09 10:00:00",
+                "signals": [],
+            }), encoding="utf-8")
+            snapshot_file.write_text(json.dumps({
+                "schema_version": 1,
+                "received_at": "2026-07-09 10:00:00",
+                "strategy_template_version": "old",
+                "positions": [],
+                "orders": [],
+            }), encoding="utf-8")
+            positions_file.write_text('{"positions": []}', encoding="utf-8")
+
+            result = joinquant_health.build_health_report(
+                signal_file,
+                snapshot_file,
+                report_file=base / "health.md",
+                now=datetime(2026, 7, 9, 10, 1),
+                positions_file=positions_file,
+                health_history_file=base / "health.jsonl",
+                db_file=db_file,
+                persist_notifications=True,
+            )
+
+            self.assertEqual(result["notification_persist_error"], "")
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    """SELECT COUNT(*) FROM notification_outbox
+                       WHERE object_type='execution_issue'"""
+                ).fetchone()[0], 1)
 if __name__ == "__main__":
     unittest.main()

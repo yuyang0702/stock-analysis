@@ -359,9 +359,8 @@ class ReconciliationTest(unittest.TestCase):
 
         notifier = Mock()
         notifier.send_markdown.return_value = True
-        self.assertTrue(notify_reconciliation(result, controls, notifier=notifier))
-        key = notifier.send_markdown.call_args.kwargs["dedupe_key"]
-        self.assertEqual(key, "reconciliation:IMMUTABLE_FILL_CONFLICT:t-1:0/1")
+        self.assertFalse(notify_reconciliation(result, controls, notifier=notifier))
+        notifier.send_markdown.assert_not_called()
 
     def test_issue_transitions_are_emitted_once_and_recover_once(self) -> None:
         difference = ReconciliationDifference(
@@ -630,6 +629,35 @@ class ReconciliationTest(unittest.TestCase):
             ).fetchone()
         self.assertIsNone(row["recovered_at"])
 
+    def test_matched_snapshot_does_not_recover_health_owned_issue(self) -> None:
+        with self.store.transaction() as conn:
+            scope = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()[0]
+            issue_key = f"scope:{scope}:health:snapshot_stale"
+            self.store.upsert_execution_issue(conn, {
+                "account_scope_id": scope,
+                "issue_key": issue_key,
+                "object_type": "health",
+                "object_id": "snapshot_stale",
+                "state": "SNAPSHOT_STALE",
+                "severity": "ERROR",
+                "stage_started_at": "2026-07-14 09:30:00",
+                "seen_at": "2026-07-14 09:30:00",
+                "details": {},
+            })
+
+        self.assertEqual(self.reconcile(self.payload).result, "matched")
+
+        with self.store.connect() as conn:
+            row = conn.execute(
+                """SELECT recovered_at FROM execution_issue_state
+                   WHERE issue_key=?""",
+                (issue_key,),
+            ).fetchone()
+        self.assertIsNone(row["recovered_at"])
+
     def test_sticky_critical_is_not_downgraded_by_later_warning(self) -> None:
         with self.store.transaction() as conn:
             self.store.upsert_execution_issue(conn, {
@@ -657,12 +685,12 @@ class ReconciliationTest(unittest.TestCase):
         }])
         notifier = Mock()
         notifier.send_markdown.return_value = True
-        self.assertTrue(notify_reconciliation(
+        self.assertFalse(notify_reconciliation(
             result, {"buy_enabled": "0", "kill_switch": "0"}, notifier=notifier
         ))
-        self.assertIn(":ERROR:", notifier.send_markdown.call_args.kwargs["dedupe_key"])
+        notifier.send_markdown.assert_not_called()
 
-    def test_unchanged_error_reminds_only_after_thirty_minutes(self) -> None:
+    def test_unchanged_error_does_not_repeat_after_thirty_minutes(self) -> None:
         difference = ReconciliationDifference(
             "exit_intent", "s-1", "SIGNAL_STALE", "0", "600", 0,
             "ERROR", {"stage_started_at": "2026-07-15 09:00:00"},
@@ -681,9 +709,9 @@ class ReconciliationTest(unittest.TestCase):
             reminders = persist_issue_transitions(
                 self.store, conn, due, "2026-07-15 09:30:00"
             )
-        self.assertEqual(reminders[0]["transition"], "REMINDER")
+        self.assertEqual(reminders, [])
 
-    def test_never_notified_error_waits_thirty_minutes_before_reminder(self) -> None:
+    def test_never_notified_error_still_does_not_repeat(self) -> None:
         difference = ReconciliationDifference(
             "exit_intent", "s-2", "SIGNAL_STALE", "0", "600", 0,
             "ERROR", {"stage_started_at": "2026-07-15 09:00:00"},
@@ -699,7 +727,7 @@ class ReconciliationTest(unittest.TestCase):
             reminders = persist_issue_transitions(
                 self.store, conn, due, "2026-07-15 09:30:00"
             )
-        self.assertEqual(reminders[0]["transition"], "REMINDER")
+        self.assertEqual(reminders, [])
 
     def test_successful_transition_notification_marks_issue_notified(self) -> None:
         difference = ReconciliationDifference(
@@ -708,18 +736,39 @@ class ReconciliationTest(unittest.TestCase):
         )
         with self.store.transaction() as conn:
             result = ReconciliationResult("r-notify", "mismatch", "ERROR", [difference], "", "snap")
+            scope = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()[0]
+            conn.execute(
+                """INSERT INTO reconciliation_runs(
+                   reconciliation_id, mode, snapshot_id, started_at, finished_at,
+                   result, severity, difference_count, control_action,
+                   summary_json, account_scope_id
+                   ) VALUES ('r-notify', 'full', NULL, ?, ?, 'mismatch',
+                   'ERROR', 1, '', '{}', ?)""",
+                ("2026-07-15 09:00:00", "2026-07-15 09:00:00", scope),
+            )
             persist_issue_transitions(self.store, conn, result, "2026-07-15 09:00:00")
         notifier = Mock()
         notifier.send_markdown.return_value = True
-        self.assertTrue(notify_reconciliation(
+        self.assertFalse(notify_reconciliation(
             result, {"buy_enabled": "0", "kill_switch": "0"}, notifier=notifier,
             store=self.store, now="2026-07-15 09:00:01",
         ))
+        notifier.send_markdown.assert_not_called()
         with self.store.connect() as conn:
             notified = conn.execute(
-                "SELECT last_notified_at FROM execution_issue_state WHERE issue_key='exit_intent:s-1'"
+                """SELECT last_notified_at FROM execution_issue_state
+                   WHERE issue_key LIKE '%:exit_intent:s-1'"""
             ).fetchone()[0]
-        self.assertEqual(notified, "2026-07-15 09:00:01")
+            outbox = conn.execute(
+                """SELECT event_key FROM notification_outbox
+                   WHERE object_type='execution_issue'
+                     AND object_id LIKE '%exit_intent:s-1'"""
+            ).fetchall()
+        self.assertIsNone(notified)
+        self.assertEqual(len(outbox), 1)
 
 
 if __name__ == "__main__":

@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-import requests
 import trading_backup
+from notification_outbox import NotificationEvent, notification_event_key
 
 from trading_backup import (
     create_backup,
@@ -26,17 +26,20 @@ from trading_store import SCHEMA_VERSION, TradingStore
 
 
 class TradingBackupTest(unittest.TestCase):
-    def test_schema_v11_backup_contract_requires_all_new_tables_and_columns(self) -> None:
+    def test_schema_v12_backup_contract_requires_all_new_tables_and_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "trading.db"
             self.make_store(path)
             facts = trading_backup.database_facts(path)
-            self.assertEqual(facts["schema_version"], 11)
+            self.assertEqual(facts["schema_version"], SCHEMA_VERSION)
             self.assertTrue({
                 "account_scopes", "broker_snapshot_current",
                 "broker_position_current", "broker_order_current",
                 "strategy_order_candidates", "pre_trade_results",
                 "execution_intents", "capacity_reservations",
+                "position_capacity_adoptions",
+                "notification_outbox", "notification_enqueue_gaps",
+                "logical_signal_plans",
             }.issubset(facts["table_counts"]))
             conn = sqlite3.connect(path)
             try:
@@ -63,6 +66,110 @@ class TradingBackupTest(unittest.TestCase):
             finally:
                 conn.close()
             with self.assertRaisesRegex(RuntimeError, "capacity_reservations"):
+                trading_backup.database_facts(path)
+
+    def test_schema_v11_backup_counts_position_capacity_adoptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            facts = trading_backup.database_facts(path)
+            self.assertEqual(
+                facts["table_counts"]["position_capacity_adoptions"], 0,
+            )
+
+    def test_schema_v12_backup_and_restore_count_notification_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            store = self.make_store(path)
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+                conn.execute(
+                    """INSERT INTO logical_signal_plans(
+                       account_scope_id, trade_date, logical_signal_id,
+                       frozen_valid_until, current_plan_version, updated_at
+                       ) VALUES(?,?,?,?,?,?)""",
+                    (
+                        scope, "2026-07-28", "logical-1",
+                        "2026-07-28T15:00:00+08:00", "plan-1",
+                        "2026-07-28T10:00:00+08:00",
+                    ),
+                )
+                for fill_id, as_gap in (("fill-1", False), ("fill-2", True)):
+                    event = NotificationEvent(
+                        event_key=notification_event_key(
+                            "joinquant", scope, "fill", fill_id=fill_id,
+                        ),
+                        account_scope_id=scope,
+                        adapter="joinquant",
+                        event_type="fill",
+                        object_type="fill",
+                        object_id=fill_id,
+                        source_fact_id=fill_id,
+                        priority="high",
+                        payload_version=1,
+                        occurred_at="2026-07-28T10:00:00+08:00",
+                        expires_at=None,
+                        title="成交回报",
+                        body=f"{fill_id} 成交",
+                        payload={"fill_id": fill_id},
+                        metadata={"renderer": "v1"},
+                    )
+                    if as_gap:
+                        store.enqueue_notification_gap(
+                            conn, event, "capacity", "2026-07-28T10:00:00+08:00",
+                        )
+                    else:
+                        store.enqueue_notification(
+                            conn, event, "2026-07-28T10:00:00+08:00",
+                        )
+            backup = Path(tmp) / "copy.db"
+            store.backup_to(backup)
+            live = trading_backup.database_facts(path)
+            restored = trading_backup.database_facts(backup)
+            self.assertEqual(live["table_counts"], restored["table_counts"])
+            self.assertEqual(restored["table_counts"]["logical_signal_plans"], 1)
+            # The high-priority gap also persists its capacity control event.
+            self.assertEqual(restored["table_counts"]["notification_outbox"], 2)
+            self.assertEqual(restored["table_counts"]["notification_enqueue_gaps"], 1)
+            self.assertEqual(live["notification_health"], restored["notification_health"])
+            self.assertEqual(restored["notification_health"], {
+                "pending": 2,
+                "leased": 0,
+                "sent": 0,
+                "dead": 0,
+                "cancelled": 0,
+                "unresolved_gaps": 1,
+                "high_unresolved_gaps": 1,
+                "dead_detail_rows": 0,
+                "dead_detail_bytes": 0,
+                "high_dead_detail_rows": 0,
+                "high_dead_total_rows": 0,
+                "tombstones": 0,
+                "write_failure_marker": False,
+                "write_failure_requires_manual_resolution": False,
+            })
+
+    def test_schema_v12_backup_rejects_foreign_key_orphans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading.db"
+            self.make_store(path)
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("PRAGMA foreign_keys=OFF")
+                conn.execute(
+                    """INSERT INTO logical_signal_plans(
+                       account_scope_id, trade_date, logical_signal_id,
+                       frozen_valid_until, current_plan_version, updated_at
+                       ) VALUES('missing','2026-07-28','logical-1',
+                                '2026-07-28T15:00:00+00:00','plan-1',
+                                '2026-07-28T02:00:00+00:00')"""
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            with self.assertRaisesRegex(ValueError, "foreign_key_check"):
                 trading_backup.database_facts(path)
 
     def test_schema_v10_backup_contract_remains_supported(self) -> None:
@@ -155,7 +262,7 @@ class TradingBackupTest(unittest.TestCase):
             self.assertEqual(result["status"], "success")
             saved = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(saved["sha256"], result["sha256"])
-            self.assertEqual(saved["table_counts"]["system_state"], 1)
+            self.assertEqual(saved["table_counts"]["system_state"], 2)
             self.assertTrue({
                 "orders", "fills", "account_snapshots", "position_snapshots",
                 "daily_equity", "reconciliation_runs", "reconciliation_items", "control_events",
@@ -241,7 +348,7 @@ class TradingBackupTest(unittest.TestCase):
 
             daily = validated_manifests(root, "daily")
             self.assertEqual(len(daily), 1)
-            self.assertEqual(daily[0]["table_counts"]["system_state"], 2)
+            self.assertEqual(daily[0]["table_counts"]["system_state"], 3)
             self.assertNotEqual(first["sha256"], second["sha256"])
             self.assertFalse(Path(str(first["backup_file"])).exists())
 
@@ -360,11 +467,11 @@ class TradingBackupTest(unittest.TestCase):
             self.assertIn("broken", text)
             self.assertFalse(report.with_suffix(".md.tmp").exists())
 
-    def test_backup_failure_notification_uses_existing_retry_queue(self) -> None:
+    def test_backup_failure_compatibility_send_never_writes_legacy_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             queue = base / "notify_failed_queue.jsonl"
-            with patch("notifier.requests.post", side_effect=requests.RequestException("offline")):
+            with patch("notifier.requests.post") as post:
                 sent = notify_failure(
                     {"command": "backup", "status": "failed", "stage": "verify", "error": "broken"},
                     webhook_url="https://example.invalid/webhook",
@@ -373,9 +480,94 @@ class TradingBackupTest(unittest.TestCase):
                 )
 
             self.assertFalse(sent)
-            rows = [json.loads(line) for line in queue.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["dedupe_key"], "trading-backup:backup:verify")
+            post.assert_not_called()
+            self.assertFalse(queue.exists())
+            self.assertFalse((base / "state.json").exists())
+
+    def test_backup_issue_replay_and_recovery_use_transactional_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_file = Path(tmp) / "trading.db"
+            store = self.make_store(db_file)
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(
+                    conn, "joinquant", "primary",
+                )
+            failed = {
+                "command": "backup",
+                "status": "failed",
+                "stage": "verify",
+                "error_code": "IntegrityError",
+                "error": "secret path must stay local",
+            }
+            first_at = datetime(2026, 7, 15, 16, 30)
+            self.assertEqual(
+                trading_backup.persist_backup_issue_transition(
+                    failed, db_file, first_at,
+                ),
+                "",
+            )
+            self.assertEqual(
+                trading_backup.persist_backup_issue_transition(
+                    failed, db_file, datetime(2026, 7, 15, 16, 31),
+                ),
+                "",
+            )
+            self.assertEqual(
+                trading_backup.persist_backup_issue_transition(
+                    {"command": "backup", "status": "success"},
+                    db_file,
+                    datetime(2026, 7, 15, 16, 32),
+                ),
+                "",
+            )
+            with store.connect() as conn:
+                issue = conn.execute(
+                    """SELECT recovered_at, transition_seq, details_json
+                       FROM execution_issue_state
+                       WHERE issue_key=?""",
+                    (f"scope:{scope}:backup:backup",),
+                ).fetchone()
+                events = conn.execute(
+                    """SELECT state, cancel_requested_at, payload_json
+                       FROM notification_outbox
+                       WHERE object_type='execution_issue'
+                       ORDER BY created_at, event_key"""
+                ).fetchall()
+            self.assertIsNotNone(issue["recovered_at"])
+            self.assertEqual(issue["transition_seq"], 2)
+            self.assertEqual(len(events), 2)
+            self.assertIsNotNone(events[0]["cancel_requested_at"])
+            self.assertIsNone(events[1]["cancel_requested_at"])
+            self.assertNotIn("secret path", "".join(str(row["payload_json"]) for row in events))
+
+    def test_backup_issue_does_not_create_missing_database_or_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            missing = base / "missing.db"
+            result = {
+                "command": "drill", "status": "failed",
+                "stage": "select_backup", "error_code": "ValueError",
+            }
+            self.assertTrue(trading_backup.persist_backup_issue_transition(
+                result, missing, datetime(2026, 7, 15, 3, 30),
+            ))
+            self.assertFalse(missing.exists())
+
+            db_file = base / "trading.db"
+            store = self.make_store(db_file)
+            self.assertEqual(
+                trading_backup.persist_backup_issue_transition(
+                    result, db_file, datetime(2026, 7, 15, 3, 30),
+                ),
+                "account scope is not registered",
+            )
+            with store.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM account_scopes"
+                ).fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM notification_outbox"
+                ).fetchone()[0], 0)
 
     def test_cli_runs_backup_drill_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -390,7 +582,8 @@ class TradingBackupTest(unittest.TestCase):
                 "--report-dir", str(output), "--now", "2026-07-14 16:30:00",
             ])
             drill_code = main([
-                "drill", "--backup-dir", str(backup_root), "--report-dir", str(output),
+                "drill", "--db", str(db_file),
+                "--backup-dir", str(backup_root), "--report-dir", str(output),
                 "--now", "2026-07-15 03:30:00",
             ])
             stdout = io.StringIO()

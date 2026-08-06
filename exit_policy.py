@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 
-EXECUTION_PLAN_VERSION = "2026-07-14.2-p0-execution-contract"
+EXECUTION_PLAN_VERSION = "2026-08-01.1-small-capital-live-risk"
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,10 @@ class PositionExitState:
     take_profit_stage: int
     holding_trade_days: int
     manual_stop_price: float = 0.0
+    profit_protection_activated_at: str = ""
+    trailing_stop_active_from: str = ""
+    decision_batch_at: str = ""
+    qty_step: int = 100
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,47 @@ _BOARD_LIMITS = {
     "growth": (2.5, 0.09),
 }
 _BOARD_RISK_BUDGET = {"main_low": 0.65, "main_active": 0.5, "growth": 0.4}
+
+
+def first_take_profit_target_qty(initial_qty: int, qty_step: int) -> int:
+    if (
+        isinstance(initial_qty, bool)
+        or isinstance(qty_step, bool)
+        or not isinstance(initial_qty, int)
+        or not isinstance(qty_step, int)
+        or initial_qty <= 0
+        or qty_step <= 0
+    ):
+        raise ValueError("initial_qty and qty_step must be positive integers")
+    minimum_remaining = (initial_qty + 1) // 2
+    aligned = ((minimum_remaining + qty_step - 1) // qty_step) * qty_step
+    return min(initial_qty, aligned)
+
+
+def _profit_protection_is_active(state: PositionExitState) -> bool:
+    if not (
+        state.profit_protection_activated_at
+        and state.trailing_stop_active_from
+        and state.decision_batch_at
+    ):
+        return False
+    try:
+        active_from = datetime.fromisoformat(
+            state.trailing_stop_active_from.replace("Z", "+00:00")
+        )
+        decision_at = datetime.fromisoformat(
+            state.decision_batch_at.replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return False
+    if (
+        active_from.tzinfo is None
+        or active_from.utcoffset() is None
+        or decision_at.tzinfo is None
+        or decision_at.utcoffset() is None
+    ):
+        return False
+    return decision_at >= active_from
 
 
 def normalize_exit_action(value: str) -> str:
@@ -148,7 +194,10 @@ def validated_initial_stop_price(
 
 def resolve_effective_stop(state: PositionExitState, market_state: str) -> EffectiveStop:
     trailing_stop = 0.0
-    if state.take_profit_stage >= 1 and state.atr14 > 0:
+    if (
+        (state.take_profit_stage >= 1 or _profit_protection_is_active(state))
+        and state.atr14 > 0
+    ):
         trail_mult = 2.0 if state.mode == "short" else 3.0
         if market_regime(market_state) == "RISK_OFF":
             trail_mult = max(1.5, trail_mult - 0.5)
@@ -249,15 +298,32 @@ def evaluate_exit(
             reason=reason,
         )
 
-    if current_price <= resolved.effective_stop_price:
-        if resolved.source == "trailing":
-            return decision("trailing_stop", 0, "首段止盈后触及移动止盈")
-        if resolved.source == "manual":
+    hard_stop = max(state.initial_stop_price, resolved.manual_stop_price)
+    if current_price <= hard_stop:
+        if resolved.manual_stop_price >= state.initial_stop_price:
             return decision("hard_stop", 0, "现价触及人工上调止损")
         return decision("hard_stop", 0, "现价触及成交校验后的冻结初始止损")
+    if resolved.trailing_stop_price > 0 and current_price <= resolved.trailing_stop_price:
+        return decision("trailing_stop", 0, "首段止盈后触及移动止盈")
     if state.take_profit_stage == 0 and r_multiple >= 2:
-        target_qty = state.initial_qty // 2 // 100 * 100
-        return decision("take_profit_1", target_qty, "达到2R，目标降至初始持仓一半")
+        target_qty = first_take_profit_target_qty(state.initial_qty, state.qty_step)
+        if target_qty > state.current_qty:
+            return decision("hold", None, "current quantity is already below the first target")
+        if target_qty == state.current_qty:
+            if not state.profit_protection_activated_at:
+                return decision(
+                    "activate_profit_protection", None,
+                    "take_profit_1: 达到2R；一手持仓不卖出，激活盈利保护",
+                )
+            return decision("hold", None, "profit protection is already active")
+        sell_qty = state.current_qty - target_qty
+        sell_pct = sell_qty / state.current_qty * 100
+        return decision(
+            "take_profit_1",
+            target_qty,
+            f"take_profit_1: 达到2R；计划卖出{sell_qty}股"
+            f"（占当前持仓{sell_pct:.1f}%），目标保留{target_qty}股",
+        )
 
     stop_days = 3 if state.mode == "short" else 10
     required_progress = 0.5 if state.mode == "short" else 1.0

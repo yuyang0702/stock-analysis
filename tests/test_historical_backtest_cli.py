@@ -4,8 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from historical_backtest import _implementation_hash, _publish_atomic, main
-from historical_data import HistoricalStore
+from historical_backtest import _implementation_hash, _implementation_paths, _publish_atomic, main
+from historical_data import HistoricalStore, strict_table_hash
+from ml_contracts import CandidateSample, TimedFeature
 
 
 class HistoricalBacktestCliTest(unittest.TestCase):
@@ -39,6 +40,221 @@ class HistoricalBacktestCliTest(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertEqual([path.name for path in output.iterdir()], ["historical_backtest_quality.json"])
             self.assertFalse(json.loads((output / "historical_backtest_quality.json").read_text(encoding="utf-8"))["accepted"])
+
+    def test_import_accepts_strict_candidate_and_price_payloads_with_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "history.db"
+            candidate = CandidateSample.from_values(
+                source="strict_history",
+                dataset_id="strict-1",
+                decision_at="2025-01-02T10:00:00+08:00",
+                code="600000",
+                strategy_version="strategy-v1",
+                parameter_version="parameter-v1",
+                feature_schema_version="feature-v1",
+                features={
+                    "score": TimedFeature(80.0, "2025-01-02T10:00:00+08:00"),
+                    "market_regime": TimedFeature("NORMAL", "2025-01-02T10:00:00+08:00"),
+                },
+                selected=True,
+                rejection_stage="selected",
+                rejection_code="",
+                final_action="selected",
+                universe_hash="universe-hash",
+                market_data_version="market-v1",
+                code_hash="code-hash",
+                generator_hash="generator-hash",
+            )
+            candidate_payload = {
+                **candidate.__dict__,
+                "features": {
+                    name: {
+                        "value": feature.value,
+                        "available_at": feature.available_at,
+                    }
+                    for name, feature in candidate.features.items()
+                },
+            }
+            prices = [{
+                "dataset_id": "strict-1",
+                "code": "600000",
+                "bar_at": "2025-01-02T10:05:00+08:00",
+                "available_at": "2025-01-02T10:05:01+08:00",
+                "open": 10.0,
+                "high": 10.2,
+                "low": 9.9,
+                "close": 10.1,
+                "volume": 1000,
+                "amount": 10100,
+                "paused": 0,
+                "limit_up": 11.0,
+                "limit_down": 9.0,
+                "adjustment_version": "raw-v1",
+            }]
+            manifest = {
+                "dataset_id": "strict-1",
+                "source": "strict_history",
+                "strategy_version": "strategy-v1",
+                "parameter_version": "parameter-v1",
+                "feature_schema_version": "feature-v1",
+                "market_data_version": "market-v1",
+                "code_hash": "code-hash",
+                "generator_hash": "generator-hash",
+                "adjustment_version": "raw-v1",
+                "cohorts": {
+                    candidate.decision_at: {
+                        "codes": [candidate.code],
+                        "universe_hash": candidate.universe_hash,
+                    },
+                },
+                "table_hashes": {
+                    "decision_candidates": strict_table_hash(
+                        "decision_candidates", [candidate]
+                    ),
+                    "candidate_prices": strict_table_hash(
+                        "candidate_prices", prices
+                    ),
+                },
+            }
+            candidate_file = root / "candidates.json"
+            price_file = root / "prices.json"
+            manifest_file = root / "manifest.json"
+            candidate_file.write_text(
+                json.dumps([candidate_payload], ensure_ascii=False), encoding="utf-8"
+            )
+            price_file.write_text(
+                json.dumps(prices, ensure_ascii=False), encoding="utf-8"
+            )
+            manifest_file.write_text(
+                json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+            )
+
+            candidate_code = main([
+                "import", "--db", str(db), "--dataset", "strict-1",
+                "--kind", "decision_candidates", "--file", str(candidate_file),
+                "--manifest", str(manifest_file),
+            ])
+            price_code = main([
+                "import", "--db", str(db), "--dataset", "strict-1",
+                "--kind", "candidate_prices", "--file", str(price_file),
+                "--manifest", str(manifest_file),
+            ])
+
+            self.assertEqual(candidate_code, 0)
+            self.assertEqual(price_code, 0)
+            store = HistoricalStore(db)
+            self.assertEqual(store.candidate_cohort("strict-1", candidate.decision_at), [candidate])
+            self.assertEqual(
+                len(store.candidate_price_path(
+                    "strict-1", "600000",
+                    "2025-01-02T10:05:00+08:00",
+                    "2025-01-02T10:05:01+08:00",
+                )),
+                1,
+            )
+
+    def test_replay_command_writes_hash_bound_decision_time_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "history.db"
+            output = root / "output"
+            store = HistoricalStore(db)
+            store.initialize()
+            candidate = CandidateSample.from_values(
+                source="strict_history",
+                dataset_id="strict-1",
+                decision_at="2025-01-02T10:00:00+08:00",
+                code="600000",
+                strategy_version="strategy-v1",
+                parameter_version="parameter-v1",
+                feature_schema_version="feature-v1",
+                features={
+                    "score": TimedFeature(80.0, "2025-01-02T10:00:00+08:00"),
+                    "market_regime": TimedFeature(
+                        "NORMAL", "2025-01-02T10:00:00+08:00"
+                    ),
+                },
+                selected=True,
+                rejection_stage="selected",
+                rejection_code="",
+                final_action="selected",
+                universe_hash="universe-hash",
+                market_data_version="market-v1",
+                code_hash="code-hash",
+                generator_hash="generator-hash",
+            )
+            manifest = {
+                "dataset_id": "strict-1",
+                "source": "strict_history",
+                "strategy_version": "strategy-v1",
+                "parameter_version": "parameter-v1",
+                "feature_schema_version": "feature-v1",
+                "market_data_version": "market-v1",
+                "code_hash": "code-hash",
+                "generator_hash": "generator-hash",
+                "adjustment_version": "raw-v1",
+                "cohorts": {
+                    candidate.decision_at: {
+                        "codes": [candidate.code],
+                        "universe_hash": candidate.universe_hash,
+                    }
+                },
+                "table_hashes": {
+                    "decision_candidates": strict_table_hash(
+                        "decision_candidates", [candidate]
+                    ),
+                    "candidate_prices": "",
+                },
+            }
+            store.import_candidate_cohorts([candidate], manifest=manifest)
+            dataset_hash = store.dataset_hash("strict-1")
+
+            args = [
+                "replay",
+                "--db", str(db),
+                "--dataset", "strict-1",
+                "--start-at", "2025-01-02T09:55:00+08:00",
+                "--end-at", "2025-01-02T10:05:00+08:00",
+                "--output-dir", str(output),
+                "--expected-dataset-hash", dataset_hash,
+                "--strategy-version", "strategy-v1",
+                "--parameter-version", "parameter-v1",
+                "--feature-schema-version", "feature-v1",
+                "--market-data-version", "market-v1",
+                "--code-hash", "code-hash",
+                "--generator-hash", "generator-hash",
+            ]
+            with patch(
+                "historical_strategy.fetch_live_quotes",
+                side_effect=AssertionError("network"),
+            ):
+                code = main(args)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {"historical_decision_replay_latest.json"},
+            )
+            evidence_file = output / "historical_decision_replay_latest.json"
+            first_bytes = evidence_file.read_bytes()
+            self.assertEqual(main(args), 0)
+            self.assertEqual(evidence_file.read_bytes(), first_bytes)
+            payload = json.loads(first_bytes)
+            self.assertEqual(payload["status"], "complete")
+            self.assertEqual(payload["replay_mode"], "decision_time")
+            self.assertEqual(payload["dataset_sha256"], dataset_hash)
+            self.assertEqual(payload["batch_count"], 1)
+            self.assertEqual(payload["candidate_count"], 1)
+            self.assertEqual(payload["selected_count"], 1)
+            self.assertEqual(
+                payload["batches"][0]["decision_at"], candidate.decision_at
+            )
+            with store.connect() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0],
+                    0,
+                )
 
     def test_proxy_run_is_labeled_and_reuses_deterministic_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -117,6 +333,20 @@ class HistoricalBacktestCliTest(unittest.TestCase):
             first = _implementation_hash([code])
             code.write_text("two", encoding="utf-8")
             self.assertNotEqual(first, _implementation_hash([code]))
+
+    def test_implementation_hash_covers_strict_candidate_and_execution_contract(self) -> None:
+        names = {path.name for path in _implementation_paths()}
+        self.assertTrue(
+            {
+                "candidate_core.py",
+                "exit_policy.py",
+                "trade_safety.py",
+                "historical_data.py",
+                "historical_strategy.py",
+                "historical_backtest.py",
+                "ml_contracts.py",
+            }.issubset(names)
+        )
 
     def test_run_failure_is_bounded_and_persisted_without_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

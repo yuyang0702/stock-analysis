@@ -8,10 +8,12 @@ import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
 from pathlib import Path
 from types import MappingProxyType
 from typing import Iterator
+
+import config as app_config
 
 from execution_contracts import (
     BrokerSnapshot,
@@ -21,8 +23,49 @@ from execution_contracts import (
     canonical_json as contract_canonical_json,
     canonical_sha256,
 )
+from notification_outbox import (
+    CapacitySnapshot,
+    DEAD_DETAIL_MAX_BYTES,
+    DEAD_DETAIL_MAX_ROWS,
+    EnqueueResult,
+    HIGH_ACTIVE_MAX_BYTES,
+    HIGH_ACTIVE_MAX_ROWS,
+    NotificationCapacityError,
+    NotificationConflict,
+    NotificationEvent,
+    NORMAL_ACTIVE_MAX_BYTES,
+    NORMAL_ACTIVE_MAX_ROWS,
+    NOTIFICATION_WRITE_FAILURE_KEY,
+    OutboxRecord,
+    body_sha256,
+    critical_trading_minutes,
+    next_critical_reminder_seq,
+    notification_event_key,
+    redact_secret_text,
+)
+from pre_trade_check import AdoptedPositionCapacityEvidence
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
+
+_NOTIFICATION_BYTE_COLUMNS = (
+    "event_key", "account_scope_id", "adapter", "event_type",
+    "object_type", "object_id", "source_fact_id", "priority",
+    "payload_sha256", "payload_json", "title", "body", "body_sha256",
+    "metadata_json", "state", "lease_owner", "lease_until",
+    "next_attempt_at", "occurred_at", "created_at", "expires_at",
+    "sent_at", "cancel_requested_at", "cancel_reason", "terminal_at",
+    "last_error_code", "last_error", "last_ambiguous_at",
+    "last_ambiguous_code",
+)
+_NOTIFICATION_BYTE_EXPRESSION = " + ".join(
+    f"length(CAST(COALESCE({column}, '') AS BLOB))"
+    for column in _NOTIFICATION_BYTE_COLUMNS
+)
+_NOTIFICATION_DETAIL_PREDICATE = (
+    "payload_json IS NOT NULL OR title IS NOT NULL OR body IS NOT NULL "
+    "OR body_sha256 IS NOT NULL OR metadata_json IS NOT NULL "
+    "OR last_error_code IS NOT NULL OR last_error IS NOT NULL"
+)
 
 
 class SignalConflictError(RuntimeError):
@@ -31,6 +74,10 @@ class SignalConflictError(RuntimeError):
 
 class FillConflictError(RuntimeError):
     """Raised when an immutable fill ID is reused for different content."""
+
+
+class OrderConflictError(ValueError):
+    """Raised when one broker order identity resolves to conflicting facts."""
 
 
 def canonical_json(value: str | dict) -> str:
@@ -514,6 +561,10 @@ SCHEMA_V11_TABLES = {
         "industry", "theme", "uncategorized", "status", "created_at",
         "released_at", "release_reason",
     },
+    "position_capacity_adoptions": {
+        "account_scope_id", "position_cycle_id", "stock_code",
+        "payload_sha256", "payload_json", "adopted_at",
+    },
 }
 
 SCHEMA_V11_REQUIRED_COLUMNS = MappingProxyType({
@@ -538,9 +589,48 @@ SCHEMA_V11_REQUIRED_COLUMNS = MappingProxyType({
     ),
 })
 
+SCHEMA_V12_TABLES = {
+    "notification_outbox": {
+        "event_key", "account_scope_id", "adapter", "event_type",
+        "object_type", "object_id", "source_fact_id", "priority",
+        "payload_version", "payload_sha256", "payload_json", "title",
+        "body", "body_sha256", "metadata_json", "state", "lease_owner",
+        "lease_until", "attempt_count", "next_attempt_at", "occurred_at",
+        "created_at", "expires_at", "sent_at", "cancel_requested_at",
+        "cancel_reason", "terminal_at", "last_error_code", "last_error",
+        "ambiguous_attempt_mask", "last_ambiguous_at",
+        "last_ambiguous_code",
+    },
+    "notification_enqueue_gaps": {
+        "event_key", "account_scope_id", "adapter", "payload_sha256",
+        "source_fact_id", "priority", "reason", "occurred_at",
+        "created_at", "resolved_at", "resolution",
+    },
+    "logical_signal_plans": {
+        "account_scope_id", "trade_date", "logical_signal_id",
+        "frozen_valid_until", "current_plan_version", "updated_at",
+    },
+}
+
+SCHEMA_V12_REQUIRED_COLUMNS = MappingProxyType({
+    **SCHEMA_V11_REQUIRED_COLUMNS,
+    **{
+        table: frozenset(columns)
+        for table, columns in SCHEMA_V12_TABLES.items()
+    },
+    "execution_issue_state": (
+        SCHEMA_V11_REQUIRED_COLUMNS["execution_issue_state"]
+        | frozenset({
+            "incident_id", "transition_seq", "critical_trading_minutes",
+            "critical_last_counted_minute", "next_reminder_seq",
+        })
+    ),
+})
+
 SCHEMA_REQUIRED_COLUMNS_BY_VERSION = MappingProxyType({
     10: SCHEMA_V10_REQUIRED_COLUMNS,
     11: SCHEMA_V11_REQUIRED_COLUMNS,
+    12: SCHEMA_V12_REQUIRED_COLUMNS,
 })
 
 SCHEMA_V10_PRIMARY_KEYS = MappingProxyType({
@@ -927,8 +1017,26 @@ SCHEMA_V11_NAMED_INDEXES = {
     "idx_reservations_scope_status": (
         "capacity_reservations", ("account_scope_id", "status"), False, None,
     ),
+    "idx_reservations_scope_created": (
+        "capacity_reservations", ("account_scope_id", "created_at"), False, None,
+    ),
     "idx_broker_orders_scope_status": (
         "broker_order_current", ("account_scope_id", "status"), False, None,
+    ),
+    "idx_position_capacity_adoptions_scope_code": (
+        "position_capacity_adoptions",
+        ("account_scope_id", "stock_code"),
+        False,
+        None,
+    ),
+    "idx_orders_first_submitted": (
+        "orders", ("first_submitted_at",), False, None,
+    ),
+    "idx_orders_updated_at": (
+        "orders", ("updated_at",), False, None,
+    ),
+    "idx_position_cycles_opened_at": (
+        "position_cycles", ("opened_at",), False, None,
     ),
 }
 
@@ -941,6 +1049,9 @@ SCHEMA_V11_PRIMARY_KEYS = {
     "pre_trade_results": ("account_scope_id", "pre_trade_result_id"),
     "execution_intents": ("account_scope_id", "client_order_id"),
     "capacity_reservations": ("account_scope_id", "reservation_id"),
+    "position_capacity_adoptions": (
+        "account_scope_id", "position_cycle_id",
+    ),
 }
 
 SCHEMA_V11_UNIQUE_KEYS = {
@@ -1009,6 +1120,10 @@ SCHEMA_V11_FOREIGN_KEYS = MappingProxyType({
                 "client_order_id", "NO ACTION",
             ),
         ),
+    }),
+    "position_capacity_adoptions": frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+        (("position_cycle_id", "position_cycles", "position_cycle_id", "NO ACTION"),),
     }),
 })
 
@@ -1133,14 +1248,140 @@ SCHEMA_V11_STATEMENTS = (
        FOREIGN KEY(account_scope_id, client_order_id)
            REFERENCES execution_intents(account_scope_id, client_order_id)
        )""",
+    """CREATE TABLE position_capacity_adoptions(
+       account_scope_id TEXT NOT NULL,
+       position_cycle_id TEXT NOT NULL,
+       stock_code TEXT NOT NULL CHECK(length(stock_code) > 0),
+       payload_sha256 TEXT NOT NULL
+           CHECK(length(payload_sha256) = 64
+                 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+       payload_json TEXT NOT NULL CHECK(length(payload_json) > 0),
+       adopted_at TEXT NOT NULL CHECK(length(adopted_at) > 0),
+       PRIMARY KEY(account_scope_id, position_cycle_id),
+       FOREIGN KEY(account_scope_id)
+           REFERENCES account_scopes(account_scope_id),
+       FOREIGN KEY(position_cycle_id)
+           REFERENCES position_cycles(position_cycle_id)
+       )""",
     """CREATE INDEX idx_candidates_scope_signal
        ON strategy_order_candidates(account_scope_id, logical_signal_id)""",
     """CREATE INDEX idx_execution_intents_scope_status
        ON execution_intents(account_scope_id, status)""",
     """CREATE INDEX idx_reservations_scope_status
        ON capacity_reservations(account_scope_id, status)""",
+    """CREATE INDEX idx_reservations_scope_created
+       ON capacity_reservations(account_scope_id, created_at)""",
     """CREATE INDEX idx_broker_orders_scope_status
        ON broker_order_current(account_scope_id, status)""",
+    """CREATE INDEX idx_position_capacity_adoptions_scope_code
+       ON position_capacity_adoptions(account_scope_id, stock_code)""",
+    """CREATE INDEX idx_orders_first_submitted
+       ON orders(first_submitted_at)""",
+    """CREATE INDEX idx_orders_updated_at ON orders(updated_at)""",
+    """CREATE INDEX idx_position_cycles_opened_at
+       ON position_cycles(opened_at)""",
+)
+
+SCHEMA_V12_NAMED_INDEXES = {
+    "idx_notification_due": (
+        "notification_outbox",
+        ("state", "next_attempt_at", "priority", "created_at"),
+        False,
+        None,
+    ),
+    "idx_notification_object": (
+        "notification_outbox", ("object_type", "object_id", "state"),
+        False, None,
+    ),
+}
+
+SCHEMA_V12_PRIMARY_KEYS = {
+    "notification_outbox": ("event_key",),
+    "notification_enqueue_gaps": ("event_key",),
+    "logical_signal_plans": (
+        "account_scope_id", "trade_date", "logical_signal_id",
+    ),
+}
+
+SCHEMA_V12_UNIQUE_KEYS: dict[str, set[tuple[str, ...]]] = {}
+
+SCHEMA_V12_FOREIGN_KEYS = MappingProxyType({
+    table: frozenset({
+        (("account_scope_id", "account_scopes", "account_scope_id", "NO ACTION"),),
+    })
+    for table in SCHEMA_V12_TABLES
+})
+
+SCHEMA_V12_STATEMENTS = (
+    """CREATE TABLE notification_outbox(
+       event_key TEXT PRIMARY KEY,
+       account_scope_id TEXT NOT NULL
+           REFERENCES account_scopes(account_scope_id),
+       adapter TEXT NOT NULL CHECK(adapter IN ('joinquant','qmt')),
+       event_type TEXT NOT NULL,
+       object_type TEXT NOT NULL,
+       object_id TEXT NOT NULL,
+       source_fact_id TEXT NOT NULL,
+       priority TEXT NOT NULL CHECK(priority IN ('normal','high')),
+       payload_version INTEGER NOT NULL CHECK(payload_version > 0),
+       payload_sha256 TEXT NOT NULL
+           CHECK(length(payload_sha256)=64
+                 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+       payload_json TEXT,
+       title TEXT,
+       body TEXT,
+       body_sha256 TEXT,
+       metadata_json TEXT,
+       state TEXT NOT NULL
+           CHECK(state IN ('pending','leased','sent','dead','cancelled')),
+       lease_owner TEXT,
+       lease_until TEXT,
+       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+       next_attempt_at TEXT,
+       occurred_at TEXT NOT NULL,
+       created_at TEXT NOT NULL,
+       expires_at TEXT,
+       sent_at TEXT,
+       cancel_requested_at TEXT,
+       cancel_reason TEXT,
+       terminal_at TEXT,
+       last_error_code TEXT,
+       last_error TEXT,
+       ambiguous_attempt_mask INTEGER NOT NULL DEFAULT 0
+           CHECK(ambiguous_attempt_mask >= 0),
+       last_ambiguous_at TEXT,
+       last_ambiguous_code TEXT
+       )""",
+    """CREATE INDEX idx_notification_due
+       ON notification_outbox(state, next_attempt_at, priority, created_at)""",
+    """CREATE INDEX idx_notification_object
+       ON notification_outbox(object_type, object_id, state)""",
+    """CREATE TABLE notification_enqueue_gaps(
+       event_key TEXT PRIMARY KEY,
+       account_scope_id TEXT NOT NULL
+           REFERENCES account_scopes(account_scope_id),
+       adapter TEXT NOT NULL CHECK(adapter IN ('joinquant','qmt')),
+       payload_sha256 TEXT NOT NULL
+           CHECK(length(payload_sha256)=64
+                 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+       source_fact_id TEXT NOT NULL,
+       priority TEXT NOT NULL CHECK(priority IN ('normal','high')),
+       reason TEXT NOT NULL,
+       occurred_at TEXT NOT NULL,
+       created_at TEXT NOT NULL,
+       resolved_at TEXT,
+       resolution TEXT
+       )""",
+    """CREATE TABLE logical_signal_plans(
+       account_scope_id TEXT NOT NULL
+           REFERENCES account_scopes(account_scope_id),
+       trade_date TEXT NOT NULL,
+       logical_signal_id TEXT NOT NULL,
+       frozen_valid_until TEXT NOT NULL,
+       current_plan_version TEXT NOT NULL,
+       updated_at TEXT NOT NULL,
+       PRIMARY KEY(account_scope_id, trade_date, logical_signal_id)
+       )""",
 )
 
 
@@ -1230,11 +1471,23 @@ class TradingStore:
                         f"database schema {current_version} is newer than supported {SCHEMA_VERSION}"
                     )
                 if current_version == SCHEMA_VERSION:
+                    self._validate_schema_v12(conn)
+                    self._ensure_schema_v11_defaults(conn)
+                    return
+                if current_version == 11:
                     self._validate_schema_v11(conn)
+                    self._migrate_schema_v12(conn)
                     return
                 if current_version == 10:
                     validate_schema_contract(conn, 10)
                     self._migrate_schema_v11(conn)
+                    migrated = int(
+                        conn.execute(
+                            "SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0] or 0
+                    )
+                    if migrated == 11:
+                        self._migrate_schema_v12(conn)
                     return
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA_V1)
@@ -1293,17 +1546,25 @@ class TradingStore:
             conn.commit()
             validate_schema_contract(conn, 10)
             self._migrate_schema_v11(conn)
+            migrated = int(
+                conn.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0] or 0
+            )
+            if migrated == 11:
+                self._migrate_schema_v12(conn)
 
     def _migrate_schema_v11(self, conn: sqlite3.Connection) -> None:
         current_version = int(
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0
         )
-        if current_version > SCHEMA_VERSION:
+        if current_version > 11:
             raise RuntimeError(
-                f"database schema {current_version} is newer than supported {SCHEMA_VERSION}"
+                f"database schema {current_version} is newer than supported 11"
             )
-        if current_version == SCHEMA_VERSION:
+        if current_version == 11:
             self._validate_schema_v11(conn)
+            self._ensure_schema_v11_defaults(conn)
             return
         if current_version != 10:
             raise RuntimeError(f"schema 11 migration requires schema 10, got {current_version}")
@@ -1341,6 +1602,7 @@ class TradingStore:
                 conn.execute(
                     "ALTER TABLE position_cycles ADD COLUMN trailing_stop_active_from TEXT"
                 )
+            self._ensure_schema_v11_defaults(conn)
             conn.execute(
                 """INSERT INTO schema_migrations(version, applied_at)
                    VALUES(11, datetime('now'))"""
@@ -1351,6 +1613,67 @@ class TradingStore:
             raise
         else:
             conn.commit()
+
+    def _migrate_schema_v12(self, conn: sqlite3.Connection) -> None:
+        current_version = int(
+            conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0] or 0
+        )
+        if current_version > 12:
+            raise RuntimeError(
+                f"database schema {current_version} is newer than supported 12"
+            )
+        if current_version == 12:
+            self._validate_schema_v12(conn)
+            return
+        if current_version != 11:
+            raise RuntimeError(
+                f"schema 12 migration requires schema 11, got {current_version}"
+            )
+        self._validate_schema_v11(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in SCHEMA_V12_STATEMENTS:
+                conn.execute(statement)
+            issue_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(execution_issue_state)"
+                )
+            }
+            additions = {
+                "incident_id": "TEXT NOT NULL DEFAULT ''",
+                "transition_seq": "INTEGER NOT NULL DEFAULT 0",
+                "critical_trading_minutes": "INTEGER NOT NULL DEFAULT 0",
+                "critical_last_counted_minute": "TEXT",
+                "next_reminder_seq": "INTEGER NOT NULL DEFAULT 1",
+            }
+            for column, declaration in additions.items():
+                if column not in issue_columns:
+                    conn.execute(
+                        f"ALTER TABLE execution_issue_state "
+                        f"ADD COLUMN {column} {declaration}"
+                    )
+            conn.execute(
+                """INSERT INTO schema_migrations(version, applied_at)
+                   VALUES(12, datetime('now'))"""
+            )
+            self._validate_schema_v12(conn)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
+    @staticmethod
+    def _ensure_schema_v11_defaults(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """INSERT OR IGNORE INTO system_state(
+               key, value, updated_at, reason
+               ) VALUES('sell_enabled', '1', datetime('now'),
+                        'schema-v11 default')"""
+        )
 
     @staticmethod
     def _validate_schema_v11(conn: sqlite3.Connection) -> None:
@@ -1446,6 +1769,92 @@ class TradingStore:
                     f"schema 11 table {table} has invalid foreign keys"
                 )
 
+    @staticmethod
+    def _validate_schema_v12(conn: sqlite3.Connection) -> None:
+        TradingStore._validate_schema_v11(conn)
+        validate_schema_contract(conn, 12)
+        for table, expected_primary_key in SCHEMA_V12_PRIMARY_KEYS.items():
+            table_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            primary_key = tuple(
+                str(row[1])
+                for row in sorted(
+                    (row for row in table_info if int(row[5]) > 0),
+                    key=lambda row: int(row[5]),
+                )
+            )
+            expected_index = tuple(
+                (column, False, "BINARY") for column in expected_primary_key
+            )
+            if (
+                primary_key != expected_primary_key
+                or _primary_key_index_signature(
+                    conn, table, table_info,
+                ) != expected_index
+            ):
+                raise RuntimeError(
+                    f"schema 12 table {table} has invalid primary key"
+                )
+            if _unique_index_signatures(conn, table) != (
+                _expected_unique_index_signatures(
+                    table,
+                    SCHEMA_V12_UNIQUE_KEYS,
+                    SCHEMA_V12_NAMED_INDEXES,
+                )
+            ):
+                raise RuntimeError(
+                    f"schema 12 table {table} has invalid unique indexes"
+                )
+        for index_name, (
+            expected_table, expected_columns, expected_unique, expected_where,
+        ) in SCHEMA_V12_NAMED_INDEXES.items():
+            index_row = conn.execute(
+                """SELECT tbl_name FROM sqlite_master
+                   WHERE type='index' AND name=?""",
+                (index_name,),
+            ).fetchone()
+            table_index = next(
+                (
+                    row for row in conn.execute(
+                        f"PRAGMA index_list({expected_table})"
+                    )
+                    if str(row[1]) == index_name
+                ),
+                None,
+            )
+            if (
+                index_row is None
+                or str(index_row[0]) != expected_table
+                or _index_key_signature(conn, index_name) != tuple(
+                    (column, False, "BINARY")
+                    for column in expected_columns
+                )
+                or table_index is None
+                or bool(table_index[2]) != expected_unique
+                or bool(table_index[4]) != (expected_where is not None)
+                or _index_predicate(conn, index_name)
+                != _normalize_index_predicate(expected_where)
+            ):
+                raise RuntimeError(
+                    f"schema 12 index {index_name} is invalid"
+                )
+        for table, expected_groups in SCHEMA_V12_FOREIGN_KEYS.items():
+            grouped: dict[int, list[sqlite3.Row]] = {}
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
+                grouped.setdefault(int(row[0]), []).append(row)
+            actual_groups = {
+                tuple(
+                    (
+                        str(row[3]), str(row[2]), str(row[4]), str(row[6]),
+                    )
+                    for row in sorted(rows, key=lambda item: int(item[1]))
+                )
+                for rows in grouped.values()
+            }
+            if actual_groups != expected_groups:
+                raise RuntimeError(
+                    f"schema 12 table {table} has invalid foreign keys"
+                )
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self.connect() as conn:
@@ -1492,8 +1901,8 @@ class TradingStore:
             with self.connect() as conn:
                 version = int(conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] or 0)
                 conn.execute("SELECT 1").fetchone()
-                if version == 11:
-                    self._validate_schema_v11(conn)
+                if version == 12:
+                    self._validate_schema_v12(conn)
             return StoreHealth(ok=version == SCHEMA_VERSION, schema_version=version)
         except Exception as exc:
             return StoreHealth(ok=False, schema_version=version, error=str(exc))
@@ -1543,6 +1952,13 @@ class TradingStore:
         return text
 
     @staticmethod
+    def _bounded_text(value: object, name: str, max_bytes: int) -> str:
+        text = TradingStore._required_text(value, name)
+        if len(text.encode("utf-8")) > max_bytes:
+            raise ValueError(f"{name} exceeds {max_bytes} UTF-8 bytes")
+        return text
+
+    @staticmethod
     def _aware_timestamp(value: object, name: str) -> str:
         text = TradingStore._required_text(value, name)
         try:
@@ -1552,6 +1968,36 @@ class TradingStore:
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError(f"{name} must include a timezone")
         return parsed.isoformat()
+
+    @staticmethod
+    def _notification_timestamp(value: object, name: str) -> str:
+        return datetime.fromisoformat(
+            TradingStore._aware_timestamp(value, name)
+        ).astimezone(timezone.utc).isoformat()
+
+    @staticmethod
+    def _shanghai_timestamp(value: object, name: str) -> str:
+        text = TradingStore._required_text(value, name)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a valid timestamp") from exc
+        shanghai = timezone(timedelta(hours=8))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=shanghai)
+        else:
+            parsed = parsed.astimezone(shanghai)
+        return parsed.isoformat(timespec="seconds")
+
+    @staticmethod
+    def _critical_minute_boundary(value: object, *, ceiling: bool) -> str:
+        parsed = datetime.fromisoformat(
+            TradingStore._shanghai_timestamp(value, "critical minute")
+        )
+        boundary = parsed.replace(second=0, microsecond=0)
+        if ceiling and parsed > boundary:
+            boundary += timedelta(minutes=1)
+        return boundary.isoformat(timespec="seconds")
 
     @staticmethod
     def _timestamp_instant(value: object, name: str) -> datetime:
@@ -1608,6 +2054,1269 @@ class TradingStore:
         return account_scope_id
 
     @staticmethod
+    def registered_account_scope(
+        conn: sqlite3.Connection,
+        adapter: str,
+        scope_alias: str,
+    ) -> str:
+        row = conn.execute(
+            """SELECT account_scope_id FROM account_scopes
+               WHERE adapter=? AND scope_alias=?""",
+            (str(adapter).strip().lower(), str(scope_alias).strip()),
+        ).fetchone()
+        if row is None:
+            raise ValueError("account scope is not registered")
+        return str(row[0])
+
+    def insert_control_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        action: str,
+        operator: str,
+        old_value: str,
+        new_value: str,
+        reason: str,
+        created_at: str,
+        reconciliation_id: str | None = None,
+        account_scope_id: str | None = None,
+        _capacity_reconcile: bool = True,
+    ) -> str:
+        if not conn.in_transaction:
+            raise ValueError("control event requires a caller-owned transaction")
+        event_id = self._required_text(event_id, "event_id")
+        action = self._required_text(action, "action")
+        operator = redact_secret_text(self._required_text(operator, "operator"))
+        reason = redact_secret_text(self._bounded_text(reason, "reason", 4096))
+        occurred_at = self._shanghai_timestamp(created_at, "created_at")
+        scope = account_scope_id or self.registered_account_scope(
+            conn, "joinquant", "primary",
+        )
+        scope_row = conn.execute(
+            "SELECT adapter FROM account_scopes WHERE account_scope_id=?",
+            (scope,),
+        ).fetchone()
+        if scope_row is None:
+            raise ValueError("account scope is not registered")
+        adapter = str(scope_row["adapter"])
+        self._require_notification_scope(conn, scope, adapter)
+        linked = reconciliation_id
+        if linked and conn.execute(
+            "SELECT 1 FROM reconciliation_runs WHERE reconciliation_id=?",
+            (linked,),
+        ).fetchone() is None:
+            linked = None
+        existing = conn.execute(
+            "SELECT * FROM control_events WHERE event_id=?", (event_id,),
+        ).fetchone()
+        values = (
+            action, operator, str(old_value), str(new_value), reason,
+            linked, occurred_at,
+        )
+        if existing is not None:
+            actual = tuple(existing[name] for name in (
+                "action", "operator", "old_value", "new_value", "reason",
+                "reconciliation_id", "created_at",
+            ))
+            if actual != values:
+                raise ValueError("control event immutable ID conflict")
+        else:
+            conn.execute(
+                """INSERT INTO control_events(
+                   event_id, action, operator, old_value, new_value, reason,
+                   reconciliation_id, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (event_id, *values),
+            )
+        event = NotificationEvent(
+            event_key=notification_event_key(
+                adapter, scope, "control", control_event_id=event_id,
+            ),
+            account_scope_id=scope,
+            adapter=adapter,
+            event_type="control",
+            object_type="control_event",
+            object_id=event_id,
+            source_fact_id=event_id,
+            priority="high",
+            payload_version=1,
+            occurred_at=occurred_at,
+            expires_at=None,
+            title=f"{adapter.upper()} 交易控制状态变化",
+            body=(
+                f"> action={action} | {old_value} -> {new_value}\n"
+                f"> operator={operator} | reason={reason[:240]}\n"
+                f"> 业务时间：{occurred_at}"
+            ),
+            payload={
+                "action": action,
+                "old_value": str(old_value),
+                "new_value": str(new_value),
+                "operator": operator,
+                "reason": reason,
+                "reconciliation_id": linked or "",
+            },
+            metadata={"renderer": "control-v1"},
+        )
+        self.enqueue_notification_or_gap(
+            conn, event, occurred_at,
+            _capacity_reconcile=_capacity_reconcile,
+        )
+        return event_id
+
+    @staticmethod
+    def _require_notification_scope(
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+        adapter: str,
+    ) -> None:
+        row = conn.execute(
+            "SELECT adapter FROM account_scopes WHERE account_scope_id=?",
+            (account_scope_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("account scope is not registered")
+        if str(row[0]) != adapter:
+            raise ValueError("notification adapter does not match account scope")
+
+    @staticmethod
+    def _insert_notification_row(
+        conn: sqlite3.Connection,
+        event: NotificationEvent,
+        created_at: str,
+        payload_hash: str,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO notification_outbox(
+               event_key, account_scope_id, adapter, event_type, object_type,
+               object_id, source_fact_id, priority, payload_version,
+               payload_sha256, payload_json, title, body, body_sha256,
+               metadata_json, state, attempt_count, next_attempt_at,
+               occurred_at, created_at, expires_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,?,?,?)""",
+            (
+                event.event_key, event.account_scope_id, event.adapter,
+                event.event_type, event.object_type, event.object_id,
+                event.source_fact_id, event.priority, event.payload_version,
+                payload_hash, contract_canonical_json(event.payload),
+                event.title, event.body, body_sha256(event.body),
+                contract_canonical_json(event.metadata), created_at,
+                event.occurred_at, created_at, event.expires_at,
+            ),
+        )
+
+    def cleanup_notifications(
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+    ) -> dict[str, int]:
+        if not conn.in_transaction:
+            raise ValueError("notification cleanup requires a caller-owned transaction")
+        now_text = self._notification_timestamp(now, "now")
+        instant = datetime.fromisoformat(now_text)
+        body_cutoff = (instant - timedelta(days=30)).isoformat()
+        sent_cutoff = (instant - timedelta(days=366)).isoformat()
+        terminal_cutoff = (instant - timedelta(days=30)).isoformat()
+        counts = {"cancelled": 0, "cancel_requested": 0, "compacted": 0}
+
+        counts["cancelled"] = conn.execute(
+            """UPDATE notification_outbox
+               SET state='cancelled', terminal_at=?,
+                   cancel_requested_at=COALESCE(cancel_requested_at, ?),
+                   cancel_reason=COALESCE(
+                     cancel_reason,
+                     CASE WHEN expires_at IS NOT NULL AND expires_at<=?
+                          THEN 'NOTIFICATION_EXPIRED' ELSE 'CANCEL_REQUESTED' END
+                   ),
+                   lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL
+               WHERE priority='normal' AND state='pending'
+                 AND (cancel_requested_at IS NOT NULL
+                      OR (expires_at IS NOT NULL AND expires_at<=?))""",
+            (now_text, now_text, now_text, now_text),
+        ).rowcount
+        counts["cancel_requested"] = conn.execute(
+            """UPDATE notification_outbox
+               SET cancel_requested_at=COALESCE(cancel_requested_at, ?),
+                   cancel_reason=COALESCE(
+                     cancel_reason,
+                     CASE WHEN expires_at IS NOT NULL AND expires_at<=?
+                          THEN 'NOTIFICATION_EXPIRED' ELSE 'CANCEL_REQUESTED' END
+                   )
+               WHERE priority='normal' AND state='leased'
+                 AND (cancel_requested_at IS NOT NULL
+                      OR (expires_at IS NOT NULL AND expires_at<=?))""",
+            (now_text, now_text, now_text),
+        ).rowcount
+
+        conn.execute(
+            """UPDATE notification_outbox SET body=NULL, body_sha256=NULL
+               WHERE state='sent' AND body IS NOT NULL
+                 AND COALESCE(sent_at, terminal_at, created_at)<=?""",
+            (body_cutoff,),
+        )
+        counts["compacted"] += conn.execute(
+            """UPDATE notification_outbox
+               SET payload_json=NULL, title=NULL, body=NULL,
+                   body_sha256=NULL, metadata_json=NULL,
+                   last_error_code=NULL, last_error=NULL
+               WHERE state='sent'
+                 AND COALESCE(sent_at, terminal_at, created_at)<=?
+                 AND (payload_json IS NOT NULL OR title IS NOT NULL
+                      OR body IS NOT NULL OR metadata_json IS NOT NULL
+                      OR last_error_code IS NOT NULL OR last_error IS NOT NULL)""",
+            (sent_cutoff,),
+        ).rowcount
+        counts["compacted"] += conn.execute(
+            """UPDATE notification_outbox
+               SET payload_json=NULL, title=NULL, body=NULL,
+                   body_sha256=NULL, metadata_json=NULL,
+                   last_error_code=NULL, last_error=NULL
+               WHERE state IN ('dead','cancelled')
+                 AND COALESCE(terminal_at, created_at)<=?
+                 AND (payload_json IS NOT NULL OR title IS NOT NULL
+                      OR body IS NOT NULL OR metadata_json IS NOT NULL
+                      OR last_error_code IS NOT NULL OR last_error IS NOT NULL)""",
+            (terminal_cutoff,),
+        ).rowcount
+
+        counts["compacted"] += self._compact_dead_notification_details(conn)
+        return counts
+
+    def _compact_dead_notification_details(
+        self,
+        conn: sqlite3.Connection,
+    ) -> int:
+        """Keep detailed dead rows within both the row and byte budgets.
+
+        This helper is intentionally callable after any transaction that turns a
+        row into ``dead``.  Running it only at the beginning of a later cleanup
+        cycle leaves a brief but observable capacity violation and can make a
+        high-priority dead row block recovery.
+        """
+        capacity = self.notification_capacity(conn)
+        if (
+            capacity.dead_rows <= DEAD_DETAIL_MAX_ROWS
+            and capacity.dead_bytes <= DEAD_DETAIL_MAX_BYTES
+        ):
+            return 0
+        details = conn.execute(
+            f"""SELECT event_key,
+                       32 + {_NOTIFICATION_BYTE_EXPRESSION} AS byte_count
+                FROM notification_outbox
+                WHERE state='dead' AND ({_NOTIFICATION_DETAIL_PREDICATE})
+                ORDER BY CASE priority WHEN 'normal' THEN 0 ELSE 1 END,
+                         COALESCE(terminal_at, created_at), event_key"""
+        ).fetchall()
+        rows_left = capacity.dead_rows
+        bytes_left = capacity.dead_bytes
+        compacted = 0
+        for row in details:
+            if (
+                rows_left <= DEAD_DETAIL_MAX_ROWS
+                and bytes_left <= DEAD_DETAIL_MAX_BYTES
+            ):
+                break
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET payload_json=NULL, title=NULL, body=NULL,
+                       body_sha256=NULL, metadata_json=NULL,
+                       last_error_code=NULL, last_error=NULL
+                   WHERE event_key=? AND state='dead'""",
+                (str(row["event_key"]),),
+            ).rowcount
+            if changed:
+                rows_left -= 1
+                bytes_left -= int(row["byte_count"] or 0)
+                compacted += 1
+        return compacted
+
+    def _check_notification_capacity_after_insert(
+        self,
+        conn: sqlite3.Connection,
+        event: NotificationEvent,
+    ) -> CapacitySnapshot:
+        snapshot = self.notification_capacity(conn)
+        if event.priority == "normal":
+            rows, bytes_used = (
+                snapshot.normal_active_rows, snapshot.normal_active_bytes,
+            )
+            max_rows, max_bytes = NORMAL_ACTIVE_MAX_ROWS, NORMAL_ACTIVE_MAX_BYTES
+        else:
+            rows, bytes_used = snapshot.high_active_rows, snapshot.high_active_bytes
+            max_rows, max_bytes = HIGH_ACTIVE_MAX_ROWS, HIGH_ACTIVE_MAX_BYTES
+        if rows <= max_rows and bytes_used <= max_bytes:
+            return snapshot
+        conn.execute(
+            "DELETE FROM notification_outbox WHERE event_key=? AND state='pending'",
+            (event.event_key,),
+        )
+        raise NotificationCapacityError(
+            f"{event.priority} active capacity exceeded: "
+            f"rows={rows}/{max_rows},bytes={bytes_used}/{max_bytes}"
+        )
+
+    def _run_notification_capacity_reconcile(
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+    ) -> None:
+        from trading_control import reconcile_notification_capacity
+
+        reconcile_notification_capacity(
+            self, conn, now=now, cycle_id=None,
+        )
+
+    def probe_notification_write_failure(
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+    ) -> bool:
+        """Clear a recoverable write-failure marker after a successful DB write.
+
+        A normal-priority outbox failure is recoverable once a later worker
+        transaction can write this state row.  A high-priority failure that
+        could not write either the outbox row or its enqueue gap is deliberately
+        sticky and requires an explicit operator resolution.
+        """
+        if not conn.in_transaction:
+            raise ValueError(
+                "notification write-failure probe requires a caller-owned transaction"
+            )
+        row = conn.execute(
+            "SELECT value FROM system_state WHERE key=?",
+            (NOTIFICATION_WRITE_FAILURE_KEY,),
+        ).fetchone()
+        if row is None or not str(row[0] or "").strip():
+            return False
+        try:
+            marker = json.loads(str(row[0]))
+        except (TypeError, ValueError, RecursionError):
+            return False
+        if not isinstance(marker, dict) or bool(
+            marker.get("requires_manual_resolution")
+        ):
+            return False
+        probe_key = f"notification_write_probe:{uuid.uuid4().hex}"
+        conn.execute(
+            """INSERT INTO system_state(key, value, updated_at, reason)
+               VALUES (?, 'ok', datetime('now'), 'notification outbox writable probe')""",
+            (probe_key,),
+        )
+        conn.execute("DELETE FROM system_state WHERE key=?", (probe_key,))
+        self.set_system_state(
+            conn,
+            NOTIFICATION_WRITE_FAILURE_KEY,
+            "",
+            f"notification outbox writable probe recovered at {self._notification_timestamp(now, 'now')}",
+        )
+        return True
+
+    def resolve_notification_write_failure(
+        self,
+        conn: sqlite3.Connection,
+        expected_event_key: str,
+        resolution: str,
+    ) -> bool:
+        """Explicitly clear a sticky notification write-failure marker."""
+        if not conn.in_transaction:
+            raise ValueError(
+                "notification write-failure resolution requires a caller-owned transaction"
+            )
+        resolution_text = redact_secret_text(
+            self._bounded_text(resolution, "resolution", 1024)
+        )
+        row = conn.execute(
+            "SELECT value FROM system_state WHERE key=?",
+            (NOTIFICATION_WRITE_FAILURE_KEY,),
+        ).fetchone()
+        if row is None or not str(row[0] or "").strip():
+            return False
+        try:
+            marker = json.loads(str(row[0]))
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("notification write-failure marker is invalid") from exc
+        if not isinstance(marker, dict) or str(
+            marker.get("event_key") or ""
+        ) != self._required_text(expected_event_key, "expected_event_key"):
+            raise ValueError("notification write-failure marker does not match expected event")
+        self.set_system_state(
+            conn,
+            NOTIFICATION_WRITE_FAILURE_KEY,
+            "",
+            f"manual notification outbox write-failure resolution: {resolution_text}",
+        )
+        return True
+
+    def _record_notification_write_failure(
+        self,
+        conn: sqlite3.Connection,
+        event: NotificationEvent,
+        now: str,
+        error: BaseException,
+    ) -> None:
+        existing_row = conn.execute(
+            "SELECT value FROM system_state WHERE key=?",
+            (NOTIFICATION_WRITE_FAILURE_KEY,),
+        ).fetchone()
+        if existing_row is not None and str(existing_row[0] or "").strip():
+            try:
+                existing = json.loads(str(existing_row[0]))
+            except (TypeError, ValueError, RecursionError):
+                existing = {}
+            if isinstance(existing, dict) and bool(
+                existing.get("requires_manual_resolution")
+            ):
+                # Never overwrite an unresolved high-priority identity.
+                return
+        now_text = self._notification_timestamp(now, "now")
+        marker = {
+            "version": 1,
+            "adapter": event.adapter,
+            "event_key": event.event_key,
+            "object_type": event.object_type,
+            "object_id": event.object_id,
+            "source_fact_id": event.source_fact_id,
+            "payload_sha256": event.semantic_payload_sha256,
+            "failed_at": now_text,
+            "priority": event.priority,
+            "error_code": type(error).__name__,
+            "requires_manual_resolution": event.priority == "high",
+        }
+        self.set_system_state(
+            conn,
+            NOTIFICATION_WRITE_FAILURE_KEY,
+            json.dumps(marker, ensure_ascii=False, sort_keys=True),
+            "notification outbox write failure",
+        )
+
+    def _clear_recoverable_notification_write_failure(
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+    ) -> None:
+        self.probe_notification_write_failure(conn, now)
+
+    def enqueue_notification(
+        self,
+        conn: sqlite3.Connection,
+        event: NotificationEvent,
+        now: str,
+        *,
+        _capacity_reconcile: bool = True,
+    ) -> EnqueueResult:
+        if not conn.in_transaction:
+            raise ValueError("notification enqueue requires a caller-owned transaction")
+        if not isinstance(event, NotificationEvent):
+            raise ValueError("event must be a NotificationEvent")
+        created_at = self._notification_timestamp(now, "now")
+        self._require_notification_scope(
+            conn, event.account_scope_id, event.adapter,
+        )
+        self.cleanup_notifications(conn, created_at)
+        payload_hash = event.semantic_payload_sha256
+        existing = conn.execute(
+            """SELECT payload_sha256, state FROM notification_outbox
+               WHERE event_key=?""",
+            (event.event_key,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload_sha256"]) != payload_hash:
+                raise NotificationConflict(
+                    f"notification event key conflict: {event.event_key}"
+                )
+            result = EnqueueResult(
+                event.event_key, False, payload_hash, str(existing["state"]),
+            )
+            self._clear_recoverable_notification_write_failure(conn, created_at)
+            if _capacity_reconcile:
+                self._run_notification_capacity_reconcile(conn, created_at)
+            return result
+        if conn.execute(
+            "SELECT 1 FROM notification_enqueue_gaps WHERE event_key=?",
+            (event.event_key,),
+        ).fetchone() is not None:
+            raise NotificationConflict(
+                f"notification gap requires explicit repair: {event.event_key}"
+            )
+        self._insert_notification_row(conn, event, created_at, payload_hash)
+        self._check_notification_capacity_after_insert(conn, event)
+        self._clear_recoverable_notification_write_failure(conn, created_at)
+        if _capacity_reconcile:
+            self._run_notification_capacity_reconcile(conn, created_at)
+        return EnqueueResult(event.event_key, True, payload_hash, "pending")
+
+    def enqueue_notification_or_gap(
+        self,
+        conn: sqlite3.Connection,
+        event: NotificationEvent,
+        now: str,
+        *,
+        _capacity_reconcile: bool = True,
+    ) -> EnqueueResult | None:
+        if not conn.in_transaction:
+            raise ValueError("notification enqueue requires a caller-owned transaction")
+        self._require_notification_scope(
+            conn, event.account_scope_id, event.adapter,
+        )
+        gap = conn.execute(
+            """SELECT payload_sha256, source_fact_id, resolved_at
+               FROM notification_enqueue_gaps WHERE event_key=?""",
+            (event.event_key,),
+        ).fetchone()
+        if gap is not None:
+            if (
+                str(gap["payload_sha256"]) != event.semantic_payload_sha256
+                or str(gap["source_fact_id"]) != event.source_fact_id
+            ):
+                raise NotificationConflict(
+                    f"notification gap key conflict: {event.event_key}"
+                )
+            if gap["resolved_at"] is None:
+                self._clear_recoverable_notification_write_failure(conn, now)
+                if event.priority == "high" and _capacity_reconcile:
+                    self._run_notification_capacity_reconcile(conn, now)
+                return None
+            existing = conn.execute(
+                """SELECT payload_sha256, source_fact_id, state
+                   FROM notification_outbox WHERE event_key=?""",
+                (event.event_key,),
+            ).fetchone()
+            if existing is None:
+                if event.priority == "high" and _capacity_reconcile:
+                    self._run_notification_capacity_reconcile(conn, now)
+                return None
+            if (
+                str(existing["payload_sha256"]) != event.semantic_payload_sha256
+                or str(existing["source_fact_id"]) != event.source_fact_id
+            ):
+                raise NotificationConflict(
+                    f"notification event key conflict: {event.event_key}"
+                )
+            result = EnqueueResult(
+                event.event_key,
+                False,
+                event.semantic_payload_sha256,
+                str(existing["state"]),
+            )
+            self._clear_recoverable_notification_write_failure(conn, now)
+            if _capacity_reconcile:
+                self._run_notification_capacity_reconcile(conn, now)
+            return result
+        savepoint = f"notification_enqueue_{uuid.uuid4().hex}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            result = self.enqueue_notification(
+                conn, event, now,
+                _capacity_reconcile=_capacity_reconcile,
+            )
+        except (NotificationCapacityError, sqlite3.Error) as exc:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+            conn.execute(f"RELEASE {savepoint}")
+            if isinstance(exc, NotificationCapacityError):
+                if event.priority == "high":
+                    self.enqueue_notification_gap(
+                        conn,
+                        event,
+                        f"capacity:{str(exc)[:900]}",
+                        now,
+                        _capacity_reconcile=False,
+                    )
+                    if _capacity_reconcile:
+                        self._run_notification_capacity_reconcile(conn, now)
+                return None
+
+            gap_recorded = False
+            if event.priority == "high":
+                try:
+                    self.enqueue_notification_gap(
+                        conn,
+                        event,
+                        f"write_failure:{type(exc).__name__}",
+                        now,
+                        _capacity_reconcile=False,
+                    )
+                    gap_recorded = True
+                except sqlite3.Error:
+                    gap_recorded = False
+            if not gap_recorded:
+                self._record_notification_write_failure(conn, event, now, exc)
+            if _capacity_reconcile:
+                self._run_notification_capacity_reconcile(conn, now)
+            return None
+        else:
+            conn.execute(f"RELEASE {savepoint}")
+            return result
+
+    def get_notification(self, event_key: str) -> OutboxRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM notification_outbox WHERE event_key=?",
+                (self._required_text(event_key, "event_key"),),
+            ).fetchone()
+        return None if row is None else OutboxRecord.from_mapping(row)
+
+    def claim_notifications(
+        self,
+        worker_id: str,
+        now: str,
+        limit: int = 50,
+        lease_seconds: int = 120,
+        skip_issue_reminders: bool = False,
+    ) -> tuple[OutboxRecord, ...]:
+        worker_id = self._bounded_text(worker_id, "worker_id", 256)
+        now = self._notification_timestamp(now, "now")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds < 1
+        ):
+            raise ValueError("lease_seconds must be a positive integer")
+        if not isinstance(skip_issue_reminders, bool):
+            raise ValueError("skip_issue_reminders must be a boolean")
+        lease_until = (
+            datetime.fromisoformat(now) + timedelta(seconds=lease_seconds)
+        ).isoformat()
+        claimed: list[OutboxRecord] = []
+        with self.transaction() as conn:
+            self.cleanup_notifications(conn, now)
+            keys = conn.execute(
+                """SELECT event_key FROM notification_outbox
+                   WHERE (?=0 OR event_type!='issue_reminder') AND (
+                     (state='pending' AND COALESCE(next_attempt_at, created_at)<=?)
+                     OR (state='leased' AND lease_until<=?)
+                   )
+                   ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END,
+                            COALESCE(next_attempt_at, created_at), created_at,
+                            event_key
+                   LIMIT ?""",
+                (int(skip_issue_reminders), now, now, limit),
+            ).fetchall()
+            for item in keys:
+                event_key = str(item[0])
+                updated = conn.execute(
+                    """UPDATE notification_outbox
+                       SET state='leased', lease_owner=?, lease_until=?,
+                           next_attempt_at=NULL
+                       WHERE event_key=? AND (
+                         (state='pending' AND COALESCE(next_attempt_at, created_at)<=?)
+                         OR (state='leased' AND lease_until<=?)
+                       )""",
+                    (worker_id, lease_until, event_key, now, now),
+                )
+                if updated.rowcount == 1:
+                    row = conn.execute(
+                        "SELECT * FROM notification_outbox WHERE event_key=?",
+                        (event_key,),
+                    ).fetchone()
+                    try:
+                        claimed.append(OutboxRecord.from_mapping(row))
+                    except (
+                        ValueError, TypeError, KeyError,
+                        json.JSONDecodeError, RecursionError,
+                    ):
+                        conn.execute(
+                            """UPDATE notification_outbox
+                               SET state='dead', terminal_at=?,
+                                   lease_owner=NULL, lease_until=NULL,
+                                   next_attempt_at=NULL,
+                                   payload_json=NULL, title=NULL, body=NULL,
+                                   body_sha256=NULL, metadata_json=NULL,
+                                   last_error_code='CONTENT_DECODE_ERROR',
+                                   last_error='stored notification content could not be decoded'
+                               WHERE event_key=? AND state='leased'
+                                 AND lease_owner=? AND lease_until=?""",
+                            (now, event_key, worker_id, lease_until),
+                        )
+            self._compact_dead_notification_details(conn)
+        return tuple(claimed)
+
+    def complete_notification(
+        self,
+        event_key: str,
+        worker_id: str,
+        sent_at: str,
+        *,
+        expected_lease_until: str,
+        completed_at: str | None = None,
+    ) -> bool:
+        sent_at = self._notification_timestamp(sent_at, "sent_at")
+        completed = self._notification_timestamp(
+            completed_at or sent_at, "completed_at",
+        )
+        lease_until = self._notification_timestamp(
+            expected_lease_until, "expected_lease_until",
+        )
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET state='sent', sent_at=?, terminal_at=?,
+                       lease_owner=NULL, lease_until=NULL,
+                       next_attempt_at=NULL, last_error_code=NULL,
+                       last_error=NULL
+                    WHERE event_key=? AND state='leased' AND lease_owner=?
+                      AND lease_until=? AND lease_until>?
+                      AND attempt_count>0 AND next_attempt_at IS NOT NULL""",
+                (
+                    sent_at, completed,
+                     self._required_text(event_key, "event_key"),
+                     self._bounded_text(worker_id, "worker_id", 256),
+                     lease_until, completed,
+                ),
+            ).rowcount
+        return changed == 1
+
+    def begin_notification_attempt(
+        self,
+        event_key: str,
+        worker_id: str,
+        expected_lease_until: str,
+        now: str,
+    ) -> int | None:
+        lease_until = self._notification_timestamp(
+            expected_lease_until, "expected_lease_until",
+        )
+        now = self._notification_timestamp(now, "now")
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET attempt_count=attempt_count+1, next_attempt_at=?
+                   WHERE event_key=? AND state='leased' AND lease_owner=?
+                     AND lease_until=? AND lease_until>?
+                     AND (expires_at IS NULL OR expires_at>?)
+                     AND cancel_requested_at IS NULL
+                     AND attempt_count<5
+                     AND next_attempt_at IS NULL""",
+                (
+                    now,
+                    self._required_text(event_key, "event_key"),
+                    self._bounded_text(worker_id, "worker_id", 256),
+                    lease_until, now, now,
+                ),
+            ).rowcount
+            if changed != 1:
+                return None
+            row = conn.execute(
+                "SELECT attempt_count FROM notification_outbox WHERE event_key=?",
+                (event_key,),
+            ).fetchone()
+        return int(row[0])
+
+    def fail_notification(
+        self,
+        event_key: str,
+        worker_id: str,
+        now: str,
+        error_code: str,
+        error: str,
+        *,
+        expected_lease_until: str,
+        retry_at: str | None = None,
+        dead: bool = False,
+    ) -> bool:
+        now = self._notification_timestamp(now, "now")
+        lease_until = self._notification_timestamp(
+            expected_lease_until, "expected_lease_until",
+        )
+        next_attempt = (
+            None
+            if dead
+            else self._notification_timestamp(retry_at or now, "retry_at")
+        )
+        state = "dead" if dead else "pending"
+        terminal_at = now if dead else None
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET state=?, lease_owner=NULL, lease_until=NULL,
+                       next_attempt_at=?, terminal_at=?, last_error_code=?,
+                       last_error=?
+                    WHERE event_key=? AND state='leased' AND lease_owner=?
+                      AND lease_until=? AND lease_until>?""",
+                (
+                    state, next_attempt, terminal_at,
+                    self._bounded_text(error_code, "error_code", 128),
+                    str(error).encode("utf-8")[:4000].decode(
+                        "utf-8", errors="ignore",
+                    ),
+                     self._required_text(event_key, "event_key"),
+                     self._bounded_text(worker_id, "worker_id", 256),
+                     lease_until, now,
+                ),
+            ).rowcount
+            if changed and dead:
+                self._compact_dead_notification_details(conn)
+        return changed == 1
+
+    def record_notification_ambiguity(
+        self,
+        event_key: str,
+        now: str,
+        reason_code: str,
+        attempt_no: int,
+    ) -> bool:
+        occurred_at = self._notification_timestamp(now, "now")
+        reason = self._bounded_text(reason_code, "reason_code", 128)
+        if (
+            isinstance(attempt_no, bool)
+            or not isinstance(attempt_no, int)
+            or attempt_no < 1
+            or attempt_no > 5
+        ):
+            raise ValueError("attempt_no must be between 1 and 5")
+        bit = 1 << (attempt_no - 1)
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET ambiguous_attempt_mask=ambiguous_attempt_mask | ?,
+                       last_ambiguous_at=CASE
+                         WHEN (ambiguous_attempt_mask & ?)=0
+                          AND (last_ambiguous_at IS NULL OR last_ambiguous_at<=?)
+                         THEN ? ELSE last_ambiguous_at END,
+                       last_ambiguous_code=CASE
+                         WHEN (ambiguous_attempt_mask & ?)=0
+                          AND (last_ambiguous_at IS NULL OR last_ambiguous_at<=?)
+                         THEN ? ELSE last_ambiguous_code END
+                   WHERE event_key=? AND attempt_count>=?""",
+                (
+                    bit,
+                    bit, occurred_at, occurred_at,
+                    bit, occurred_at, reason,
+                    self._required_text(event_key, "event_key"),
+                    attempt_no,
+                ),
+            ).rowcount
+        return changed == 1
+
+    def request_notification_cancel(
+        self,
+        conn: sqlite3.Connection,
+        event_key: str,
+        requested_at: str,
+        reason: str,
+    ) -> bool:
+        if not conn.in_transaction:
+            raise ValueError("notification cancellation requires a caller-owned transaction")
+        changed = conn.execute(
+            """UPDATE notification_outbox
+               SET cancel_requested_at=COALESCE(cancel_requested_at, ?),
+                   cancel_reason=COALESCE(cancel_reason, ?)
+               WHERE event_key=? AND state IN ('pending','leased')""",
+            (
+                self._notification_timestamp(requested_at, "requested_at"),
+                self._bounded_text(reason, "reason", 1024),
+                self._required_text(event_key, "event_key"),
+            ),
+        ).rowcount
+        return changed == 1
+
+    def defer_notification_before_send(
+        self,
+        event_key: str,
+        worker_id: str,
+        now: str,
+        *,
+        expected_lease_until: str,
+        attempt_no: int,
+    ) -> bool:
+        if (
+            isinstance(attempt_no, bool)
+            or not isinstance(attempt_no, int)
+            or attempt_no < 1
+        ):
+            raise ValueError("attempt_no must be a positive integer")
+        now_text = self._notification_timestamp(now, "now")
+        lease_until = self._notification_timestamp(
+            expected_lease_until, "expected_lease_until",
+        )
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET state='pending', lease_owner=NULL, lease_until=NULL,
+                       next_attempt_at=?, attempt_count=attempt_count-1
+                   WHERE event_key=? AND state='leased' AND lease_owner=?
+                     AND lease_until=? AND lease_until>?
+                     AND attempt_count=? AND next_attempt_at IS NOT NULL""",
+                (
+                    now_text,
+                    self._required_text(event_key, "event_key"),
+                    self._bounded_text(worker_id, "worker_id", 256),
+                    lease_until, now_text, attempt_no,
+                ),
+            ).rowcount
+        return changed == 1
+
+    def cancel_notification(
+        self,
+        event_key: str,
+        now: str,
+        reason: str,
+        worker_id: str | None = None,
+        expected_lease_until: str | None = None,
+    ) -> bool:
+        now = self._notification_timestamp(now, "now")
+        parameters: list[object] = [
+            now, self._bounded_text(reason, "reason", 1024), now,
+            self._required_text(event_key, "event_key"),
+        ]
+        owner_clause = " AND state='pending'"
+        if worker_id is not None:
+            if expected_lease_until is None:
+                raise ValueError("expected_lease_until is required for a leased cancellation")
+            owner_clause = " AND state='leased' AND lease_owner=? AND lease_until=?"
+            parameters.append(self._bounded_text(worker_id, "worker_id", 256))
+            parameters.append(self._notification_timestamp(
+                expected_lease_until, "expected_lease_until",
+            ))
+            owner_clause += " AND lease_until>?"
+            parameters.append(now)
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET state='cancelled', cancel_requested_at=COALESCE(
+                       cancel_requested_at, ?
+                   ), cancel_reason=?, terminal_at=?, lease_owner=NULL,
+                       lease_until=NULL, next_attempt_at=NULL
+                   WHERE event_key=? AND state IN ('pending','leased')"""
+                + owner_clause,
+                parameters,
+            ).rowcount
+        return changed == 1
+
+    def compact_notification(self, event_key: str) -> bool:
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """UPDATE notification_outbox
+                   SET payload_json=NULL, title=NULL, body=NULL,
+                       body_sha256=NULL, metadata_json=NULL,
+                       last_error_code=NULL, last_error=NULL
+                   WHERE event_key=?
+                     AND state IN ('sent','dead','cancelled')""",
+                (self._required_text(event_key, "event_key"),),
+            ).rowcount
+        return changed == 1
+
+    def enqueue_notification_gap(
+        self,
+        conn: sqlite3.Connection,
+        event: NotificationEvent,
+        reason: str,
+        now: str,
+        *,
+        _capacity_reconcile: bool = True,
+    ) -> bool:
+        if not conn.in_transaction:
+            raise ValueError("notification gap requires a caller-owned transaction")
+        self._require_notification_scope(
+            conn, event.account_scope_id, event.adapter,
+        )
+        payload_hash = event.semantic_payload_sha256
+        outbox = conn.execute(
+            "SELECT payload_sha256 FROM notification_outbox WHERE event_key=?",
+            (event.event_key,),
+        ).fetchone()
+        if outbox is not None:
+            if str(outbox["payload_sha256"]) != payload_hash:
+                raise NotificationConflict(
+                    f"notification event key conflict: {event.event_key}"
+                )
+            return False
+        existing = conn.execute(
+            """SELECT payload_sha256, source_fact_id
+               FROM notification_enqueue_gaps WHERE event_key=?""",
+            (event.event_key,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["payload_sha256"]) != payload_hash
+                or str(existing["source_fact_id"]) != event.source_fact_id
+            ):
+                raise NotificationConflict(
+                    f"notification gap key conflict: {event.event_key}"
+                )
+            if event.priority == "high" and _capacity_reconcile:
+                self._run_notification_capacity_reconcile(conn, now)
+            return False
+        conn.execute(
+            """INSERT INTO notification_enqueue_gaps(
+               event_key, account_scope_id, adapter, payload_sha256,
+               source_fact_id, priority, reason, occurred_at, created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                event.event_key, event.account_scope_id, event.adapter,
+                payload_hash, event.source_fact_id, event.priority,
+                 self._bounded_text(reason, "reason", 1024), event.occurred_at,
+                self._notification_timestamp(now, "now"),
+            ),
+        )
+        self._clear_recoverable_notification_write_failure(conn, now)
+        if event.priority == "high" and _capacity_reconcile:
+            self._run_notification_capacity_reconcile(conn, now)
+        return True
+
+    def repair_notification_gap(
+        self,
+        conn: sqlite3.Connection,
+        event: NotificationEvent,
+        now: str,
+        resolution: str,
+        *,
+        _capacity_reconcile: bool = True,
+    ) -> EnqueueResult:
+        if not conn.in_transaction:
+            raise ValueError("notification gap repair requires a caller-owned transaction")
+        self._require_notification_scope(
+            conn, event.account_scope_id, event.adapter,
+        )
+        repaired_at = self._notification_timestamp(now, "now")
+        self.cleanup_notifications(conn, repaired_at)
+        resolution_text = self._bounded_text(
+            resolution, "resolution", 1024,
+        )
+        payload_hash = event.semantic_payload_sha256
+        gap = conn.execute(
+            """SELECT payload_sha256, source_fact_id, resolved_at
+               FROM notification_enqueue_gaps WHERE event_key=?""",
+            (event.event_key,),
+        ).fetchone()
+        if gap is None:
+            raise ValueError("notification gap does not exist")
+        if gap["resolved_at"] is not None:
+            raise NotificationConflict(
+                f"notification gap is already resolved: {event.event_key}"
+            )
+        if (
+            str(gap["payload_sha256"]) != payload_hash
+            or str(gap["source_fact_id"]) != event.source_fact_id
+        ):
+            raise NotificationConflict(
+                f"notification gap key conflict: {event.event_key}"
+            )
+        existing = conn.execute(
+            "SELECT payload_sha256, state FROM notification_outbox WHERE event_key=?",
+            (event.event_key,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["payload_sha256"]) != payload_hash:
+                raise NotificationConflict(
+                    f"notification event key conflict: {event.event_key}"
+                )
+            result = EnqueueResult(
+                event.event_key, False, payload_hash, str(existing["state"]),
+            )
+        else:
+            self._insert_notification_row(
+                conn, event, repaired_at, payload_hash,
+            )
+            self._check_notification_capacity_after_insert(conn, event)
+            result = EnqueueResult(
+                event.event_key, True, payload_hash, "pending",
+            )
+        changed = conn.execute(
+            """UPDATE notification_enqueue_gaps
+               SET resolved_at=?, resolution=?
+               WHERE event_key=? AND resolved_at IS NULL""",
+            (
+                repaired_at, resolution_text,
+                event.event_key,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise NotificationConflict(
+                f"notification gap is already resolved: {event.event_key}"
+            )
+        self._clear_recoverable_notification_write_failure(conn, repaired_at)
+        if _capacity_reconcile:
+            self._run_notification_capacity_reconcile(conn, repaired_at)
+        return result
+
+    def resolve_notification_gap(
+        self,
+        conn: sqlite3.Connection,
+        event_key: str,
+        resolved_at: str,
+        resolution: str,
+    ) -> bool:
+        if not conn.in_transaction:
+            raise ValueError("notification gap resolution requires a caller-owned transaction")
+        changed = conn.execute(
+            """UPDATE notification_enqueue_gaps
+               SET resolved_at=?, resolution=?
+               WHERE event_key=? AND resolved_at IS NULL""",
+            (
+                self._notification_timestamp(resolved_at, "resolved_at"),
+                self._bounded_text(resolution, "resolution", 1024),
+                self._required_text(event_key, "event_key"),
+            ),
+        ).rowcount
+        return changed == 1
+
+    def notification_capacity(
+        self,
+        conn: sqlite3.Connection | None = None,
+    ) -> CapacitySnapshot:
+        owned = conn is None
+        if conn is None:
+            conn = self.connect()
+        try:
+            rows = conn.execute(
+                f"""SELECT priority, state, COUNT(*) AS row_count,
+                           COALESCE(SUM(32 + {_NOTIFICATION_BYTE_EXPRESSION}), 0)
+                             AS byte_count
+                    FROM notification_outbox
+                    GROUP BY priority, state"""
+            ).fetchall()
+            dead_detail = conn.execute(
+                f"""SELECT COUNT(*) AS row_count,
+                           COALESCE(SUM(32 + {_NOTIFICATION_BYTE_EXPRESSION}), 0)
+                             AS byte_count
+                    FROM notification_outbox
+                    WHERE state='dead' AND ({_NOTIFICATION_DETAIL_PREDICATE})"""
+            ).fetchone()
+            dead_total = conn.execute(
+                f"""SELECT COUNT(*) AS row_count,
+                           COALESCE(SUM(32 + {_NOTIFICATION_BYTE_EXPRESSION}), 0)
+                             AS byte_count
+                    FROM notification_outbox WHERE state='dead'"""
+            ).fetchone()
+            high_dead_detail_rows = int(conn.execute(
+                f"""SELECT COUNT(*) FROM notification_outbox
+                    WHERE priority='high' AND state='dead'
+                      AND ({_NOTIFICATION_DETAIL_PREDICATE})"""
+            ).fetchone()[0])
+            values = {
+                (str(row["priority"]), str(row["state"])): (
+                    int(row["row_count"]), int(row["byte_count"]),
+                )
+                for row in rows
+            }
+            active = {"pending", "leased"}
+            normal_rows = sum(
+                values.get(("normal", state), (0, 0))[0]
+                for state in active
+            )
+            normal_bytes = sum(
+                values.get(("normal", state), (0, 0))[1]
+                for state in active
+            )
+            high_rows = sum(
+                values.get(("high", state), (0, 0))[0]
+                for state in active
+            )
+            high_bytes = sum(
+                values.get(("high", state), (0, 0))[1]
+                for state in active
+            )
+            dead_rows = int(dead_detail["row_count"])
+            dead_bytes = int(dead_detail["byte_count"])
+            dead_total_rows = int(dead_total["row_count"])
+            dead_total_bytes = int(dead_total["byte_count"])
+            high_dead_total_rows = values.get(("high", "dead"), (0, 0))[0]
+            gap_rows = conn.execute(
+                """SELECT priority, COUNT(*) AS row_count
+                   FROM notification_enqueue_gaps WHERE resolved_at IS NULL
+                   GROUP BY priority"""
+            ).fetchall()
+            gaps = {
+                str(row["priority"]): int(row["row_count"])
+                for row in gap_rows
+            }
+            unresolved = sum(gaps.values())
+            tombstones = int(conn.execute(
+                """SELECT COUNT(*) FROM notification_outbox
+                   WHERE state IN ('sent','dead','cancelled')
+                     AND payload_json IS NULL AND title IS NULL
+                     AND body IS NULL AND body_sha256 IS NULL
+                     AND metadata_json IS NULL AND last_error_code IS NULL
+                     AND last_error IS NULL"""
+            ).fetchone()[0])
+        finally:
+            if owned:
+                conn.close()
+        return CapacitySnapshot(
+            normal_active_rows=normal_rows,
+            normal_active_bytes=normal_bytes,
+            high_active_rows=high_rows,
+            high_active_bytes=high_bytes,
+            dead_rows=dead_rows,
+            dead_bytes=dead_bytes,
+            unresolved_gap_rows=unresolved,
+            tombstone_rows=tombstones,
+            dead_total_rows=dead_total_rows,
+            dead_total_bytes=dead_total_bytes,
+            high_dead_rows=high_dead_detail_rows,
+            high_unresolved_gap_rows=gaps.get("high", 0),
+            high_dead_total_rows=high_dead_total_rows,
+        )
+
+    def upsert_logical_signal_plan(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+        trade_date: str,
+        logical_signal_id: str,
+        frozen_valid_until: str,
+        current_plan_version: str,
+        now: str,
+    ) -> dict[str, object]:
+        if not conn.in_transaction:
+            raise ValueError("logical plan requires a caller-owned transaction")
+        scope = self._required_text(account_scope_id, "account_scope_id")
+        row = conn.execute(
+            "SELECT adapter FROM account_scopes WHERE account_scope_id=?",
+            (scope,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("account scope is not registered")
+        values = (
+            scope,
+            self._required_text(trade_date, "trade_date"),
+            self._required_text(logical_signal_id, "logical_signal_id"),
+        )
+        frozen = self._notification_timestamp(
+            frozen_valid_until, "frozen_valid_until",
+        )
+        version = self._required_text(
+            current_plan_version, "current_plan_version",
+        )
+        updated_at = self._notification_timestamp(now, "now")
+        conn.execute(
+            """INSERT INTO logical_signal_plans(
+               account_scope_id, trade_date, logical_signal_id,
+               frozen_valid_until, current_plan_version, updated_at
+               ) VALUES(?,?,?,?,?,?)
+               ON CONFLICT(account_scope_id, trade_date, logical_signal_id)
+               DO UPDATE SET current_plan_version=excluded.current_plan_version,
+                             updated_at=excluded.updated_at
+               WHERE logical_signal_plans.current_plan_version<>
+                     excluded.current_plan_version""",
+            (*values, frozen, version, updated_at),
+        )
+        return dict(conn.execute(
+            """SELECT * FROM logical_signal_plans
+               WHERE account_scope_id=? AND trade_date=?
+                 AND logical_signal_id=?""",
+            values,
+        ).fetchone())
+
+    def get_logical_signal_plan(
+        self,
+        account_scope_id: str,
+        trade_date: str,
+        logical_signal_id: str,
+    ) -> dict[str, object] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM logical_signal_plans
+                   WHERE account_scope_id=? AND trade_date=?
+                     AND logical_signal_id=?""",
+                (account_scope_id, trade_date, logical_signal_id),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    @staticmethod
     def _adopt_legacy_execution_issues(
         conn: sqlite3.Connection, account_scope_id: str,
     ) -> None:
@@ -1659,7 +3368,9 @@ class TradingStore:
                    object_type=?, object_id=?, state=?, severity=?,
                    first_seen_at=?, stage_started_at=?, last_seen_at=?,
                    last_transition_at=?, last_notified_at=?, recovered_at=?,
-                   signal_id=?, order_id=?, reconciliation_id=?, details_json=?
+                   signal_id=?, order_id=?, reconciliation_id=?, details_json=?,
+                   incident_id=?, transition_seq=?, critical_trading_minutes=?,
+                   critical_last_counted_minute=?, next_reminder_seq=?
                    WHERE issue_key=?""",
                 (
                     winner["object_type"], winner["object_id"],
@@ -1668,6 +3379,10 @@ class TradingStore:
                     notified or None, winner["recovered_at"],
                     winner["signal_id"], winner["order_id"],
                     winner["reconciliation_id"], winner["details_json"],
+                    winner["incident_id"], winner["transition_seq"],
+                    winner["critical_trading_minutes"],
+                    winner["critical_last_counted_minute"],
+                    winner["next_reminder_seq"],
                     scoped_key,
                 ),
             )
@@ -1839,6 +3554,131 @@ class TradingStore:
             ),
         )
 
+    def insert_position_capacity_adoption(
+        self,
+        conn: sqlite3.Connection,
+        evidence: AdoptedPositionCapacityEvidence | dict,
+    ) -> str:
+        record = AdoptedPositionCapacityEvidence.from_dict(
+            evidence.to_dict()
+            if isinstance(evidence, AdoptedPositionCapacityEvidence)
+            else evidence
+        )
+        scope = conn.execute(
+            """SELECT adapter FROM account_scopes
+               WHERE account_scope_id=?""",
+            (record.account_scope_id,),
+        ).fetchone()
+        if scope is None:
+            raise ValueError("position capacity adoption account scope is missing")
+        if str(scope["adapter"]) != record.adapter:
+            raise ValueError("position capacity adoption adapter does not match account scope")
+        snapshot_row = conn.execute(
+            """SELECT snapshot_sha256, payload_json
+               FROM broker_snapshot_current WHERE account_scope_id=?""",
+            (record.account_scope_id,),
+        ).fetchone()
+        if snapshot_row is None:
+            raise ValueError("position capacity adoption broker snapshot is missing")
+        try:
+            snapshot = BrokerSnapshot.from_dict(
+                json.loads(str(snapshot_row["payload_json"]))
+            )
+        except Exception as exc:
+            raise ValueError(
+                "position capacity adoption broker snapshot is invalid"
+            ) from exc
+        if (
+            snapshot.account_scope_id != record.account_scope_id
+            or snapshot.adapter != record.adapter
+            or snapshot.snapshot_sha256 != str(snapshot_row["snapshot_sha256"])
+            or record.source_sha256 != snapshot.snapshot_sha256
+        ):
+            raise ValueError(
+                "position capacity adoption source does not match broker snapshot"
+            )
+        broker_position = next(
+            (item for item in snapshot.positions if item.code == record.code),
+            None,
+        )
+        if (
+            broker_position is None
+            or broker_position.total_qty != record.initial_qty
+        ):
+            raise ValueError(
+                "position capacity adoption quantity does not match broker snapshot"
+            )
+        cycle = conn.execute(
+            """SELECT stock_code, status, current_qty
+               FROM position_cycles WHERE position_cycle_id=?""",
+            (record.position_cycle_id,),
+        ).fetchone()
+        if cycle is None:
+            raise ValueError("position capacity adoption position cycle is missing")
+        if (
+            str(cycle["stock_code"]) != record.code
+            or str(cycle["status"]) != "active"
+            or int(cycle["current_qty"]) != record.initial_qty
+        ):
+            raise ValueError(
+                "position capacity adoption does not match active position cycle"
+            )
+        payload = contract_canonical_json(record.to_dict())
+        payload_sha256 = canonical_sha256(record.to_dict())
+        return self._insert_immutable_fact(
+            conn,
+            table="position_capacity_adoptions",
+            scope=record.account_scope_id,
+            identity_column="position_cycle_id",
+            identity=record.position_cycle_id,
+            hash_column="payload_sha256",
+            content_hash=payload_sha256,
+            statement="""INSERT INTO position_capacity_adoptions(
+                account_scope_id, position_cycle_id, stock_code,
+                payload_sha256, payload_json, adopted_at
+                ) VALUES(?,?,?,?,?,?)""",
+            parameters=(
+                record.account_scope_id, record.position_cycle_id,
+                record.code, payload_sha256, payload, record.adopted_at,
+            ),
+        )
+
+    def list_position_capacity_adoptions(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+    ) -> list[dict]:
+        account_scope_id = self._required_text(
+            account_scope_id, "account_scope_id",
+        )
+        rows = conn.execute(
+            """SELECT position_cycle_id, stock_code, payload_sha256,
+                      payload_json, adopted_at
+               FROM position_capacity_adoptions
+               WHERE account_scope_id=? ORDER BY position_cycle_id""",
+            (account_scope_id,),
+        ).fetchall()
+        payloads: list[dict] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+                record = AdoptedPositionCapacityEvidence.from_dict(payload)
+            except Exception as exc:
+                raise ValueError(
+                    "position capacity adoption payload is invalid"
+                ) from exc
+            if (
+                record.account_scope_id != account_scope_id
+                or record.position_cycle_id != str(row["position_cycle_id"])
+                or record.code != str(row["stock_code"])
+                or record.adopted_at != str(row["adopted_at"])
+                or canonical_sha256(record.to_dict())
+                != str(row["payload_sha256"])
+            ):
+                raise ValueError("position capacity adoption hash does not match payload")
+            payloads.append(record.to_dict())
+        return payloads
+
     def insert_pre_trade_result(
         self,
         conn: sqlite3.Connection,
@@ -1967,7 +3807,7 @@ class TradingStore:
             transitioned_at, "transitioned_at",
         )
         transitions = {
-            "READY": {"SUBMITTING", "EXPIRED"},
+            "READY": {"SUBMITTING", "EXPIRED", "REJECTED"},
             "SUBMITTING": {
                 "SUBMITTED", "REJECTED", "NOT_SUBMITTED", "SUBMIT_UNKNOWN",
             },
@@ -2249,9 +4089,11 @@ class TradingStore:
             )
         client_order_id = str(row["client_order_id"])
         try:
-            intent = ExecutionIntent.from_dict(
-                json.loads(str(row["payload_json"]))
-            )
+            with localcontext() as context:
+                context.prec = 50
+                intent = ExecutionIntent.from_dict(
+                    json.loads(str(row["payload_json"]))
+                )
         except Exception as exc:
             raise ValueError(
                 "capacity reservation execution intent evidence is invalid"
@@ -2360,7 +4202,6 @@ class TradingStore:
                 "PARTIALLY_FILLED cumulative quantity must be below target quantity"
             )
         remaining_qty = target_qty - cumulative_filled_qty
-        ratio = Decimal(remaining_qty) / Decimal(target_qty)
         original = (
             target_qty,
             Decimal(row["cash_yuan"]),
@@ -2373,12 +4214,15 @@ class TradingStore:
             Decimal(row["remaining_position_value_yuan"]),
             Decimal(row["remaining_open_risk_yuan"]),
         )
-        remaining = (
-            remaining_qty,
-            *((value * ratio).quantize(
-                Decimal("0.01"), rounding=ROUND_CEILING,
-            ) for value in original[1:]),
-        )
+        with localcontext() as context:
+            context.prec = 50
+            ratio = Decimal(remaining_qty) / Decimal(target_qty)
+            remaining = (
+                remaining_qty,
+                *((value * ratio).quantize(
+                    Decimal("0.01"), rounding=ROUND_CEILING,
+                ) for value in original[1:]),
+            )
         if any(value > limit for value, limit in zip(remaining, current)):
             raise ValueError("remaining reservation values cannot increase")
         remaining_text = tuple(
@@ -2479,6 +4323,74 @@ class TradingStore:
                 result["uncategorized_value_yuan"] += value
         return result
 
+    def _validate_local_admission_order(
+        self,
+        conn: sqlite3.Connection,
+        order: sqlite3.Row,
+        intent: ExecutionIntent,
+        *,
+        expected_status: str,
+        never_submitted: bool,
+    ) -> str:
+        if str(order["status"]).lower() != expected_status:
+            raise ValueError(
+                f"local admission order must be {expected_status} before release"
+            )
+        if str(order["order_id"] or "").strip():
+            raise ValueError("local admission order contains a broker order id")
+        if (
+            int(order["filled_qty"] or 0) != 0
+            or Decimal(str(order["average_fill_price"] or 0)) != 0
+            or conn.execute(
+                "SELECT 1 FROM fills WHERE client_order_id=?",
+                (intent.client_order_id,),
+            ).fetchone() is not None
+        ):
+            raise ValueError("local admission order conflicts with fill evidence")
+        if (
+            str(order["stock_code"]) != intent.code
+            or str(order["action"]).lower() != intent.side
+            or int(order["requested_qty"] or 0) != intent.order_qty
+            or int(order["target_qty"] or 0) != intent.target_position_qty
+        ):
+            raise ValueError("local admission order does not match execution intent")
+        try:
+            payload = json.loads(str(order["raw_json"]))
+        except Exception as exc:
+            raise ValueError("local admission content is invalid") from exc
+        expected_payload = {
+            "source": "execution_admission",
+            "client_order_id": intent.client_order_id,
+            "intent_sha256": intent.intent_sha256,
+            "pre_trade_result_id": intent.pre_trade_result_id,
+            "target_qty": intent.target_position_qty,
+            "requested_qty": intent.order_qty,
+        }
+        if not isinstance(payload, dict) or any(
+            key not in payload
+            or type(payload[key]) is not type(value)
+            or payload[key] != value
+            for key, value in expected_payload.items()
+        ):
+            raise ValueError("local admission content does not match execution intent")
+        submit_count = int(order["submit_count"] or 0)
+        first_submitted_at = str(order["first_submitted_at"] or "").strip()
+        if submit_count < 0 or (
+            never_submitted and (submit_count != 0 or first_submitted_at)
+        ):
+            raise ValueError("local admission order contains submission evidence")
+        if not never_submitted and (
+            (submit_count == 0 and first_submitted_at)
+            or (submit_count > 0 and not first_submitted_at)
+        ):
+            raise ValueError("local admission submission evidence is inconsistent")
+        updated_at = self._aware_timestamp(order["updated_at"], "order.updated_at")
+        if first_submitted_at and self._timestamp_instant(
+            first_submitted_at, "order.first_submitted_at",
+        ) > self._timestamp_instant(updated_at, "order.updated_at"):
+            raise ValueError("local admission submission evidence is inconsistent")
+        return updated_at
+
     def release_capacity_reservation(
         self,
         conn: sqlite3.Connection,
@@ -2497,7 +4409,8 @@ class TradingStore:
         reason = self._required_text(reason, "reason")
         row = conn.execute(
             """SELECT i.client_order_id, i.status AS intent_status,
-                      i.expires_at, i.status_updated_at, i.payload_json
+                      i.expires_at, i.status_updated_at, i.payload_json,
+                      i.intent_sha256
                FROM capacity_reservations AS r
                JOIN execution_intents AS i
                  ON i.account_scope_id=r.account_scope_id
@@ -2516,6 +4429,18 @@ class TradingStore:
                 f"{intent_status} capacity reservation cannot be released"
             )
         client_order_id = str(row["client_order_id"])
+        try:
+            intent = ExecutionIntent.from_dict(
+                json.loads(str(row["payload_json"]))
+            )
+        except Exception as exc:
+            raise ValueError("capacity release execution intent is invalid") from exc
+        if (
+            intent.account_scope_id != account_scope_id
+            or intent.client_order_id != client_order_id
+            or intent.intent_sha256 != str(row["intent_sha256"])
+        ):
+            raise ValueError("capacity release execution intent hash mismatch")
         release_instant = self._timestamp_instant(released_at, "released_at")
         if intent_status in {"READY", "EXPIRED"}:
             expires_at = self._timestamp_instant(row["expires_at"], "expires_at")
@@ -2527,20 +4452,13 @@ class TradingStore:
                 raise ValueError(
                     "READY intent must transition to EXPIRED before release"
                 )
-            if conn.execute(
-                "SELECT 1 FROM orders WHERE client_order_id=?",
+            order = conn.execute(
+                """SELECT stock_code, action, order_id, target_qty,
+                          requested_qty, filled_qty, average_fill_price, status,
+                          submit_count, first_submitted_at, updated_at, raw_json
+                   FROM orders WHERE client_order_id=?""",
                 (client_order_id,),
-            ).fetchone() is not None:
-                raise ValueError(
-                    "EXPIRED capacity release conflicts with submission evidence"
-                )
-            if conn.execute(
-                "SELECT 1 FROM fills WHERE client_order_id=?",
-                (client_order_id,),
-            ).fetchone() is not None:
-                raise ValueError(
-                    "EXPIRED capacity release conflicts with fill evidence"
-                )
+            ).fetchone()
             if conn.execute(
                 """SELECT 1 FROM broker_order_current
                    WHERE account_scope_id=? AND client_order_id=?""",
@@ -2549,6 +4467,24 @@ class TradingStore:
                 raise ValueError(
                     "EXPIRED capacity release conflicts with current broker order"
                 )
+            if order is not None:
+                order_updated_at = self._timestamp_instant(
+                    self._validate_local_admission_order(
+                        conn, order, intent, expected_status="expired",
+                        never_submitted=True,
+                    ),
+                    "order.updated_at",
+                )
+                if release_instant < order_updated_at:
+                    raise ValueError("capacity release predates local order expiry")
+            else:
+                if conn.execute(
+                    "SELECT 1 FROM fills WHERE client_order_id=?",
+                    (client_order_id,),
+                ).fetchone() is not None:
+                    raise ValueError(
+                        "EXPIRED capacity release conflicts with fill evidence"
+                    )
             broker_snapshot = conn.execute(
                 """SELECT broker_time, generated_at
                    FROM broker_snapshot_current WHERE account_scope_id=?""",
@@ -2619,31 +4555,38 @@ class TradingStore:
                     "terminal capacity release conflicts with current broker order"
                 )
             order = conn.execute(
-                """SELECT stock_code, action, status, filled_qty,
-                          requested_qty, target_qty, updated_at
+                """SELECT stock_code, action, order_id, status, filled_qty,
+                          requested_qty, target_qty, average_fill_price,
+                          submit_count, first_submitted_at, updated_at, raw_json
                    FROM orders WHERE client_order_id=?""",
                 (client_order_id,),
             ).fetchone()
             if intent_status == "NOT_SUBMITTED":
-                if order is not None:
-                    raise ValueError(
-                        "NOT_SUBMITTED capacity release conflicts with order evidence"
+                if order is None:
+                    if conn.execute(
+                        "SELECT 1 FROM fills WHERE client_order_id=?",
+                        (client_order_id,),
+                    ).fetchone() is not None:
+                        raise ValueError(
+                            "NOT_SUBMITTED capacity release conflicts with fill evidence"
+                        )
+                    evidence_at = str(row["status_updated_at"])
+                else:
+                    order_updated_at = self._validate_local_admission_order(
+                        conn, order, intent, expected_status="not_submitted",
+                        never_submitted=False,
                     )
-                if conn.execute(
-                    "SELECT 1 FROM fills WHERE client_order_id=?",
-                    (client_order_id,),
-                ).fetchone() is not None:
-                    raise ValueError(
-                        "NOT_SUBMITTED capacity release conflicts with fill evidence"
+                    evidence_at = max(
+                        (order_updated_at, str(row["status_updated_at"])),
+                        key=lambda value: self._timestamp_instant(
+                            value, "terminal evidence timestamp",
+                        ),
                     )
-                evidence_at = str(row["status_updated_at"])
             else:
-                intent = ExecutionIntent.from_dict(
-                    json.loads(str(row["payload_json"]))
-                )
                 expected_order_statuses = {
                     "REJECTED": {
                         "rejected", "risk_rejected", "failed", "skipped",
+                        "not_submitted",
                     },
                     "CANCELLED": {"cancelled"},
                     "FILLED": {"filled"},
@@ -2655,6 +4598,11 @@ class TradingStore:
                     raise ValueError(
                         f"{intent_status} intent does not match terminal order "
                         f"status {order_status}"
+                    )
+                if intent_status == "REJECTED" and order_status == "not_submitted":
+                    self._validate_local_admission_order(
+                        conn, order, intent, expected_status="not_submitted",
+                        never_submitted=True,
                     )
                 order_qty = order_allowed_quantity(
                     order["requested_qty"], order["target_qty"],
@@ -2877,6 +4825,50 @@ class TradingStore:
         result["_ledger_generated_at"] = str(row["generated_at"])
         return result
 
+    def bind_execution_intent_signal(
+        self,
+        conn: sqlite3.Connection,
+        account_scope_id: str,
+        client_order_id: str,
+        signal_id: str,
+    ) -> bool:
+        row = conn.execute(
+            """SELECT o.signal_id, i.payload_json, i.intent_sha256
+               FROM orders AS o
+               JOIN execution_intents AS i
+                 ON i.client_order_id=o.client_order_id
+               WHERE i.account_scope_id=? AND i.client_order_id=?""",
+            (account_scope_id, client_order_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("execution intent order is unavailable for signal binding")
+        try:
+            intent = ExecutionIntent.from_dict(json.loads(str(row["payload_json"])))
+        except Exception as exc:
+            raise ValueError("execution intent payload is invalid for signal binding") from exc
+        if (
+            intent.account_scope_id != account_scope_id
+            or intent.client_order_id != client_order_id
+            or intent.source_signal_id != signal_id
+            or intent.intent_sha256 != str(row["intent_sha256"])
+        ):
+            raise ValueError("execution intent does not match signal binding")
+        if conn.execute(
+            "SELECT 1 FROM signals WHERE signal_id=?", (signal_id,),
+        ).fetchone() is None:
+            raise ValueError("signal must exist before execution intent binding")
+        existing = str(row["signal_id"] or "")
+        if existing and existing != signal_id:
+            raise ValueError("execution intent order is bound to another signal")
+        cursor = conn.execute(
+            """UPDATE orders SET signal_id=?
+               WHERE client_order_id=? AND (signal_id IS NULL OR signal_id=?)""",
+            (signal_id, client_order_id, signal_id),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("execution intent signal binding failed")
+        return not bool(existing)
+
     def record_signal(self, conn: sqlite3.Connection, signal: SignalRecord) -> bool:
         cursor = conn.execute(
             """
@@ -2966,63 +4958,433 @@ class TradingStore:
             row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
         return default if row is None else str(row[0])
 
+    @staticmethod
+    def _material_issue_details(value: object) -> dict[str, object]:
+        details = value if isinstance(value, dict) else {}
+        allowed = {
+            "command", "error_code", "expected", "actual", "filled_qty",
+            "position_codes", "reason_code", "stage", "stock_code",
+            "target_qty", "template_version", "expected_template_version",
+        }
+        return {
+            str(key): item for key, item in details.items()
+            if str(key) in allowed
+        }
+
+    def _enqueue_execution_issue_transition(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        account_scope_id: str,
+        issue_key: str,
+        incident_id: str,
+        transition_seq: int,
+        transition: str,
+        state: str,
+        severity: str,
+        object_type: str,
+        object_id: str,
+        occurred_at: str,
+        details: dict[str, object],
+    ) -> None:
+        if not issue_key.startswith(f"scope:{account_scope_id}:"):
+            raise ValueError("execution issue does not match account scope")
+        scope_row = conn.execute(
+            "SELECT adapter FROM account_scopes WHERE account_scope_id=?",
+            (account_scope_id,),
+        ).fetchone()
+        if scope_row is None:
+            raise ValueError("account scope is not registered")
+        adapter = str(scope_row["adapter"])
+        event = NotificationEvent(
+            event_key=notification_event_key(
+                adapter,
+                account_scope_id,
+                "issue",
+                issue_key=issue_key,
+                incident_id=incident_id,
+                transition_seq=transition_seq,
+                transition=transition,
+                severity=severity,
+            ),
+            account_scope_id=account_scope_id,
+            adapter=adapter,
+            event_type="issue_transition",
+            object_type="execution_issue",
+            object_id=issue_key,
+            source_fact_id=f"{issue_key}#{incident_id}#{transition_seq}",
+            priority=(
+                "high" if severity in {"ERROR", "CRITICAL"} else "normal"
+            ),
+            payload_version=1,
+            occurred_at=occurred_at,
+            expires_at=None,
+            title=f"{adapter.upper()} 执行异常状态变化",
+            body=(
+                f"> {transition} | {severity} | {state}\n"
+                f"> {object_type}:{object_id}\n"
+                f"> 业务时间：{occurred_at}"
+            ),
+            payload={
+                "issue_key": issue_key,
+                "incident_id": incident_id,
+                "transition_seq": transition_seq,
+                "transition": transition,
+                "state": state,
+                "severity": severity,
+                "object_type": object_type,
+                "object_id": object_id,
+                "details": details,
+            },
+            metadata={"renderer": "execution-issue-v1"},
+        )
+        self.enqueue_notification_or_gap(conn, event, occurred_at)
+
+    def _enqueue_execution_issue_reminder(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        account_scope_id: str,
+        adapter: str,
+        row: sqlite3.Row,
+        reminder_seq: int,
+        critical_minutes: int,
+        occurred_at: str,
+    ) -> None:
+        issue_key = str(row["issue_key"])
+        incident_id = str(row["incident_id"])
+        source_fact_id = (
+            f"{issue_key}#{incident_id}#reminder#{reminder_seq}"
+        )
+        event = NotificationEvent(
+            event_key=notification_event_key(
+                adapter,
+                account_scope_id,
+                "issue-reminder",
+                issue_key=issue_key,
+                incident_id=incident_id,
+                reminder_seq=reminder_seq,
+            ),
+            account_scope_id=account_scope_id,
+            adapter=adapter,
+            event_type="issue_reminder",
+            object_type="execution_issue",
+            object_id=issue_key,
+            source_fact_id=source_fact_id,
+            priority="high",
+            payload_version=1,
+            occurred_at=occurred_at,
+            expires_at=None,
+            title=f"{adapter.upper()} CRITICAL issue reminder",
+            body=(
+                f"> CRITICAL remains unresolved for {critical_minutes} "
+                f"A-share trading minutes\n"
+                f"> {row['object_type']}:{row['object_id']}"
+            ),
+            payload={
+                "issue_key": issue_key,
+                "incident_id": incident_id,
+                "reminder_seq": reminder_seq,
+                "critical_trading_minutes": critical_minutes,
+                "state": str(row["state"]),
+                "severity": "CRITICAL",
+                "object_type": str(row["object_type"]),
+                "object_id": str(row["object_id"]),
+            },
+            metadata={"renderer": "execution-issue-reminder-v1"},
+        )
+        self.enqueue_notification_or_gap(conn, event, occurred_at)
+
+    def enqueue_due_critical_reminders(
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+        calendar: object,
+        paused_intervals: object = (),
+    ) -> int:
+        if not conn.in_transaction:
+            raise ValueError("critical reminders require a caller-owned transaction")
+        pauses = tuple(paused_intervals or ())
+        occurred_at = self._shanghai_timestamp(now, "now")
+        boundary = self._critical_minute_boundary(occurred_at, ceiling=False)
+        boundary_at = datetime.fromisoformat(boundary)
+        if critical_trading_minutes(
+            boundary,
+            boundary_at + timedelta(minutes=1),
+            calendar,
+            paused_intervals=pauses,
+        ) != 1:
+            return 0
+
+        scopes = [
+            (str(row["account_scope_id"]), str(row["adapter"]))
+            for row in conn.execute(
+                "SELECT account_scope_id, adapter FROM account_scopes"
+            ).fetchall()
+        ]
+        rows = conn.execute(
+            """SELECT * FROM execution_issue_state
+               WHERE recovered_at IS NULL AND severity='CRITICAL'"""
+        ).fetchall()
+        generated = 0
+        for row in rows:
+            issue_key = str(row["issue_key"])
+            matches = [
+                item for item in scopes
+                if issue_key.startswith(f"scope:{item[0]}:")
+            ]
+            if len(matches) != 1 or not str(row["incident_id"] or ""):
+                continue
+            account_scope_id, adapter = matches[0]
+            counted_from = str(
+                row["critical_last_counted_minute"]
+                or self._critical_minute_boundary(
+                    row["last_transition_at"] or row["first_seen_at"],
+                    ceiling=True,
+                )
+            )
+            if boundary_at < datetime.fromisoformat(counted_from):
+                continue
+            elapsed = critical_trading_minutes(
+                counted_from,
+                boundary,
+                calendar,
+                paused_intervals=pauses,
+            )
+            critical_minutes = int(row["critical_trading_minutes"] or 0) + elapsed
+            next_seq = max(1, int(row["next_reminder_seq"] or 1))
+            due_seq = next_critical_reminder_seq(critical_minutes)
+            if next_seq <= due_seq:
+                reminder_prefix = (
+                    f"{issue_key}#{row['incident_id']}#reminder#"
+                )
+                lower = conn.execute(
+                    """SELECT event_key, source_fact_id
+                       FROM notification_outbox
+                       WHERE account_scope_id=? AND event_type='issue_reminder'
+                         AND object_id=? AND state IN ('pending','leased')
+                         AND substr(source_fact_id, 1, ?)=?""",
+                    (
+                        account_scope_id, issue_key,
+                        len(reminder_prefix), reminder_prefix,
+                    ),
+                ).fetchall()
+                for pending in lower:
+                    try:
+                        reminder_seq = int(
+                            str(pending["source_fact_id"])[len(reminder_prefix):]
+                        )
+                    except ValueError:
+                        continue
+                    if reminder_seq < due_seq:
+                        self.request_notification_cancel(
+                            conn,
+                            str(pending["event_key"]),
+                            occurred_at,
+                            "superseded by newer critical reminder",
+                        )
+                self._enqueue_execution_issue_reminder(
+                    conn,
+                    account_scope_id=account_scope_id,
+                    adapter=adapter,
+                    row=row,
+                    reminder_seq=due_seq,
+                    critical_minutes=critical_minutes,
+                    occurred_at=occurred_at,
+                )
+                generated += 1
+                next_seq = due_seq + 1
+            conn.execute(
+                """UPDATE execution_issue_state SET
+                   critical_trading_minutes=?,
+                   critical_last_counted_minute=?, next_reminder_seq=?
+                   WHERE issue_key=? AND recovered_at IS NULL
+                     AND severity='CRITICAL' AND incident_id=?""",
+                (
+                    critical_minutes, boundary, next_seq, issue_key,
+                    str(row["incident_id"]),
+                ),
+            )
+        return generated
+
     def upsert_execution_issue(
-        self, conn: sqlite3.Connection, issue: dict[str, object]
+        self,
+        conn: sqlite3.Connection,
+        issue: dict[str, object],
+        *,
+        calendar: object | None = None,
+        paused_intervals: object = (),
     ) -> dict[str, object]:
-        key = str(issue["issue_key"])
+        if not conn.in_transaction:
+            raise ValueError("execution issue requires a caller-owned transaction")
+        key = self._required_text(issue.get("issue_key"), "issue_key")
         previous = conn.execute(
             "SELECT * FROM execution_issue_state WHERE issue_key=?", (key,)
         ).fetchone()
-        state = str(issue["state"])
-        severity = str(issue["severity"])
+        state = self._required_text(issue.get("state"), "state")
+        severity = self._required_text(
+            issue.get("severity"), "severity",
+        ).upper()
         seen_at = str(issue["seen_at"])
-        transitioned = previous is None or (
-            str(previous["state"]) != state or str(previous["severity"]) != severity
-            or previous["recovered_at"] is not None
+        occurred_at = self._shanghai_timestamp(seen_at, "seen_at")
+        details = issue.get("details") if isinstance(issue.get("details"), dict) else {}
+        material_details = self._material_issue_details(details)
+        previous_material = self._material_issue_details(
+            json.loads(str(previous["details_json"] or "{}"))
+            if previous is not None else {}
         )
-        first_seen = str(previous["first_seen_at"]) if previous else seen_at
-        transition_at = seen_at if transitioned else str(previous["last_transition_at"])
-        last_notified = str(previous["last_notified_at"] or "") if previous else ""
-        stage_started = str(issue["stage_started_at"])
-        if previous is not None and not transitioned:
-            previous_details = json.loads(str(previous["details_json"] or "{}"))
-            current_details = issue.get("details") or {}
-            material_progress = (
-                state == "PARTIAL_FILL_PENDING"
-                and int(current_details.get("filled_qty") or 0)
-                > int(previous_details.get("filled_qty") or 0)
+        reopened = bool(previous and previous["recovered_at"] is not None)
+        legacy_adoption = bool(
+            previous is not None
+            and not reopened
+            and not str(previous["incident_id"] or "")
+        )
+        material_changed = bool(previous) and previous_material != material_details
+        transitioned = previous is None or reopened or (
+            str(previous["state"]) != state
+            or str(previous["severity"]).upper() != severity
+            or material_changed
+        )
+        if previous is None or reopened:
+            incident_id = str(uuid.uuid4())
+            transition_seq = 1
+            transition = "OPENED"
+            first_seen = seen_at
+            last_notified = ""
+            critical_minutes = 0
+            critical_last_minute = (
+                self._critical_minute_boundary(occurred_at, ceiling=True)
+                if severity == "CRITICAL" else None
             )
-            if not material_progress:
-                stage_started = str(previous["stage_started_at"])
+            next_reminder_seq = 1
+        else:
+            previous_severity = str(previous["severity"] or "").upper()
+            incident_id = str(previous["incident_id"] or uuid.uuid4())
+            transition_seq = int(previous["transition_seq"] or 0)
+            transition = ""
+            if transitioned:
+                transition_seq += 1
+                severity_rank = {
+                    "INFO": 0, "WARNING": 1, "ERROR": 2, "CRITICAL": 3,
+                }
+                transition = (
+                    "ESCALATED"
+                    if severity_rank.get(severity, -1)
+                    > severity_rank.get(str(previous["severity"]).upper(), -1)
+                    else "CHANGED"
+                )
+            first_seen = str(previous["first_seen_at"])
+            last_notified = str(previous["last_notified_at"] or "")
+            critical_minutes = int(previous["critical_trading_minutes"] or 0)
+            critical_last_minute = previous["critical_last_counted_minute"]
+            next_reminder_seq = int(previous["next_reminder_seq"] or 1)
+            if previous_severity == "CRITICAL" and severity != "CRITICAL":
+                counted_from = str(
+                    critical_last_minute
+                    or self._critical_minute_boundary(
+                        previous["last_transition_at"] or previous["first_seen_at"],
+                        ceiling=True,
+                    )
+                )
+                paused_at = self._critical_minute_boundary(
+                    occurred_at, ceiling=False,
+                )
+                critical_minutes += critical_trading_minutes(
+                    counted_from,
+                    paused_at,
+                    (
+                        app_config.A_SHARE_HOLIDAYS_DEFAULT
+                        if calendar is None else calendar
+                    ),
+                    paused_intervals=paused_intervals,
+                )
+                critical_last_minute = (
+                    counted_from
+                    if self._timestamp_instant(counted_from, "critical cursor")
+                    > self._timestamp_instant(paused_at, "critical pause")
+                    else paused_at
+                )
+            elif previous_severity != "CRITICAL" and severity == "CRITICAL":
+                resumed_at = self._critical_minute_boundary(
+                    occurred_at, ceiling=True,
+                )
+                critical_last_minute = (
+                    str(critical_last_minute)
+                    if critical_last_minute
+                    and self._timestamp_instant(
+                        critical_last_minute, "critical cursor",
+                    ) > self._timestamp_instant(resumed_at, "critical resume")
+                    else resumed_at
+                )
+            elif severity == "CRITICAL" and not critical_last_minute:
+                critical_last_minute = self._critical_minute_boundary(
+                    previous["last_transition_at"] or previous["first_seen_at"],
+                    ceiling=True,
+                )
+        transition_at = (
+            seen_at if transitioned else str(previous["last_transition_at"])
+        )
+        stage_started = str(issue["stage_started_at"])
+        if previous is not None and not reopened and not material_changed:
+            stage_started = str(previous["stage_started_at"])
         conn.execute(
             """INSERT INTO execution_issue_state(
                issue_key, object_type, object_id, state, severity, first_seen_at,
                stage_started_at, last_seen_at, last_transition_at, last_notified_at,
-               recovered_at, signal_id, order_id, reconciliation_id, details_json
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+               recovered_at, signal_id, order_id, reconciliation_id, details_json,
+               incident_id, transition_seq, critical_trading_minutes,
+               critical_last_counted_minute, next_reminder_seq
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(issue_key) DO UPDATE SET
                object_type=excluded.object_type, object_id=excluded.object_id,
                state=excluded.state, severity=excluded.severity,
+               first_seen_at=excluded.first_seen_at,
                stage_started_at=excluded.stage_started_at, last_seen_at=excluded.last_seen_at,
-               last_transition_at=excluded.last_transition_at, recovered_at=NULL,
+               last_transition_at=excluded.last_transition_at,
+               last_notified_at=excluded.last_notified_at, recovered_at=NULL,
                signal_id=excluded.signal_id, order_id=excluded.order_id,
-               reconciliation_id=excluded.reconciliation_id, details_json=excluded.details_json""",
+               reconciliation_id=excluded.reconciliation_id, details_json=excluded.details_json,
+               incident_id=excluded.incident_id, transition_seq=excluded.transition_seq,
+               critical_trading_minutes=excluded.critical_trading_minutes,
+               critical_last_counted_minute=excluded.critical_last_counted_minute,
+               next_reminder_seq=excluded.next_reminder_seq""",
             (
                 key, str(issue["object_type"]), str(issue["object_id"]), state, severity,
                 first_seen, stage_started, seen_at, transition_at,
                 last_notified or None, str(issue.get("signal_id") or "") or None,
                 str(issue.get("order_id") or "") or None,
                 str(issue.get("reconciliation_id") or "") or None,
-                canonical_json(issue.get("details") or {}),
+                canonical_json(details), incident_id, transition_seq,
+                critical_minutes, critical_last_minute, next_reminder_seq,
             ),
         )
+        account_scope_id = str(issue.get("account_scope_id") or "").strip()
+        if transitioned and account_scope_id:
+            self._enqueue_execution_issue_transition(
+                conn,
+                account_scope_id=account_scope_id,
+                issue_key=key,
+                incident_id=incident_id,
+                transition_seq=transition_seq,
+                transition=transition,
+                state=state,
+                severity=severity,
+                object_type=str(issue["object_type"]),
+                object_id=str(issue["object_id"]),
+                occurred_at=occurred_at,
+                details=material_details,
+            )
         return {
             "issue_key": key,
             "previous_state": str(previous["state"]) if previous else "",
             "state": state,
             "severity": severity,
             "transitioned": transitioned,
-            "reopened": bool(previous and previous["recovered_at"] is not None),
+            "transition": transition,
+            "reopened": reopened,
+            "legacy_adoption": legacy_adoption,
+            "incident_id": incident_id,
+            "transition_seq": transition_seq,
             "last_notified_at": last_notified,
             "last_transition_at": transition_at,
         }
@@ -3038,23 +5400,96 @@ class TradingStore:
             ((now, key) for key in keys),
         )
 
+    def is_current_critical_incident(
+        self, issue_key: str, incident_id: str,
+    ) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT 1 FROM execution_issue_state
+                   WHERE issue_key=? AND incident_id=?
+                     AND recovered_at IS NULL AND severity='CRITICAL'""",
+                (
+                    self._required_text(issue_key, "issue_key"),
+                    self._required_text(incident_id, "incident_id"),
+                ),
+            ).fetchone()
+        return row is not None
+
     def recover_execution_issue(
-        self, conn: sqlite3.Connection, issue_key: str, now: str
+        self,
+        conn: sqlite3.Connection,
+        issue_key: str,
+        now: str,
+        *,
+        account_scope_id: str | None = None,
     ) -> dict[str, object] | None:
         row = conn.execute(
             "SELECT * FROM execution_issue_state WHERE issue_key=?", (issue_key,)
         ).fetchone()
         if row is None or row["recovered_at"] is not None:
             return None
+        occurred_at = self._shanghai_timestamp(now, "now")
+        incident_id = str(row["incident_id"] or uuid.uuid4())
+        transition_seq = int(row["transition_seq"] or 0) + 1
         conn.execute(
             """UPDATE execution_issue_state SET state='RECOVERED', severity='INFO',
-               last_seen_at=?, last_transition_at=?, recovered_at=? WHERE issue_key=?""",
-            (now, now, now, issue_key),
+               last_seen_at=?, last_transition_at=?, recovered_at=?,
+               incident_id=?, transition_seq=? WHERE issue_key=?""",
+            (now, now, now, incident_id, transition_seq, issue_key),
         )
+        scope = str(account_scope_id or "").strip()
+        if scope:
+            if not str(issue_key).startswith(f"scope:{scope}:"):
+                raise ValueError("execution issue does not match account scope")
+            rows = conn.execute(
+                """SELECT event_key FROM notification_outbox
+                   WHERE account_scope_id=? AND object_type='execution_issue'
+                     AND object_id=? AND state IN ('pending','leased')""",
+                (scope, issue_key),
+            ).fetchall()
+            for pending in rows:
+                self.request_notification_cancel(
+                    conn,
+                    str(pending["event_key"]),
+                    occurred_at,
+                    "execution issue recovered",
+                )
+            gap_prefix = f"{issue_key}#{incident_id}#"
+            gaps = conn.execute(
+                """SELECT event_key FROM notification_enqueue_gaps
+                   WHERE account_scope_id=? AND resolved_at IS NULL
+                     AND substr(source_fact_id, 1, ?)=?""",
+                (scope, len(gap_prefix), gap_prefix),
+            ).fetchall()
+            for gap in gaps:
+                self.resolve_notification_gap(
+                    conn,
+                    str(gap["event_key"]),
+                    occurred_at,
+                    "superseded_by_recovery",
+                )
+            self._enqueue_execution_issue_transition(
+                conn,
+                account_scope_id=scope,
+                issue_key=str(issue_key),
+                incident_id=incident_id,
+                transition_seq=transition_seq,
+                transition="RECOVERED",
+                state="RECOVERED",
+                severity="INFO",
+                object_type=str(row["object_type"]),
+                object_id=str(row["object_id"]),
+                occurred_at=occurred_at,
+                details=self._material_issue_details(
+                    json.loads(str(row["details_json"] or "{}"))
+                ),
+            )
         return {
             "issue_key": issue_key, "previous_state": str(row["state"]),
             "state": "RECOVERED", "severity": "INFO", "transitioned": True,
-            "reopened": False, "last_notified_at": str(row["last_notified_at"] or ""),
+            "transition": "RECOVERED", "reopened": False,
+            "incident_id": incident_id, "transition_seq": transition_seq,
+            "last_notified_at": str(row["last_notified_at"] or ""),
         }
 
     def reconcile_position_cycles(
@@ -3126,8 +5561,68 @@ class TradingStore:
                     ),
                 )
                 continue
-            target_half = int(row["initial_qty"]) // 2 // 100 * 100
-            stage = max(int(row["take_profit_stage"]), int(qty <= target_half))
+            stage = int(row["take_profit_stage"])
+            if stage == 0 and qty < int(row["initial_qty"]):
+                from exit_policy import (
+                    first_take_profit_target_qty,
+                    normalize_exit_action,
+                )
+                take_profit_signal_id = (
+                    f"{row['position_cycle_id']}-take_profit_1-0"
+                )
+                expected_target = first_take_profit_target_qty(
+                    int(row["initial_qty"]), 100,
+                )
+                intent = conn.execute(
+                    """SELECT i.target_qty, i.reason, i.created_at,
+                              s.generated_at AS signal_generated_at
+                       FROM exit_intents AS i
+                       JOIN signals AS s ON s.signal_id=i.signal_id
+                       WHERE i.signal_id=? AND i.stock_code=?""",
+                    (take_profit_signal_id, code),
+                ).fetchone()
+                fill_times = conn.execute(
+                    """SELECT updated_at AS evidence_at FROM orders
+                       WHERE signal_id=? AND stock_code=? AND action='sell'
+                         AND filled_qty>0
+                       UNION ALL
+                       SELECT filled_at AS evidence_at FROM fills
+                       WHERE signal_id=? AND stock_code=? AND action='sell'
+                         AND qty>0""",
+                    (take_profit_signal_id, code, take_profit_signal_id, code),
+                ).fetchall()
+                observed_at = self._timestamp_instant(
+                    snapshot_at, "snapshot_at",
+                )
+                filled = False
+                if intent is not None:
+                    evidence_start = max(
+                        self._timestamp_instant(
+                            row["opened_at"], "position_cycle.opened_at",
+                        ),
+                        self._timestamp_instant(
+                            intent["created_at"], "exit_intent.created_at",
+                        ),
+                        self._timestamp_instant(
+                            intent["signal_generated_at"], "signal.generated_at",
+                        ),
+                    )
+                    filled = any(
+                        evidence_start
+                        <= self._timestamp_instant(
+                            item["evidence_at"], "take_profit_fill_at",
+                        )
+                        <= observed_at
+                        for item in fill_times
+                    )
+                if (
+                    intent is not None
+                    and int(intent["target_qty"]) == expected_target
+                    and normalize_exit_action(str(intent["reason"]))
+                    == "take_profit_1"
+                    and filled
+                ):
+                    stage = 1
             added = qty > int(row["current_qty"])
             updated_entry = entry_price if added else float(row["entry_price"])
             from exit_policy import validated_initial_stop_price
@@ -3138,11 +5633,15 @@ class TradingStore:
                 ),
             )
             if repaired_stop > float(row["initial_stop_price"]):
-                conn.execute(
-                    """INSERT INTO control_events(event_id, action, operator, old_value, new_value,
-                       reason, created_at) VALUES (?, 'repair_initial_stop', 'system:migration-v8', ?, ?,
-                       '按真实持仓成本和板块最大亏损边界只上调修复', ?)""",
-                    (f"stop-repair-{row['position_cycle_id']}", str(row["initial_stop_price"]), str(repaired_stop), snapshot_at),
+                self.insert_control_event(
+                    conn,
+                    event_id=f"stop-repair-{row['position_cycle_id']}",
+                    action="repair_initial_stop",
+                    operator="system:migration-v8",
+                    old_value=str(row["initial_stop_price"]),
+                    new_value=str(repaired_stop),
+                    reason="按真实持仓成本和板块最大亏损边界只上调修复",
+                    created_at=snapshot_at,
                 )
             updated_r = round(max(updated_entry - repaired_stop, 0.01), 4)
             conn.execute(
@@ -3154,6 +5653,62 @@ class TradingStore:
                     snapshot_at, row["position_cycle_id"],
                 ),
             )
+
+    def activate_profit_protection(
+        self,
+        conn: sqlite3.Connection,
+        position_cycle_id: str,
+        *,
+        expected_current_qty: int,
+        batch_at: str,
+        highest_price: object,
+    ) -> bool:
+        if not conn.in_transaction:
+            raise ValueError("profit protection requires a caller-owned transaction")
+        position_cycle_id = self._required_text(
+            position_cycle_id, "position_cycle_id",
+        )
+        expected_current_qty = self._quantity(
+            expected_current_qty, "expected_current_qty", positive=True,
+        )
+        batch_at = self._aware_timestamp(batch_at, "batch_at")
+        price = self._money(highest_price, "highest_price")
+        if price <= 0:
+            raise ValueError("highest_price must be positive")
+        row = conn.execute(
+            """SELECT stock_code, initial_qty, current_qty FROM position_cycles
+               WHERE position_cycle_id=?""",
+            (position_cycle_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("position cycle not found")
+        from exit_policy import first_take_profit_target_qty
+        if (
+            int(row["current_qty"]) != expected_current_qty
+            or first_take_profit_target_qty(int(row["initial_qty"]), 100)
+            != expected_current_qty
+        ):
+            return False
+        active_from = (
+            datetime.fromisoformat(batch_at) + timedelta(microseconds=1)
+        ).isoformat()
+        changed = conn.execute(
+            """UPDATE position_cycles
+               SET profit_protection_activated_at=?, trailing_stop_active_from=?,
+                   highest_price=max(highest_price, ?), updated_at=?
+               WHERE position_cycle_id=? AND status='active'
+                 AND take_profit_stage=0 AND current_qty=?
+                 AND profit_protection_activated_at IS NULL
+                 AND NOT EXISTS(
+                     SELECT 1 FROM exit_intents
+                     WHERE stock_code=? AND status='active'
+                 )""",
+            (
+                batch_at, active_from, float(price), batch_at,
+                position_cycle_id, expected_current_qty, str(row["stock_code"]),
+            ),
+        ).rowcount
+        return changed == 1
 
     def set_manual_stop(
         self,
@@ -3184,10 +5739,15 @@ class TradingStore:
             (new or None, row["position_cycle_id"]),
         )
         event_time = now or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute(
-            """INSERT INTO control_events(event_id, action, operator, old_value, new_value, reason, created_at)
-               VALUES (?, 'set_manual_stop', ?, ?, ?, ?, ?)""",
-            (f"manual-stop-{uuid.uuid4().hex}", operator, str(old or ""), str(new or ""), reason.strip(), event_time),
+        self.insert_control_event(
+            conn,
+            event_id=f"manual-stop-{uuid.uuid4().hex}",
+            action="set_manual_stop",
+            operator=operator,
+            old_value=str(old or ""),
+            new_value=str(new or ""),
+            reason=reason.strip(),
+            created_at=event_time,
         )
         return {**dict(row), "manual_stop_price": new or None}
 
@@ -3226,7 +5786,10 @@ class TradingStore:
             rows = conn.execute(
                 """SELECT o.stock_code, s.raw_json
                    FROM orders o JOIN signals s ON s.signal_id=o.signal_id
-                   WHERE o.action='buy' AND o.status IN ('submitting','submitted','held','open','partial')
+                   WHERE o.action='buy' AND o.status IN (
+                       'ready','submitting','submit_unknown','new','submitted',
+                       'held','open','partial','partially_filled','pending_cancel'
+                   )
                    ORDER BY o.stock_code, o.client_order_id"""
             ).fetchall()
         result: list[dict] = []
@@ -3285,7 +5848,7 @@ class TradingStore:
             (order["client_order_id"], order.get("order_id")),
         ).fetchall()
         if len(rows) > 1:
-            raise ValueError("order identity resolves to multiple ledger rows")
+            raise OrderConflictError("order identity resolves to multiple ledger rows")
         row = rows[0] if rows else None
         if row is not None:
             incoming_order_id = str(order.get("order_id") or "")
@@ -3317,16 +5880,17 @@ class TradingStore:
                     and incoming_order_id != existing_order_id
                 )
             ):
-                raise ValueError("order identity conflict")
+                raise OrderConflictError("order identity conflict")
         signal_id = order.get("signal_id")
         if signal_id and conn.execute("SELECT 1 FROM signals WHERE signal_id=?", (signal_id,)).fetchone() is None:
             signal_id = None
         terminal = {
             "filled", "cancelled", "rejected", "risk_rejected", "failed",
-            "skipped",
+            "skipped", "not_submitted", "expired",
         }
         non_fill_terminal = {
             "rejected", "risk_rejected", "failed", "skipped",
+            "not_submitted", "expired",
         }
         incoming_status = str(order["status"]).lower()
         incoming_filled_qty = int(order["filled_qty"] or 0)
@@ -3395,14 +5959,12 @@ class TradingStore:
                     "terminal order cannot gain filled quantity"
                 )
             active_rank = {
-                "unknown": 0,
-                "new": 1,
-                "open": 1,
-                "held": 1,
-                "submitted": 1,
-                "partial": 2,
-                "partially_filled": 2,
-                "pending_cancel": 2,
+                "unknown": 0, "ready": 0,
+                "submitting": 1,
+                "new": 2, "open": 2, "held": 2, "submitted": 2,
+                "submit_unknown": 2,
+                "partial": 3, "partially_filled": 3,
+                "pending_cancel": 3,
             }
             if existing_status in terminal:
                 status = existing_status
@@ -3442,6 +6004,16 @@ class TradingStore:
             )
             reason = row["reason"] if metadata_stale else order["reason"]
             raw_json = row["raw_json"] if metadata_stale else order["raw_json"]
+            try:
+                admission_payload = json.loads(str(row["raw_json"]))
+            except Exception:
+                admission_payload = None
+            if (
+                isinstance(admission_payload, dict)
+                and admission_payload.get("source") == "execution_admission"
+                and admission_payload.get("intent_sha256")
+            ):
+                raw_json = row["raw_json"]
             completed_at = row["completed_at"] or (
                 updated_at if status in terminal else order.get("completed_at")
             )
@@ -3450,12 +6022,14 @@ class TradingStore:
                    target_qty=COALESCE(?, target_qty), requested_qty=max(requested_qty, ?),
                    filled_qty=?, average_fill_price=?,
                    status=?, submit_count=max(submit_count, ?), reason=?, updated_at=?,
+                   first_submitted_at=COALESCE(first_submitted_at, ?),
                    completed_at=?, raw_json=? WHERE client_order_id=?""",
                 (
                     signal_id, order.get("order_id"), order.get("target_qty"), order["requested_qty"],
                     filled_qty, average_fill_price, status,
-                    order["submit_count"], reason, updated_at, completed_at,
-                    raw_json, client_id,
+                    order["submit_count"], reason, updated_at,
+                    order.get("first_submitted_at"), completed_at, raw_json,
+                    client_id,
                 ),
             )
             inserted = False
@@ -3575,8 +6149,18 @@ class TradingStore:
             rows = conn.execute("SELECT * FROM exit_intents WHERE status='active'").fetchall()
         return {str(row["stock_code"]): dict(row) for row in rows}
 
-    def confirm_market_regime(self, observed: str) -> str:
+    def confirm_market_regime(self, observed: str, *, enabled: bool = True) -> str:
         from trade_safety import MarketRegimeState
+        observed = str(observed).strip().upper()
+        if observed not in {"NORMAL", "CAUTION", "RISK_OFF"}:
+            raise ValueError(f"invalid market regime: {observed!r}")
+        if not enabled:
+            with self.transaction() as conn:
+                self.set_system_state(
+                    conn, "market_regime", observed,
+                    "observed market regime; confirmation disabled",
+                )
+            return observed
         raw = self.get_system_state("market_regime_confirmation", "")
         data = json.loads(raw) if raw else {}
         state = MarketRegimeState(
@@ -3585,6 +6169,9 @@ class TradingStore:
         ).advance(observed)
         with self.transaction() as conn:
             self.set_system_state(conn, "market_regime_confirmation", canonical_json(state.__dict__), "confirmed scans")
+            self.set_system_state(
+                conn, "market_regime", state.current, "confirmed market regime",
+            )
         return state.current
 
     def is_in_cooldown(self, code: str, trade_date: str) -> bool:

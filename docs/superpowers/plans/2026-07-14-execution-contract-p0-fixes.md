@@ -1,5 +1,7 @@
 # Execution Contract P0 Fixes Implementation Plan
 
+> **2026-08-01 incremental boundary:** The five completed P0 fixes and their deployment evidence remain valid. The local small-capital Batch A adds schema 11, exact-quantity intents and atomic capacity admission under `docs/superpowers/plans/2026-07-28-small-capital-live-risk-execution.md`; the complete batch has not yet formed its final commit and is not deployed, observed or validated. The historical tasks and version literals below remain unchanged.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make risk rejection, final buy plans, unfinished exits, JoinQuant position limits, and existing-holding classification enforce one durable and auditable simulation-trading contract.

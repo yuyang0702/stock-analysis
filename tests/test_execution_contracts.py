@@ -68,8 +68,10 @@ def make_candidate(
     stop_price: str = "9.5",
     signal_time: str = "2026-07-28T09:55:00+08:00",
     frozen_valid_until: str = "2026-07-28T10:05:00+08:00",
+    code: str = "600000",
     industry: object = "technology",
     theme: object = "artificial-intelligence",
+    rule_position_cap_fraction: Decimal | None = D("0.20"),
     buy_gap_price: Decimal | None = None,
     buy_price_cap: Decimal | None = None,
     requested_target_position_qty: object = None,
@@ -78,21 +80,25 @@ def make_candidate(
     exit_priority: object = None,
     sell_limit_price: Decimal | None = None,
     sell_price_floor: Decimal | None = None,
+    fee_schedule_version: str = "sim-v1",
 ) -> StrategyOrderCandidate:
     logical = logical_signal_id(
-        "scope-uuid", "2026-07-28", "main", "s1", "600000", side, "breakout"
+        "scope-uuid", "2026-07-28", "main", "s1", code, side, "breakout"
     )
     return StrategyOrderCandidate(
         candidate_id="candidate-1", logical_signal_id=logical,
         account_scope_id="scope-uuid", source_signal_id="signal-run-1",
         source_run_id="run-1", strategy_id="main", strategy_version="s1",
         parameter_version="p1", model_version="disabled",
-        fee_schedule_version="sim-v1", code="600000", side=side,
+        fee_schedule_version=fee_schedule_version, code=code, side=side,
         setup_type="breakout", suggested_entry_price=D("10"), stop_price=D(stop_price),
         target_price=D(target_price), signal_time=signal_time,
         frozen_valid_until=frozen_valid_until,
         industry=industry, theme=theme,
         uncategorized=not (str(industry or "").strip() and str(theme or "").strip()),
+        rule_position_cap_fraction=(
+            rule_position_cap_fraction if side == "buy" else None
+        ),
         buy_gap_price=D("9") if side == "buy" and buy_gap_price is None else buy_gap_price,
         buy_price_cap=D("10.10") if side == "buy" and buy_price_cap is None else buy_price_cap,
         requested_target_position_qty=(
@@ -154,7 +160,9 @@ def pre_trade_values(
         "projected_total_position_value_yuan": D("31000") if is_buy else D("30000"),
         "projected_industry_value_yuan": D("9000") if is_buy else D("8000"),
         "projected_theme_value_yuan": D("7000") if is_buy else D("6000"),
-        "projected_uncategorized_value_yuan": D("0"),
+        "projected_uncategorized_value_yuan": (
+            D("1000") if is_buy and candidate.uncategorized else D("0")
+        ),
         "projected_open_risk_yuan": (
             D("500") + max(planned_loss, gap_loss) if is_buy else D("500")
         ),
@@ -183,6 +191,9 @@ def pre_trade_values(
         "broker_snapshot_id": "broker-1", "broker_snapshot_sha256": "a" * 64,
         "quote_snapshot_id": "quote-1", "quote_snapshot_sha256": "b" * 64,
         "instrument_rules_sha256": "c" * 64,
+        "risk_policy_sha256": "d" * 64,
+        "reservation_view_sha256": "e" * 64,
+        "system_state_sha256": "f" * 64,
     }
     values.update(changes)
     return values
@@ -253,7 +264,7 @@ def intent_values(
         "fee_schedule_sha256": result.fee_schedule_sha256,
         "fee_evidence_status": result.fee_evidence_status,
         "rule_evidence_status": result.rule_evidence_status,
-        "code": "600000", "side": candidate.side,
+        "code": candidate.code, "side": candidate.side,
         "order_qty": result.approved_qty, "expected_current_qty": current_qty,
         "target_position_qty": result.target_position_qty,
         "limit_price": result.approved_limit_price,
@@ -282,6 +293,20 @@ def intent_values(
 
 
 class ExecutionContractsTest(unittest.TestCase):
+    def test_candidate_rule_position_cap_is_signed_and_legacy_optional(self) -> None:
+        candidate = make_candidate(rule_position_cap_fraction=D("0.18"))
+        self.assertEqual(candidate.rule_position_cap_fraction, D("0.18"))
+        self.assertEqual(
+            StrategyOrderCandidate.from_dict(candidate.to_dict()), candidate,
+        )
+        with self.assertRaises(ValueError):
+            make_candidate(rule_position_cap_fraction=D("1.01"))
+
+        legacy = make_candidate(rule_position_cap_fraction=None)
+        payload = legacy.to_dict()
+        self.assertNotIn("rule_position_cap_fraction", payload)
+        self.assertEqual(StrategyOrderCandidate.from_dict(payload), legacy)
+
     def test_buy_and_sell_minimum_commissions_are_independent_and_hashed(self) -> None:
         fees = FeeSchedule(
             version="asymmetric-v1",
@@ -336,6 +361,25 @@ class ExecutionContractsTest(unittest.TestCase):
         )
 
         self.assertEqual(result.input_sha256, expected)
+
+    def test_fee_schedule_scope_is_signed_and_legacy_payload_round_trips(self) -> None:
+        live = replace(FEES, version="broker-live-v1", execution_scope="live")
+        self.assertEqual(live.execution_scope, "live")
+        self.assertNotEqual(live.contract_sha256, FEES.contract_sha256)
+
+        legacy_content = FEES.to_dict()
+        legacy_content.pop("contract_sha256")
+        legacy_content.pop("contract_version")
+        legacy_content.pop("execution_scope")
+        legacy_payload = {
+            **legacy_content,
+            "contract_sha256": canonical_sha256(legacy_content),
+        }
+
+        restored = FeeSchedule.from_dict(legacy_payload)
+        self.assertEqual(restored.contract_version, 1)
+        self.assertEqual(restored.execution_scope, "simulation")
+        self.assertEqual(restored.to_dict(), legacy_payload)
 
     def test_signed_fee_records_reject_changed_totals_and_extra_fields(self) -> None:
         breakdown = FEES.estimate("buy", D("10"), 100)
@@ -506,6 +550,117 @@ class ExecutionContractsTest(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             snapshot.cash = D("1")
 
+    def test_legacy_broker_snapshot_hash_round_trips_without_reinterpretation(self) -> None:
+        current = BrokerSnapshot.from_values(
+            account_scope_id="scope-uuid",
+            trade_date="2026-07-28",
+            broker_time="2026-07-28T10:00:00+08:00",
+            total_equity=50_000,
+            cash=20_000,
+            available_cash=20_000,
+            frozen_cash=0,
+            positions=[],
+            open_orders=[],
+            fills=[],
+            adapter_version="sim-1",
+            node_version="node-1",
+            session_id="session-1",
+            capabilities_version="cap-1",
+        )
+        legacy_content = current.to_dict()
+        legacy_content.pop("snapshot_sha256")
+        for field in (
+            "contract_version", "adapter", "daily_risk_evidence_status",
+            "daily_turnover_fraction", "consecutive_losses",
+        ):
+            legacy_content.pop(field)
+        legacy_payload = {
+            **legacy_content,
+            "snapshot_sha256": canonical_sha256(legacy_content),
+        }
+
+        restored = BrokerSnapshot.from_dict(legacy_payload)
+        self.assertEqual(restored.contract_version, 1)
+        self.assertEqual(restored.to_dict(), legacy_payload)
+        with self.assertRaisesRegex(ValueError, "legacy|hash"):
+            BrokerSnapshot.from_dict({**legacy_payload, "adapter": "qmt"})
+
+    def test_reported_daily_risk_and_positions_must_be_explicit(self) -> None:
+        values = {
+            "account_scope_id": "scope-uuid",
+            "trade_date": "2026-07-28",
+            "broker_time": "2026-07-28T10:00:00+08:00",
+            "total_equity": 50_000,
+            "cash": 20_000,
+            "available_cash": 20_000,
+            "frozen_cash": 0,
+            "positions": [],
+            "open_orders": [],
+            "fills": [],
+            "adapter_version": "sim-1",
+            "node_version": "node-1",
+            "session_id": "session-1",
+            "capabilities_version": "cap-1",
+            "daily_risk_evidence_status": "reported",
+            "intraday_pnl": 0,
+            "account_drawdown_pct": 0,
+            "daily_turnover_fraction": "0.105",
+            "consecutive_losses": 2,
+        }
+        for field in (
+            "intraday_pnl",
+            "account_drawdown_pct",
+            "daily_turnover_fraction",
+            "consecutive_losses",
+        ):
+            with self.subTest(field=field):
+                incomplete = dict(values)
+                incomplete.pop(field)
+                with self.assertRaisesRegex(ValueError, field):
+                    BrokerSnapshot.from_values(**incomplete)
+
+        snapshot = BrokerSnapshot.from_values(**values)
+        incomplete_payload = snapshot.to_dict()
+        incomplete_payload.pop("positions")
+        incomplete_payload["snapshot_sha256"] = canonical_sha256({
+            key: value
+            for key, value in incomplete_payload.items()
+            if key != "snapshot_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "positions"):
+            BrokerSnapshot.from_dict(incomplete_payload)
+
+        self.assertEqual(snapshot.daily_turnover_fraction, D("0.105"))
+        self.assertEqual(snapshot.consecutive_losses, 2)
+        self.assertEqual(BrokerSnapshot.from_dict(snapshot.to_dict()), snapshot)
+
+    def test_daily_turnover_and_consecutive_losses_fail_closed(self) -> None:
+        common = {
+            "account_scope_id": "scope-uuid",
+            "trade_date": "2026-07-28",
+            "broker_time": "2026-07-28T10:00:00+08:00",
+            "total_equity": 50_000,
+            "cash": 20_000,
+            "available_cash": 20_000,
+            "frozen_cash": 0,
+            "positions": [],
+            "open_orders": [],
+            "fills": [],
+            "adapter_version": "sim-1",
+            "node_version": "node-1",
+            "session_id": "session-1",
+            "capabilities_version": "cap-1",
+        }
+        for field, value in (
+            ("daily_turnover_fraction", "-0.01"),
+            ("daily_turnover_fraction", "NaN"),
+            ("consecutive_losses", -1),
+            ("consecutive_losses", True),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, field):
+                    BrokerSnapshot.from_values(**common, **{field: value})
+
     def test_snapshot_allows_negative_drawdown_and_canonicalizes_equivalent_facts(self) -> None:
         first_quote = QuoteSnapshot.from_values(
             code="600000", quote_time="2026-07-28T10:00:00+08:00",
@@ -631,6 +786,39 @@ class ExecutionContractsTest(unittest.TestCase):
         self.assertNotEqual(first.intent_sha256, conflicting.intent_sha256)
         with self.assertRaises(FrozenInstanceError):
             first.order_qty = 200
+
+    def test_legacy_pre_trade_result_hash_round_trips_and_v2_requires_state_hashes(self) -> None:
+        candidate = make_candidate()
+        current = PreTradeResult(**pre_trade_values(candidate))
+        legacy_content = current.to_dict()
+        legacy_content.pop("result_sha256")
+        legacy_content.pop("contract_version")
+        for field in (
+            "risk_policy_sha256",
+            "reservation_view_sha256",
+            "system_state_sha256",
+        ):
+            legacy_content.pop(field)
+        legacy_payload = {
+            **legacy_content,
+            "result_sha256": canonical_sha256(legacy_content),
+        }
+
+        restored = PreTradeResult.from_dict(legacy_payload)
+        self.assertEqual(restored.contract_version, 1)
+        self.assertEqual(restored.to_dict(), legacy_payload)
+
+        for side in ("buy", "sell"):
+            for field in (
+                "risk_policy_sha256",
+                "reservation_view_sha256",
+                "system_state_sha256",
+            ):
+                with self.subTest(side=side, field=field):
+                    values = pre_trade_values(make_candidate(side=side))
+                    values.pop(field)
+                    with self.assertRaisesRegex(ValueError, field):
+                        PreTradeResult(**values)
 
     def test_candidate_freezes_admission_facts(self) -> None:
         buy = make_candidate(industry="", theme="")
@@ -1289,9 +1477,13 @@ class ExecutionContractsTest(unittest.TestCase):
             checked_at="2026-07-28T10:06:00+08:00",
             valid_until="2026-07-28T10:06:00+08:00",
         )
+        PreTradeResult(
+            **rejected,
+            checked_at="2026-07-28T09:54:59+08:00",
+            valid_until="2026-07-28T09:54:59+08:00",
+        )
         for checked_at, valid_until in (
             ("2026-07-28T10:06:00+08:00", "2026-07-28T10:06:01+08:00"),
-            ("2026-07-28T09:54:59+08:00", "2026-07-28T09:54:59+08:00"),
         ):
             with self.subTest(invalid_rejected=(checked_at, valid_until)):
                 with self.assertRaisesRegex(ValueError, "checked_at|signal_time|valid_until"):

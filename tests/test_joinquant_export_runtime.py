@@ -48,9 +48,15 @@ class JoinQuantExportRuntimeTest(unittest.TestCase):
             store.daily_activity.return_value = (0, 0)
             rows = pd.DataFrame([{"code": "600519"}])
             positions = {"600000": {"code": "600000", "market_value": 20000}}
+            fresh_spot = pd.DataFrame([{
+                "code": "600519", "price": 1500.0,
+                "quote_time": "2026-08-01T10:00:00+08:00",
+            }])
 
             with patch("a_share_strategy.TradingStore", return_value=store), patch(
                 "a_share_strategy.is_a_share_trading_time", return_value=True
+            ), patch(
+                "a_share_strategy.fetch_spot_data", return_value=fresh_spot
             ), patch("a_share_strategy.load_portfolio_positions", return_value=positions), patch(
                 "a_share_strategy.load_pending_buy_codes", return_value={"000001"}
             ), patch("a_share_strategy.load_portfolio_account_total_value", return_value=100000), patch(
@@ -61,11 +67,56 @@ class JoinQuantExportRuntimeTest(unittest.TestCase):
                 a_share_strategy.run_joinquant_export(a_share_strategy.Config(), rows)
 
             kwargs = export.call_args.kwargs
+            exported_rows = export.call_args.args[0]
+            self.assertIs(kwargs["store"], store)
             self.assertEqual(kwargs["cohort_mode"], "after")
             self.assertEqual(kwargs["cohort_interval_sec"], 300)
             self.assertEqual(kwargs["current_position_count"], 2)
             self.assertEqual(kwargs["sector_exposure_pct"], {"银行": 25.0})
             self.assertEqual(kwargs["theme_exposure_pct"], {"高股息": 25.0})
+            self.assertEqual(exported_rows.iloc[0]["price"], 1500.0)
+            self.assertEqual(
+                exported_rows.iloc[0]["quote_time"],
+                "2026-08-01T10:00:00+08:00",
+            )
+
+    def test_execution_quote_refresh_preserves_strategy_fields_and_missing_codes(self) -> None:
+        rows = pd.DataFrame([
+            {
+                "code": "600000", "price": 10.0, "quote_time": "old",
+                "final_score": 91, "entry_price": 9.8,
+            },
+            {
+                "code": "000001", "price": 12.0, "quote_time": "old",
+                "final_score": 88, "entry_price": 11.8,
+            },
+        ])
+        fresh = pd.DataFrame([{
+            "code": "600000", "price": 10.2, "pct_chg": 2.0,
+            "quote_time": "2026-08-01T10:00:00+08:00",
+        }])
+
+        refreshed = a_share_strategy._refresh_execution_quote_rows(rows, fresh)
+
+        self.assertEqual(refreshed.iloc[0]["price"], 10.2)
+        self.assertEqual(
+            refreshed.iloc[0]["quote_time"], "2026-08-01T10:00:00+08:00",
+        )
+        self.assertEqual(refreshed.iloc[0]["final_score"], 91)
+        self.assertEqual(refreshed.iloc[0]["entry_price"], 9.8)
+        self.assertEqual(refreshed.iloc[1]["price"], 12.0)
+        self.assertEqual(refreshed.iloc[1]["quote_time"], "old")
+
+    def test_spot_quotes_keep_the_real_fetch_timestamp(self) -> None:
+        raw = pd.DataFrame([{
+            "代码": "600000", "名称": "PF Bank", "最新价": 10.0,
+            "涨跌幅": 1.0, "成交额": 100000000,
+        }])
+        with patch.object(a_share_strategy.ak, "stock_zh_a_spot_em", return_value=raw):
+            result = a_share_strategy.fetch_spot_data()
+
+        self.assertIn("quote_time", result.columns)
+        self.assertRegex(str(result.iloc[0]["quote_time"]), r"\+08:00$")
 
     def test_runtime_blocks_buy_export_outside_a_share_trading_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

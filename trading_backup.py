@@ -11,7 +11,6 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import config as app_config
-from notifier import WeComNotifier
 from trading_store import (
     TradingStore,
     required_schema_columns,
@@ -20,10 +19,10 @@ from trading_store import (
 
 
 SCHEMA_10_TABLES = tuple(required_schema_columns(10))
-CORE_TABLES = tuple(required_schema_columns(11))
+CORE_TABLES = tuple(required_schema_columns(12))
 REQUIRED_TABLES_BY_SCHEMA = {
     version: frozenset(required_schema_columns(version))
-    for version in (10, 11)
+    for version in (10, 11, 12)
 }
 
 
@@ -72,6 +71,7 @@ def validate_backup_root(db_file: Path, backup_root: Path, project_root: Path) -
 
 def database_facts(db_file: Path) -> dict[str, object]:
     store = TradingStore(db_file)
+    notification_health: dict[str, object] | None = None
     with store.connect() as conn:
         tables = {
             str(row[0])
@@ -91,21 +91,72 @@ def database_facts(db_file: Path) -> dict[str, object]:
             )
         if schema_version == 11:
             store._validate_schema_v11(conn)
+        elif schema_version == 12:
+            store._validate_schema_v12(conn)
         else:
             validate_schema_contract(conn, schema_version)
         counts = {
             name: int(conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
             for name in required
         }
+        if schema_version == 12:
+            states = {
+                str(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) FROM notification_outbox GROUP BY state"
+                )
+            }
+            capacity = store.notification_capacity(conn)
+            marker_row = conn.execute(
+                "SELECT value FROM system_state WHERE key=?",
+                ("notification_outbox_write_failure",),
+            ).fetchone()
+            marker_text = str(marker_row[0] or "") if marker_row is not None else ""
+            marker: dict[str, object] = {}
+            if marker_text:
+                try:
+                    parsed = json.loads(marker_text)
+                except (TypeError, ValueError, RecursionError):
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    marker = parsed
+            notification_health = {
+                "pending": states.get("pending", 0),
+                "leased": states.get("leased", 0),
+                "sent": states.get("sent", 0),
+                "dead": states.get("dead", 0),
+                "cancelled": states.get("cancelled", 0),
+                "unresolved_gaps": capacity.unresolved_gap_rows,
+                "high_unresolved_gaps": capacity.high_unresolved_gap_rows,
+                "dead_detail_rows": capacity.dead_rows,
+                "dead_detail_bytes": capacity.dead_bytes,
+                "high_dead_detail_rows": capacity.high_dead_rows,
+                "high_dead_total_rows": capacity.high_dead_total_rows,
+                "tombstones": capacity.tombstone_rows,
+                "write_failure_marker": bool(marker_text),
+                "write_failure_requires_manual_resolution": bool(
+                    marker.get("requires_manual_resolution")
+                ),
+            }
         check_row = conn.execute("PRAGMA integrity_check").fetchone()
+        foreign_key_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
     check = str(check_row[0]) if check_row is not None else "missing"
     if check != "ok":
         raise ValueError(f"integrity_check failed: {check}")
-    return {
+    if foreign_key_violations:
+        first = foreign_key_violations[0]
+        raise ValueError(
+            "foreign_key_check failed: "
+            f"table={first[0]} rowid={first[1]} parent={first[2]}"
+        )
+    result = {
         "integrity_check": check,
         "schema_version": schema_version,
         "table_counts": counts,
     }
+    if notification_health is not None:
+        result["notification_health"] = notification_health
+    return result
 
 
 def _slot_field(tier: str) -> str:
@@ -131,6 +182,11 @@ def _valid_entry(backup_root: Path, tier: str, manifest_file: Path) -> dict[str,
         if facts["schema_version"] != manifest.get("schema_version"):
             return None
         if facts["table_counts"] != manifest.get("table_counts"):
+            return None
+        if (
+            "notification_health" in facts
+            and facts["notification_health"] != manifest.get("notification_health")
+        ):
             return None
     except Exception:
         return None
@@ -275,8 +331,24 @@ def write_latest_report(report_file: Path, result: dict[str, object]) -> None:
     ]
     if result.get("error"):
         lines.append(f"- 错误：`{str(result['error'])[:300]}`")
+    if result.get("notification_persist_error"):
+        lines.append(
+            "- notification persistence: "
+            f"`{str(result['notification_persist_error'])[:240]}`"
+        )
     if count_lines:
         lines.extend(["", "## 核心表计数", "", *count_lines])
+    notification_health = result.get("notification_health")
+    if isinstance(notification_health, dict):
+        lines.extend([
+            "",
+            "## Notification outbox",
+            "",
+            *[
+                f"- `{name}`: {value}"
+                for name, value in sorted(notification_health.items())
+            ],
+        ])
     _atomic_write_text(Path(report_file), "\n".join(lines) + "\n")
 
 
@@ -285,6 +357,7 @@ def run_restore_drill(
     *,
     now: datetime,
     report_dir: Path,
+    notification_db_file: Path | None = None,
 ) -> dict[str, object]:
     root = Path(backup_root)
     report_dir = Path(report_dir)
@@ -319,8 +392,11 @@ def run_restore_drill(
             if _sha256(restored) != selected["sha256"]:
                 raise ValueError("restored backup sha256 mismatch")
             facts = database_facts(restored)
-            for key in ("integrity_check", "schema_version", "table_counts"):
-                if facts[key] != selected.get(key):
+            for key in (
+                "integrity_check", "schema_version", "table_counts",
+                "notification_health",
+            ):
+                if facts.get(key) != selected.get(key):
                     raise ValueError(f"restored backup {key} mismatch")
         result.update({
             "status": "success",
@@ -328,12 +404,18 @@ def run_restore_drill(
             "integrity_check": facts["integrity_check"],
             "schema_version": facts["schema_version"],
             "table_counts": facts["table_counts"],
+            "notification_health": facts.get("notification_health", {}),
         })
     except Exception as exc:
         result["status"] = "failed"
         result["stage"] = stage
+        result["error_code"] = type(exc).__name__
         result["error"] = str(exc)[:300]
     result["finished_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    if notification_db_file is not None:
+        error = persist_backup_issue_transition(result, notification_db_file, now)
+        if error:
+            result["notification_persist_error"] = error
     _save_status(root, "drill", result)
     write_latest_report(report_dir / "trading_backup_latest.md", result)
     quarter = (now.month - 1) // 3 + 1
@@ -348,20 +430,68 @@ def notify_failure(
     state_file: Path,
     queue_file: Path,
 ) -> bool:
-    if result.get("status") != "failed":
-        return False
-    command = str(result.get("command") or "unknown")
-    stage = str(result.get("stage") or "unknown")
-    notifier = WeComNotifier(
-        webhook_url,
-        Path(state_file),
-        retry_queue_file=Path(queue_file),
-    )
-    return notifier.send_markdown(
-        "SQLite备份异常",
-        f"> 命令：{command}\n> 阶段：{stage}\n> 错误：{str(result.get('error') or '-')[:160]}",
-        dedupe_key=f"trading-backup:{command}:{stage}",
-    )
+    """Deprecated compatibility hook; backup transitions enqueue in SQLite."""
+    del result, webhook_url, state_file, queue_file
+    return False
+
+
+def persist_backup_issue_transition(
+    result: dict[str, object],
+    db_file: Path,
+    now: datetime,
+) -> str:
+    command = str(result.get("command") or "").strip().lower()
+    if command not in {"backup", "drill"}:
+        return "backup command is invalid"
+    failed = result.get("status") == "failed"
+    db_file = Path(db_file)
+    if not db_file.is_file():
+        return "trading database is unavailable" if failed else ""
+    store = TradingStore(db_file)
+    health = store.health()
+    if not health.ok:
+        return (
+            f"trading database schema {health.schema_version} is unavailable"
+            if failed else ""
+        )
+    occurred_at = store._shanghai_timestamp(now.isoformat(), "backup time")
+    try:
+        with store.transaction() as conn:
+            scope_row = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()
+            if scope_row is None:
+                return "account scope is not registered" if failed else ""
+            scope = str(scope_row[0])
+            issue_key = f"scope:{scope}:backup:{command}"
+            if failed:
+                store.upsert_execution_issue(conn, {
+                    "account_scope_id": scope,
+                    "issue_key": issue_key,
+                    "object_type": "backup",
+                    "object_id": command,
+                    "state": f"{command.upper()}_FAILED",
+                    "severity": "ERROR",
+                    "stage_started_at": occurred_at,
+                    "seen_at": occurred_at,
+                    "details": {
+                        "command": command,
+                        "stage": str(result.get("stage") or "unknown")[:128],
+                        "error_code": str(
+                            result.get("error_code") or "UNKNOWN"
+                        )[:128],
+                    },
+                })
+            else:
+                store.recover_execution_issue(
+                    conn, issue_key, occurred_at, account_scope_id=scope,
+                )
+    except Exception as exc:
+        return " ".join(
+            str(exc).replace("\r", " ").replace("\n", " ").split()
+        )[:240]
+    return ""
 
 
 def create_backup(
@@ -392,6 +522,7 @@ def create_backup(
             "schema_version": facts["schema_version"],
             "integrity_check": facts["integrity_check"],
             "table_counts": facts["table_counts"],
+            "notification_health": facts.get("notification_health", {}),
             "tier": "daily",
             "date_slot": now.strftime("%Y-%m-%d"),
             "iso_week_slot": f"{iso_year}-W{iso_week:02d}",
@@ -432,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
     backup_parser = commands.add_parser("backup")
     _add_common_paths(backup_parser, include_db=True)
     drill_parser = commands.add_parser("drill")
-    _add_common_paths(drill_parser)
+    _add_common_paths(drill_parser, include_db=True)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--backup-dir", type=Path, default=app_config.TRADING_BACKUP_DIR)
     args = parser.parse_args(argv)
@@ -445,7 +576,12 @@ def main(argv: list[str] | None = None) -> int:
 
     now = _parse_now(args.now)
     if args.command == "drill":
-        result = run_restore_drill(args.backup_dir, now=now, report_dir=args.report_dir)
+        result = run_restore_drill(
+            args.backup_dir,
+            now=now,
+            report_dir=args.report_dir,
+            notification_db_file=args.db,
+        )
     else:
         try:
             result = create_backup(
@@ -467,21 +603,23 @@ def main(argv: list[str] | None = None) -> int:
                 "command": "backup",
                 "status": "failed",
                 "stage": "backup",
+                "error_code": type(exc).__name__,
                 "error": str(exc)[:300],
                 "finished_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             }
+        error = persist_backup_issue_transition(result, args.db, now)
+        if error:
+            result["notification_persist_error"] = error
         _save_status(args.backup_dir, "backup", result)
         write_latest_report(args.report_dir / "trading_backup_latest.md", result)
 
-    if result.get("status") == "failed":
-        notify_failure(
-            result,
-            webhook_url=app_config.WECOM_WEBHOOK_URL,
-            state_file=app_config.CACHE_DIR / "trading_backup_notify_state.json",
-            queue_file=app_config.CACHE_DIR / "notify_failed_queue.jsonl",
-        )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
-    return 0 if result.get("status") == "success" else 1
+    return (
+        0
+        if result.get("status") == "success"
+        and not result.get("notification_persist_error")
+        else 1
+    )
 
 
 if __name__ == "__main__":

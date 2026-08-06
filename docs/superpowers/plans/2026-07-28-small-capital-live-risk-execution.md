@@ -4,13 +4,13 @@
 
 **Goal:** Replace amount-based and observation-only buy preparation with versioned costs, exact board-lot sizing, enforceable pre-trade checks, atomic reservations and correct one-lot profit protection.
 
-**Architecture:** Pure contracts and sizing functions calculate an exact quantity from a frozen account/quote/rule snapshot. A single `BEGIN IMMEDIATE` admission transaction rereads controls and current broker state, records the complete decision, reserves capacity, creates an immutable `ExecutionIntent`, and creates one READY order. JoinQuant continues as the simulator executor, but receives exact quantities and never fabricates live-ready evidence from an empty portfolio.
+**Architecture:** Pure contracts and sizing functions calculate an exact quantity from a frozen account/quote/rule snapshot. A single `BEGIN IMMEDIATE` admission transaction rereads controls and current broker state, records the complete decision, creates an immutable `ExecutionIntent`, reserves capacity against that intent, and creates one READY order. JoinQuant continues as the simulator executor, but receives exact quantities and never fabricates live-ready evidence from an empty portfolio.
 
 **Tech Stack:** Python 3.11+, dataclasses, Decimal, sqlite3, pandas, existing unittest suite and JoinQuant template.
 
-**Status:** `implementation in progress`; the standalone components in Tasks 1-3 are `implemented / not deployed / not observed / not validated`, but the end-to-end Batch A capability is not implemented until Tasks 4-8 are complete.
+**Status:** Batch A Tasks 1-8 are `implemented（local feature branch; not merged or pushed） / not deployed / not observed / not validated`. Tasks 1-3 are committed on this feature branch; Tasks 4-8 remain uncommitted. The release commit, Linux evidence and every external action require separate authorization.
 
-**Local evidence (2026-07-29):** Task 1 contracts, the Task 2 exact-sizing standalone component and the Task 3 schema/current-state/reconciliation component are included on this feature branch; the latest Task 2 hardening is commit `a4848b0`. Tasks 4-6 still have to connect these components to the production buy path, so ordinary buys do not yet use the new exact allocator. None of this is deployment, trading-session observation or strategy validation evidence.
+**Local evidence (2026-08-01):** Task 1 contracts, Task 2 exact sizing and Task 3 schema/current-state/reconciliation are locally committed on this feature branch. Task 4 has the pure unified decision pipeline. Task 5 adds atomic candidate/result/intent/reservation/READY admission, scoped current broker evidence, fail-closed replay, safe expiry/terminal release, partial-fill adjustment, protected-sell retry boundaries and full-reconciliation-only unknown-submission recovery. Task 6 connects ordinary JoinQuant buys to current quote refresh, exact admission and quantity-only execution; the signal server revalidates current controls and the complete immutable intent before delivery. Task 7 adds ceiling-half `+2R` targets, one-lot next-batch profit protection, causal fill-confirmed stage progression, consistent risk consumers and point-in-time strict-backtest semantics under execution-plan version `2026-08-01.1-small-capital-live-risk`. Task 8 expanded compilation/focused coverage passed `559/559`, including configurable `observe/enforce`; full Windows discovery passed `766/769`, with only the three Linux-script tests unable to start because Windows has no `bash.exe`. Documentation and deployment preparation are synchronized, but Tasks 4-8 are not yet committed. None of this is deployment, JoinQuant website update, trading-session observation or strategy validation evidence.
 
 ## Global Constraints
 
@@ -366,10 +366,16 @@ git commit -m "fix: harden broker state reconciliation"
 
 **Files:**
 
+- Modify: `execution_contracts.py`
+- Modify: `position_sizing.py`
 - Modify: `pre_trade_check.py`
+- Modify: `joinquant_sync.py`
+- Modify: `tests/test_execution_contracts.py`
+- Modify: `tests/test_position_sizing.py`
 - Modify: `tests/test_pre_trade_check.py`
 - Modify: `tests/test_portfolio_validation.py`
 - Modify: `tests/test_trade_safety.py`
+- Modify: `tests/test_joinquant_sync.py`
 
 **Interfaces:**
 
@@ -377,7 +383,7 @@ git commit -m "fix: harden broker state reconciliation"
 - Produces `pre_trade_check(candidate, broker_snapshot, quote, instrument_rules, system_state, risk_policy, reservations) -> PreTradeResult`.
 - Preserves `evaluate_observation(...)` only as a compatibility wrapper for historical observe reports, never as the admission path.
 
-- [ ] **Step 1: Write failing hard/soft and buy/sell matrix tests**
+- [x] **Step 1: Write failing hard/soft and buy/sell matrix tests**
 
 ```python
 def test_observe_does_not_soften_existing_hard_blocks(self):
@@ -392,26 +398,30 @@ def test_buy_disabled_does_not_block_valid_stop_sell(self):
 
 Cover missing snapshot/rules/fees, signal age, duplicate order, unique exit ownership, T+1, suspension/limit state, price protection, 5 positions, 80% total, single stock, industry/theme/uncategorized/open-risk, cash, daily orders/turnover/loss/drawdown and `kill_switch` semantics.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
+
+Historical RED output was not retained and cannot be reconstructed from the current GREEN tree; the failing cases were added before the implementation and remain as the executable regressions below.
 
 Run: `python -m unittest tests.test_pre_trade_check tests.test_portfolio_validation tests.test_trade_safety -v`
 
 Expected: current module only has observation structures and cannot enforce the matrix.
 
-- [ ] **Step 3: Implement a side-effect-free decision pipeline**
+- [x] **Step 3: Implement a side-effect-free decision pipeline**
 
 Normalize inputs first, accumulate stable hard blocks and warnings in deterministic order, call `allocate_buy_quantity` only for buys, and include exact approved quantity, target holding, cash/position/classification/open-risk projections, fee components, stop/gap losses, all snapshot/version IDs, `checked_at`, `valid_until` and result hash. In observe mode, failed new economic soft gates become warnings, but every pre-existing safety gate remains a hard block.
 
-- [ ] **Step 4: Run GREEN and old P0 regressions**
+- [x] **Step 4: Run GREEN and old P0 regressions**
 
 Run: `python -m unittest tests.test_pre_trade_check tests.test_portfolio_validation tests.test_trade_safety tests.test_risk_engine tests.test_execution_state -v`
 
 Expected: all hard blocks are stable in both modes, valid sell exits remain available, and no function writes storage.
 
+Local GREEN evidence (2026-08-01): contract, sizing, pre-trade, portfolio, sell-safety, backtest, paper-trading, config, gap and JoinQuant sync suites passed `222/222`; the broader Task 3-4 ledger/reconciliation set passed `291/291`. The latest code also rejects incomplete full snapshots, preserves legacy contract hashes, normalizes JoinQuant daily-risk values independently of process Decimal settings, keeps terminal buy reservations from blocking protective sells and requires cancel confirmation for nonterminal cross-side orders. Final complete-suite and Linux evidence remain Task 8 work.
+
 - [ ] **Step 5: Commit only after separate authorization**
 
 ```bash
-git add pre_trade_check.py tests/test_pre_trade_check.py tests/test_portfolio_validation.py tests/test_trade_safety.py
+git add execution_contracts.py position_sizing.py pre_trade_check.py joinquant_sync.py tests/test_execution_contracts.py tests/test_position_sizing.py tests/test_pre_trade_check.py tests/test_portfolio_validation.py tests/test_trade_safety.py tests/test_joinquant_sync.py docs/superpowers/plans/2026-07-28-small-capital-live-risk-execution.md docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md
 git commit -m "feat: enforce unified pre-trade decisions"
 ```
 
@@ -431,7 +441,7 @@ git commit -m "feat: enforce unified pre-trade decisions"
 - Produces `admit_candidate(store, request, now) -> AdmissionResult`.
 - Produces `expire_ready_intents(store, now) -> int` and terminal-evidence-based reservation release.
 
-- [ ] **Step 1: Write failing concurrency, idempotency and rollback tests**
+- [x] **Step 1: Write failing concurrency, idempotency and rollback tests**
 
 ```python
 def test_two_buyers_cannot_spend_the_same_capacity(self):
@@ -449,13 +459,15 @@ def test_rejection_records_decision_but_not_intent_or_order(self):
 
 Also test same ID/same hash idempotency, same ID/different hash conflict, transaction failure rollback, `BEGIN IMMEDIATE` contention, READY expiry release, no release for `SUBMITTING/SUBMIT_UNKNOWN/SUBMITTED/PARTIALLY_FILLED`, partial-fill adjustment and sell exit ownership.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
+
+Historical RED output was not retained and cannot be reconstructed from the current GREEN tree; the failing cases remain as executable regressions below.
 
 Run: `python -m unittest tests.test_execution_admission tests.test_order_ledger tests.test_execution_ledger_integration -v`
 
 Expected: admission module is absent and concurrent decisions can see the same capacity.
 
-- [ ] **Step 3: Implement the single transaction**
+- [x] **Step 3: Implement the single transaction**
 
 ```text
 BEGIN IMMEDIATE
@@ -465,19 +477,22 @@ insert/conflict-check StrategyOrderCandidate
 call pure pre_trade_check
 insert/conflict-check PreTradeResult
 if rejected: COMMIT
-insert exact capacity reservation
 derive immutable ExecutionIntent and client_order_id
+insert/conflict-check immutable ExecutionIntent
+insert exact capacity reservation referencing that intent
 insert READY order with normalized intent hash
 COMMIT
 ```
 
 An explicit `client_order_id` from the intent takes precedence; keep legacy derivation only for old JoinQuant events. Release is driven by authoritative terminal order/reconciliation facts, except never-submitted READY expiry. No empty portfolio is accepted for live-ready admission.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `python -m unittest tests.test_execution_admission tests.test_order_ledger tests.test_execution_ledger_integration tests.test_trading_control -v`
 
 Expected: one concurrent candidate wins, all content conflicts fail closed, and existing order/fill controls remain intact.
+
+Local GREEN evidence (2026-08-01): the Task 5 admission/control set passed `36/36`; the broader admission, order-ledger, callback, control, JoinQuant sync/server, reconciliation, schema/backup and sell-safety set passed `247/247`. Regressions cover authoritative broker/fill/event replay blocking, `SUBMIT_UNKNOWN` preservation across incremental snapshots, release only after matched full reconciliation, two distinct post-stop matched snapshots before automatic buy recovery, safe protected-sell retry after `EXPIRED/CANCELLED/REJECTED + released`, and no automatic reissue after `NOT_SUBMITTED`. `py_compile` and `git diff --check` passed. Final complete-suite and Linux evidence remain Task 8 work.
 
 - [ ] **Step 5: Commit only after separate authorization**
 
@@ -492,18 +507,25 @@ git commit -m "feat: reserve execution capacity atomically"
 
 - Modify: `joinquant_exporter.py`
 - Modify: `a_share_strategy.py`
+- Modify: `historical_backtest.py`
+- Modify: `joinquant_sync.py`
+- Modify: `holdings_web.py`
+- Modify: `execution_admission.py`
 - Modify: `joinquant_strategy.py`
+- Modify: `joinquant_signal_server.py`
 - Modify: `tests/test_joinquant_exporter.py`
 - Modify: `tests/test_joinquant_export_runtime.py`
 - Modify: `tests/test_joinquant_strategy_template.py`
+- Modify: `tests/test_joinquant_signal_server.py`
 - Modify: `tests/test_config_env.py`
 
 **Interfaces:**
 
 - `joinquant_exporter.export_signals(...)` consumes admitted intents and publishes `target_qty`, `target_position`, `client_order_id`, snapshot/version references and expiry.
 - `joinquant_strategy.py` executes the exact `target_qty` with `order_target`, then reports the same `client_order_id`.
+- `joinquant_signal_server.py` serves a buy only while exact `0/1` controls allow it and the complete signed SQLite intent still matches the published execution fields, remains `READY` and is unexpired.
 
-- [ ] **Step 1: Write failing exact-quantity and empty-state tests**
+- [x] **Step 1: Write failing exact-quantity and empty-state tests**
 
 ```python
 def test_buy_signal_is_backed_by_admitted_exact_quantity(self):
@@ -520,21 +542,25 @@ def test_template_has_no_amount_based_buy_fallback(self):
 
 Cover snapshot refresh, all-buy rejection on ledger failure while sells remain published, sell priority, stale intent, duplicate plan, existing 5/80/classification gates and byte-equivalent behavior for paths not affected by sizing.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
+
+Historical RED output was not retained and cannot be reconstructed from the current GREEN tree; the failing cases remain as executable regressions below.
 
 Run: `python -m unittest tests.test_joinquant_exporter tests.test_joinquant_export_runtime tests.test_joinquant_strategy_template tests.test_config_env -v`
 
 Expected: exporter still uses observation evidence/hand accumulation and template retains amount-based behavior.
 
-- [ ] **Step 3: Wire the production path**
+- [x] **Step 3: Wire the production path**
 
 Build candidates from rule decisions, call `admit_candidate` per candidate, publish only admitted immutable intents, and serialize each exact integer quantity. Remove `PortfolioState.empty()` from admission evidence. In the template, recheck current cash/price/holding and reject mismatches; never resize or switch to target value. Keep existing exits able to publish when buy admission or storage fails.
 
-- [ ] **Step 4: Run GREEN and template regressions**
+- [x] **Step 4: Run GREEN and template regressions**
 
 Run: `python -m unittest tests.test_joinquant_exporter tests.test_joinquant_export_runtime tests.test_joinquant_strategy_template tests.test_execution_ledger_integration tests.test_signal_lifecycle -v`
 
 Expected: every ordinary buy has a persisted intent and exact quantity; sell behavior and current JoinQuant callback format remain compatible.
+
+Local GREEN evidence (2026-08-01): the focused exporter/runtime/template/config/signal-server/ledger/lifecycle set passed `148/148`; the expanded contracts, admission, sync, ledger, reconciliation, portfolio, sell-safety, backup and control set passed `455/455`. Regressions cover fresh execution quotes, score-ordered reservations, exact one-lot sizing with decimal account equity, frozen-cap 80% projection, no amount fallback, SELL priority, malformed BUY isolation, current-control and full immutable-intent delivery binding, stale/terminal intent suppression, no false full snapshot when platform order or trade collections are unavailable, per-order gap-cleanup isolation, per-row gap-state storage isolation, and fail-closed malformed/unknown open-order evidence for both BUY and SELL. `py_compile` and `git diff --check` passed. Final complete-suite and Linux evidence remain Task 8 work.
 
 - [ ] **Step 5: Commit only after separate authorization**
 
@@ -554,6 +580,10 @@ git commit -m "feat: publish exact-quantity JoinQuant intents"
 - Modify: `tests/test_trading_store.py`
 - Modify: `tests/test_holding_stop_loss.py`
 - Modify: `tests/test_execution_ledger_integration.py`
+- Modify: `tests/test_historical_backtest.py`
+- Modify: `tests/test_joinquant_sync.py`
+- Modify: `tests/test_holdings_web.py`
+- Modify: `tests/test_execution_admission.py`
 
 **Interfaces:**
 
@@ -561,7 +591,7 @@ git commit -m "feat: publish exact-quantity JoinQuant intents"
 - Produces transactional `activate_profit_protection(...)` with `trailing_stop_active_from` set to the next decision batch.
 - Advances `take_profit_stage` only from confirmed partial-reduction fills.
 
-- [ ] **Step 1: Write failing 100/300/500 and stage tests**
+- [x] **Step 1: Write failing 100/300/500 and stage tests**
 
 ```python
 def test_first_take_profit_targets_preserve_at_least_half(self):
@@ -578,13 +608,13 @@ def test_one_lot_activates_protection_next_batch_without_advancing_stage(self):
 
 Also test duplicate scans, no same-batch trailing exit, 300-share sell 100/retain 200, 500-share sell 200/retain 300, hard stop/full exits, partial fill before stage, confirmed reduction after stage and no duplicate exit intent.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `python -m unittest tests.test_exit_policy tests.test_trading_store tests.test_holding_stop_loss tests.test_execution_ledger_integration -v`
 
 Expected: current floor arithmetic turns 100 to zero and over-sells 300 shares.
 
-- [ ] **Step 3: Implement discrete target and independent protection state**
+- [x] **Step 3: Implement discrete target and independent protection state**
 
 ```python
 def first_take_profit_target_qty(initial_qty: int, qty_step: int) -> int:
@@ -594,16 +624,18 @@ def first_take_profit_target_qty(initial_qty: int, qty_step: int) -> int:
 
 At `+2R`, a target equal to current quantity writes protection activation, high-water mark and next-batch activation in the same transaction but creates no sell intent. A real reduction fill updates the position cycle and then advances stage. Hard stop, effective trailing stop, time stop and market-risk exits retain their priority and may clear the position.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `python -m unittest tests.test_exit_policy tests.test_trading_store tests.test_holding_stop_loss tests.test_execution_ledger_integration -v`
 
 Expected: exact discrete targets, no duplicate intent, no same-batch activation/exit and fill-driven stage progression.
 
+Local GREEN evidence (2026-08-01): the focused Task 7 suite passed `105/105` with exact 100/300/500 targets, transactionally persisted one-lot protection, no same-batch trailing exit, stable exit ownership and real callback-driven stage progression. The expanded exit/store/sync/web/admission/historical suite passed `205/205` with future-dated broker evidence rejected atomically, stage evidence bounded by cycle/signal/intent/snapshot time, every effective-stop consumer using the independent protection fields, hard-stop priority, and strict daily OHLC trailing decisions using only the prior-batch high-water mark. `py_compile`, `git diff --check` and independent spec/adversarial/Ponytail reviews passed with no remaining P0/P1/P2. The deterministic strict tests are implementation evidence only; no real 6-month/1-year strict dataset or representative JoinQuant trading-day cycle has been observed or validated.
+
 - [ ] **Step 5: Commit only after separate authorization**
 
 ```bash
-git add exit_policy.py trading_store.py a_share_strategy.py tests/test_exit_policy.py tests/test_trading_store.py tests/test_holding_stop_loss.py tests/test_execution_ledger_integration.py
+git add exit_policy.py trading_store.py a_share_strategy.py historical_backtest.py joinquant_sync.py holdings_web.py execution_admission.py tests/test_exit_policy.py tests/test_trading_store.py tests/test_holding_stop_loss.py tests/test_execution_ledger_integration.py tests/test_historical_backtest.py tests/test_joinquant_sync.py tests/test_holdings_web.py tests/test_execution_admission.py
 git commit -m "fix: preserve odd-lot profit protection semantics"
 ```
 
@@ -626,16 +658,18 @@ git commit -m "fix: preserve odd-lot profit protection semantics"
 - Modify: `docs/superpowers/specs/2026-07-28-small-capital-live-readiness-integration-design.md`
 - Modify: `linux_deploy.md`
 
-- [ ] **Step 1: Run target compilation and focused safety suites**
+- [x] **Step 1: Run target compilation and focused safety suites**
 
 ```powershell
-python -m py_compile execution_contracts.py position_sizing.py execution_admission.py pre_trade_check.py trading_store.py joinquant_sync.py order_ledger.py joinquant_exporter.py a_share_strategy.py joinquant_strategy.py exit_policy.py gap_reentry.py backtest_engine.py historical_backtest.py paper_trading.py
-python -m unittest tests.test_execution_contracts tests.test_position_sizing tests.test_execution_admission tests.test_pre_trade_check tests.test_trading_store tests.test_joinquant_sync tests.test_order_ledger tests.test_joinquant_exporter tests.test_joinquant_export_runtime tests.test_joinquant_strategy_template tests.test_exit_policy tests.test_gap_reentry tests.test_execution_ledger_integration tests.test_trading_control tests.test_reconciliation tests.test_trading_backup -v
+python -m py_compile execution_contracts.py position_sizing.py execution_admission.py pre_trade_check.py trading_store.py joinquant_sync.py order_ledger.py joinquant_exporter.py a_share_strategy.py joinquant_strategy.py exit_policy.py gap_reentry.py backtest_engine.py historical_backtest.py paper_trading.py config.py holdings_web.py joinquant_signal_server.py reconciliation.py trading_control.py trading_backup.py
+python -m unittest tests.test_execution_contracts tests.test_position_sizing tests.test_execution_admission tests.test_pre_trade_check tests.test_trading_store tests.test_joinquant_sync tests.test_order_ledger tests.test_joinquant_exporter tests.test_joinquant_export_runtime tests.test_joinquant_strategy_template tests.test_exit_policy tests.test_gap_reentry tests.test_execution_ledger_integration tests.test_trading_control tests.test_reconciliation tests.test_trading_backup tests.test_config_env tests.test_holdings_web tests.test_joinquant_signal_server tests.test_portfolio_validation tests.test_trade_safety tests.test_historical_backtest tests.test_holding_stop_loss -v
 ```
 
 Expected: all focused tests pass and the old five P0 invariants remain green.
 
-- [ ] **Step 2: Run the complete local suite and diff checks**
+Local evidence (2026-08-01): compilation passed and the expanded focused set passed `559/559`.
+
+- [x] **Step 2: Run the complete local suite and diff checks**
 
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
@@ -645,16 +679,24 @@ git status --short --branch
 
 Expected: all platform-independent tests pass and only intentional source/test/document files are changed.
 
-- [ ] **Step 3: Update documents truthfully**
+Local evidence (2026-08-01): full discovery ran `769` tests; `766` passed and only the three `tests.test_joinquant_linux_script` cases failed to launch because Windows has no `bash.exe`. The earlier complete-snapshot fixture timestamp was corrected and its module passes `27/27`. Linux full-suite evidence remains a mandatory pre-deployment check; tests were not skipped to manufacture an all-green Windows result. `git diff --check` passes apart from existing LF/CRLF notices.
+
+- [x] **Step 3: Update documents truthfully**
 
 Record schema 11, exact quantity, atomic admission and profit-protection implementation as `implemented / not deployed / not observed / not validated`. Keep old P0 as already deployed but not automatically validated. State that changed sizing/exit semantics require strict backtest and representative JoinQuant trading-day evidence before real money.
+
+Local evidence (2026-08-01): the roadmap, handoff, live execution, read-only observation, storage, ledger/risk/P0/gap bridge documents, integrated design and Linux deployment runbook now separate the local schema 11 checkpoint from the last recorded schema 10 server checkpoint.
 
 - [ ] **Step 4: Commit only after separate authorization**
 
 ```bash
-git add docs/project_roadmap.md docs/project_handoff.md docs/live_trading_execution_plan.md docs/codex_simulation_observation_plan.md docs/data_storage_policy.md docs/superpowers/specs docs/superpowers/plans linux_deploy.md
+git diff --name-only
+git add <逐个审核确认属于本批的文件路径>
+git diff --cached --name-only
 git commit -m "docs: record small-capital execution implementation"
 ```
+
+不得直接暂存整个 `docs/superpowers/specs`、`docs/superpowers/plans` 或工作树；并行批次和私有文件必须排除。提交仍需当次单独授权。
 
 ## Deployment And Observation Boundary
 

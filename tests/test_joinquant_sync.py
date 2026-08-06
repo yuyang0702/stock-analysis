@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from decimal import Decimal, ROUND_DOWN, getcontext, localcontext
 from pathlib import Path
 
 import joinquant_sync
@@ -8,6 +9,27 @@ from trading_store import TradingStore
 
 
 class JoinQuantSyncTest(unittest.TestCase):
+    def test_cycle_risk_fields_include_active_one_lot_trailing_stop(self) -> None:
+        positions = [{
+            "code": "600000", "qty": 100, "cost_price": 10,
+            "current_price": 12.1,
+        }]
+        cycles = {"600000": {
+            "mode": "short", "initial_qty": 100, "entry_price": 10,
+            "initial_stop_price": 9, "highest_price": 13, "atr14": 0.4,
+            "take_profit_stage": 0, "manual_stop_price": None,
+            "market_state": "NORMAL", "position_cycle_id": "cycle-1",
+            "profit_protection_activated_at": "2026-07-28T09:55:00+08:00",
+            "trailing_stop_active_from": "2026-07-28T09:55:00.000001+08:00",
+        }}
+
+        joinquant_sync.apply_cycle_risk_fields(
+            positions, cycles, "2026-07-28T10:00:00+08:00"
+        )
+
+        self.assertEqual(positions[0]["trailing_stop_price"], 12.2)
+        self.assertEqual(positions[0]["effective_stop_price"], 12.2)
+
     @staticmethod
     def _ledger_snapshot(generated_at: str = "2026-07-07 10:05:00") -> dict:
         return {
@@ -22,6 +44,7 @@ class JoinQuantSyncTest(unittest.TestCase):
             "daily_turnover_pct": 10.5,
             "daily_pnl_pct": 0.5,
             "account_drawdown_pct": -0.2,
+            "consecutive_losses": 0,
             "positions": [{
                 "code": "600000", "jq_code": "600000.XSHG", "qty": 1000,
                 "closeable_amount": 1000, "locked_amount": 0, "today_amount": 0,
@@ -64,6 +87,127 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertEqual(equity["fee_data_status"], "reported")
             self.assertEqual(equity["realized_pnl_status"], "unknown")
             self.assertEqual(equity["unrealized_pnl"], 500)
+
+    def test_snapshot_rejects_future_order_or_fill_evidence_atomically(self) -> None:
+        for future_kind in ("order", "fill"):
+            with self.subTest(future_kind=future_kind), tempfile.TemporaryDirectory() as tmp:
+                store = TradingStore(Path(tmp) / "trading.db")
+                snapshot = self._ledger_snapshot("2026-07-07 10:00:00")
+                snapshot["orders"][0]["datetime"] = "2026-07-07 10:00:00"
+                snapshot["trades"][0]["datetime"] = "2026-07-07 10:00:00"
+                if future_kind == "order":
+                    snapshot["orders"][0]["datetime"] = "2026-07-07 10:01:00"
+                else:
+                    snapshot["trades"][0]["datetime"] = "2026-07-07 10:01:00"
+
+                with self.assertRaisesRegex(ValueError, "follows snapshot generated_at"):
+                    joinquant_sync.ingest_snapshot_payload(
+                        snapshot, store, "2026-07-07 10:00:02"
+                    )
+
+                with store.connect() as conn:
+                    self.assertEqual(conn.execute(
+                        "SELECT COUNT(*) FROM account_snapshots"
+                    ).fetchone()[0], 0)
+                    self.assertEqual(conn.execute(
+                        "SELECT COUNT(*) FROM orders"
+                    ).fetchone()[0], 0)
+                    self.assertEqual(conn.execute(
+                        "SELECT COUNT(*) FROM fills"
+                    ).fetchone()[0], 0)
+
+    def test_legacy_snapshot_normalizes_adapter_and_daily_risk_evidence(self) -> None:
+        payload = self._ledger_snapshot()
+        payload["orders"] = []
+        payload["trades"] = []
+        normalized = joinquant_sync._legacy_broker_snapshot(
+            payload, "scope-uuid", "2026-07-07 10:05:02", {},
+        )
+        with localcontext() as context:
+            context.prec = 50
+            expected_intraday = (
+                Decimal("100000")
+                - Decimal("100000") * Decimal("100") / Decimal("100.5")
+            )
+
+        self.assertEqual(normalized.adapter, "joinquant")
+        self.assertEqual(normalized.daily_risk_evidence_status, "reported")
+        self.assertEqual(normalized.intraday_pnl, expected_intraday)
+        self.assertEqual(normalized.account_drawdown_pct, Decimal("-0.2"))
+        self.assertEqual(normalized.daily_turnover_fraction, Decimal("0.105"))
+        self.assertEqual(normalized.consecutive_losses, 0)
+
+        explicit_pnl = dict(payload)
+        explicit_pnl.pop("daily_pnl_pct")
+        explicit_pnl["intraday_pnl"] = "123.45"
+        normalized = joinquant_sync._legacy_broker_snapshot(
+            explicit_pnl, "scope-uuid", "2026-07-07 10:05:02", {},
+        )
+        self.assertEqual(normalized.daily_risk_evidence_status, "reported")
+        self.assertEqual(normalized.intraday_pnl, Decimal("123.45"))
+
+        for field in (
+            "daily_pnl_pct",
+            "account_drawdown_pct",
+            "daily_turnover_pct",
+            "consecutive_losses",
+        ):
+            with self.subTest(field=field):
+                incomplete = dict(payload)
+                incomplete.pop(field, None)
+                unknown = joinquant_sync._legacy_broker_snapshot(
+                    incomplete, "scope-uuid", "2026-07-07 10:05:02", {},
+                )
+                self.assertEqual(unknown.daily_risk_evidence_status, "unknown")
+
+    def test_daily_risk_numeric_evidence_fails_closed(self) -> None:
+        for field, value in (
+            ("daily_turnover_pct", -1),
+            ("daily_turnover_pct", "NaN"),
+            ("consecutive_losses", -1),
+            ("consecutive_losses", "1.5"),
+        ):
+            with self.subTest(field=field, value=value):
+                payload = self._ledger_snapshot()
+                payload[field] = value
+                payload["orders"] = []
+                payload["trades"] = []
+                with self.assertRaisesRegex(ValueError, field):
+                    joinquant_sync._legacy_broker_snapshot(
+                        payload, "scope-uuid", "2026-07-07 10:05:02", {},
+                    )
+
+    def test_daily_pnl_normalization_is_independent_of_decimal_context(self) -> None:
+        payload = self._ledger_snapshot()
+        payload["orders"] = []
+        payload["trades"] = []
+        context = getcontext()
+        original = context.prec, context.rounding
+        try:
+            hashes = set()
+            values = set()
+            for precision in (10, 28, 50):
+                context.prec = precision
+                context.rounding = ROUND_DOWN
+                snapshot = joinquant_sync._legacy_broker_snapshot(
+                    payload, "scope-uuid", "2026-07-07 10:05:02", {},
+                )
+                hashes.add(snapshot.snapshot_sha256)
+                values.add((snapshot.intraday_pnl, snapshot.daily_turnover_fraction))
+            self.assertEqual(len(hashes), 1)
+            self.assertEqual(len(values), 1)
+        finally:
+            context.prec, context.rounding = original
+
+    def test_complete_snapshot_requires_explicit_position_order_and_trade_sets(self) -> None:
+        for field in ("positions", "orders", "trades"):
+            with self.subTest(field=field):
+                payload = self._ledger_snapshot()
+                payload.pop(field)
+                with self.assertRaisesRegex(ValueError, field):
+                    joinquant_sync._legacy_broker_snapshot(
+                        payload, "scope-uuid", "2026-07-07 10:05:02", {},
+                    )
 
     def test_ingest_persists_strict_scoped_current_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,6 +280,96 @@ class JoinQuantSyncTest(unittest.TestCase):
                        WHERE broker_order_id='target-only-open'"""
                 ).fetchone()
             self.assertEqual(tuple(row), (100, 0, "submitted"))
+
+    def test_complete_snapshot_deduplicates_orders_and_keeps_each_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            snapshot = self._ledger_snapshot()
+            snapshot["orders"] = [
+                {
+                    "order_id": "duplicate-open", "action": "buy",
+                    "code": "600000", "amount": 100, "filled": 0,
+                    "status": "submitted", "datetime": "2026-07-07 10:03:00",
+                },
+                {
+                    "order_id": "duplicate-open", "action": "buy",
+                    "code": "600000", "amount": 100, "filled": 0,
+                    "status": "submitted", "datetime": "2026-07-07 10:04:00",
+                },
+                {
+                    "order_id": "other-open", "action": "buy",
+                    "code": "000001", "amount": 200, "filled": 0,
+                    "status": "submitted", "datetime": "2026-07-07 10:05:00",
+                },
+            ]
+            snapshot["trades"] = []
+
+            joinquant_sync.ingest_snapshot_payload(
+                snapshot, store, "2026-07-07 10:05:02",
+            )
+
+            with store.connect() as conn:
+                rows = conn.execute(
+                    """SELECT broker_order_id, updated_at
+                       FROM broker_order_current ORDER BY broker_order_id"""
+                ).fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertNotEqual(rows[0]["updated_at"], rows[1]["updated_at"])
+            self.assertTrue(str(rows[0]["updated_at"]).endswith("02:04:00+00:00"))
+            self.assertTrue(str(rows[1]["updated_at"]).endswith("02:05:00+00:00"))
+
+    def test_duplicate_submitted_then_filled_order_is_not_left_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            snapshot = self._ledger_snapshot()
+            submitted = {
+                "order_id": "duplicate-filled", "action": "buy",
+                "code": "600000", "amount": 100, "filled": 0,
+                "status": "submitted", "datetime": "2026-07-07 10:04:00",
+            }
+            snapshot["orders"] = [
+                submitted,
+                {**submitted, "filled": 100, "avg_price": 10,
+                 "status": "filled", "datetime": "2026-07-07 10:05:00"},
+            ]
+            snapshot["trades"] = [{
+                "trade_id": "duplicate-fill", "order_id": "duplicate-filled",
+                "action": "buy", "code": "600000", "amount": 100,
+                "price": 10, "datetime": "2026-07-07 10:05:00",
+            }]
+
+            joinquant_sync.ingest_snapshot_payload(
+                snapshot, store, "2026-07-07 10:05:02",
+            )
+
+            with store.connect() as conn:
+                open_count = conn.execute(
+                    "SELECT COUNT(*) FROM broker_order_current"
+                ).fetchone()[0]
+                status = conn.execute(
+                    """SELECT status FROM orders
+                       WHERE order_id='duplicate-filled'"""
+                ).fetchone()[0]
+            self.assertEqual(open_count, 0)
+            self.assertEqual(status, "filled")
+
+    def test_complete_snapshot_rejects_duplicate_broker_order_with_client_conflict(self) -> None:
+        payload = self._ledger_snapshot()
+        base = {
+            "order_id": "same-broker-order", "action": "buy",
+            "code": "600000", "amount": 100, "filled": 0,
+            "status": "submitted", "datetime": "2026-07-07 10:04:00",
+        }
+        payload["orders"] = [
+            {**base, "client_order_id": "client-a"},
+            {**base, "client_order_id": "client-b"},
+        ]
+        payload["trades"] = []
+
+        with self.assertRaisesRegex(ValueError, "duplicate snapshot order conflict"):
+            joinquant_sync._legacy_broker_snapshot(
+                payload, "scope-uuid", "2026-07-07 10:05:02", {},
+            )
 
     def test_complete_snapshot_rejects_conflicting_or_negative_fill_aliases(self) -> None:
         cases = (
@@ -299,7 +533,7 @@ class JoinQuantSyncTest(unittest.TestCase):
 
             with store.connect() as conn:
                 for table in (
-                    "account_scopes", "broker_snapshot_current",
+                    "broker_snapshot_current",
                     "account_snapshots", "orders", "fills",
                 ):
                     self.assertEqual(
@@ -393,15 +627,35 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertNotIn("control_actions", result)
             with store.connect() as conn:
                 for table in (
-                    "account_scopes", "broker_snapshot_current",
+                    "broker_snapshot_current",
                     "account_snapshots", "position_snapshots", "daily_equity",
-                    "reconciliation_runs", "control_events", "system_state",
+                    "reconciliation_runs", "control_events",
                 ):
                     self.assertEqual(
                         conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0],
                         0,
                         table,
                     )
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM account_scopes").fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        """SELECT count(*) FROM notification_outbox
+                           WHERE event_type IN ('fill','order_terminal')"""
+                    ).fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    [
+                        (row["key"], row["value"])
+                        for row in conn.execute(
+                            "SELECT key, value FROM system_state ORDER BY key"
+                        )
+                    ],
+                    [("sell_enabled", "1")],
+                )
                 self.assertEqual(conn.execute("SELECT count(*) FROM orders").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT count(*) FROM fills").fetchone()[0], 1)
             self.assertIn("600000", store.get_active_position_cycles())
@@ -747,6 +1001,120 @@ class JoinQuantSyncTest(unittest.TestCase):
                 current.open_orders[0]["client_order_id"], original_client_id,
             )
 
+    def test_explicit_client_order_identity_survives_sanitize_and_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            first = self._ledger_snapshot("2026-07-07 10:05:00")
+            first["orders"][0].update(
+                client_order_id="intent-order-1",
+                status="partial",
+                filled=500,
+            )
+            first["trades"][0].update(
+                client_order_id="intent-order-1",
+                amount=500,
+            )
+
+            sanitized = joinquant_sync.sanitize_joinquant_payload(first)
+            self.assertEqual(
+                sanitized["orders"][0]["client_order_id"], "intent-order-1",
+            )
+            self.assertEqual(
+                sanitized["trades"][0]["client_order_id"], "intent-order-1",
+            )
+            result = joinquant_sync.ingest_snapshot_payload(
+                first, store, "2026-07-07 10:05:02",
+            )
+            self.assertEqual(
+                result["new_executions"][0]["client_order_id"],
+                "intent-order-1",
+            )
+
+            later = json.loads(json.dumps(first))
+            later["generated_at"] = "2026-07-07 10:06:00"
+            later["orders"][0].pop("client_order_id")
+            later["trades"] = []
+            later["orders"][0]["datetime"] = later["generated_at"]
+            joinquant_sync.ingest_snapshot_payload(
+                later, store, "2026-07-07 10:06:02",
+            )
+
+            with store.connect() as conn:
+                scope = conn.execute(
+                    "SELECT account_scope_id FROM account_scopes"
+                ).fetchone()[0]
+                current = store.load_current_broker_snapshot(conn, scope)
+                order_ids = conn.execute(
+                    "SELECT client_order_id FROM orders WHERE order_id='10'"
+                ).fetchall()
+                fill_id = conn.execute(
+                    "SELECT client_order_id FROM fills WHERE fill_id='20'"
+                ).fetchone()[0]
+            self.assertEqual([row[0] for row in order_ids], ["intent-order-1"])
+            self.assertEqual(fill_id, "intent-order-1")
+            self.assertEqual(
+                current.open_orders[0]["client_order_id"], "intent-order-1",
+            )
+
+    def test_explicit_client_order_identity_conflict_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            seed = {
+                "schema_version": 1,
+                "positions": [],
+                "trades": [],
+                "orders": [{
+                    "client_order_id": "intent-order-1",
+                    "order_id": "stable-order",
+                    "action": "buy",
+                    "code": "600000",
+                    "amount": 100,
+                    "filled": 0,
+                    "status": "submitted",
+                    "datetime": "2026-07-07 10:00:00",
+                }],
+            }
+            joinquant_sync.ingest_snapshot_payload(
+                seed, store, "2026-07-07 10:00:01",
+            )
+            conflicting = json.loads(json.dumps(seed))
+            conflicting["orders"][0]["client_order_id"] = "intent-order-2"
+            conflicting["orders"][0]["datetime"] = "2026-07-07 10:01:00"
+            with self.assertRaisesRegex(ValueError, "identity"):
+                joinquant_sync.ingest_snapshot_payload(
+                    conflicting, store, "2026-07-07 10:01:01",
+                )
+            with store.connect() as conn:
+                rows = conn.execute(
+                    "SELECT client_order_id FROM orders WHERE order_id='stable-order'"
+                ).fetchall()
+            self.assertEqual([row[0] for row in rows], ["intent-order-1"])
+
+    def test_invalid_nested_client_order_identity_is_not_sanitized_away(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "positions": [],
+            "trades": [],
+            "orders": [{
+                "client_order_id": ["invalid"],
+                "order_id": "bad-order",
+                "action": "buy",
+                "code": "600000",
+                "amount": 100,
+                "filled": 0,
+                "status": "submitted",
+                "datetime": "2026-07-07 10:00:00",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            ValueError, "client_order_id",
+        ):
+            joinquant_sync.ingest_snapshot_payload(
+                payload,
+                TradingStore(Path(tmp) / "trading.db"),
+                "2026-07-07 10:00:01",
+            )
+
     def test_missing_signal_packet_cannot_erase_broker_order_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
@@ -807,7 +1175,10 @@ class JoinQuantSyncTest(unittest.TestCase):
                 )
 
     def test_new_fill_cannot_rewrite_rejected_order_as_filled(self) -> None:
-        for status in ("rejected", "failed", "skipped", "risk_rejected"):
+        for status in (
+            "rejected", "failed", "skipped", "risk_rejected",
+            "not_submitted", "expired",
+        ):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 store = TradingStore(Path(tmp) / "trading.db")
                 joinquant_sync.ingest_snapshot_payload(
@@ -1347,6 +1718,119 @@ class JoinQuantSyncTest(unittest.TestCase):
             self.assertEqual(increased["new_executions"][0]["qty"], 50)
             self.assertEqual(increased["new_executions"][0]["cumulative_qty"], 100)
 
+    def test_late_real_trade_does_not_renotify_legacy_covered_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            legacy = self._ledger_snapshot()
+            legacy["trades"] = []
+            legacy["orders"][0].update({
+                "amount": 100, "filled": 50, "avg_price": 10,
+                "status": "partial",
+            })
+            first = joinquant_sync.ingest_snapshot_payload(
+                legacy, store, "2026-07-07 10:05:02",
+            )
+
+            authoritative = json.loads(json.dumps(legacy))
+            authoritative["generated_at"] = "2026-07-07 10:06:00"
+            authoritative["orders"][0]["datetime"] = "2026-07-07 10:06:00"
+            authoritative["trades"] = [{
+                "trade_id": "late-fill-50", "order_id": "10",
+                "code": "600000", "action": "buy", "amount": 50,
+                "price": 10, "datetime": "2026-07-07 10:05:30",
+            }]
+            second = joinquant_sync.ingest_snapshot_payload(
+                authoritative, store, "2026-07-07 10:06:02",
+            )
+
+            with store.connect() as conn:
+                fill_count = conn.execute(
+                    "SELECT COUNT(*) FROM fills WHERE fill_id='late-fill-50'"
+                ).fetchone()[0]
+                notice_count = conn.execute(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE event_type='fill'"
+                ).fetchone()[0]
+            self.assertEqual(first["new_executions"][0]["qty"], 50)
+            self.assertEqual(second["new_executions"], [])
+            self.assertEqual(second["inserted_fills"], 1)
+            self.assertEqual(fill_count, 1)
+            self.assertEqual(notice_count, 1)
+
+    def test_late_broker_order_id_keeps_legacy_fill_notification_covered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            legacy = self._ledger_snapshot()
+            legacy["trades"] = []
+            legacy["orders"][0].update({
+                "client_order_id": "client-late-broker-id",
+                "amount": 100, "filled": 50, "avg_price": 10,
+                "status": "partial",
+            })
+            legacy["orders"][0].pop("order_id")
+            first = joinquant_sync.ingest_snapshot_payload(
+                legacy, store, "2026-07-07 10:05:02",
+            )
+
+            authoritative = json.loads(json.dumps(legacy))
+            authoritative["generated_at"] = "2026-07-07 10:06:00"
+            authoritative["orders"][0].update({
+                "order_id": "broker-arrived-late",
+                "datetime": "2026-07-07 10:06:00",
+            })
+            authoritative["trades"] = [{
+                "trade_id": "late-id-fill-50",
+                "client_order_id": "client-late-broker-id",
+                "order_id": "broker-arrived-late", "code": "600000",
+                "action": "buy", "amount": 50, "price": 10,
+                "datetime": "2026-07-07 10:05:30",
+            }]
+            second = joinquant_sync.ingest_snapshot_payload(
+                authoritative, store, "2026-07-07 10:06:02",
+            )
+
+            with store.connect() as conn:
+                notice_count = conn.execute(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE event_type='fill'"
+                ).fetchone()[0]
+                broker_id = conn.execute(
+                    """SELECT order_id FROM orders
+                       WHERE client_order_id='client-late-broker-id'"""
+                ).fetchone()[0]
+            self.assertEqual(first["new_executions"][0]["qty"], 50)
+            self.assertEqual(second["new_executions"], [])
+            self.assertEqual(second["inserted_fills"], 1)
+            self.assertEqual(notice_count, 1)
+            self.assertEqual(broker_id, "broker-arrived-late")
+
+    def test_legacy_progress_fact_direct_replay_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradingStore(Path(tmp) / "trading.db")
+            store.initialize()
+            execution = {
+                "event_id": "legacy:client-1:50",
+                "source": "legacy_order_progress",
+                "client_order_id": "client-1",
+                "order_id": "broker-1",
+                "signal_id": "signal-1",
+                "stock_code": "600000",
+                "action": "buy",
+                "qty": 50,
+                "cumulative_qty": 50,
+                "price": 10,
+                "status": "partial",
+                "filled_at": "2026-07-07T10:05:00+08:00",
+            }
+            with store.transaction() as conn:
+                self.assertTrue(joinquant_sync._insert_legacy_progress_fact(
+                    conn, execution,
+                ))
+                self.assertFalse(joinquant_sync._insert_legacy_progress_fact(
+                    conn, execution,
+                ))
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM order_events"
+                ).fetchone()[0], 1)
+
     def test_detail_retention_keeps_changes_and_hourly_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TradingStore(Path(tmp) / "trading.db")
@@ -1420,6 +1904,7 @@ class JoinQuantSyncTest(unittest.TestCase):
                                 "authorization": "position-auth-secret",
                             }
                         ],
+                        "orders": [],
                         "trades": [],
                     }
                 ),

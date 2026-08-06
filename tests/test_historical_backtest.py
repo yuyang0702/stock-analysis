@@ -10,6 +10,7 @@ from backtest_engine import BacktestConfig, BacktestEngine
 from execution_contracts import FeeSchedule
 
 from historical_backtest import (
+    DecisionTimeReplayResult,
     EquityPoint,
     HistoricalBacktestConfig,
     HistoricalBacktestResult,
@@ -18,15 +19,168 @@ from historical_backtest import (
     compare_results,
     compute_metrics,
     group_metrics,
+    run_decision_time_replay,
     run_historical_backtest,
     sensitivity_matrix,
 )
-from historical_data import HistoricalStore
+from historical_data import HistoricalDataValidationError, HistoricalStore, strict_table_hash
 from historical_strategy import Candidate
+from ml_contracts import CandidateSample, TimedFeature
 from paper_trading import apply_paper_trades, new_account, summarize_account
 
 
 class HistoricalBacktestTest(unittest.TestCase):
+    @staticmethod
+    def _strict_sample(decision_at: str, *, selected: bool = True) -> CandidateSample:
+        return CandidateSample.from_values(
+            source="strict_history",
+            dataset_id="strict-1",
+            decision_at=decision_at,
+            code="600000",
+            strategy_version="strategy-v1",
+            parameter_version="params-v1",
+            feature_schema_version="features-v1",
+            features={
+                "price": TimedFeature(10.5, decision_at),
+                "market_regime": TimedFeature("NORMAL", decision_at),
+            },
+            selected=selected,
+            rejection_stage="selected" if selected else "score",
+            rejection_code="" if selected else "BELOW_SCORE",
+            final_action="selected" if selected else "score_rejected",
+            universe_hash="universe-sha",
+            market_data_version="market-v1",
+            code_hash="code-sha",
+            generator_hash="generator-sha",
+        )
+
+    @staticmethod
+    def _strict_manifest(samples: list[CandidateSample]) -> dict[str, object]:
+        cohorts = {}
+        for decision_at in sorted({sample.decision_at for sample in samples}):
+            rows = [sample for sample in samples if sample.decision_at == decision_at]
+            cohorts[decision_at] = {
+                "codes": [sample.code for sample in rows],
+                "universe_hash": rows[0].universe_hash,
+            }
+        return {
+            "dataset_id": "strict-1",
+            "source": "strict_history",
+            "strategy_version": "strategy-v1",
+            "parameter_version": "params-v1",
+            "feature_schema_version": "features-v1",
+            "market_data_version": "market-v1",
+            "code_hash": "code-sha",
+            "generator_hash": "generator-sha",
+            "adjustment_version": "raw-v1",
+            "cohorts": cohorts,
+            "table_hashes": {
+                "decision_candidates": strict_table_hash(
+                    "decision_candidates", samples
+                ),
+                "candidate_prices": "",
+            },
+        }
+
+    @staticmethod
+    def _strict_replay_config() -> dict[str, str]:
+        return {
+            "strategy_version": "strategy-v1",
+            "parameter_version": "params-v1",
+            "feature_schema_version": "features-v1",
+            "market_data_version": "market-v1",
+            "code_hash": "code-sha",
+            "generator_hash": "generator-sha",
+        }
+
+    def test_decision_time_replay_is_exact_hash_bound_and_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            samples = [
+                self._strict_sample("2025-01-02T10:00:00+08:00"),
+                self._strict_sample(
+                    "2025-01-02T10:05:00+08:00", selected=False
+                ),
+            ]
+            store.import_candidate_cohorts(
+                samples, manifest=self._strict_manifest(samples)
+            )
+            expected_hash = store.dataset_hash("strict-1")
+
+            with patch.object(
+                store, "daily_slice", side_effect=AssertionError("current cache")
+            ), patch(
+                "historical_strategy.fetch_live_quotes",
+                side_effect=AssertionError("network"),
+            ):
+                replay = run_decision_time_replay(
+                    store,
+                    "strict-1",
+                    "2025-01-02T09:55:00+08:00",
+                    "2025-01-02T10:10:00+08:00",
+                    strategy_config=self._strict_replay_config(),
+                    expected_dataset_hash=expected_hash,
+                )
+
+            self.assertIsInstance(replay, DecisionTimeReplayResult)
+            self.assertEqual(replay.dataset_sha256, expected_hash)
+            self.assertEqual(
+                [batch.decision_at for batch in replay.batches],
+                [sample.decision_at for sample in samples],
+            )
+            self.assertEqual(
+                [batch.candidate_count for batch in replay.batches],
+                [1, 1],
+            )
+            self.assertEqual(
+                [batch.selected_count for batch in replay.batches],
+                [1, 0],
+            )
+            self.assertEqual(replay.candidate_count, 2)
+            self.assertEqual(replay.selected_count, 1)
+
+    def test_decision_time_replay_rejects_dataset_hash_mismatch_before_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            with patch.object(
+                store, "decision_times", side_effect=AssertionError("must not read")
+            ), self.assertRaisesRegex(
+                HistoricalDataValidationError, "STRICT_DATASET_HASH_MISMATCH"
+            ):
+                run_decision_time_replay(
+                    store,
+                    "strict-1",
+                    "2025-01-02T09:55:00+08:00",
+                    "2025-01-02T10:10:00+08:00",
+                    strategy_config=self._strict_replay_config(),
+                    expected_dataset_hash="0" * 64,
+                )
+
+    def test_daily_backtest_does_not_auto_switch_to_decision_time_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(
+                Path(tmp),
+                [("2025-01-02", 10, 10.2, 9.8, 10, 0, 11, 9)],
+            )
+            with patch(
+                "historical_backtest.generate_daily_candidates", return_value=[]
+            ) as daily, patch(
+                "historical_backtest.generate_candidates_at",
+                side_effect=AssertionError("decision-time replay must be explicit"),
+            ):
+                result = run_historical_backtest(
+                    store,
+                    "d1",
+                    "2025-01-02",
+                    "2025-01-02",
+                    HistoricalBacktestConfig(mode="strict"),
+                )
+
+            daily.assert_called_once()
+            self.assertEqual(result.trades, [])
+
     def test_reports_versioned_fee_components(self) -> None:
         fees = FeeSchedule(
             version="test-v1", effective_from="2026-01-01",
@@ -124,7 +278,7 @@ class HistoricalBacktestTest(unittest.TestCase):
             [
                 {"date": "2025-01-03", "code": "600000", "action": "buy", "price": 10,
                  "entry_price": 10, "position_pct": 10},
-                {"date": "2025-01-06", "code": "600000", "action": "sell", "price": 10.1},
+                {"date": "2025-01-06", "code": "600000", "action": "sell", "price": 8.9},
             ]
         )
 
@@ -138,8 +292,8 @@ class HistoricalBacktestTest(unittest.TestCase):
         )
         paper_sell = apply_paper_trades(
             account,
-            pd.DataFrame([{"code": "600000", "price": 10.1,
-                           "stop_loss": 9, "take_profit": 10.1}]),
+            pd.DataFrame([{"code": "600000", "price": 8.9,
+                           "stop_loss": 9, "take_profit": 12}]),
             trade_date="2025-01-06", fee_schedule=fees,
         )[0]
 
@@ -149,10 +303,10 @@ class HistoricalBacktestTest(unittest.TestCase):
                 [
                     ("2025-01-02", 10, 10, 9.9, 10, 0, 11, 9),
                     ("2025-01-03", 10, 10, 9.9, 10, 0, 11, 9),
-                    ("2025-01-06", 10.1, 10.1, 10, 10.1, 0, 11, 9),
+                    ("2025-01-06", 8.9, 9, 8.8, 8.9, 0, 10, 8),
                 ],
             )
-            candidate = self._candidate(take_profit=10.1)
+            candidate = self._candidate(take_profit=12)
             with patch(
                 "historical_backtest.generate_daily_candidates",
                 side_effect=[[candidate], [], []],
@@ -173,10 +327,88 @@ class HistoricalBacktestTest(unittest.TestCase):
             historical.trades[-1].pnl,
         ]
         self.assertEqual(quantities, [100, 100, 100])
-        self.assertEqual(pnls, [-2.52, -2.52, -2.52])
+        self.assertEqual(pnls, [-122.34, -122.34, -122.34])
         metrics = compute_metrics(historical.equity, historical.trades)
         self.assertEqual(metrics.win_rate, 0)
         self.assertEqual(metrics.profit_factor, 0)
+
+    def test_strict_backtest_uses_one_lot_and_odd_lot_profit_protection(self) -> None:
+        days = [
+            ("2025-01-02", 10, 10.1, 9.9, 10, 0, 11, 9),
+            ("2025-01-03", 10, 10.1, 9.9, 10, 0, 11, 9),
+            ("2025-01-06", 11.8, 12.2, 11.8, 12, 0, 13, 10),
+            ("2025-01-07", 11.7, 11.9, 11.2, 11.8, 0, 13, 10),
+            ("2025-01-08", 11.2, 11.4, 11, 11.1, 0, 12, 10),
+        ]
+        for initial_qty, first_sell_qty in ((100, 0), (300, 100), (500, 200)):
+            with self.subTest(initial_qty=initial_qty), tempfile.TemporaryDirectory() as tmp:
+                store = self._store(Path(tmp), days)
+                candidate = self._candidate(take_profit=12, position_pct=100)
+                with patch(
+                    "historical_backtest.generate_daily_candidates",
+                    side_effect=[[candidate], [], [], [], []],
+                ):
+                    result = run_historical_backtest(
+                        store,
+                        "d1",
+                        "2025-01-02",
+                        "2025-01-08",
+                        HistoricalBacktestConfig(
+                            initial_cash=initial_qty * 10,
+                            commission_rate=0,
+                            minimum_commission=0,
+                            stamp_tax_rate=0,
+                            slippage_bps=0,
+                        ),
+                    )
+
+                first_profit_sells = [
+                    trade for trade in result.trades
+                    if trade.reason == "TAKE_PROFIT_1"
+                ]
+                self.assertEqual(
+                    sum(trade.quantity for trade in first_profit_sells),
+                    first_sell_qty,
+                )
+                if initial_qty == 100:
+                    trailing = [
+                        trade for trade in result.trades
+                        if trade.reason == "TRAILING_STOP"
+                    ]
+                    self.assertEqual([trade.quantity for trade in trailing], [100])
+                    self.assertEqual(trailing[0].trade_date, "2025-01-07")
+
+    def test_trailing_stop_does_not_use_same_day_future_high(self) -> None:
+        days = [
+            ("2025-01-02", 10, 10.1, 9.9, 10, 0, 11, 9),
+            ("2025-01-03", 10, 10.1, 9.9, 10, 0, 11, 9),
+            ("2025-01-06", 11.8, 12.2, 11.8, 12, 0, 13, 10),
+            ("2025-01-07", 12.3, 14, 12, 13.5, 0, 15, 11),
+            ("2025-01-08", 13.3, 13.5, 13.2, 13.4, 0, 15, 12),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp), days)
+            candidate = self._candidate(take_profit=12, position_pct=50)
+            with patch(
+                "historical_backtest.generate_daily_candidates",
+                side_effect=[[candidate], [], [], [], []],
+            ):
+                result = run_historical_backtest(
+                    store,
+                    "d1",
+                    "2025-01-02",
+                    "2025-01-08",
+                    HistoricalBacktestConfig(
+                        initial_cash=4000,
+                        commission_rate=0,
+                        minimum_commission=0,
+                        stamp_tax_rate=0,
+                        slippage_bps=0,
+                    ),
+                )
+
+        trailing = [trade for trade in result.trades if trade.reason == "TRAILING_STOP"]
+        self.assertEqual([trade.trade_date for trade in trailing], ["2025-01-08"])
 
     def test_close_decision_executes_next_open_with_lot_slippage_and_fee(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2,9 +2,11 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
-from historical_data import HistoricalStore, STRICT_FEATURES
-from historical_strategy import generate_daily_candidates
+from historical_data import HistoricalDataValidationError, HistoricalStore, STRICT_FEATURES
+from historical_strategy import generate_candidates_at, generate_daily_candidates
+from ml_contracts import CandidateSample, TimedFeature, canonical_hash
 
 
 class HistoricalStrategyTest(unittest.TestCase):
@@ -177,6 +179,140 @@ class HistoricalStrategyTest(unittest.TestCase):
             )
 
             self.assertEqual(candidates, [])
+
+    def test_exact_time_replay_reads_only_imported_candidate_cohort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            sample = CandidateSample.from_values(
+                source="strict_history",
+                dataset_id="strict-1",
+                decision_at="2025-01-02T10:00:00+08:00",
+                code="600000",
+                strategy_version="strategy-v1",
+                parameter_version="params-v1",
+                feature_schema_version="features-v1",
+                features={
+                    "price": TimedFeature(10.5, "2025-01-02T09:59:59+08:00"),
+                    "market_regime": TimedFeature("NORMAL", "2025-01-02T09:59:59+08:00"),
+                },
+                selected=True,
+                rejection_stage="selected",
+                rejection_code="",
+                final_action="selected",
+                universe_hash="universe-sha",
+                market_data_version="market-v1",
+                code_hash="code-sha",
+                generator_hash="generator-sha",
+            )
+            manifest = {
+                "dataset_id": "strict-1",
+                "source": "strict_history",
+                "strategy_version": "strategy-v1",
+                "parameter_version": "params-v1",
+                "feature_schema_version": "features-v1",
+                "market_data_version": "market-v1",
+                "code_hash": "code-sha",
+                "generator_hash": "generator-sha",
+                "adjustment_version": "raw-v1",
+                "cohorts": {sample.decision_at: {"codes": [sample.code], "universe_hash": sample.universe_hash}},
+                "table_hashes": {"decision_candidates": canonical_hash([canonical_hash(sample)]), "candidate_prices": ""},
+            }
+            store.import_candidate_cohorts([sample], manifest=manifest)
+
+            config = {
+                "strategy_version": "strategy-v1",
+                "parameter_version": "params-v1",
+                "feature_schema_version": "features-v1",
+                "market_data_version": "market-v1",
+                "code_hash": "code-sha",
+                "generator_hash": "generator-sha",
+            }
+            with patch.object(store, "daily_slice", side_effect=AssertionError("current cache")), patch(
+                "historical_strategy.fetch_live_quotes", side_effect=AssertionError("network")
+            ):
+                rows = generate_candidates_at(store, "strict-1", sample.decision_at, config)
+
+            self.assertEqual(rows, [sample])
+
+    def test_exact_time_replay_fails_closed_on_strategy_version_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            sample = CandidateSample.from_values(
+                source="strict_history",
+                dataset_id="strict-1",
+                decision_at="2025-01-02T10:00:00+08:00",
+                code="600000",
+                strategy_version="strategy-v1",
+                parameter_version="params-v1",
+                feature_schema_version="features-v1",
+                features={
+                    "price": TimedFeature(10.5, "2025-01-02T09:59:59+08:00"),
+                    "market_regime": TimedFeature(
+                        "NORMAL", "2025-01-02T09:59:59+08:00"
+                    ),
+                },
+                selected=True,
+                rejection_stage="selected",
+                rejection_code="",
+                final_action="selected",
+                universe_hash="universe-sha",
+                market_data_version="market-v1",
+                code_hash="code-sha",
+                generator_hash="generator-sha",
+            )
+            manifest = {
+                "dataset_id": "strict-1",
+                "source": "strict_history",
+                "strategy_version": "strategy-v1",
+                "parameter_version": "params-v1",
+                "feature_schema_version": "features-v1",
+                "market_data_version": "market-v1",
+                "code_hash": "code-sha",
+                "generator_hash": "generator-sha",
+                "adjustment_version": "raw-v1",
+                "cohorts": {
+                    sample.decision_at: {
+                        "codes": [sample.code],
+                        "universe_hash": sample.universe_hash,
+                    }
+                },
+                "table_hashes": {
+                    "decision_candidates": canonical_hash([canonical_hash(sample)]),
+                    "candidate_prices": "",
+                },
+            }
+            store.import_candidate_cohorts([sample], manifest=manifest)
+
+            with self.assertRaisesRegex(
+                HistoricalDataValidationError,
+                "STRICT_COHORT_VERSION_MISMATCH: strategy_version",
+            ):
+                generate_candidates_at(
+                    store,
+                    "strict-1",
+                    sample.decision_at,
+                    {
+                        "strategy_version": "strategy-v2",
+                        "parameter_version": "params-v1",
+                        "feature_schema_version": "features-v1",
+                        "market_data_version": "market-v1",
+                        "code_hash": "code-sha",
+                        "generator_hash": "generator-sha",
+                    },
+                )
+
+    def test_exact_time_replay_requires_complete_version_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            with self.assertRaisesRegex(
+                HistoricalDataValidationError, "STRICT_STRATEGY_CONFIG_INCOMPLETE"
+            ):
+                generate_candidates_at(
+                    store,
+                    "strict-1",
+                    "2025-01-02T10:00:00+08:00",
+                    {"strategy_version": "strategy-v1"},
+                )
 
 
 if __name__ == "__main__":

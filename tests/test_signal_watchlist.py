@@ -1,12 +1,14 @@
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
 
 import a_share_strategy as strat
+from notification_outbox import NotificationEvent, notification_event_key
+from trading_store import TradingStore
 
 
 class FakeNotifier:
@@ -21,6 +23,75 @@ class FakeNotifier:
 
 
 class SignalWatchlistTest(unittest.TestCase):
+    @staticmethod
+    def _store_with_sent_buy_plans(tmpdir: str, path: Path) -> TradingStore:
+        store = TradingStore(Path(tmpdir) / "trading.db")
+        store.initialize()
+        payload = strat.load_signal_watchlist(path)
+        with store.transaction() as conn:
+            scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
+            for index, item in enumerate(payload["items"]):
+                if item.get("kind") != "买点":
+                    continue
+                trade_date = str(item.get("pushed_at") or "")[:10]
+                logical_id = f"logical-{index}"
+                version = f"version-{index}"
+                event_key = notification_event_key(
+                    "joinquant",
+                    scope,
+                    "buy-plan",
+                    trade_date=trade_date,
+                    logical_signal_id=logical_id,
+                    plan_version=version,
+                )
+                occurred_at = (
+                    datetime.fromisoformat(str(item["pushed_at"]))
+                    .replace(tzinfo=timezone(timedelta(hours=8)))
+                    .isoformat()
+                )
+                store.enqueue_notification(
+                    conn,
+                    NotificationEvent(
+                        event_key=event_key,
+                        account_scope_id=scope,
+                        adapter="joinquant",
+                        event_type="buy-plan",
+                        object_type="logical_signal_plan",
+                        object_id=logical_id,
+                        source_fact_id=f"{logical_id}:{version}",
+                        priority="normal",
+                        payload_version=1,
+                        occurred_at=occurred_at,
+                        expires_at=None,
+                        title="买入计划",
+                        body=f"计划 {index}",
+                        payload={
+                            "trade_date": trade_date,
+                            "logical_signal_id": logical_id,
+                            "plan_version": version,
+                            "code": str(item["code"]),
+                            "side": "buy",
+                        },
+                        metadata={"renderer": "buy-plan-v1"},
+                    ),
+                    occurred_at,
+                )
+                conn.execute(
+                    """UPDATE notification_outbox
+                       SET state='sent', sent_at=?, terminal_at=?
+                       WHERE event_key=?""",
+                    (occurred_at, occurred_at, event_key),
+                )
+                item.update({
+                    "buy_plan_event_key": event_key,
+                    "account_scope_id": scope,
+                    "trade_date": trade_date,
+                    "logical_signal_id": logical_id,
+                    "plan_version": version,
+                })
+        strat.save_signal_watchlist(path, payload)
+        return store
+
     def test_review_offsets_use_a_share_trading_days(self) -> None:
         friday = datetime(2026, 7, 10, 10, 0)
         monday = datetime(2026, 7, 13, 15, 30)
@@ -142,6 +213,7 @@ class SignalWatchlistTest(unittest.TestCase):
                 ]
                 },
             )
+            store = self._store_with_sent_buy_plans(tmpdir, path)
             result = pd.DataFrame(
                 [
                     {
@@ -165,6 +237,7 @@ class SignalWatchlistTest(unittest.TestCase):
                 path,
                 chunk_size=3,
                 now=datetime(2026, 7, 14, 15, 30),
+                store=store,
             )
             self.assertEqual(len(messages), 1)
             message = messages[0][1]
@@ -210,6 +283,7 @@ class SignalWatchlistTest(unittest.TestCase):
                 "signal_id": "300001:mid:2026-07-13", "active": True,
             }
             strat.save_signal_watchlist(path, {"items": prior_buys + [same_day, risk]})
+            store = self._store_with_sent_buy_plans(tmpdir, path)
             quotes = pd.DataFrame([
                 {
                     "code": f"60000{index}", "name": f"昨日买点{index}", "price": 10.5,
@@ -224,7 +298,8 @@ class SignalWatchlistTest(unittest.TestCase):
             }])
 
             messages = strat.build_watchlist_review_messages(
-                quotes, path, chunk_size=3, now=datetime(2026, 7, 14, 15, 30)
+                quotes, path, chunk_size=3, now=datetime(2026, 7, 14, 15, 30),
+                store=store,
             )
             combined = "\n".join(markdown for _, markdown in messages)
             self.assertEqual(len(messages), 4)
@@ -247,11 +322,13 @@ class SignalWatchlistTest(unittest.TestCase):
                 "stop_loss": 9.5, "take_profit": 11.0,
                 "signal_id": "600000:mid:2026-07-13", "active": True,
             }]})
+            store = self._store_with_sent_buy_plans(tmpdir, path)
 
             messages = strat.build_watchlist_review_messages(
                 pd.DataFrame(columns=["code", "price", "high", "low"]),
                 path,
                 now=datetime(2026, 7, 14, 15, 30),
+                store=store,
             )
 
             self.assertEqual(len(messages), 1)
@@ -266,39 +343,51 @@ class SignalWatchlistTest(unittest.TestCase):
                 "pushed_at": "2026-07-13 10:00:00", "entry_price": 10.0,
                 "signal_id": "600000:mid:2026-07-13", "active": True,
             }]})
+            store = self._store_with_sent_buy_plans(tmpdir, path)
 
             messages = strat.build_watchlist_review_messages(
                 pd.DataFrame([{"code": "600000", "name": "昨日买点", "price": None}]),
                 path,
                 now=datetime(2026, 7, 14, 15, 30),
+                store=store,
             )
 
             self.assertEqual(len(messages), 1)
             self.assertIn("行情缺失", messages[0][1])
 
-    def test_dispatch_after_sends_every_review_chunk_from_full_quotes(self) -> None:
-        notifier = FakeNotifier()
-        result = pd.DataFrame(columns=["code", "final_score"])
-        quotes = pd.DataFrame([{"code": "600000", "price": 10.0}])
-        chunks = [("d1:1", "第一组"), ("d1:2", "第二组")]
+    def test_dispatch_after_enqueues_one_close_event_with_review_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            notifier = FakeNotifier()
+            store = TradingStore(Path(tmpdir) / "trading.db")
+            store.initialize()
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
+            result = pd.DataFrame([{"code": "600000", "final_score": 80}])
+            quotes = pd.DataFrame([{"code": "600000", "price": 10.0}])
+            chunks = [("d1:1", "第一组"), ("d1:2", "第二组")]
 
-        with patch("a_share_strategy.is_a_share_trading_day", return_value=True):
-            with patch("a_share_strategy.select_signal_rows", return_value=(result, result)):
-                with patch("a_share_strategy.build_watchlist_review_messages", return_value=chunks) as build:
-                    strat.dispatch_notifications(
-                        strat.Config(mode="after", notify_top=6),
-                        notifier,
-                        result,
-                        {"state": "震荡"},
-                        "中性",
-                        review_quotes=quotes,
-                    )
+            with patch("a_share_strategy.is_a_share_trading_day", return_value=True):
+                with patch("a_share_strategy.build_summary_markdown", return_value="盘后摘要"):
+                    with patch("a_share_strategy.build_watchlist_review_messages", return_value=chunks) as build:
+                        strat.dispatch_notifications(
+                            strat.Config(mode="after", notify_top=6),
+                            notifier,
+                            result,
+                            {"state": "震荡"},
+                            "中性",
+                            review_quotes=quotes,
+                            store=store,
+                            now=datetime(2026, 7, 30, 15, 10),
+                        )
 
-        self.assertIs(build.call_args.args[0], quotes)
-        review_keys = [key for _, _, key in notifier.sent if key and key.startswith("watch-review:")]
-        self.assertEqual(review_keys, ["watch-review:d1:1", "watch-review:d1:2"])
+            self.assertIs(build.call_args.args[0], quotes)
+            self.assertEqual(notifier.sent, [])
+            close = store.get_notification(f"joinquant:{scope}:close:2026-07-30")
+            self.assertIsNotNone(close)
+            self.assertIn("第一组", close.body)
+            self.assertIn("第二组", close.body)
 
-    def test_dispatch_after_titles_and_records_highlight(self) -> None:
+    def test_dispatch_after_does_not_record_unsent_highlight(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             old_path = strat.SIGNAL_WATCHLIST_FILE
             strat.SIGNAL_WATCHLIST_FILE = Path(tmpdir) / "signal_watchlist.json"
@@ -331,6 +420,10 @@ class SignalWatchlistTest(unittest.TestCase):
                     ]
                 )
                 notifier = FakeNotifier()
+                store = TradingStore(Path(tmpdir) / "trading.db")
+                store.initialize()
+                with store.transaction() as conn:
+                    scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
 
                 with patch("a_share_strategy.is_a_share_trading_day", return_value=True):
                     strat.dispatch_notifications(
@@ -339,12 +432,15 @@ class SignalWatchlistTest(unittest.TestCase):
                         result,
                         {"state": "强势进攻", "sh_pct": 1.2},
                         "题材催化偏强",
+                        store=store,
+                        now=datetime(2026, 7, 30, 15, 10),
                     )
 
-                self.assertTrue(all(title.startswith("【盘后】") for title, _, _ in notifier.sent))
+                self.assertEqual(notifier.sent, [])
                 data = strat.load_signal_watchlist(strat.SIGNAL_WATCHLIST_FILE)
-                self.assertEqual(data["items"][0]["code"], "600000")
-                self.assertEqual(data["items"][0]["kind"], "强势")
+                self.assertEqual(data["items"], [])
+                close = store.get_notification(f"joinquant:{scope}:close:2026-07-30")
+                self.assertTrue(close.title.startswith("【盘后】"))
             finally:
                 strat.SIGNAL_WATCHLIST_FILE = old_path
 
@@ -387,7 +483,7 @@ class SignalWatchlistTest(unittest.TestCase):
 
         self.assertEqual(notifier.sent, [])
 
-    def test_dispatch_notifications_can_be_enabled_on_non_trading_day_for_debug(self) -> None:
+    def test_dispatch_notifications_stays_silent_on_non_trading_day_debug_flag(self) -> None:
         notifier = FakeNotifier()
         result = pd.DataFrame(
             [
@@ -424,7 +520,167 @@ class SignalWatchlistTest(unittest.TestCase):
                 watch_result=result,
             )
 
-        self.assertTrue(notifier.sent)
+        self.assertEqual(notifier.sent, [])
+
+    def test_review_eligibility_requires_successful_buy_plan_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "signal_watchlist.json"
+            store = TradingStore(Path(tmpdir) / "trading.db")
+            store.initialize()
+            sent_at = "2026-07-13T10:05:00+08:00"
+            with store.transaction() as conn:
+                scope = store.get_or_create_account_scope(conn, "joinquant", "primary")
+                event_key = notification_event_key(
+                    "joinquant", scope, "buy-plan",
+                    trade_date="2026-07-11",
+                    logical_signal_id="logical-retry",
+                    plan_version="version-1",
+                )
+                store.enqueue_notification(
+                    conn,
+                    NotificationEvent(
+                        event_key=event_key,
+                        account_scope_id=scope,
+                        adapter="joinquant",
+                        event_type="buy-plan",
+                        object_type="logical_signal_plan",
+                        object_id="logical-retry",
+                        source_fact_id="logical-retry:version-1",
+                        priority="normal",
+                        payload_version=1,
+                        occurred_at="2026-07-11T10:00:00+08:00",
+                        expires_at=None,
+                        title="买入计划",
+                        body="等待重试",
+                        payload={
+                            "trade_date": "2026-07-11",
+                            "logical_signal_id": "logical-retry",
+                            "plan_version": "version-1",
+                            "code": "600000",
+                            "side": "buy",
+                        },
+                        metadata={"renderer": "buy-plan-v1"},
+                    ),
+                    "2026-07-11T10:00:00+08:00",
+                )
+            strat.save_signal_watchlist(path, {"items": [{
+                "code": "600000", "name": "重试样本", "kind": "买点",
+                "buy_plan_event_key": event_key, "entry_price": 10.0,
+                "stop_loss": 9.5, "take_profit": 11.0, "active": True,
+                "account_scope_id": scope, "trade_date": "2026-07-11",
+                "logical_signal_id": "logical-retry", "plan_version": "version-1",
+            }]})
+            quotes = pd.DataFrame([{
+                "code": "600000", "price": 10.5, "high": 10.6, "low": 9.9,
+            }])
+
+            for state in ("pending", "leased", "dead", "cancelled"):
+                with store.transaction() as conn:
+                    conn.execute(
+                        "UPDATE notification_outbox SET state=?, sent_at=? WHERE event_key=?",
+                        (state, sent_at, event_key),
+                    )
+                self.assertEqual(
+                    strat.build_watchlist_review_messages(
+                        quotes, path, now=datetime(2026, 7, 14, 15, 30), store=store,
+                    ),
+                    [],
+                )
+
+            with store.transaction() as conn:
+                conn.execute(
+                    """UPDATE notification_outbox
+                       SET state='sent', sent_at=?, terminal_at=?, attempt_count=2
+                       WHERE event_key=?""",
+                    (sent_at, sent_at, event_key),
+                )
+            messages = strat.build_watchlist_review_messages(
+                quotes, path, now=datetime(2026, 7, 14, 15, 30), store=store,
+            )
+
+            self.assertEqual(len(messages), 1)
+            self.assertIn(":d1:", messages[0][0])
+            item = strat.load_signal_watchlist(path)["items"][0]
+            self.assertEqual(item["pushed_at"], "2026-07-13 10:05:00")
+            self.assertEqual(item["buy_plan_sent_at"], "2026-07-13 10:05:00")
+
+    def test_review_delivery_binding_fails_closed_for_forged_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "watchlist.json"
+            strat.save_signal_watchlist(path, {"items": [{
+                "code": "600000", "name": "绑定样本", "kind": "买点",
+                "pushed_at": "2026-07-13 10:05:00", "active": True,
+            }]})
+            store = self._store_with_sent_buy_plans(tmpdir, path)
+            item = strat.load_signal_watchlist(path)["items"][0]
+
+            self.assertIsNotNone(strat._sent_buy_plan_watchlist_item(store, item))
+            for field, forged in (
+                ("account_scope_id", "other-scope"),
+                ("logical_signal_id", "other-logical"),
+                ("plan_version", "other-version"),
+                ("code", "000001"),
+            ):
+                with self.subTest(field=field):
+                    self.assertIsNone(strat._sent_buy_plan_watchlist_item(
+                        store, {**item, field: forged},
+                    ))
+
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE notification_outbox SET object_type='other' WHERE event_key=?",
+                    (item["buy_plan_event_key"],),
+                )
+            self.assertIsNone(strat._sent_buy_plan_watchlist_item(store, item))
+            with store.transaction() as conn:
+                conn.execute(
+                    """UPDATE notification_outbox
+                       SET object_type='logical_signal_plan', sent_at='2026-07-13T10:05:00'
+                       WHERE event_key=?""",
+                    (item["buy_plan_event_key"],),
+                )
+            self.assertIsNone(strat._sent_buy_plan_watchlist_item(store, item))
+
+    def test_review_item_rejects_file_only_delivery_claim(self) -> None:
+        with self.assertRaisesRegex(ValueError, "notification_outbox.sent_at"):
+            strat.review_watchlist_item(
+                {
+                    "code": "600000", "kind": "买点",
+                    "pushed_at": "2026-07-13 10:00:00",
+                },
+                None,
+                datetime(2026, 7, 14, 15, 30),
+                1,
+            )
+
+    def test_sync_buy_plan_watchlist_requires_stable_export_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            signal_path = Path(tmpdir) / "signals.json"
+            watchlist_path = Path(tmpdir) / "watchlist.json"
+            signal_path.write_text(
+                """{"signals":[
+                  {"action":"buy","code":"600000","name":"稳定计划",
+                   "entry_price":10.1,"stop_loss":9.7,"take_profit":11.2,
+                   "buy_plan_event_key":"joinquant:scope:buy-plan:2026-08-04:logical:v1",
+                   "account_scope_id":"scope","trade_date":"2026-08-04",
+                   "logical_signal_id":"logical","plan_version":"v1"},
+                  {"action":"buy","code":"000001","name":"缺身份"},
+                  {"action":"sell","code":"300001","name":"卖出"}
+                ]}""",
+                encoding="utf-8",
+            )
+
+            strat.sync_buy_plan_watchlist(signal_path, watchlist_path, mode="intraday")
+            strat.sync_buy_plan_watchlist(signal_path, watchlist_path, mode="intraday")
+
+            items = strat.load_signal_watchlist(watchlist_path)["items"]
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["code"], "600000")
+            self.assertEqual(items[0]["kind"], "买点")
+            self.assertEqual(items[0]["buy_plan_event_key"], "joinquant:scope:buy-plan:2026-08-04:logical:v1")
+            self.assertEqual(items[0]["logical_signal_id"], "logical")
+            self.assertEqual(items[0]["plan_version"], "v1")
+            self.assertEqual(items[0]["pushed_at"], "")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import random
@@ -11,7 +10,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time as datetime_time, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -39,9 +38,9 @@ from paper_trading import (
     save_account,
 )
 from risk_engine import RiskDecision, build_risk_decision, build_signal_lifecycle, classify_trade_mode
-from shadow_score import apply_shadow_scores
 from strategy_profile import build_strategy_profile
 from notifier import WeComNotifier
+from notification_outbox import NotificationEvent, notification_event_key
 from trading_store import StrategyRunRecord, TradingStore
 
 try:
@@ -62,6 +61,7 @@ SIGNAL_WATCHLIST_FILE = CACHE_DIR / "signal_watchlist.json"
 REVIEW_TRADING_DAY_OFFSETS = (0, 1, 3, 5, 10)
 SIGNAL_WATCHLIST_MAX_ITEMS = 500
 SECTOR_MARKET_CONTEXT_FILE = CACHE_DIR / "market" / "sector_context.json"
+SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -349,11 +349,16 @@ def merge_holding_stop_loss_rows(
     exit_intents: dict[str, dict[str, Any]] | None = None,
     market_state: str = "NORMAL",
     current_day: date | None = None,
+    store: TradingStore | None = None,
+    decision_batch_at: str | None = None,
 ) -> pd.DataFrame:
     """把全持仓退出动作合并到 JoinQuant 导出源。"""
     cycles = cycles or {}
     exit_intents = exit_intents or {}
     current_day = current_day or datetime.now().date()
+    decision_batch_at = decision_batch_at or datetime.now(
+        timezone(timedelta(hours=8))
+    ).isoformat(timespec="microseconds")
     quotes = {
         clean_code(row.get("code")): row
         for _, row in spot.iterrows()
@@ -426,8 +431,35 @@ def merge_holding_stop_loss_rows(
                     take_profit_stage=int(_float_value(cycle.get("take_profit_stage"))),
                     holding_trade_days=holding_trade_days,
                     manual_stop_price=_float_value(cycle.get("manual_stop_price")),
+                    profit_protection_activated_at=safe_text(
+                        cycle.get("profit_protection_activated_at")
+                    ),
+                    trailing_stop_active_from=safe_text(
+                        cycle.get("trailing_stop_active_from")
+                    ),
+                    decision_batch_at=decision_batch_at,
                 ), price, market_state)
-                if decision.action != "hold":
+                if decision.action == "activate_profit_protection":
+                    if store is not None:
+                        try:
+                            with store.transaction() as conn:
+                                store.activate_profit_protection(
+                                    conn,
+                                    safe_text(cycle.get("position_cycle_id")),
+                                    expected_current_qty=int(qty),
+                                    batch_at=decision_batch_at,
+                                    highest_price=max(
+                                        _float_value(cycle.get("highest_price")),
+                                        price,
+                                    ),
+                                )
+                        except (OSError, sqlite3.Error, ValueError) as exc:
+                            print(
+                                f"PROFIT_PROTECTION activation skipped "
+                                f"code={code} error={exc}",
+                                flush=True,
+                            )
+                if decision.action not in {"hold", "activate_profit_protection"}:
                     action = decision.action
                     target_qty = int(decision.target_qty or 0)
                     effective_stop = decision.effective_stop_price
@@ -455,6 +487,9 @@ def merge_holding_stop_loss_rows(
                 "signal_state": "stop_hit" if action in {"hard_stop", "stop_loss"} else action,
                 "signal_note": note,
                 "exit_signal_id": exit_signal_id,
+                "position_cycle_id": (
+                    safe_text(cycle.get("position_cycle_id")) if cycle else ""
+                ),
                 "target_qty": target_qty,
                 "has_holding": True,
                 "hold_status": status,
@@ -504,6 +539,88 @@ def notification_title(mode: str, title: str) -> str:
     return clean_title if clean_title.startswith(prefix) else f"{prefix}{clean_title}"
 
 
+def _shanghai_datetime(value: datetime) -> datetime:
+    return value.replace(tzinfo=SHANGHAI_TZ) if value.tzinfo is None else value.astimezone(SHANGHAI_TZ)
+
+
+def next_a_share_trading_day(value: date) -> date:
+    cursor = value + timedelta(days=1)
+    while cursor.weekday() >= 5 or cursor.isoformat() in app_config.A_SHARE_HOLIDAYS_DEFAULT:
+        cursor += timedelta(days=1)
+    return cursor
+
+
+def _bounded_notification_body(*sections: str, max_bytes: int = 3800) -> str:
+    kept: list[str] = []
+    for section in (str(value or "").strip() for value in sections):
+        if not section:
+            continue
+        candidate = "\n\n".join((*kept, section))
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            kept.append(section)
+            continue
+        if kept:
+            break
+        raw = section.encode("utf-8")[: max_bytes - 3]
+        kept.append(raw.decode("utf-8", errors="ignore") + "…")
+        break
+    return "\n\n".join(kept)
+
+
+def enqueue_scan_notification(
+    store: TradingStore,
+    event_type: str,
+    title: str,
+    body: str,
+    now: datetime,
+) -> str | None:
+    """Freeze the first daily/weekly digest and enqueue it exactly once."""
+    kind = safe_text(event_type).lower()
+    if kind not in {"pre", "close", "weekly"}:
+        raise ValueError("event_type must be pre, close or weekly")
+    frozen_body = _bounded_notification_body(body)
+    if not frozen_body:
+        return None
+    occurred = _shanghai_datetime(now)
+    trade_date = occurred.date().isoformat()
+    iso = occurred.date().isocalendar()
+    object_id = f"{iso.year}-W{iso.week:02d}" if kind == "weekly" else trade_date
+    expiry_day = occurred.date() if kind == "pre" else next_a_share_trading_day(occurred.date())
+    expiry_time = datetime_time(9, 30) if kind == "pre" else datetime_time(9, 15)
+    expires_at = datetime.combine(expiry_day, expiry_time, SHANGHAI_TZ).isoformat()
+    key_parts = {"iso_week": object_id} if kind == "weekly" else {"trade_date": trade_date}
+    with store.transaction() as conn:
+        scope = store.registered_account_scope(conn, "joinquant", "primary")
+        event_key = notification_event_key("joinquant", scope, kind, **key_parts)
+        if conn.execute(
+            """SELECT 1 FROM notification_outbox WHERE event_key=?
+               UNION ALL
+               SELECT 1 FROM notification_enqueue_gaps WHERE event_key=?
+               LIMIT 1""",
+            (event_key, event_key),
+        ).fetchone() is not None:
+            return event_key
+        event = NotificationEvent(
+            event_key=event_key,
+            account_scope_id=scope,
+            adapter="joinquant",
+            event_type=kind,
+            object_type=f"strategy_{kind}_digest",
+            object_id=object_id,
+            source_fact_id=f"{kind}:{object_id}",
+            priority="normal",
+            payload_version=1,
+            occurred_at=occurred.isoformat(),
+            expires_at=expires_at,
+            title=title,
+            body=frozen_body,
+            payload=key_parts,
+            metadata={"renderer": f"strategy-{kind}-v1"},
+        )
+        store.enqueue_notification_or_gap(conn, event, occurred.isoformat())
+    return event_key
+
+
 def load_signal_watchlist(path: Path = SIGNAL_WATCHLIST_FILE) -> dict[str, Any]:
     if not path.exists():
         return {"items": []}
@@ -544,11 +661,11 @@ def prune_signal_watchlist_items(items: list[dict[str, Any]], now: datetime | No
     keep_days = max(1, int(getattr(app_config, "SIGNAL_WATCHLIST_DAYS_DEFAULT", 10)))
     kept: list[dict[str, Any]] = []
     for item in items:
-        pushed_at = _parse_watchlist_time(item.get("pushed_at"))
+        pushed_at = _parse_watchlist_time(item.get("pushed_at") or item.get("trade_date"))
         if pushed_at and (now - pushed_at).days > keep_days:
             continue
         kept.append(item)
-    kept.sort(key=lambda item: _parse_watchlist_time(item.get("pushed_at")) or datetime.min)
+    kept.sort(key=lambda item: _parse_watchlist_time(item.get("pushed_at") or item.get("trade_date")) or datetime.min)
     return kept[-SIGNAL_WATCHLIST_MAX_ITEMS:]
 
 
@@ -674,13 +791,19 @@ def record_signal_watchlist(
     if not code:
         return
     pushed_at = pushed_at or datetime.now()
-    signal_id = safe_text(row.get("signal_anchor_id")) or safe_text(row.get("signal_first_seen")) or f"{code}:{mode}:{pushed_at.date().isoformat()}"
+    event_key = safe_text(row.get("buy_plan_event_key"))
+    signal_id = (
+        event_key
+        or safe_text(row.get("signal_anchor_id"))
+        or safe_text(row.get("signal_first_seen"))
+        or f"{code}:{mode}:{pushed_at.date().isoformat()}"
+    )
     item = {
         "code": code,
         "name": safe_text(row.get("name")),
         "kind": safe_text(kind),
         "mode": safe_text(row.get("mode")) or safe_text(mode),
-        "pushed_at": pushed_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "pushed_at": "" if event_key else pushed_at.strftime("%Y-%m-%d %H:%M:%S"),
         "pushed_price": _series_float(row, "price") or _series_float(row, "entry_price"),
         "entry_price": _series_float(row, "entry_price"),
         "stop_loss": _series_float(row, "stop_loss"),
@@ -694,18 +817,70 @@ def record_signal_watchlist(
         "risk_reason": compact_text(row.get("risk_reason") or row.get("buy_reason") or row.get("entry_reason"), 120),
         "buy_state": safe_text(row.get("buy_state")),
         "signal_id": signal_id,
-        "last_reviewed_at": "",
-        "active": True,
+        "buy_plan_event_key": event_key,
+        "account_scope_id": safe_text(row.get("account_scope_id")),
+        "trade_date": safe_text(row.get("trade_date")),
+        "logical_signal_id": safe_text(row.get("logical_signal_id")),
+        "plan_version": safe_text(row.get("plan_version")),
+        "source_signal_id": safe_text(row.get("signal_id")),
     }
     payload = load_signal_watchlist(path)
     items = payload["items"]
     for idx, existing in enumerate(items):
         if clean_code(existing.get("code")) == code and safe_text(existing.get("signal_id")) == signal_id:
+            if event_key and safe_text(existing.get("pushed_at")):
+                item.pop("pushed_at", None)
             items[idx] = {**existing, **item}
             break
     else:
-        items.append(item)
+        items.append({**item, "last_reviewed_at": "", "active": True})
     save_signal_watchlist(path, {"items": prune_signal_watchlist_items(items)})
+
+
+def sync_buy_plan_watchlist(
+    signal_path: Path,
+    watchlist_path: Path = SIGNAL_WATCHLIST_FILE,
+    *,
+    mode: str,
+) -> None:
+    try:
+        payload = json.loads(Path(signal_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return
+    signals = payload.get("signals") if isinstance(payload, dict) else None
+    if not isinstance(signals, list):
+        return
+    required = (
+        "buy_plan_event_key", "account_scope_id", "trade_date",
+        "logical_signal_id", "plan_version",
+    )
+    for signal in signals:
+        if not isinstance(signal, dict) or safe_text(signal.get("action")).lower() != "buy":
+            continue
+        if any(not safe_text(signal.get(name)) for name in required):
+            continue
+        try:
+            expected_key = notification_event_key(
+                "joinquant",
+                safe_text(signal["account_scope_id"]),
+                "buy-plan",
+                trade_date=safe_text(signal["trade_date"]),
+                logical_signal_id=safe_text(signal["logical_signal_id"]),
+                plan_version=safe_text(signal["plan_version"]),
+            )
+        except ValueError:
+            continue
+        if safe_text(signal["buy_plan_event_key"]) != expected_key:
+            continue
+        try:
+            record_signal_watchlist(
+                watchlist_path,
+                pd.Series(signal),
+                "买点",
+                mode,
+            )
+        except OSError:
+            return
 
 
 def review_watchlist_item(
@@ -714,6 +889,8 @@ def review_watchlist_item(
     now: datetime,
     offset: int,
 ) -> tuple[dict[str, Any], list[str]]:
+    if not safe_text(item.get("buy_plan_sent_at")):
+        raise ValueError("buy plan review requires notification_outbox.sent_at")
     code = clean_code(item.get("code"))
     name = safe_text(row.get("name")) if row is not None else ""
     name = name or safe_text(item.get("name"))
@@ -863,14 +1040,79 @@ def build_review_cohort_summary(
     return lines
 
 
+def _sent_buy_plan_watchlist_item(
+    store: TradingStore,
+    item: dict[str, Any],
+) -> dict[str, Any] | None:
+    event_key = safe_text(item.get("buy_plan_event_key"))
+    account_scope_id = safe_text(item.get("account_scope_id"))
+    trade_date = safe_text(item.get("trade_date"))
+    logical_signal_id = safe_text(item.get("logical_signal_id"))
+    version = safe_text(item.get("plan_version"))
+    code = clean_code(item.get("code"))
+    if not all((
+        event_key, account_scope_id, trade_date, logical_signal_id, version, code,
+    )):
+        return None
+    try:
+        expected_key = notification_event_key(
+            "joinquant",
+            account_scope_id,
+            "buy-plan",
+            trade_date=trade_date,
+            logical_signal_id=logical_signal_id,
+            plan_version=version,
+        )
+    except (TypeError, ValueError):
+        return None
+    if event_key != expected_key:
+        return None
+    try:
+        record = store.get_notification(event_key)
+    except (TypeError, ValueError, KeyError):
+        return None
+    if (
+        record is None
+        or record.adapter != "joinquant"
+        or record.event_type != "buy-plan"
+        or record.object_type != "logical_signal_plan"
+        or record.object_id != logical_signal_id
+        or record.source_fact_id != f"{logical_signal_id}:{version}"
+        or record.account_scope_id != account_scope_id
+        or record.state != "sent"
+        or not record.sent_at
+    ):
+        return None
+    payload = record.payload or {}
+    if (
+        safe_text(payload.get("trade_date")) != trade_date
+        or safe_text(payload.get("logical_signal_id")) != logical_signal_id
+        or safe_text(payload.get("plan_version")) != version
+        or clean_code(payload.get("code")) != code
+        or safe_text(payload.get("side")).lower() != "buy"
+    ):
+        return None
+    try:
+        sent_at = datetime.fromisoformat(record.sent_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if sent_at.tzinfo is None or sent_at.utcoffset() is None:
+        return None
+    sent_at = _shanghai_datetime(sent_at).replace(tzinfo=None)
+    rendered = sent_at.strftime("%Y-%m-%d %H:%M:%S")
+    return {**item, "pushed_at": rendered, "buy_plan_sent_at": rendered}
+
+
 def build_watchlist_review_messages(
     quotes: pd.DataFrame,
     path: Path = SIGNAL_WATCHLIST_FILE,
     chunk_size: int = 6,
     now: datetime | None = None,
+    store: TradingStore | None = None,
 ) -> list[tuple[str, str]]:
-    now = now or datetime.now()
+    now = _shanghai_datetime(now or datetime.now()).replace(tzinfo=None)
     items = prune_signal_watchlist_items(load_signal_watchlist(path)["items"], now=now)
+    store = store or TradingStore(app_config.TRADING_DB_FILE)
     rows_by_code = {
         clean_code(row.get("code")): row
         for _, row in quotes.iterrows()
@@ -878,17 +1120,25 @@ def build_watchlist_review_messages(
     }
     due: dict[int, list[dict[str, Any]]] = {}
     for item in items:
-        offset = due_review_offset(item, now)
+        delivered = _sent_buy_plan_watchlist_item(store, item)
+        if delivered is None:
+            continue
+        offset = due_review_offset(delivered, now)
         if offset is not None:
-            due.setdefault(offset, []).append(item)
+            due.setdefault(offset, []).append(delivered)
 
     def identity(item: dict[str, Any]) -> tuple[str, str]:
         return (
             clean_code(item.get("code")),
-            safe_text(item.get("signal_id")) or safe_text(item.get("pushed_at")),
+            safe_text(item.get("buy_plan_event_key"))
+            or safe_text(item.get("signal_id"))
+            or safe_text(item.get("pushed_at")),
         )
 
     updated_by_identity = {identity(item): item for item in items}
+    for cohort in due.values():
+        for item in cohort:
+            updated_by_identity[identity(item)] = item
     messages: list[tuple[str, str]] = []
     safe_chunk_size = max(1, chunk_size)
     for offset in REVIEW_TRADING_DAY_OFFSETS:
@@ -1171,6 +1421,9 @@ def fetch_spot_data() -> pd.DataFrame:
     df = to_numeric(df, numeric_cols)
     df["code"] = df["code"].astype(str).map(clean_code)
     df["name"] = df["name"].astype(str)
+    df["quote_time"] = datetime.now(
+        timezone(timedelta(hours=8))
+    ).isoformat(timespec="seconds")
 
     if "open" in df.columns and "prev_close" in df.columns:
         df["gap"] = (df["open"] - df["prev_close"]) / df["prev_close"] * 100
@@ -1178,6 +1431,35 @@ def fetch_spot_data() -> pd.DataFrame:
         df["gap"] = 0.0
 
     return df.dropna(subset=["price", "pct_chg", "amount"]).copy()
+
+
+def _refresh_execution_quote_rows(
+    rows: pd.DataFrame, fresh_spot: pd.DataFrame,
+) -> pd.DataFrame:
+    """Overlay only live quote fields immediately before buy admission."""
+    if rows is None:
+        return pd.DataFrame()
+    if rows.empty or fresh_spot is None or fresh_spot.empty:
+        return rows.copy()
+    refreshed = rows.copy()
+    refreshed["code"] = refreshed["code"].map(clean_code)
+    live = fresh_spot.copy()
+    live["code"] = live["code"].map(clean_code)
+    live = live.drop_duplicates("code", keep="last").set_index("code")
+    for column in (
+        "price", "pct_chg", "open", "prev_close", "high", "low", "amount",
+        "volume", "turnover", "market_cap", "gap", "quote_time",
+        "bid_price", "ask_price", "limit_up_price", "limit_down_price",
+        "paused", "suspended", "is_suspended",
+    ):
+        if column not in live.columns:
+            continue
+        values = refreshed["code"].map(live[column])
+        if column in refreshed.columns:
+            refreshed[column] = values.where(values.notna(), refreshed[column])
+        else:
+            refreshed[column] = values
+    return refreshed
 
 
 def build_sector_market_context(frames: Iterable[pd.DataFrame]) -> dict[str, dict[str, Any]]:
@@ -2763,21 +3045,11 @@ def save_outputs(
             "amount",
             "score",
             "final_score",
-            "enhanced_score",
-            "shadow_adjust_score",
-            "original_rank",
-            "shadow_rank",
-            "shadow_rank_change",
-            "shadow_reason",
-            "news_catalyst_score",
-            "theme_heat_adjust_score",
-            "sector_position_score",
             "sector_pct_chg",
             "sector_rank_pct",
             "sector_amount_rank_pct",
             "sector_hot_level",
             "sector_position_reason",
-            "market_emotion_score",
             "global_risk_score",
             "amount_rank_pct",
             "limit_quality",
@@ -2826,14 +3098,13 @@ def save_outputs(
     lines.append(f"- 上证指数：{market_info.get('sh_price') or '未知'}")
     lines.append(f"- 上证涨跌幅：{market_info.get('sh_pct') if market_info.get('sh_pct') is not None else '未知'}")
     lines.append("")
-    lines.append("| 代码 | 名称 | 行业 | 涨幅 | 成交额(亿) | 原分 | 影子分 | 买点 | 历史 | 卖出 |")
-    lines.append("|---|---|---|---:|---:|---:|---:|---|---|---|")
+    lines.append("| 代码 | 名称 | 行业 | 涨幅 | 成交额(亿) | 规则分 | 买点 | 历史 | 卖出 |")
+    lines.append("|---|---|---|---:|---:|---:|---|---|---|")
     for _, row in result.iterrows():
         lines.append(
             f"| {row['code']} | {row['name']} | {row.get('industry', '')} | "
             f"{row['pct_chg']:.2f}% | {row['amount'] / 1e8:.2f} | "
             f"{row.get('final_score', row.get('score', 0)):.2f} | "
-            f"{row.get('enhanced_score', row.get('final_score', row.get('score', 0))):.2f} | "
             f"{safe_text(row.get('buy_state', ''))} | "
             f"{safe_text(row.get('history_replay', ''))} | "
             f"{safe_text(row.get('exit_plan', ''))} |"
@@ -3256,6 +3527,7 @@ def run_paper_trading(
     notifier: WeComNotifier | None = None,
     now: datetime | None = None,
 ) -> str:
+    _ = notifier  # 本地 paper 仅保留账本和控制台；通知由正式 outbox 事件承担。
     now = now or datetime.now()
     account = load_account(app_config.PAPER_TRADE_FILE, cfg.paper_trade_cash)
     if not is_a_share_trading_time(now):
@@ -3269,9 +3541,6 @@ def run_paper_trading(
         md = build_paper_trade_markdown(account, [])
         md += f"\n> 非A股交易时间，本地模拟盘本轮不执行买卖。当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
         print(md.replace("\n", " | "), flush=True)
-        if notifier and notifier.enabled and cfg.mode == "after":
-            digest = hashlib.sha256(md.encode("utf-8")).hexdigest()
-            notifier.send_markdown(notification_title(cfg.mode, "本地模拟盘账户"), md, dedupe_key=f"paper:{cfg.mode}:{digest}")
         return md
 
     events = apply_paper_trades(
@@ -3290,9 +3559,6 @@ def run_paper_trading(
     save_account(app_config.PAPER_TRADE_FILE, account)
     md = build_paper_trade_markdown(account, events)
     print(md.replace("\n", " | "), flush=True)
-    if notifier and notifier.enabled and (events or cfg.mode == "after"):
-        digest = hashlib.sha256(md.encode("utf-8")).hexdigest()
-        notifier.send_markdown(notification_title(cfg.mode, "本地模拟盘账户"), md, dedupe_key=f"paper:{cfg.mode}:{digest}")
     return md
 
 
@@ -3367,11 +3633,10 @@ def build_joinquant_dry_run_markdown(payload: dict[str, Any]) -> str:
         price = item.get("price", "-")
         reason = compact_text(item.get("reason", ""), 48)
         if item.get("action") == "buy":
-            shadow = f" | 影子 {item.get('enhanced_score')}" if item.get("enhanced_score") not in (None, "") else ""
             entry_path = " | 跳空二次确认" if item.get("entry_path") == "gap_reentry" else ""
             lines.append(
                 f"- {action} {code} {name} | 目标仓位 {item.get('position_pct', 0)}% | "
-                f"价格 {price} | 分数 {item.get('final_score', '-')}{shadow}{entry_path}"
+                f"价格 {price} | 分数 {item.get('final_score', '-')}{entry_path}"
             )
         else:
             lines.append(f"- {action} {code} {name} | 价格 {price}")
@@ -3396,6 +3661,14 @@ def run_joinquant_export(
     allow_sell = app_config.JOINQUANT_ALLOW_SELL_DEFAULT
     if app_config.JOINQUANT_ENFORCE_HEALTH_GATE_DEFAULT and allow_buy:
         allow_buy = joinquant_health_gate_pass()
+    if allow_buy:
+        try:
+            result = _refresh_execution_quote_rows(result, fetch_spot_data())
+        except Exception as exc:
+            print(
+                f"JoinQuant execution quote refresh failed; stale buys will be rejected: {exc}",
+                flush=True,
+            )
     account_total_value = load_portfolio_account_total_value(cfg.paper_trade_cash)
     available_cash = load_portfolio_available_cash(account_total_value)
     positions = load_portfolio_positions()
@@ -3481,21 +3754,13 @@ def run_joinquant_export(
         account_drawdown_pct=account_metrics.get("account_drawdown_pct", 0),
         consecutive_losses=int(account_metrics.get("consecutive_losses", 0)),
         enforce_execution_contract=True,
+        store=store,
         cohort_mode=cfg.mode,
         cohort_interval_sec=cfg.interval,
     )
+    sync_buy_plan_watchlist(path, SIGNAL_WATCHLIST_FILE, mode=cfg.mode)
     print(f"JoinQuant signals exported: {path}", flush=True)
-    if notifier and notifier.enabled and (cfg.notify_non_trading_day or is_a_share_trading_day()):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {}
-        md = build_joinquant_dry_run_markdown(payload)
-        digest = hashlib.sha256(md.encode("utf-8")).hexdigest()
-        title = "JoinQuant Dry-Run" if payload.get("dry_run", True) else "JoinQuant 模拟盘"
-        notifier.send_markdown(notification_title(cfg.mode, title), md, dedupe_key=f"joinquant:{cfg.mode}:{digest}")
-    elif notifier and notifier.enabled:
-        print("非A股交易日，已跳过 JoinQuant 计划微信推送。", flush=True)
+    _ = notifier  # buy-plan 通知已由 exporter 与业务事实同事务写入 outbox。
     return path
 
 
@@ -3653,7 +3918,6 @@ def run_once(
         lambda row: format_execution_plan_text(row, bool(row.get("has_holding"))),
         axis=1,
     )
-    result = apply_shadow_scores(result, global_risk_score=float(market_info.get("global_risk_score", 0) or 0))
     pending_theme_mask = result["theme_label"].isin(["未识别题材", "题材待确认"])
     industry.note_pending(result[pending_theme_mask][["code", "name", "theme_label"]].copy())
 
@@ -3735,10 +3999,6 @@ def run_once(
                 lambda row: format_execution_plan_text(row, bool(row.get("has_holding"))),
                 axis=1,
             )
-            watch_result = apply_shadow_scores(
-                watch_result,
-                global_risk_score=float(market_info.get("global_risk_score", 0) or 0),
-            )
             watch_result = watch_result.sort_values("final_score", ascending=False).reset_index(drop=True)
             watch_pending_theme_mask = watch_result["theme_label"].isin(["未识别题材", "题材待确认"])
             industry.note_pending(watch_result[watch_pending_theme_mask][["code", "name", "theme_label"]].copy())
@@ -3751,13 +4011,19 @@ def run_once(
         position_cycles: dict[str, dict[str, Any]] = {}
         open_exit_intents: dict[str, dict[str, Any]] = {}
         confirmed_regime = market_regime(str(market_info.get("state") or ""))
+        trading_store: TradingStore | None = None
+        decision_batch_at = datetime.now(
+            timezone(timedelta(hours=8))
+        ).isoformat(timespec="microseconds")
         try:
             trading_store = TradingStore(app_config.TRADING_DB_FILE)
             trading_store.initialize()
             position_cycles = trading_store.get_active_position_cycles() if app_config.JOINQUANT_LAYERED_EXIT_ENABLE_DEFAULT else {}
             open_exit_intents = trading_store.get_open_exit_intents()
-            if app_config.JOINQUANT_REGIME_CONFIRM_ENABLE_DEFAULT:
-                confirmed_regime = trading_store.confirm_market_regime(confirmed_regime)
+            confirmed_regime = trading_store.confirm_market_regime(
+                confirmed_regime,
+                enabled=app_config.JOINQUANT_REGIME_CONFIRM_ENABLE_DEFAULT,
+            )
         except (OSError, ValueError, sqlite3.Error) as exc:
             print(f"Position cycle load skipped; fixed holding stops remain active: {exc}", flush=True)
         export_source = merge_holding_stop_loss_rows(
@@ -3768,6 +4034,8 @@ def run_once(
             exit_intents=open_exit_intents,
             market_state=confirmed_regime,
             current_day=date.today(),
+            store=trading_store,
+            decision_batch_at=decision_batch_at,
         )
         run_joinquant_export(
             cfg, export_source, notifier if cfg.notify else None, run_id=run_id,
@@ -3856,26 +4124,6 @@ def _run_once_with_ledger(
     return result
 
 
-def build_notification_digest(result: pd.DataFrame, market_info: dict[str, Any], market_news_state: str, cfg: Config) -> str:
-    top_rows = result.head(cfg.notify_top)
-    digest_source = [
-        market_info.get("state", ""),
-        market_news_state,
-        str(market_info.get("sh_pct", "")),
-    ]
-    for _, row in top_rows.iterrows():
-        digest_source.append(
-            f"{row['code']}|{row.get('final_score', 0):.2f}|{row.get('news_score', 0):.2f}|{row.get('lhb_tag', '')}|"
-            f"{safe_text(row.get('holding_brief', ''))}|{safe_text(row.get('trade_bias', ''))}|{safe_text(row.get('history_replay', ''))}|"
-            f"{safe_text(row.get('next_day_opportunity', ''))}|{safe_text(row.get('trade_playbook', ''))}|"
-            f"{safe_text(row.get('mode', ''))}|{safe_text(row.get('entry_price', ''))}|{safe_text(row.get('stop_loss', ''))}|"
-            f"{safe_text(row.get('take_profit', ''))}|{safe_text(row.get('position_pct', ''))}|{safe_text(row.get('risk_reason', ''))}|"
-            f"{safe_text(row.get('signal_state', ''))}|{safe_text(row.get('signal_age_days', ''))}|{safe_text(row.get('signal_action', ''))}|"
-            f"{safe_text(row.get('theme_label', ''))}|{safe_text(row.get('theme_heat_level', ''))}"
-        )
-    return hashlib.sha256("::".join(digest_source).encode("utf-8")).hexdigest()
-
-
 def dispatch_notifications(
     cfg: Config,
     notifier: WeComNotifier,
@@ -3885,93 +4133,67 @@ def dispatch_notifications(
     watch_result: pd.DataFrame | None = None,
     review_quotes: pd.DataFrame | None = None,
     ai_overview: str = "",
+    store: TradingStore | None = None,
+    now: datetime | None = None,
 ) -> None:
-    """通知和策略彻底解耦：通知失败不影响主流程。"""
+    """只为稳定的盘前、盘后和周度业务事件写 outbox。"""
+    _ = watch_result
     if not notifier.enabled:
         print("通知未启用或缺少企业微信 Webhook。", flush=True)
         return
-    if not cfg.notify_non_trading_day and not is_a_share_trading_day():
-        print("非A股交易日，已跳过微信推送。设置 NOTIFY_NON_TRADING_DAY=1 可用于联调。", flush=True)
+    now = _shanghai_datetime(now or datetime.now())
+    if not is_a_share_trading_day(now):
+        print("非A股交易日，稳定通知事件保持静默。", flush=True)
         return
-
-    digest = build_notification_digest(result, market_info, market_news_state, cfg)
-    summary_key = f"summary:{cfg.mode}:{digest}"
+    if result is None or result.empty or cfg.mode not in {"pre", "after"}:
+        return
+    store = store or TradingStore(app_config.TRADING_DB_FILE)
     summary_md = build_summary_markdown(result, market_info, market_news_state, cfg, ai_overview=ai_overview)
-
-    if cfg.notify_only_signal:
-        if cfg.mode == "intraday" and watch_result is not None and not watch_result.empty:
-            buy_rows = select_intraday_buy_rows(watch_result, cfg)
-            if buy_rows.empty:
-                print("本轮没有触发买点提醒。", flush=True)
-                return
-            row = buy_rows.head(1).iloc[0]
-            signal_id = safe_text(row.get("signal_anchor_id")) or safe_text(row.get("signal_first_seen")) or safe_text(row.get("buy_state"))
-            key = f"intraday:{datetime.now().strftime('%Y%m%d')}:{row['code']}:{signal_id}:{safe_text(row.get('buy_state'))}"
-            md = build_alert_markdown(row, "买点", market_info, market_news_state, cfg.mode)
-            if notifier.send_markdown(notification_title(cfg.mode, f"买点提醒 {row['code']} {row['name']}"), md, dedupe_key=key):
-                record_signal_watchlist(SIGNAL_WATCHLIST_FILE, row, "买点", cfg.mode)
-            return
-
-        strong_rows, risk_rows = select_signal_rows(result, cfg)
-        chosen_row = None
-        chosen_kind = ""
-        if not risk_rows.empty:
-            chosen_row = risk_rows.sort_values(["news_score", "final_score"]).iloc[0]
-            chosen_kind = "风险"
-        elif not strong_rows.empty:
-            chosen_row = strong_rows.sort_values("final_score", ascending=False).iloc[0]
-            chosen_kind = "强势"
-
-        if chosen_row is None:
-            print("本轮没有触发需要推送的信号。", flush=True)
-            return
-
-        signal_id = safe_text(chosen_row.get("signal_anchor_id")) or safe_text(chosen_row.get("signal_first_seen")) or safe_text(chosen_row.get("buy_state"))
-        key = f"signal:{chosen_kind}:{chosen_row['code']}:{signal_id}:{safe_text(chosen_row.get('signal_state'))}:{safe_text(chosen_row.get('signal_action'))}"
-        md = build_alert_markdown(chosen_row, chosen_kind, market_info, market_news_state, cfg.mode)
-        if notifier.send_markdown(notification_title(cfg.mode, f"{chosen_kind}提醒 {chosen_row['code']} {chosen_row['name']}"), md, dedupe_key=key):
-            record_signal_watchlist(SIGNAL_WATCHLIST_FILE, chosen_row, chosen_kind, cfg.mode)
-        return
-
-    # 默认模式：发一条汇总，盘后模式再补一条更完整的复盘
-    title = "盘后复盘" if cfg.mode == "after" else "扫描汇总"
-    notifier.send_markdown(notification_title(cfg.mode, title), summary_md, dedupe_key=summary_key)
-
-    if cfg.mode == "after" and review_quotes is not None:
-        for suffix, review_md in build_watchlist_review_messages(
-            review_quotes,
-            SIGNAL_WATCHLIST_FILE,
-            chunk_size=min(max(cfg.notify_top, 1), 6),
-        ):
-            notifier.send_markdown(
-                notification_title(cfg.mode, "推送跟踪复盘"),
-                review_md,
-                dedupe_key=f"watch-review:{suffix}",
+    try:
+        store.initialize()
+        if cfg.mode == "pre":
+            enqueue_scan_notification(
+                store,
+                "pre",
+                notification_title("pre", "盘前摘要"),
+                summary_md,
+                now,
             )
+            return
 
-    # 盘中或盘后都只再补一条重点卡片，避免消息过杂
-    highlight_row = None
-    highlight_kind = ""
-    if cfg.mode == "intraday" and watch_result is not None and not watch_result.empty:
-        buy_rows = select_intraday_buy_rows(watch_result, cfg)
-        if not buy_rows.empty:
-            highlight_row = buy_rows.sort_values("final_score", ascending=False).iloc[0]
-            highlight_kind = "买点"
-    else:
-        strong_rows, risk_rows = select_signal_rows(result, cfg)
-        if not risk_rows.empty:
-            highlight_row = risk_rows.sort_values(["news_score", "final_score"]).iloc[0]
-            highlight_kind = "风险"
-        elif not strong_rows.empty:
-            highlight_row = strong_rows.sort_values("final_score", ascending=False).iloc[0]
-            highlight_kind = "强势"
+        review_sections: list[str] = []
+        if review_quotes is not None:
+            review_sections = [
+                markdown
+                for _, markdown in build_watchlist_review_messages(
+                    review_quotes,
+                    SIGNAL_WATCHLIST_FILE,
+                    chunk_size=min(max(cfg.notify_top, 1), 6),
+                    now=now,
+                    store=store,
+                )
+            ]
+        close_body = _bounded_notification_body(summary_md, *review_sections)
+        enqueue_scan_notification(
+            store,
+            "close",
+            notification_title("after", "盘后复盘"),
+            close_body,
+            now,
+        )
 
-    if highlight_row is not None:
-        signal_id = safe_text(highlight_row.get("signal_anchor_id")) or safe_text(highlight_row.get("signal_first_seen")) or safe_text(highlight_row.get("buy_state"))
-        key = f"highlight:{cfg.mode}:{highlight_kind}:{highlight_row['code']}:{signal_id}:{safe_text(highlight_row.get('signal_state'))}:{safe_text(highlight_row.get('signal_action'))}"
-        md = build_alert_markdown(highlight_row, highlight_kind, market_info, market_news_state, cfg.mode)
-        if notifier.send_markdown(notification_title(cfg.mode, f"{highlight_kind}提醒 {highlight_row['code']} {highlight_row['name']}"), md, dedupe_key=key):
-            record_signal_watchlist(SIGNAL_WATCHLIST_FILE, highlight_row, highlight_kind, cfg.mode)
+        next_day = next_a_share_trading_day(now.date())
+        if next_day.isocalendar()[:2] != now.date().isocalendar()[:2]:
+            weekly_body = build_signal_performance_markdown(SIGNAL_WATCHLIST_FILE)
+            enqueue_scan_notification(
+                store,
+                "weekly",
+                "策略周度复盘",
+                weekly_body,
+                now,
+            )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print(f"稳定通知事件入队失败：{type(exc).__name__}: {exc}", flush=True)
 
 
 def parse_args() -> Config:
@@ -4109,7 +4331,7 @@ def build_summary_markdown(
                 f"止损 {_fmt_num(row.get('stop_loss'))} | 止盈 {_take_profit_text(row)} | "
                 f"仓位 {_fmt_num(row.get('position_pct'), 1)}% | {holding_flag}"
             )
-            score_text = _score_pair_text(row)
+            score_text = _rule_score_text(row)
             if score_text:
                 lines.append(f"> {score_text}")
             lines.append(f"> 理由：{compact_text(row.get('risk_reason') or row.get('buy_reason') or row.get('entry_reason') or '', 72)}")
@@ -4154,27 +4376,9 @@ def _take_profit_text(row: pd.Series) -> str:
     return _fmt_num(row.get("take_profit"))
 
 
-def _score_pair_text(row: pd.Series) -> str:
+def _rule_score_text(row: pd.Series) -> str:
     final_score = _fmt_num(row.get("final_score"), 1)
-    enhanced_score = _fmt_num(row.get("enhanced_score"), 1)
-    shadow_adjust = _fmt_num(row.get("shadow_adjust_score"), 1)
-    original_rank = _fmt_num(row.get("original_rank"), 0)
-    shadow_rank = _fmt_num(row.get("shadow_rank"), 0)
-    rank_change = _fmt_num(row.get("shadow_rank_change"), 0)
-    if final_score == "-" and enhanced_score == "-":
-        return ""
-    parts = [f"原分 {final_score}"]
-    if enhanced_score != "-":
-        parts.append(f"影子 {enhanced_score}")
-    if shadow_adjust != "-":
-        parts.append(f"调整 {float(row.get('shadow_adjust_score') or 0):+.1f}")
-    if original_rank != "-" and shadow_rank != "-":
-        parts.append(f"排名 {original_rank}->{shadow_rank}")
-    elif shadow_rank != "-":
-        parts.append(f"影子排名 {shadow_rank}")
-    if rank_change != "-":
-        parts.append(f"变化 {int(float(row.get('shadow_rank_change') or 0)):+d}")
-    return " | ".join(parts)
+    return "" if final_score == "-" else f"规则分 {final_score}"
 
 
 def build_alert_markdown(row: pd.Series, kind: str, market_info: dict[str, Any], market_news_state: str, mode: str) -> str:
@@ -4200,17 +4404,6 @@ def build_alert_markdown(row: pd.Series, kind: str, market_info: dict[str, Any],
         lines.insert(7, f"- {entry_status}")
     if _fmt_num(row.get("final_score"), 1) != "-":
         lines.append(f"- 原策略分：{_fmt_num(row.get('final_score'), 1)}")
-    if _fmt_num(row.get("enhanced_score"), 1) != "-":
-        lines.append(f"- 影子评分：{_fmt_num(row.get('enhanced_score'), 1)}（仅观察，不参与下单）")
-    if _fmt_num(row.get("shadow_adjust_score"), 1) != "-":
-        lines.append(f"- 影子调整：{float(row.get('shadow_adjust_score') or 0):+.1f}")
-    if _fmt_num(row.get("original_rank"), 0) != "-" and _fmt_num(row.get("shadow_rank"), 0) != "-":
-        lines.append(
-            f"- 排名变化：{_fmt_num(row.get('original_rank'), 0)} -> {_fmt_num(row.get('shadow_rank'), 0)} "
-            f"({int(float(row.get('shadow_rank_change') or 0)):+d})"
-        )
-    if safe_text(row.get("shadow_reason")):
-        lines.append(f"- 影子依据：{compact_text(row.get('shadow_reason'), 88)}")
     if safe_text(row.get("theme_heat_reason")):
         lines.append(f"- 热度依据：{compact_text(row.get('theme_heat_reason'), 88)}")
     if safe_text(row.get("sector_position_reason")):
@@ -4231,7 +4424,25 @@ def build_alert_markdown(row: pd.Series, kind: str, market_info: dict[str, Any],
     return "\n".join(lines)
 
 
-def save_outputs(result: pd.DataFrame, market_info: dict[str, Any], market_news_state: str, ai_overview: str = "") -> None:
+def strip_legacy_rule_shadow_fields(result: pd.DataFrame) -> pd.DataFrame:
+    """Keep archived rule-shadow columns out of current scan artifacts."""
+    return result.drop(
+        columns=[
+            "enhanced_score", "shadow_adjust_score", "shadow_base_score",
+            "original_rank", "shadow_rank", "shadow_rank_change", "shadow_reason",
+            "news_catalyst_score", "theme_heat_adjust_score",
+            "sector_position_score", "market_emotion_score",
+        ],
+        errors="ignore",
+    )
+
+
+def save_outputs(
+    result: pd.DataFrame,
+    market_info: dict[str, Any],
+    market_news_state: str,
+    ai_overview: str = "",
+) -> tuple[Path, Path]:
     """保存 CSV 和 Markdown 结果。
 
     参数说明：
@@ -4245,10 +4456,11 @@ def save_outputs(result: pd.DataFrame, market_info: dict[str, Any], market_news_
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = OUTPUT_DIR / f"scan_{stamp}.csv"
     md_path = OUTPUT_DIR / f"scan_{stamp}.md"
-    result.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    export_result = strip_legacy_rule_shadow_fields(result)
+    export_result.to_csv(csv_path, index=False, encoding="utf-8-sig")
     md_path.write_text(
         build_summary_markdown(
-            result,
+            export_result,
             market_info,
             market_news_state,
             Config(),
@@ -4257,6 +4469,7 @@ def save_outputs(result: pd.DataFrame, market_info: dict[str, Any], market_news_
         encoding="utf-8",
     )
     print(f"已保存：{csv_path.name} / {md_path.name}", flush=True)
+    return csv_path, md_path
 
 
 def print_console_report(result: pd.DataFrame, market_info: dict[str, Any], market_news_state: str) -> None:

@@ -1,6 +1,8 @@
 # Gap Reentry Confirmation Implementation Plan
 
-状态：Tasks 1–7 已实现、通过最终复查、推送并部署服务器；`GAP_REENTRY_ENABLE=False`，JoinQuant 网站模板尚未确认更新，未观察、未验证。最终复查补齐精确100股下单、当前价费用缓冲、部分成交撤余单、交易控制拦截不误标发布，以及无效风险单位状态一致性。
+> **2026-08-01 incremental boundary:** The deployed gap-reentry state machine and one-lot safeguards remain valid. Local small-capital Batch A routes that buy path through separate per-trade/portfolio risk budgets, exact quantity and atomic admission under `docs/superpowers/plans/2026-07-28-small-capital-live-risk-execution.md`; the complete batch has not yet formed its final commit and is not deployed, observed or validated. The status and commands below remain historical implementation evidence.
+
+状态：Tasks 1–7 已实现、通过最终复查、推送并部署服务器；最后记录的外部检查点为 `GAP_REENTRY_ENABLE=1` 且 JoinQuant 实际/期望模板一致，机会账本仍为空，故未观察、未验证；实时状态仍需重新核验。最终复查补齐精确100股下单、当前价费用缓冲、部分成交撤余单、交易控制拦截不误标发布，以及无效风险单位状态一致性。
 
 执行记录：Tasks 1–7 的首轮实现提交为 `11e887e`，最终复查提交为 `6cde4b1`，服务器部署实现检查点为 `5ad0ad539ef66aa7cf1073ad7142fde116d74ea5`；下列逐任务提交命令是原计划检查点，实际未拆成七个提交。服务器虚拟环境 Linux 全量440/440、Python编译、schema 9健康/可写、环境哈希与三个服务均已核验。
 

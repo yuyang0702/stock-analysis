@@ -1,15 +1,19 @@
 import csv
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from historical_data import (
     STRICT_FEATURES,
     HistoricalDataConflict,
+    HistoricalDataValidationError,
     HistoricalStorageLimitError,
     HistoricalStore,
+    strict_table_hash,
     validate_dataset,
 )
+from ml_contracts import CandidateSample, TimedFeature, canonical_hash
 
 
 JOINQUANT_FIELDS = [
@@ -27,6 +31,131 @@ JOINQUANT_FIELDS = [
 
 
 class HistoricalDataTest(unittest.TestCase):
+    def _strict_candidate(
+        self,
+        *,
+        decision_at: str = "2025-01-02T10:00:00+08:00",
+        code: str = "600000",
+        available_at: str = "2025-01-02T09:59:59+08:00",
+        selected: bool = True,
+    ) -> CandidateSample:
+        return CandidateSample.from_values(
+            source="strict_history",
+            dataset_id="strict-1",
+            decision_at=decision_at,
+            code=code,
+            strategy_version="strategy-v1",
+            parameter_version="params-v1",
+            feature_schema_version="features-v1",
+            features={
+                "price": TimedFeature(10.5, available_at),
+                "market_regime": TimedFeature("NORMAL", available_at),
+            },
+            selected=selected,
+            rejection_stage="selected" if selected else "score",
+            rejection_code="" if selected else "BELOW_SCORE",
+            final_action="selected" if selected else "score_rejected",
+            universe_hash="universe-sha",
+            market_data_version="market-v1",
+            code_hash="code-sha",
+            generator_hash="generator-sha",
+        )
+
+    def _strict_manifest(
+        self,
+        samples: list[CandidateSample],
+        *,
+        expected_codes: list[str] | None = None,
+        candidate_hash: str | None = None,
+        price_hash: str = "",
+    ) -> dict:
+        decision_at = samples[0].decision_at
+        hashes = [canonical_hash(sample) for sample in sorted(samples, key=lambda row: (row.decision_at, row.code))]
+        return {
+            "dataset_id": "strict-1",
+            "source": "strict_history",
+            "strategy_version": "strategy-v1",
+            "parameter_version": "params-v1",
+            "feature_schema_version": "features-v1",
+            "market_data_version": "market-v1",
+            "code_hash": "code-sha",
+            "generator_hash": "generator-sha",
+            "adjustment_version": "raw-v1",
+            "cohorts": {
+                decision_at: {
+                    "codes": expected_codes or [sample.code for sample in samples],
+                    "universe_hash": "universe-sha",
+                }
+            },
+            "table_hashes": {
+                "decision_candidates": candidate_hash or canonical_hash(hashes),
+                "candidate_prices": price_hash,
+            },
+        }
+
+    @staticmethod
+    def _candidate_payload(sample: CandidateSample) -> dict:
+        return {
+            "sample_id": sample.sample_id,
+            "source": sample.source,
+            "dataset_id": sample.dataset_id,
+            "trade_date": sample.trade_date,
+            "decision_at": sample.decision_at,
+            "code": sample.code,
+            "strategy_version": sample.strategy_version,
+            "parameter_version": sample.parameter_version,
+            "feature_schema_version": sample.feature_schema_version,
+            "features": {
+            name: {"value": feature.value, "available_at": feature.available_at}
+            for name, feature in sample.features.items()
+            },
+            "selected": sample.selected,
+            "rejection_stage": sample.rejection_stage,
+            "rejection_code": sample.rejection_code,
+            "final_action": sample.final_action,
+            "universe_hash": sample.universe_hash,
+            "market_data_version": sample.market_data_version,
+            "code_hash": sample.code_hash,
+            "generator_hash": sample.generator_hash,
+        }
+
+    @staticmethod
+    def _prices() -> list[dict]:
+        return [
+            {
+                "dataset_id": "strict-1",
+                "code": "600000",
+                "bar_at": "2025-01-02T10:05:00+08:00",
+                "available_at": "2025-01-02T10:05:01+08:00",
+                "open": 10.5,
+                "high": 10.7,
+                "low": 10.4,
+                "close": 10.6,
+                "volume": 10000,
+                "amount": 106000,
+                "paused": 0,
+                "limit_up": 11.5,
+                "limit_down": 9.5,
+                "adjustment_version": "raw-v1",
+            },
+            {
+                "dataset_id": "strict-1",
+                "code": "600000",
+                "bar_at": "2025-01-02T10:10:00+08:00",
+                "available_at": "2025-01-02T10:10:01+08:00",
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": None,
+                "volume": None,
+                "amount": None,
+                "paused": 1,
+                "limit_up": 11.5,
+                "limit_down": 9.5,
+                "adjustment_version": "raw-v1",
+            },
+        ]
+
     def _write_csv(self, path: Path, fields: list[str], rows: list[dict]) -> Path:
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
@@ -103,7 +232,7 @@ class HistoricalDataTest(unittest.TestCase):
 
             store.initialize()
 
-            self.assertEqual(store.schema_version(), 1)
+            self.assertEqual(store.schema_version(), 2)
             self.assertEqual(store.import_csv("d1", "bars", bars, "joinquant", "raw"), 2)
             self.assertEqual(store.import_csv("d1", "bars", bars, "joinquant", "raw"), 0)
             self.assertEqual(store.dataset_counts("d1")["daily_bars"], 2)
@@ -125,8 +254,223 @@ class HistoricalDataTest(unittest.TestCase):
                     "backtest_runs",
                     "backtest_equity",
                     "backtest_trades",
+                    "decision_candidates",
+                    "candidate_prices",
                 }.issubset(tables)
             )
+
+            with store.connect() as connection:
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_schema_one_database_migrates_additively_to_schema_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.db"
+            import sqlite3
+
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations VALUES (1, '2025-01-01T00:00:00+00:00')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = HistoricalStore(path)
+            store.initialize()
+
+            self.assertEqual(store.schema_version(), 2)
+            with store.connect() as connection:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertTrue({"decision_candidates", "candidate_prices"}.issubset(tables))
+
+    def test_strict_candidate_round_trip_is_complete_idempotent_and_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            samples = [
+                self._strict_candidate(code="000001"),
+                self._strict_candidate(code="600000", selected=False),
+            ]
+            manifest = self._strict_manifest(samples)
+
+            before = store.dataset_hash("strict-1")
+            self.assertEqual(store.import_candidate_cohorts(samples, manifest=manifest), 2)
+            after = store.dataset_hash("strict-1")
+            self.assertNotEqual(before, after)
+            self.assertEqual(store.import_candidate_cohorts(list(reversed(samples)), manifest=manifest), 0)
+            self.assertEqual(store.dataset_hash("strict-1"), after)
+            self.assertEqual(
+                store.decision_times(
+                    "strict-1",
+                    "2025-01-02T09:55:00+08:00",
+                    "2025-01-02T10:05:00+08:00",
+                ),
+                ["2025-01-02T10:00:00+08:00"],
+            )
+            self.assertEqual(store.candidate_cohort("strict-1", samples[0].decision_at), samples)
+            self.assertEqual(store.dataset_counts("strict-1")["decision_candidates"], 2)
+
+    def test_strict_candidate_read_rejects_tampered_content_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            sample = self._strict_candidate()
+            store.import_candidate_cohorts(
+                [sample], manifest=self._strict_manifest([sample])
+            )
+            with store.connect() as connection:
+                connection.execute(
+                    "UPDATE decision_candidates SET content_sha256=? "
+                    "WHERE dataset_id=? AND sample_id=?",
+                    ("0" * 64, sample.dataset_id, sample.sample_id),
+                )
+
+            with self.assertRaisesRegex(
+                HistoricalDataValidationError, "STRICT_COHORT_HASH_MISMATCH"
+            ):
+                store.candidate_cohort(sample.dataset_id, sample.decision_at)
+
+    def test_strict_candidate_rejects_future_feature_and_current_cache_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            sample = self._strict_candidate()
+            future = self._candidate_payload(sample)
+            future["features"]["price"]["available_at"] = "2025-01-02T10:00:01+08:00"
+            with self.assertRaisesRegex(HistoricalDataValidationError, "FEATURE_FROM_FUTURE"):
+                store.import_candidate_cohorts([future], manifest=self._strict_manifest([sample]))
+
+            cache_row = self._candidate_payload(sample)
+            cache_row["source"] = "current_cache"
+            with self.assertRaisesRegex(HistoricalDataValidationError, "STRICT_HISTORY_SOURCE_REQUIRED"):
+                store.import_candidate_cohorts([cache_row], manifest=self._strict_manifest([sample]))
+
+    def test_strict_candidate_conflict_rolls_back_and_missing_cohort_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            first = self._strict_candidate(code="000001")
+            second = self._strict_candidate(code="600000")
+
+            with self.assertRaisesRegex(HistoricalDataValidationError, "INCOMPLETE_COHORT"):
+                store.import_candidate_cohorts(
+                    [first], manifest=self._strict_manifest([first], expected_codes=["000001", "600000"])
+                )
+
+            store.import_candidate_cohorts([first, second], manifest=self._strict_manifest([first, second]))
+            changed = replace(first, selected=False, rejection_stage="score", rejection_code="LOW", final_action="score_rejected")
+            with self.assertRaises(HistoricalDataConflict):
+                store.import_candidate_cohorts(
+                    [changed, second], manifest=self._strict_manifest([changed, second])
+                )
+            self.assertEqual(store.candidate_cohort("strict-1", first.decision_at), [first, second])
+
+    def test_strict_manifest_rejects_table_hash_and_version_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            sample = self._strict_candidate()
+            with self.assertRaisesRegex(HistoricalDataValidationError, "TABLE_HASH_MISMATCH"):
+                store.import_candidate_cohorts(
+                    [sample], manifest=self._strict_manifest([sample], candidate_hash="bad")
+                )
+            manifest = self._strict_manifest([sample])
+            manifest["parameter_version"] = "wrong"
+            with self.assertRaisesRegex(HistoricalDataValidationError, "MANIFEST_VERSION_MISMATCH"):
+                store.import_candidate_cohorts([sample], manifest=manifest)
+
+    def test_candidate_prices_preserve_pauses_exact_availability_and_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            prices = self._prices()
+            price_hash = strict_table_hash("candidate_prices", prices)
+            manifest = self._strict_manifest([self._strict_candidate()], price_hash=price_hash)
+
+            self.assertEqual(store.import_candidate_prices(prices, manifest=manifest), 2)
+            self.assertEqual(store.import_candidate_prices(list(reversed(prices)), manifest=manifest), 0)
+            self.assertEqual(
+                store.candidate_price_path(
+                    "strict-1",
+                    "600000",
+                    "2025-01-02T10:00:00+08:00",
+                    "2025-01-02T10:10:01+08:00",
+                ),
+                prices,
+            )
+            changed = [{**prices[0], "close": 10.65}, prices[1]]
+            changed_manifest = self._strict_manifest(
+                [self._strict_candidate()],
+                price_hash=strict_table_hash("candidate_prices", changed),
+            )
+            with self.assertRaises(HistoricalDataConflict):
+                store.import_candidate_prices(changed, manifest=changed_manifest)
+            self.assertEqual(store.candidate_price_path(
+                "strict-1", "600000", "2025-01-02T10:00:00+08:00", "2025-01-02T10:10:01+08:00"
+            ), prices)
+
+    def test_candidate_price_read_rejects_tampered_content_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            prices = self._prices()
+            manifest = self._strict_manifest(
+                [self._strict_candidate()],
+                price_hash=strict_table_hash("candidate_prices", prices),
+            )
+            store.import_candidate_prices(prices, manifest=manifest)
+            with store.connect() as connection:
+                connection.execute(
+                    "UPDATE candidate_prices SET content_sha256=? "
+                    "WHERE dataset_id=? AND code=? AND bar_at=?",
+                    ("0" * 64, "strict-1", "600000", prices[0]["bar_at"]),
+                )
+
+            with self.assertRaisesRegex(
+                HistoricalDataValidationError, "STRICT_PRICE_HASH_MISMATCH"
+            ):
+                store.candidate_price_path(
+                    "strict-1",
+                    "600000",
+                    "2025-01-02T10:00:00+08:00",
+                    "2025-01-02T10:10:01+08:00",
+                )
+
+    def test_candidate_prices_reject_late_visibility_invalid_ohlc_and_naive_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HistoricalStore(Path(tmp) / "history.db")
+            store.initialize()
+            base = self._prices()[0]
+            cases = (
+                ({**base, "available_at": "2025-01-02T10:04:59+08:00"}, "PRICE_AVAILABLE_BEFORE_BAR"),
+                ({**base, "high": 10.0}, "INVALID_PRICE_OHLC"),
+                ({**base, "bar_at": "2025-01-02T10:05:00"}, "TIMEZONE_AWARE_TIMESTAMP_REQUIRED"),
+            )
+            for row, code in cases:
+                with self.subTest(code=code):
+                    manifest = self._strict_manifest(
+                        [self._strict_candidate()], price_hash=canonical_hash([row])
+                    )
+                    with self.assertRaisesRegex(HistoricalDataValidationError, code):
+                        store.import_candidate_prices([row], manifest=manifest)
+
+    def test_strict_import_preflight_counts_database_and_wal_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.db"
+            bootstrap = HistoricalStore(path)
+            bootstrap.initialize()
+            current = path.stat().st_size
+            store = HistoricalStore(path, max_db_bytes=current + 4096)
+            sample = self._strict_candidate()
+
+            with self.assertRaises(HistoricalStorageLimitError):
+                store.import_candidate_cohorts([sample], manifest=self._strict_manifest([sample]))
+
+            self.assertEqual(store.dataset_counts("strict-1")["decision_candidates"], 0)
 
     def test_conflicting_replay_rolls_back_the_entire_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import config as app_config
+from notification_outbox import (
+    HIGH_CAPACITY_STOP_BYTES,
+    HIGH_CAPACITY_STOP_ROWS,
+)
 from trading_store import TradingStore
-from notifier import WeComNotifier
 
 
 FAILED_STATUSES = {"failed", "rejected", "cancelled"}
@@ -52,6 +55,8 @@ def _sanitize_ledger_error(value: str) -> str:
 
 
 def _ledger_status(db_file: Path, signals: list[dict[str, Any]]) -> tuple[bool, int, int, bool, str]:
+    if not Path(db_file).is_file():
+        return False, 0, 0, False, "trading database is unavailable"
     store = TradingStore(db_file)
     health = store.health()
     if not health.ok:
@@ -74,11 +79,28 @@ def _execution_ledger_metrics(
         "account_snapshot_count": 0, "order_count": 0, "fill_count": 0,
         "recovery_ready": False, "active_execution_issue_count": 0,
         "active_execution_error_count": 0, "auto_resume_owned": False,
+        "notification_capacity_auto_resume_owned": False,
         "strategy_run_count_today": 0, "strategy_run_failed_count_today": 0,
         "latest_strategy_run_result": "",
+        "notification_normal_active_rows": 0,
+        "notification_normal_active_bytes": 0,
+        "notification_high_active_rows": 0,
+        "notification_high_active_bytes": 0,
+        "notification_dead_detail_rows": 0,
+        "notification_dead_detail_bytes": 0,
+        "notification_dead_total_rows": 0,
+        "notification_dead_total_bytes": 0,
+        "notification_high_dead_rows": 0,
+        "notification_high_dead_total_rows": 0,
+        "notification_unresolved_gap_rows": 0,
+        "notification_high_unresolved_gap_rows": 0,
+        "notification_tombstone_rows": 0,
     }
+    if not Path(db_file).is_file():
+        return metrics
     try:
-        with TradingStore(db_file).connect() as conn:
+        store = TradingStore(db_file)
+        with store.connect() as conn:
             for key, fallback in (("buy_enabled", "1"), ("kill_switch", "0")):
                 row = conn.execute("SELECT value FROM system_state WHERE key=?", (key,)).fetchone()
                 metrics[key] = str(row[0]) if row else fallback
@@ -124,11 +146,38 @@ def _execution_ledger_metrics(
                 "SELECT value FROM system_state WHERE key='reconciliation_auto_resume_owner'"
             ).fetchone()
             metrics["auto_resume_owned"] = bool(owner and str(owner[0]))
+            capacity_owner = conn.execute(
+                """SELECT value FROM system_state
+                   WHERE key='notification_capacity_auto_resume_owner'"""
+            ).fetchone()
+            metrics["notification_capacity_auto_resume_owned"] = bool(
+                capacity_owner and str(capacity_owner[0])
+            )
             matched = conn.execute(
                 """SELECT snapshot_id FROM reconciliation_runs WHERE mode='full' AND result='matched'
                    ORDER BY finished_at DESC LIMIT 2"""
             ).fetchall()
             metrics["recovery_ready"] = len({str(row[0]) for row in matched if row[0]}) >= 2
+            capacity = store.notification_capacity(conn)
+            metrics.update({
+                "notification_normal_active_rows": capacity.normal_active_rows,
+                "notification_normal_active_bytes": capacity.normal_active_bytes,
+                "notification_high_active_rows": capacity.high_active_rows,
+                "notification_high_active_bytes": capacity.high_active_bytes,
+                "notification_dead_detail_rows": capacity.dead_detail_rows,
+                "notification_dead_detail_bytes": capacity.dead_detail_bytes,
+                "notification_dead_total_rows": capacity.dead_total_rows,
+                "notification_dead_total_bytes": capacity.dead_total_bytes,
+                "notification_high_dead_rows": capacity.high_dead_rows,
+                "notification_high_dead_total_rows": (
+                    capacity.high_dead_total_rows
+                ),
+                "notification_unresolved_gap_rows": capacity.unresolved_gap_rows,
+                "notification_high_unresolved_gap_rows": (
+                    capacity.high_unresolved_gap_rows
+                ),
+                "notification_tombstone_rows": capacity.tombstone_rows,
+            })
     except Exception:
         pass
     return metrics
@@ -358,6 +407,7 @@ def build_health_report(
     positions_file: Path | None = None,
     health_history_file: Path | None = None,
     db_file: Path | None = None,
+    persist_notifications: bool = False,
 ) -> dict[str, Any]:
     now = now or datetime.now()
     signal_file = signal_file or app_config.JOINQUANT_SIGNAL_FILE
@@ -424,6 +474,20 @@ def build_health_report(
     if execution_metrics["kill_switch"] == "1":
         issue_codes.append("kill_switch_active")
         issues.append("自动交易 KILL_SWITCH 已开启")
+    if execution_metrics["notification_high_unresolved_gap_rows"] > 0:
+        issue_codes.append("notification_high_enqueue_gap")
+        issues.append("高优先级通知存在未解决 enqueue gap")
+    if (
+        execution_metrics["notification_high_active_rows"]
+        >= HIGH_CAPACITY_STOP_ROWS
+        or execution_metrics["notification_high_active_bytes"]
+        >= HIGH_CAPACITY_STOP_BYTES
+    ):
+        issue_codes.append("notification_high_capacity_pressure")
+        issues.append("高优先级通知容量达到停买水位")
+    if execution_metrics["notification_high_dead_rows"] > 0:
+        issue_codes.append("notification_high_dead_detail")
+        issues.append("高优先级通知存在 dead 明细，自动恢复买入受阻")
     if execution_metrics["latest_reconciliation_result"] == "mismatch":
         issue_codes.append("reconciliation_mismatch")
         issues.append("最近一次自动对账存在差异")
@@ -524,6 +588,7 @@ def build_health_report(
         "observation_day_status": observation_day_status,
         "is_trading_time": is_trading_time,
         "alert_required": alert_required,
+        "fresh_executable_buy": fresh_executable_buy,
         "issues": issues,
         "issue_codes": issue_codes,
         "signal_count": len(signals),
@@ -559,6 +624,12 @@ def build_health_report(
         "latest_cash": _num(snapshot_payload.get("cash")),
         **execution_metrics,
     }
+    if persist_notifications:
+        result["notification_persist_error"] = persist_health_issue_transitions(
+            result, db_file, now,
+        )
+        if result["notification_persist_error"]:
+            result["stable_gate_pass"] = False
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text(build_report_markdown(result), encoding="utf-8")
     _append_jsonl(health_history_file, result)
@@ -585,6 +656,17 @@ def build_report_markdown(result: dict[str, Any]) -> str:
         f"- SQLite schema_version：{result.get('ledger_schema_version', 0)}",
         f"- SQLite/JSON 信号一致：{'是' if result.get('ledger_json_parity') else '否'}",
         f"- SQLite 错误：{_sanitize_ledger_error(result.get('ledger_error') or '') or '-'}",
+        (
+            "- Notification capacity: "
+            f"normal={result.get('notification_normal_active_rows', 0)}/"
+            f"{result.get('notification_normal_active_bytes', 0)}B, "
+            f"high={result.get('notification_high_active_rows', 0)}/"
+            f"{result.get('notification_high_active_bytes', 0)}B, "
+            f"dead_detail={result.get('notification_dead_detail_rows', 0)}/"
+            f"{result.get('notification_dead_detail_bytes', 0)}B, "
+            f"dead_total={result.get('notification_dead_total_rows', 0)}, "
+            f"gaps={result.get('notification_unresolved_gap_rows', 0)}"
+        ),
         f"- 跳空二次确认状态：{json.dumps(result.get('gap_reentry_states') or {}, ensure_ascii=False, sort_keys=True)}",
         f"- 信号年龄：{result.get('signal_age_min')} 分钟",
         f"- 快照年龄：{result.get('snapshot_age_min')} 分钟",
@@ -608,6 +690,10 @@ def build_report_markdown(result: dict[str, Any]) -> str:
     ]
     issues = result.get("issues") or []
     lines.extend(f"- {item}" for item in issues) if issues else lines.append("- 暂无异常。")
+    if result.get("notification_persist_error"):
+        lines.append(
+            f"- notification persistence: {result['notification_persist_error']}"
+        )
 
     breakdown = result.get("failed_order_breakdown") or {}
     if breakdown:
@@ -630,20 +716,129 @@ def build_alert_markdown(result: dict[str, Any]) -> str:
     ]
     for issue in result.get("issues") or []:
         lines.append(f"- {issue}")
+    if result.get("notification_persist_error"):
+        lines.append(
+            f"- notification persistence: {result['notification_persist_error']}"
+        )
     return "\n".join(lines)
 
 
+_HEALTH_ISSUE_OWNERS = {
+    "buy_disabled_by_control",
+    "kill_switch_active",
+    "ledger_unavailable",
+    "reconciliation_mismatch",
+}
+
+
+def _health_issue_details(code: str, result: dict[str, Any]) -> dict[str, object]:
+    if code == "template_version_mismatch":
+        return {
+            "template_version": str(
+                result.get("strategy_template_version") or "missing"
+            ),
+            "expected_template_version": str(
+                result.get("expected_template_version") or ""
+            ),
+        }
+    if code == "position_mismatch":
+        return {
+            "position_codes": sorted(
+                str(item) for item in result.get("position_mismatches") or []
+            )[:32],
+        }
+    return {}
+
+
+def persist_health_issue_transitions(
+    result: dict[str, Any],
+    db_file: Path,
+    now: datetime,
+) -> str:
+    fresh_buy = bool(result.get("fresh_executable_buy"))
+    issue_codes = [str(code) for code in result.get("issue_codes") or []]
+    active_codes = {
+        code for code in issue_codes
+        if code not in _HEALTH_ISSUE_OWNERS
+        and _alert_required([code], now, fresh_buy)
+    }
+    alert_required = bool(result.get("alert_required"))
+    db_file = Path(db_file)
+    if not db_file.is_file():
+        return "trading database is unavailable" if alert_required else ""
+    store = TradingStore(db_file)
+    health = store.health()
+    if not health.ok:
+        return (
+            f"trading database schema {health.schema_version} is unavailable"
+            if alert_required else ""
+        )
+    shanghai_now = store._shanghai_timestamp(now.isoformat(), "health time")
+    messages = {
+        str(code): str(message)
+        for code, message in zip(
+            result.get("issue_codes") or [], result.get("issues") or [],
+        )
+    }
+    try:
+        with store.transaction() as conn:
+            scope_row = conn.execute(
+                """SELECT account_scope_id FROM account_scopes
+                   WHERE adapter='joinquant' AND scope_alias='primary'"""
+            ).fetchone()
+            if scope_row is None:
+                return "account scope is not registered" if alert_required else ""
+            scope = str(scope_row[0])
+            prefix = f"scope:{scope}:health:"
+            for code in sorted(active_codes):
+                store.upsert_execution_issue(conn, {
+                    "account_scope_id": scope,
+                    "issue_key": prefix + code,
+                    "object_type": "health",
+                    "object_id": code,
+                    "state": code.upper(),
+                    "severity": (
+                        "WARNING"
+                        if code in {"api_errors", "failed_orders_high"}
+                        else "ERROR"
+                    ),
+                    "stage_started_at": shanghai_now,
+                    "seen_at": shanghai_now,
+                    "details": {
+                        **_health_issue_details(code, result),
+                        "message": messages.get(code, "")[:240],
+                    },
+                })
+            rows = conn.execute(
+                """SELECT issue_key, object_id FROM execution_issue_state
+                   WHERE recovered_at IS NULL AND object_type='health'
+                     AND substr(issue_key, 1, ?) = ?""",
+                (len(prefix), prefix),
+            ).fetchall()
+            for row in rows:
+                code = str(row["object_id"])
+                if code in active_codes:
+                    continue
+                if (
+                    code in NON_TRADING_NOISE_ISSUES
+                    and not _is_a_share_trading_time(now)
+                ):
+                    continue
+                store.recover_execution_issue(
+                    conn,
+                    str(row["issue_key"]),
+                    shanghai_now,
+                    account_scope_id=scope,
+                )
+    except Exception as exc:
+        return _sanitize_ledger_error(str(exc)) or type(exc).__name__
+    return ""
+
+
 def notify_if_needed(result: dict[str, Any]) -> bool:
-    if not result.get("alert_required") or not app_config.WECOM_WEBHOOK_URL:
-        return False
-    notifier = WeComNotifier(
-        webhook_url=app_config.WECOM_WEBHOOK_URL,
-        state_file=app_config.CACHE_DIR / "wecom_notify_state.json",
-        cooldown_sec=app_config.NOTIFY_COOLDOWN_SEC_DEFAULT,
-        timeout_sec=app_config.WECOM_TIMEOUT_SEC,
-    )
-    key = "joinquant-health:" + ",".join(result.get("issue_codes") or ["unknown"])
-    return notifier.send_markdown("JoinQuant 健康异常", build_alert_markdown(result), dedupe_key=key)
+    """Deprecated compatibility hook; health transitions enqueue in SQLite."""
+    del result
+    return False
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -658,7 +853,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main() -> int:
     args = build_arg_parser().parse_args()
     result = build_health_report(
         args.signal_file,
@@ -667,11 +862,11 @@ def main() -> None:
         args.report_file,
         api_event_file=args.api_event_file,
         positions_file=args.positions_file,
+        persist_notifications=args.notify,
     )
-    if args.notify:
-        notify_if_needed(result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("notification_persist_error") else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

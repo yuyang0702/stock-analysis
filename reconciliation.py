@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
 
 import config as app_config
@@ -39,6 +38,9 @@ class ReconciliationResult:
 
 _SEVERITY = {"INFO": 0, "WARNING": 1, "ERROR": 2, "CRITICAL": 3}
 _STICKY_ISSUES = {"LEDGER_INTEGRITY_FAILURE", "IMMUTABLE_FILL_CONFLICT"}
+_RECONCILIATION_ISSUE_OBJECT_TYPES = (
+    "account", "ledger", "position", "order", "fill", "exit_intent",
+)
 
 
 def _text(value: Any) -> str:
@@ -198,7 +200,8 @@ def reconcile_snapshot(
                 "order", order_id, "ORDER_MISSING_LOCAL", "missing", "present", 0, "ERROR",
             ))
         elif platform is None and str(local["status"]) not in {
-            "filled", "cancelled", "rejected", "failed", "skipped", "risk_rejected",
+            "filled", "cancelled", "rejected", "failed", "skipped",
+            "risk_rejected", "not_submitted", "expired",
         }:
             differences.append(_difference(
                 "order", order_id, "ORDER_MISSING_PLATFORM", "present", "missing", 0, "ERROR",
@@ -248,6 +251,52 @@ def reconcile_snapshot(
                             "order", order_id, reason_code,
                             local_value, platform_value, 0, "ERROR",
                         ))
+
+    unknown_client_order_ids: set[str] = set()
+    for order in broker_snapshot.open_orders:
+        if str(order["status"]).lower() == "submit_unknown":
+            unknown_client_order_ids.add(str(order["client_order_id"]))
+            differences.append(_difference(
+                "order",
+                str(order["client_order_id"]),
+                "ORDER_SUBMIT_UNKNOWN",
+                "submission outcome unknown",
+                "broker order id missing",
+                0,
+                "ERROR",
+            ))
+    for row in conn.execute(
+        """SELECT i.client_order_id, o.status AS local_status,
+                  b.status AS broker_status
+           FROM execution_intents AS i
+           JOIN orders AS o ON o.client_order_id=i.client_order_id
+           JOIN capacity_reservations AS r
+             ON r.account_scope_id=i.account_scope_id
+            AND r.client_order_id=i.client_order_id
+           LEFT JOIN broker_order_current AS b
+             ON b.account_scope_id=i.account_scope_id
+            AND b.client_order_id=i.client_order_id
+           WHERE i.account_scope_id=? AND r.status='active'
+             AND (i.status='SUBMIT_UNKNOWN' OR o.status='submit_unknown')""",
+        (broker_snapshot.account_scope_id,),
+    ):
+        client_order_id = str(row["client_order_id"])
+        if client_order_id in unknown_client_order_ids:
+            continue
+        if mode == "full" and (
+            str(row["broker_status"] or "").lower() == "not_submitted"
+            or (
+                row["broker_status"] is None
+                and str(row["local_status"]).lower() == "not_submitted"
+            )
+        ):
+            continue
+        unknown_client_order_ids.add(client_order_id)
+        differences.append(_difference(
+            "order", client_order_id, "ORDER_SUBMIT_UNKNOWN",
+            "submission outcome unknown", "absent from full broker snapshot",
+            0, "ERROR",
+        ))
 
     local_fills = {
         str(row["fill_id"]): row for row in conn.execute(
@@ -427,6 +476,7 @@ def persist_issue_transitions(
         ):
             continue
         changed = store.upsert_execution_issue(conn, {
+            "account_scope_id": account_scope_id,
             "issue_key": key, "object_type": item.category, "object_id": item.object_id,
             "state": item.reason_code, "severity": item.severity,
             "stage_started_at": str(item.details.get("stage_started_at") or now),
@@ -434,37 +484,40 @@ def persist_issue_transitions(
             "signal_id": item.object_id if item.category == "exit_intent" else "",
             "order_id": item.object_id if item.category == "order" else "",
             "reconciliation_id": result.reconciliation_id,
-            "details": item.details,
+            "details": {
+                **item.details,
+                "reason_code": item.reason_code,
+                "expected": item.local_value,
+                "actual": item.platform_value,
+            },
         })
         if changed["transitioned"]:
-            changed["transition"] = "OPENED" if not changed["previous_state"] else "CHANGED"
             transitions.append(changed)
-        elif item.severity == "ERROR":
-            notified = str(changed.get("last_notified_at") or "")
-            reminder_base = notified or str(changed.get("last_transition_at") or "")
-            if reminder_base and (
-                datetime.fromisoformat(now) - datetime.fromisoformat(reminder_base)
-            ).total_seconds() >= 1800:
-                changed["transition"] = "REMINDER"
-                transitions.append(changed)
     if scope_prefix:
+        placeholders = ",".join("?" for _ in _RECONCILIATION_ISSUE_OBJECT_TYPES)
         rows = conn.execute(
-            """SELECT issue_key, state FROM execution_issue_state
+            f"""SELECT issue_key, state FROM execution_issue_state
                WHERE recovered_at IS NULL
-                 AND substr(issue_key, 1, ?) = ?""",
-            (len(scope_prefix), scope_prefix),
+                 AND substr(issue_key, 1, ?) = ?
+                 AND object_type IN ({placeholders})""",
+            (len(scope_prefix), scope_prefix, *_RECONCILIATION_ISSUE_OBJECT_TYPES),
         ).fetchall()
     else:
+        placeholders = ",".join("?" for _ in _RECONCILIATION_ISSUE_OBJECT_TYPES)
         rows = conn.execute(
-            """SELECT issue_key, state FROM execution_issue_state
+            f"""SELECT issue_key, state FROM execution_issue_state
                WHERE recovered_at IS NULL
-                 AND issue_key NOT LIKE 'scope:%'"""
+                 AND issue_key NOT LIKE 'scope:%'
+                 AND object_type IN ({placeholders})""",
+            _RECONCILIATION_ISSUE_OBJECT_TYPES,
         ).fetchall()
     for row in rows:
         key, state = str(row[0]), str(row[1])
         if key in active_keys or state in _STICKY_ISSUES:
             continue
-        recovered = store.recover_execution_issue(conn, key, now)
+        recovered = store.recover_execution_issue(
+            conn, key, now, account_scope_id=account_scope_id or None,
+        )
         if recovered:
             recovered["transition"] = "RECOVERED"
             transitions.append(recovered)
@@ -502,39 +555,6 @@ def notify_reconciliation(
     result: ReconciliationResult, controls: dict[str, str], *, notifier: Any,
     store: TradingStore | None = None, now: str | None = None,
 ) -> bool:
-    if not result.differences and not result.transitions:
-        return False
-    if result.transitions:
-        visible = [
-            item for item in result.transitions
-            if item.get("state") == "RECOVERED"
-            or item.get("severity") in {"WARNING", "ERROR", "CRITICAL"}
-        ]
-        if not visible:
-            return False
-        transition = visible[0]
-        sent = bool(notifier.send_markdown(
-            "JoinQuant 自动对账状态变化",
-            build_reconciliation_markdown(result, controls),
-            dedupe_key=(
-                f"reconciliation-transition:{transition.get('issue_key')}:"
-                f"{transition.get('state')}:{transition.get('severity')}:"
-                f"{transition.get('transition')}"
-            ),
-        ))
-        if sent and store is not None:
-            notified_at = now or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with store.transaction() as conn:
-                store.mark_execution_issues_notified(
-                    conn, [str(item.get("issue_key") or "") for item in visible], notified_at
-                )
-        return sent
-    primary = max(
-        result.differences, key=lambda item: _SEVERITY.get(item.severity, 0)
-    )
-    control_state = f"{controls.get('buy_enabled', '1')}/{controls.get('kill_switch', '0')}"
-    return bool(notifier.send_markdown(
-        "JoinQuant 自动对账告警",
-        build_reconciliation_markdown(result, controls),
-        dedupe_key=f"reconciliation:{primary.reason_code}:{primary.object_id}:{control_state}",
-    ))
+    """Deprecated compatibility hook; transitions enqueue in the source transaction."""
+    del result, controls, notifier, store, now
+    return False

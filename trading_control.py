@@ -9,11 +9,21 @@ from datetime import datetime
 from pathlib import Path
 
 from reconciliation import ReconciliationResult
+from notification_outbox import (
+    HIGH_CAPACITY_RECOVER_BYTES,
+    HIGH_CAPACITY_RECOVER_ROWS,
+    HIGH_CAPACITY_STOP_BYTES,
+    HIGH_CAPACITY_STOP_ROWS,
+    NOTIFICATION_WRITE_FAILURE_KEY,
+)
 from trading_store import TradingStore
 
 
 class StaleControlStateError(RuntimeError):
     pass
+
+
+NOTIFICATION_CAPACITY_OWNER_KEY = "notification_capacity_auto_resume_owner"
 
 
 def _current(conn: object, key: str, default: str) -> str:
@@ -24,24 +34,215 @@ def _current(conn: object, key: str, default: str) -> str:
 def _set_control(
     store: TradingStore, conn: object, *, key: str, value: str, action: str,
     reason: str, operator: str, reconciliation_id: str | None,
+    _capacity_reconcile: bool = True,
 ) -> str | None:
     old = _current(conn, key, "1" if key == "buy_enabled" else "0")
     if old == value:
         return None
     store.set_system_state(conn, key, value, reason)
-    linked = reconciliation_id
-    if linked and conn.execute(
-        "SELECT 1 FROM reconciliation_runs WHERE reconciliation_id=?", (linked,)
-    ).fetchone() is None:
-        linked = None
     event_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO control_events(
-           event_id, action, operator, old_value, new_value, reason, reconciliation_id, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-        (event_id, action, operator, old, value, reason, linked),
+    scope_row = conn.execute(
+        """SELECT account_scope_id FROM reconciliation_runs
+           WHERE reconciliation_id=?""",
+        (reconciliation_id,),
+    ).fetchone() if reconciliation_id else None
+    scope = (
+        str(scope_row[0]) if scope_row and scope_row[0]
+        else store.registered_account_scope(conn, "joinquant", "primary")
+    )
+    store.insert_control_event(
+        conn,
+        event_id=event_id,
+        action=action,
+        operator=operator,
+        old_value=old,
+        new_value=value,
+        reason=reason,
+        reconciliation_id=reconciliation_id,
+        created_at=datetime.now().isoformat(),
+        account_scope_id=scope,
+        _capacity_reconcile=_capacity_reconcile,
     )
     return event_id
+
+
+def _capacity_owner(conn: object) -> dict[str, object]:
+    raw = _current(conn, NOTIFICATION_CAPACITY_OWNER_KEY, "")
+    try:
+        value = json.loads(raw) if raw else {}
+    except (TypeError, ValueError, RecursionError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def reconcile_notification_capacity(
+    store: TradingStore,
+    conn: object,
+    *,
+    now: str,
+    cycle_id: str | None,
+) -> dict[str, object] | None:
+    if not getattr(conn, "in_transaction", False):
+        raise ValueError("notification capacity reconciliation requires a transaction")
+    now_text = store._notification_timestamp(now, "now")
+    cycle = str(cycle_id or "").strip()
+    capacity = store.notification_capacity(conn)
+    pressure = bool(
+        capacity.high_active_rows >= HIGH_CAPACITY_STOP_ROWS
+        or capacity.high_active_bytes >= HIGH_CAPACITY_STOP_BYTES
+        or capacity.high_unresolved_gap_rows > 0
+        or _current(conn, NOTIFICATION_WRITE_FAILURE_KEY, "")
+    )
+    owner = _capacity_owner(conn)
+    buy = conn.execute(
+        "SELECT value, updated_at FROM system_state WHERE key='buy_enabled'",
+    ).fetchone()
+    buy_value = str(buy[0]) if buy else "1"
+    buy_updated_at = str(buy[1]) if buy else ""
+
+    if pressure:
+        if buy_value == "1":
+            event_id = _set_control(
+                store, conn, key="buy_enabled", value="0", action="stop_buy",
+                reason="notification high-priority capacity pressure",
+                operator="NOTIFICATION_CAPACITY", reconciliation_id=None,
+                _capacity_reconcile=False,
+            )
+            stopped = conn.execute(
+                "SELECT value, updated_at FROM system_state WHERE key='buy_enabled'",
+            ).fetchone()
+            if event_id and stopped is not None:
+                store.set_system_state(
+                    conn,
+                    NOTIFICATION_CAPACITY_OWNER_KEY,
+                    json.dumps({
+                        "owner": "notification_capacity",
+                        "control_event_id": event_id,
+                        "expected_value": "0",
+                        "expected_updated_at": str(stopped[1]),
+                        "stopped_at": now_text,
+                        "last_cycle_id": cycle,
+                        "low_cycle_id": "",
+                        "low_checked_at": "",
+                    }, ensure_ascii=False, sort_keys=True),
+                    "notification-capacity-owned stop-buy",
+                )
+                return {"action": "stop_buy", "event_id": event_id}
+        elif owner.get("owner") == "notification_capacity":
+            if (
+                buy_updated_at != str(owner.get("expected_updated_at") or "")
+                or str(owner.get("expected_value") or "") != "0"
+            ):
+                store.set_system_state(
+                    conn, NOTIFICATION_CAPACITY_OWNER_KEY, "",
+                    "notification capacity control generation changed",
+                )
+                return None
+            owner.update({
+                "last_cycle_id": cycle or str(owner.get("last_cycle_id") or ""),
+                "low_cycle_id": "",
+                "low_checked_at": "",
+            })
+            store.set_system_state(
+                conn, NOTIFICATION_CAPACITY_OWNER_KEY,
+                json.dumps(owner, ensure_ascii=False, sort_keys=True),
+                "notification capacity remains above recovery threshold",
+            )
+        return None
+
+    if owner.get("owner") != "notification_capacity":
+        return None
+    if (
+        buy_value != "0"
+        or str(owner.get("expected_value") or "") != "0"
+        or buy_updated_at != str(owner.get("expected_updated_at") or "")
+    ):
+        store.set_system_state(
+            conn, NOTIFICATION_CAPACITY_OWNER_KEY, "",
+            "notification capacity control generation changed",
+        )
+        return None
+    if not cycle or cycle == str(owner.get("last_cycle_id") or ""):
+        return None
+
+    low = bool(
+        capacity.high_active_rows < HIGH_CAPACITY_RECOVER_ROWS
+        and capacity.high_active_bytes < HIGH_CAPACITY_RECOVER_BYTES
+        and capacity.high_dead_rows == 0
+        and capacity.high_unresolved_gap_rows == 0
+        and _current(conn, "kill_switch", "0") == "0"
+        and not _current(conn, "reconciliation_auto_resume_owner", "")
+    )
+    owner["last_cycle_id"] = cycle
+    if not low:
+        owner["low_cycle_id"] = ""
+        owner["low_checked_at"] = ""
+        store.set_system_state(
+            conn, NOTIFICATION_CAPACITY_OWNER_KEY,
+            json.dumps(owner, ensure_ascii=False, sort_keys=True),
+            "notification capacity recovery conditions not met",
+        )
+        return None
+
+    first_cycle = str(owner.get("low_cycle_id") or "")
+    first_at = str(owner.get("low_checked_at") or "")
+    if not first_cycle or not first_at:
+        owner["low_cycle_id"] = cycle
+        owner["low_checked_at"] = now_text
+        store.set_system_state(
+            conn, NOTIFICATION_CAPACITY_OWNER_KEY,
+            json.dumps(owner, ensure_ascii=False, sort_keys=True),
+            "notification capacity first low-water cycle",
+        )
+        return None
+    try:
+        elapsed = (
+            datetime.fromisoformat(now_text)
+            - datetime.fromisoformat(first_at)
+        ).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        elapsed = -1
+    if cycle == first_cycle or elapsed < 300:
+        store.set_system_state(
+            conn, NOTIFICATION_CAPACITY_OWNER_KEY,
+            json.dumps(owner, ensure_ascii=False, sort_keys=True),
+            "notification capacity awaiting second low-water cycle",
+        )
+        return None
+
+    changed = conn.execute(
+        """UPDATE system_state SET value='1', updated_at=?, reason=?
+           WHERE key='buy_enabled' AND value='0' AND updated_at=?""",
+        (
+            now_text, "notification capacity recovered",
+            str(owner["expected_updated_at"]),
+        ),
+    ).rowcount
+    if changed != 1:
+        store.set_system_state(
+            conn, NOTIFICATION_CAPACITY_OWNER_KEY, "",
+            "notification capacity recovery CAS lost",
+        )
+        return None
+    event_id = str(uuid.uuid4())
+    scope = store.registered_account_scope(conn, "joinquant", "primary")
+    store.insert_control_event(
+        conn,
+        event_id=event_id,
+        action="auto_resume_buy",
+        operator="NOTIFICATION_CAPACITY",
+        old_value="0",
+        new_value="1",
+        reason="two distinct five-minute low-water worker cycles",
+        created_at=now_text,
+        account_scope_id=scope,
+        _capacity_reconcile=False,
+    )
+    store.set_system_state(
+        conn, NOTIFICATION_CAPACITY_OWNER_KEY, "",
+        "notification capacity automatic recovery complete",
+    )
+    return {"action": "auto_resume_buy", "event_id": event_id}
 
 
 def apply_reconciliation_control(
@@ -61,6 +262,11 @@ def apply_reconciliation_control(
     reason = f"reconciliation {result.reconciliation_id} {result.severity}"
     stop_event_id = None
     if result.severity in {"ERROR", "CRITICAL"}:
+        if _current(conn, NOTIFICATION_CAPACITY_OWNER_KEY, ""):
+            store.set_system_state(
+                conn, NOTIFICATION_CAPACITY_OWNER_KEY, "",
+                "reconciliation control precedence",
+            )
         stop_event_id = _set_control(
             store, conn, key="buy_enabled", value="0", action="stop_buy", reason=reason,
             operator=operator, reconciliation_id=result.reconciliation_id,
@@ -123,7 +329,28 @@ def unlock_eligibility(store: TradingStore, *, now: str) -> tuple[bool, list[str
         snapshot = conn.execute(
             "SELECT generated_at FROM account_snapshots ORDER BY generated_at DESC LIMIT 1"
         ).fetchone()
-        unknown = conn.execute("SELECT 1 FROM orders WHERE status='submit_unknown' LIMIT 1").fetchone()
+        unknown = conn.execute(
+            """SELECT 1 FROM execution_intents AS i
+               JOIN capacity_reservations AS r
+                 ON r.account_scope_id=i.account_scope_id
+                AND r.client_order_id=i.client_order_id
+               JOIN orders AS o ON o.client_order_id=i.client_order_id
+               WHERE r.status='active'
+                 AND (i.status='SUBMIT_UNKNOWN' OR o.status='submit_unknown')
+               LIMIT 1"""
+        ).fetchone()
+        terminal_reservation = conn.execute(
+            """SELECT 1 FROM execution_intents AS i
+               JOIN capacity_reservations AS r
+                 ON r.account_scope_id=i.account_scope_id
+                AND r.client_order_id=i.client_order_id
+               JOIN orders AS o ON o.client_order_id=i.client_order_id
+               WHERE r.status='active'
+                 AND (i.status IN ('NOT_SUBMITTED','REJECTED','CANCELLED','FILLED')
+                      OR o.status IN ('not_submitted','rejected','risk_rejected',
+                                      'failed','skipped','cancelled','filled'))
+               LIMIT 1"""
+        ).fetchone()
     if latest is None or str(latest[0]) != "matched":
         reasons.append("LATEST_FULL_RECONCILIATION_NOT_MATCHED")
     if len(rows) < 2 or len({str(row[0]) for row in rows if row[0]}) < 2:
@@ -136,6 +363,8 @@ def unlock_eligibility(store: TradingStore, *, now: str) -> tuple[bool, list[str
             reasons.append("ACCOUNT_SNAPSHOT_STALE")
     if unknown is not None:
         reasons.append("SUBMIT_UNKNOWN_PRESENT")
+    if terminal_reservation is not None:
+        reasons.append("TERMINAL_RESERVATION_UNRECONCILED")
     return not reasons, reasons
 
 
@@ -153,7 +382,61 @@ def control_status(store: TradingStore) -> dict[str, object]:
         latest = conn.execute(
             "SELECT * FROM reconciliation_runs ORDER BY finished_at DESC LIMIT 1"
         ).fetchone()
-    return {"controls": states, "latest_reconciliation": dict(latest) if latest else None}
+        owner = conn.execute(
+            "SELECT * FROM system_state WHERE key='reconciliation_auto_resume_owner'"
+        ).fetchone()
+        capacity_owner = conn.execute(
+            "SELECT * FROM system_state WHERE key=?",
+            (NOTIFICATION_CAPACITY_OWNER_KEY,),
+        ).fetchone()
+        capacity = store.notification_capacity(conn)
+        marker_row = conn.execute(
+            "SELECT value FROM system_state WHERE key=?",
+            (NOTIFICATION_WRITE_FAILURE_KEY,),
+        ).fetchone()
+        marker_text = str(marker_row[0] or "") if marker_row is not None else ""
+        marker: dict[str, object] = {}
+        if marker_text:
+            try:
+                parsed = json.loads(marker_text)
+            except (TypeError, ValueError, RecursionError):
+                parsed = {}
+            if isinstance(parsed, dict):
+                marker = parsed
+        notification_state_counts = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                "SELECT state, COUNT(*) FROM notification_outbox GROUP BY state"
+            )
+        }
+        recent_events = conn.execute(
+            "SELECT * FROM control_events ORDER BY created_at DESC, event_id DESC LIMIT 5"
+        ).fetchall()
+    return {
+        "controls": states,
+        "automatic_recovery_owner": dict(owner) if owner else None,
+        "notification_capacity_recovery_owner": (
+            dict(capacity_owner) if capacity_owner else None
+        ),
+        "notification_health": {
+            "pending": notification_state_counts.get("pending", 0),
+            "leased": notification_state_counts.get("leased", 0),
+            "dead": notification_state_counts.get("dead", 0),
+            "unresolved_gaps": capacity.unresolved_gap_rows,
+            "high_unresolved_gaps": capacity.high_unresolved_gap_rows,
+            "high_dead_detail_rows": capacity.high_dead_rows,
+            "dead_detail_rows": capacity.dead_rows,
+            "dead_detail_bytes": capacity.dead_bytes,
+            "tombstones": capacity.tombstone_rows,
+            "write_failure_marker": bool(marker_text),
+            "write_failure_requires_manual_resolution": bool(
+                marker.get("requires_manual_resolution")
+            ),
+            "write_failure_event_key": str(marker.get("event_key") or ""),
+        },
+        "recent_control_events": [dict(row) for row in recent_events],
+        "latest_reconciliation": dict(latest) if latest else None,
+    }
 
 
 def change_control(
@@ -180,31 +463,68 @@ def change_control(
             ("kill_switch", "1"): "kill_switch_on",
             ("kill_switch", "0"): "kill_switch_off",
         }[(key, value)]
+        reconciliation_owner = ""
+        capacity_owner = ""
+        if operator != "system":
+            reconciliation_owner = _current(
+                conn, "reconciliation_auto_resume_owner", "",
+            )
+            capacity_owner = _current(
+                conn, NOTIFICATION_CAPACITY_OWNER_KEY, "",
+            )
+            if reconciliation_owner:
+                store.set_system_state(
+                    conn, "reconciliation_auto_resume_owner", "",
+                    "manual control precedence",
+                )
+            if capacity_owner:
+                store.set_system_state(
+                    conn, NOTIFICATION_CAPACITY_OWNER_KEY, "",
+                    "manual control precedence",
+                )
         event_id = _set_control(
             store, conn, key=key, value=value, action=action, reason=reason,
             operator=operator, reconciliation_id=None,
         )
         changed = bool(event_id)
         if operator != "system":
-            owner = _current(conn, "reconciliation_auto_resume_owner", "")
-            if owner:
-                store.set_system_state(
-                    conn, "reconciliation_auto_resume_owner", "", "manual control precedence"
-                )
+            if reconciliation_owner:
                 if not changed:
-                    conn.execute(
-                        """INSERT INTO control_events(
-                           event_id,action,operator,old_value,new_value,reason,reconciliation_id,created_at
-                           ) VALUES (?, 'cancel_auto_resume', ?, ?, ?, ?, NULL, datetime('now'))""",
-                        (str(uuid.uuid4()), operator, current_value, current_value, reason),
+                    store.insert_control_event(
+                        conn,
+                        event_id=str(uuid.uuid4()),
+                        action="cancel_auto_resume",
+                        operator=operator,
+                        old_value=current_value,
+                        new_value=current_value,
+                        reason=reason,
+                        created_at=datetime.now().isoformat(),
+                    )
+                    changed = True
+            if capacity_owner:
+                if not changed:
+                    store.insert_control_event(
+                        conn,
+                        event_id=str(uuid.uuid4()),
+                        action="cancel_notification_capacity_auto_resume",
+                        operator=operator,
+                        old_value=current_value,
+                        new_value=current_value,
+                        reason=reason,
+                        created_at=datetime.now().isoformat(),
+                        _capacity_reconcile=False,
                     )
                     changed = True
             if not changed and value == "0":
-                conn.execute(
-                    """INSERT INTO control_events(
-                       event_id,action,operator,old_value,new_value,reason,reconciliation_id,created_at
-                       ) VALUES (?, 'hold_buy_disabled', ?, '0', '0', ?, NULL, datetime('now'))""",
-                    (str(uuid.uuid4()), operator, reason),
+                store.insert_control_event(
+                    conn,
+                    event_id=str(uuid.uuid4()),
+                    action="hold_buy_disabled",
+                    operator=operator,
+                    old_value="0",
+                    new_value="0",
+                    reason=reason,
+                    created_at=datetime.now().isoformat(),
                 )
                 changed = True
             if changed and key == "buy_enabled" and value == "1":
@@ -214,10 +534,16 @@ def change_control(
                        WHERE recovered_at IS NULL
                        AND state IN ('LEDGER_INTEGRITY_FAILURE','IMMUTABLE_FILL_CONFLICT')"""
                 ).fetchall()
+                scope = store.registered_account_scope(
+                    conn, "joinquant", "primary",
+                )
                 for row in rows:
-                    store.recover_execution_issue(conn, str(row[0]), recovered_at)
-    if changed:
-        _notify_control_change(action, key, value, reason, operator)
+                    store.recover_execution_issue(
+                        conn,
+                        str(row[0]),
+                        recovered_at,
+                        account_scope_id=scope,
+                    )
     return changed
 
 
@@ -271,8 +597,32 @@ def auto_resume_eligibility(
         "SELECT 1 FROM execution_issue_state WHERE recovered_at IS NULL AND severity IN ('ERROR','CRITICAL') LIMIT 1"
     ).fetchone():
         reasons.append("UNRESOLVED_EXECUTION_ERROR")
-    if conn.execute("SELECT 1 FROM orders WHERE status='submit_unknown' LIMIT 1").fetchone():
+    if conn.execute(
+        """SELECT 1 FROM execution_intents AS i
+           JOIN capacity_reservations AS r
+             ON r.account_scope_id=i.account_scope_id
+            AND r.client_order_id=i.client_order_id
+           JOIN orders AS o ON o.client_order_id=i.client_order_id
+           WHERE i.account_scope_id=? AND r.status='active'
+             AND (i.status='SUBMIT_UNKNOWN' OR o.status='submit_unknown')
+           LIMIT 1""",
+        (account_scope_id,),
+    ).fetchone():
         reasons.append("SUBMIT_UNKNOWN_PRESENT")
+    if conn.execute(
+        """SELECT 1 FROM execution_intents AS i
+           JOIN capacity_reservations AS r
+             ON r.account_scope_id=i.account_scope_id
+            AND r.client_order_id=i.client_order_id
+           JOIN orders AS o ON o.client_order_id=i.client_order_id
+           WHERE i.account_scope_id=? AND r.status='active'
+             AND (i.status IN ('NOT_SUBMITTED','REJECTED','CANCELLED','FILLED')
+                  OR o.status IN ('not_submitted','rejected','risk_rejected',
+                                  'failed','skipped','cancelled','filled'))
+           LIMIT 1""",
+        (account_scope_id,),
+    ).fetchone():
+        reasons.append("TERMINAL_RESERVATION_UNRECONCILED")
     return not reasons, reasons, owner
 
 
@@ -307,42 +657,20 @@ def apply_automatic_buy_recovery(
     if cursor.rowcount != 1:
         return None
     event_id = str(uuid.uuid4())
-    conn.execute(
-        """INSERT INTO control_events(
-           event_id,action,operator,old_value,new_value,reason,reconciliation_id,created_at
-           ) VALUES (?, 'auto_resume_buy', 'system', '0', '1', ?, ?, ?)""",
-        (
-            event_id, "two distinct post-stop reconciliations matched",
-            result.reconciliation_id if conn.execute(
-                "SELECT 1 FROM reconciliation_runs WHERE reconciliation_id=?", (result.reconciliation_id,)
-            ).fetchone() else None, now,
-        ),
+    store.insert_control_event(
+        conn,
+        event_id=event_id,
+        action="auto_resume_buy",
+        operator="system",
+        old_value="0",
+        new_value="1",
+        reason="two distinct post-stop reconciliations matched",
+        reconciliation_id=result.reconciliation_id,
+        created_at=now,
+        account_scope_id=str(owner["account_scope_id"]),
     )
     store.set_system_state(conn, "reconciliation_auto_resume_owner", "", "automatic recovery complete")
     return {"action": "auto_resume_buy", "event_id": event_id, "at": now}
-
-
-def _notify_control_change(action: str, key: str, value: str, reason: str, operator: str) -> bool:
-    import config as app_config
-    from notifier import WeComNotifier
-
-    if not app_config.WECOM_WEBHOOK_URL:
-        return False
-    notifier = WeComNotifier(
-        app_config.WECOM_WEBHOOK_URL,
-        app_config.CACHE_DIR / "wecom_notify_state.json",
-        cooldown_sec=app_config.NOTIFY_COOLDOWN_SEC_DEFAULT,
-        timeout_sec=app_config.WECOM_TIMEOUT_SEC,
-    )
-    content = (
-        f"> action={action} | {key}={value}\n"
-        f"> operator={operator} | reason={reason[:120]}\n"
-        "```text\nbash run_ubuntu.sh trading-status\n```"
-    )
-    return notifier.send_markdown(
-        "交易控制状态已人工变更", content,
-        dedupe_key=f"trading-control:{action}:{key}:{value}:{reason[:48]}",
-    )
 
 
 def run_full_reconciliation(store: TradingStore, account_file: Path, now: str) -> object:

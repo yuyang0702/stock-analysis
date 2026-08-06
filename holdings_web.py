@@ -9,6 +9,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from flask import Flask, abort, make_response, redirect, render_template_string, request, url_for
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -104,7 +105,7 @@ def _capabilities() -> list[dict[str, str]]:
         {"name": "执行时效与对账恢复", "state": "deployed", "note": "implemented / deployed / not observed / not validated"},
         {"name": "跳空二次确认入场", "state": "planned", "note": "planned / not implemented / not deployed / not observed / not validated"},
         {"name": "完整历史回测框架", "state": "implemented", "note": "implemented / not deployed / not observed / not validated"},
-        {"name": "训练型影子模型", "state": "implemented", "note": "partially implemented / not deployed / not observed / not validated"},
+        {"name": "训练模型数据底座", "state": "partially implemented", "note": "Task 1-3 only / not deployed / not observed / not validated；训练模型 unavailable"},
     ]
 
 
@@ -278,6 +279,9 @@ def _dashboard_data() -> dict[str, Any]:
     store.initialize()
     snapshot_store = PositionStore(POSITIONS_FILE, EVENTS_FILE)
     cycles = store.get_active_position_cycles()
+    decision_batch_at = datetime.now(
+        ZoneInfo("Asia/Shanghai")
+    ).isoformat(timespec="microseconds")
     with store.connect() as conn:
         state = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM system_state")}
         latest = conn.execute("SELECT * FROM account_snapshots ORDER BY generated_at DESC LIMIT 1").fetchone()
@@ -331,6 +335,11 @@ def _dashboard_data() -> dict[str, Any]:
                 highest_price=max(float(cycle.get("highest_price") or 0), current),
                 atr14=float(cycle.get("atr14") or 0), take_profit_stage=int(cycle.get("take_profit_stage") or 0),
                 holding_trade_days=0, manual_stop_price=float(cycle.get("manual_stop_price") or 0),
+                profit_protection_activated_at=str(
+                    cycle.get("profit_protection_activated_at") or ""
+                ),
+                trailing_stop_active_from=str(cycle.get("trailing_stop_active_from") or ""),
+                decision_batch_at=decision_batch_at,
             )
             stop = resolve_effective_stop(state_obj, str(cycle.get("market_state") or "NORMAL"))
             cost = float(item.get("cost_price") or cycle.get("entry_price") or 0)

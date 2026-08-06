@@ -2,6 +2,11 @@
 
 > 当前项目规划以 `docs/project_roadmap.md` 为准。本文只保留服务器执行步骤。
 
+> 2026-08-01 小资金执行 Batch A 只在本地功能分支实现，目标交易库为 schema 11、JoinQuant 模板版本为 `2026-08-01.1-exact-intent`、执行计划版本为 `2026-08-01.1-small-capital-live-risk`。最后有文档证据的服务器仍运行 schema 10；本批尚未推送、部署、更新网站模板、观察或验证。下述 schema 10→11 流程只是未来 runbook，不授权当前执行。
+>
+> 2026-08-05 Batch B Tasks 1–7 已在同一未提交功能分支实现，目标交易库为 schema 12，包含事务通知 outbox/gap、租约 worker、有限重试、容量控制、CRITICAL 交易分钟复报、规则影子退役、详细 `ledger-check` 和人工解除 CLI。Batch B 当前严格为 `implemented（本地功能分支，未提交） / not deployed / not observed / not validated`；服务器仍按最后记录的 schema 10/旧 JSON 通知队列运行。当前没有 schema 11→12 的可执行部署 runbook，禁止把 schema 10→11 快捷流程用于 Batch B，也不得据本地代码推断服务器已切换。
+> 2026-08-06 Batch C ML-7 Tasks 4–10 已在本地工作树实现，状态为 `implemented（本地未提交）`；Task 11 本地总验收进行中；Task 12 的依赖安装、服务器部署、L0 启用和交易日观察未获授权且未运行。Batch C 整体严格为 `not committed / not deployed / not observed / not validated`。当前没有真实一年/365 天 strict 数据、可信/可批准或活动模型、人工审批或服务器 L0 证据。本文件不提供可立即执行的 Batch C 部署授权；任何 ML 部署/启用必须另行制定并批准 runbook。
+
 > 2026-07-15 schema 7/模板 `2026-07-15.1-execution-state-recovery` 增量已随 `e2ce5b5` 推送并部署服务器：schema 6 备份完整性、Linux 324/324 测试、schema 7 `ledger-check`、配置哈希和三个服务状态均通过。用户报告已手动更新 JoinQuant 网站模板；新模板尚待交易日快照观察和验证。下列命令仍是未来部署操作说明，不代表可在没有当次授权时再次执行。
 
 项目上传到服务器后只用一个入口脚本：
@@ -34,12 +39,13 @@ https://github.com/yuyang0702/stock-analysis.git
 
 ```bash
 git status
-git add .
+git status --short
+git add <本次确认要提交的文件路径>
 git commit -m "说明这次修改"
 git push
 ```
 
-如果是 Codex 帮忙修改代码，Codex 会在本地完成检查、提交并推送到 GitHub。
+如果是 Codex 帮忙修改代码，检查可在本地执行；提交和推送只有在用户当次明确授权后才能执行。
 
 ### 服务器更新到最新版
 
@@ -49,19 +55,16 @@ git push
 cd /opt/stock-analysis
 ```
 
-更新代码并重启服务：
+下面的快捷更新只适用于已经确认不含 SQLite schema、JoinQuant 模板、systemd 或配置变化的普通版本；任何这类变化都必须执行对应专项 runbook。schema 10→11 本批禁止使用本快捷路径。
+
+经当次授权后更新普通版本：
 
 ```bash
-git pull origin main
+git pull --ff-only origin main
 chmod +x run_ubuntu.sh
-bash run_ubuntu.sh
 ```
 
-进入菜单后选择“重启服务”。如果只想用命令方式：
-
-```bash
-bash run_ubuntu.sh restart-all
-```
+随后只重启当次明确授权的服务；不得默认运行菜单中的“重启全部服务”或 `restart-all`。
 
 ### 首次从 GitHub 部署
 
@@ -107,7 +110,6 @@ bash run_ubuntu.sh install --cash 200000
 bash run_ubuntu.sh install --web-port 8080
 bash run_ubuntu.sh install --signal-port 8010
 bash run_ubuntu.sh install
-bash run_ubuntu.sh install --skip-install
 bash run_ubuntu.sh install --no-start
 ```
 
@@ -138,10 +140,16 @@ stock-joinquant-sync.timer
 stock-joinquant-health.timer
 stock-notify-retry.timer
 stock-joinquant-readiness.timer
-stock-ml-report.timer
+stock-ml-labels.service/.timer
+stock-ml-train.service/.timer
+stock-ml-backup.service/.timer
+stock-history-backup.service/.timer
+stock-strategy-compare.service/.timer
 stock-trading-backup.timer
 stock-trading-backup-drill.timer
 ```
+
+`stock-ml-report.timer` 是旧版复盘单元；新版本安装时会禁用并移除它，改由 `stock-strategy-compare.timer` 生成对照报告。ML 标签、训练、ML/历史库备份和对照报告 timer 只做有界离线维护，不批准、激活、发布或改变交易权限。它们在本次 Batch C 部署前不会因代码拉取自动启用；如需安装/启用，必须另行确认目标单元和维护窗口。
 
 默认安全模式：
 
@@ -174,10 +182,10 @@ NOTIFY_NON_TRADING_DAY=1
 A_SHARE_HOLIDAYS=2026-10-01,2026-10-02,2026-10-05
 ```
 
-修改后重启：
+经当次授权后，只重启读取该配置的策略扫描服务：
 
 ```bash
-bash /opt/stock-analysis/run_ubuntu.sh restart-all
+sudo systemctl restart stock-analysis.service
 ```
 
 ## 日常命令
@@ -193,7 +201,6 @@ bash run_ubuntu.sh
 命令方式：
 ```bash
 bash run_ubuntu.sh status-all
-bash run_ubuntu.sh restart-all
 bash run_ubuntu.sh logs-strategy
 bash run_ubuntu.sh logs-web
 bash run_ubuntu.sh logs-joinquant
@@ -212,7 +219,7 @@ bash run_ubuntu.sh kill-switch-on --reason "人工熔断原因"
 bash run_ubuntu.sh test
 ```
 
-`unlock` 是交互式向导，不是强制解锁：它会执行一次完整对账，要求最近两个全量一致结果来自不同新鲜快照，先确认关闭 `KILL_SWITCH`，再二次确认恢复买入。`kill-switch-off` 不会自动把 `buy_enabled` 改回 1。schema 6、上述命令和新菜单当前仅本地 `implemented`；服务器部署、真实运行和解锁演练仍需单独授权与证据。
+`unlock` 是交互式向导，不是强制解锁：它会执行一次完整对账，要求最近两个全量一致结果来自不同新鲜快照，先确认关闭 `KILL_SWITCH`，再二次确认恢复买入。`kill-switch-off` 不会自动把 `buy_enabled` 改回 1。最后有文档证据的服务器正式库为 schema 10；schema 11/12 仍是本地实现，部署、真实运行和解锁演练均需单独授权与证据。
 
 前台调试：
 
@@ -224,7 +231,14 @@ bash run_ubuntu.sh sync-joinquant
 bash run_ubuntu.sh health
 bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh readiness
-bash run_ubuntu.sh ml-report
+bash run_ubuntu.sh ml-labels
+bash run_ubuntu.sh ml-train
+bash run_ubuntu.sh ml-model-status
+bash run_ubuntu.sh ml-backup --kind ml
+bash run_ubuntu.sh ml-restore-check --kind ml
+bash run_ubuntu.sh ml-retention-dry-run
+bash run_ubuntu.sh ml-retention-apply
+bash run_ubuntu.sh strategy-compare
 bash run_ubuntu.sh backtest
 bash run_ubuntu.sh backup
 bash run_ubuntu.sh backup-drill
@@ -240,6 +254,8 @@ bash run_ubuntu.sh backup-status
 ```
 
 `stock-trading-backup.timer` 每天 `16:30 Asia/Shanghai` 使用 SQLite 在线备份 API 生成一致性副本，校验 SHA-256、`PRAGMA integrity_check`、schema 和核心表计数，并按 7 份每日、4 份每周、12 份每月轮转。`stock-trading-backup-drill.timer` 在每季度第一个周日凌晨复制最新有效备份到隔离临时目录进行恢复校验；它不会替换或写入正在使用的主库。
+
+Batch C 的本地代码还提供以下受控维护单元和命令：标签 `16:10`、对照报告 `16:25`、每周五训练 `18:00`、ML/strict 历史库备份 `19:00`。这些单元只能登记 challenger 和生成报告，不能批准、激活、发布或改变买卖权限；`ml-restore-check`、`ml-retention-dry-run` 和 `ml-retention-apply` 仍是人工命令，不能把它们当作自动恢复或自动清理已经上线。
 
 部署或数据库迁移前先手工执行：
 
@@ -265,6 +281,164 @@ cat output/trading_backup_drill_$(date +%Y)-Q$((($(date +%-m)-1)/3+1)).md
 ```
 
 如需改变目录或保留数量，只允许修改 `stock-analysis.env` 中的 `TRADING_BACKUP_DIR`、`TRADING_BACKUP_DAILY_KEEP`、`TRADING_BACKUP_WEEKLY_KEEP` 和 `TRADING_BACKUP_MONTHLY_KEEP`；备份目录必须位于项目外并保证运行 systemd service 的用户可写。任何主库替换仍需停机、人工确认和单独恢复流程，本命令不会自动执行。
+
+## schema 10→11 小资金执行部署 runbook
+
+本节仅在用户当次明确授权目标提交、服务器、备份、测试、迁移和具体服务重启后执行。JoinQuant 网站编辑器更新需要另一项明确授权。部署不得显示私有配置内容、打印 Token/Webhook/私钥等变量值，或修改任何凭据。
+
+部署前必须确认：目标提交已经进入 `origin/main`；服务器工作树干净；正式库仍为 schema 10；维护窗口内允许暂停全部项目服务、timer 及已经触发的 oneshot unit；迁移前备份目录位于项目外。先记录部署前 enabled/active 单元清单，完成后只恢复该清单中且本次获准恢复的单元。任一条件不满足即停止。
+
+先设置当次明确授权的完整提交 SHA，并执行失败即退出的前置门；占位符未替换、远端不匹配或工作树不干净时不得继续：
+
+```bash
+set -euo pipefail
+cd /opt/stock-analysis
+TARGET_SHA='<当次授权的完整提交SHA>'
+test "$TARGET_SHA" != '<当次授权的完整提交SHA>' || { echo 'STOP: TARGET_SHA 未设置'; exit 1; }
+git fetch origin main
+test "$(git rev-parse origin/main)" = "$TARGET_SHA" || { echo 'STOP: origin/main 不是授权提交'; exit 1; }
+test "$(git branch --show-current)" = 'main' || { echo 'STOP: 当前分支不是 main'; exit 1; }
+git cat-file -e "$TARGET_SHA^{commit}"
+test -z "$(git status --porcelain --untracked-files=all)" || { echo 'STOP: 工作树不干净'; exit 1; }
+printf '%s\n' "$TARGET_SHA" > /tmp/stock-target-sha-schema11.txt
+```
+
+### 1. 冻结私有配置并创建预备在线备份
+
+先用服务器当前版本备份，尚未拉取新代码：
+
+```bash
+set -euo pipefail
+cd /opt/stock-analysis
+test -z "$(git status --porcelain --untracked-files=all)" || { echo 'STOP: 工作树不干净'; exit 1; }
+git rev-parse HEAD
+umask 077
+sha256sum stock-analysis.env > /tmp/stock-env-before-schema11.sha256
+bash run_ubuntu.sh backup
+bash run_ubuntu.sh backup-status
+```
+
+这是第一个人工确认点。预备备份必须明确为 schema 10、`integrity_check=ok`，且包含完整核心表计数。它防止停机步骤本身失败，但不是迁移回滚的最终备份；最终备份必须在下一步确认所有写入者停止后重新创建。不得继续使用缺少清单、哈希不一致或位于项目目录内的备份。未逐项确认前不要复制执行下一块。
+
+### 2. 记录单元状态、停止全部写入者、拉取指定提交并运行 Linux 测试
+
+先记录状态，再停止 timer、三个常驻服务和 timer 可能已经触发的全部 oneshot service，避免旧进程在拉取或迁移时继续写正式库：
+
+```bash
+set -euo pipefail
+systemctl list-unit-files 'stock-*.timer' --state=enabled --no-legend --plain | awk '{print $1}' | sort -u > /tmp/stock-enabled-timers-before-schema11.txt
+systemctl list-units 'stock-*' --state=active,activating --no-legend --plain | awk '{print $1}' | sort -u > /tmp/stock-active-before-schema11.txt
+cat /tmp/stock-enabled-timers-before-schema11.txt
+cat /tmp/stock-active-before-schema11.txt
+bash run_ubuntu.sh stop-all
+sudo systemctl stop \
+  stock-joinquant-sync.service stock-joinquant-health.service \
+  stock-notify-retry.service stock-joinquant-readiness.service \
+  stock-ml-report.service stock-global-context.service \
+  stock-sector-context.service stock-strategy-compare.service \
+  stock-strategy-compare-weekly.service stock-trading-backup.service \
+  stock-trading-backup-drill.service
+if systemctl list-units 'stock-*' --state=active,activating --no-legend --plain | grep -q .; then
+  systemctl list-units 'stock-*' --state=active,activating
+  echo 'STOP: 仍有项目 writer active/activating'
+  exit 1
+fi
+```
+
+只有上一块以 0 退出且两个部署前清单已人工保存后，才可创建最终静止备份：
+
+```bash
+set -euo pipefail
+bash run_ubuntu.sh backup
+bash run_ubuntu.sh backup-status
+```
+
+这是第二个人工确认点。必须确认这份停止全部 writer 后的备份仍为 schema 10、`integrity_check=ok`、SHA-256 与核心表计数完整，并把它标记为实际回滚源。确认后才可更新代码；不要把备份和拉取放在同一个可连续执行的命令块：
+
+```bash
+set -euo pipefail
+TARGET_SHA="$(cat /tmp/stock-target-sha-schema11.txt)"
+git cat-file -e "$TARGET_SHA^{commit}"
+git merge --ff-only "$TARGET_SHA"
+test "$(git rev-parse HEAD)" = "$TARGET_SHA" || { echo 'STOP: HEAD 不是授权提交'; exit 1; }
+test -z "$(git status --porcelain --untracked-files=all)" || { echo 'STOP: 更新后工作树不干净'; exit 1; }
+```
+
+停止后状态检查不得仍显示任何项目单元处于 `active/activating`；否则不得创建最终备份、拉取或迁移。停止后的第二份备份才是 schema 10 迁移回滚依据，必须再次确认 `integrity_check=ok`、SHA-256 和完整表计数。`stop-all` 本身不覆盖已经启动的 oneshot，因此不能单独作为停机证据。
+
+`HEAD` 必须等于当次授权的目标 SHA。随后只运行代码编译和使用隔离临时数据库的测试，不手工指定正式交易库：
+
+```bash
+set -euo pipefail
+.venv/bin/python -m py_compile \
+  config.py execution_contracts.py position_sizing.py execution_admission.py \
+  pre_trade_check.py trading_store.py trading_backup.py joinquant_sync.py \
+  order_ledger.py reconciliation.py trading_control.py joinquant_exporter.py \
+  joinquant_signal_server.py a_share_strategy.py holdings_web.py \
+  joinquant_strategy.py exit_policy.py gap_reentry.py historical_backtest.py
+bash run_ubuntu.sh test
+```
+
+任一编译或测试失败都不得迁移正式库或启动服务。
+
+### 3. 迁移、检查、迁移后备份和隔离恢复
+
+`ledger-check` 会初始化正式库、执行幂等 migration 并做可写探针，因此它是 schema 10→11 的实际迁移步骤：
+
+```bash
+set -euo pipefail
+bash run_ubuntu.sh ledger-check
+bash run_ubuntu.sh backup
+bash run_ubuntu.sh backup-status
+bash run_ubuntu.sh backup-drill
+sha256sum -c /tmp/stock-env-before-schema11.sha256
+```
+
+必须同时满足：`ledger-check` 报 schema 11、健康和可写探针成功；迁移后备份报 schema 11、`integrity_check=ok` 且包含全部新增表；隔离恢复演练成功；私有配置哈希未变。失败时保持服务停止，保留现场，不得只回滚 Git 后继续使用 schema 11 主库。恢复 schema 10 备份和回滚代码必须另行授权并在停机状态完成。
+
+### 4. JoinQuant 单独授权和启动前核验
+
+网站模板只能在单独授权后更新，并应在服务器交易进程仍停止时完成，避免旧模板先拉取新契约。更新时必须保留原 `SIGNAL_URL`、`SNAPSHOT_URL`、`SYNC_TOKEN` 和运行配置，不得显示或复制 Token 到日志、文档或聊天。编辑器代码应与仓库 `joinquant_strategy.py` 一致，并显示模板版本 `2026-08-01.1-exact-intent`。
+
+没有网站更新授权、编辑器保存失败或版本无法确认时，不得启动交易相关服务；服务器迁移只能记为待完成部署，不能写成端到端 `deployed`。
+
+### 5. 受控启动与端到端验收
+
+只有前述证据和网站模板版本全部通过，才可按当次授权恢复部署前已启用且明确获准的单元。启动必须安排在 A 股非连续竞价时段，或已有明确人工停买状态。先运行 `bash run_ubuntu.sh trading-status` 保存控制值、原因、更新时间、自动恢复 owner、最近控制事件和最新对账基线。不要运行 `start-all`，因为它会无条件启动全部 timer，可能改变部署前运行配置。
+
+先只恢复持仓 Web 和 JoinQuant 信号/快照接收服务，保持策略扫描器停止：
+
+```bash
+set -euo pipefail
+for unit in stock-holdings-web.service stock-joinquant-signal.service; do
+  grep -Fxq "$unit" /tmp/stock-active-before-schema11.txt || { echo "STOP: $unit 部署前未 active"; exit 1; }
+done
+sudo systemctl start \
+  stock-holdings-web.service stock-joinquant-signal.service
+systemctl is-active \
+  stock-holdings-web.service stock-joinquant-signal.service
+git status --short --branch
+git rev-parse HEAD
+```
+
+等待一份新的完整账户快照，核对它回传模板版本 `2026-08-01.1-exact-intent`、账户 scope、snapshot 哈希和 current broker 子表均完整且一致。完整快照仍会执行既有对账控制：异常可自动停买或打开 kill switch，满足严格条件的 reconciliation-owned 停买也可能自动恢复。每收到一份验证快照都必须再次运行 `bash run_ubuntu.sh trading-status`，把控制值、reason/updated_at、自动恢复 owner、最近控制事件和最新对账与启动前基线逐项比较。版本不一致、快照不完整、仍在新鲜窗内的旧快照、控制状态意外恢复或 owner/事件无法解释时，均不得启动扫描器。不得靠启动扫描器来“试一下”模板。
+
+完成上述核验后，才可启动获准的策略扫描服务：
+
+```bash
+set -euo pipefail
+grep -Fxq stock-analysis.service /tmp/stock-active-before-schema11.txt || { echo 'STOP: stock-analysis.service 部署前未 active'; exit 1; }
+sudo systemctl start stock-analysis.service
+systemctl is-active stock-analysis.service
+```
+
+timer 只能逐个按部署前记录和当次授权恢复，并在恢复后逐个检查；不得借本次部署新启用此前 disabled 的 timer。
+
+随后只检查授权范围内的服务状态、启动日志、schema 11 健康、新快照对账和最新 `trading-status`，并确认精确 `target_qty` 契约与服务器预期一致。任何异常都应停止尚未恢复的单元并保留证据；部署人员不得人工覆盖控制位或修改环境配置。既有对账代码产生的自动安全转换必须保留审计证据，且只有结果与启动前预期一致时才能继续恢复其他单元。
+
+服务器代码、正式库和网站模板均完成上述核验后才可标记端到端 `deployed`；真实交易日证据出现前仍为 `not observed / not validated`。
+
+`RISK_MODE=observe` 与 `enforce` 均受代码支持，但保留现有环境意味着服务器继续使用部署前的实际值；`observe` 只把本批新增经济性软门降为 warning，既有硬安全块仍强制。把它改为 `enforce` 是独立配置变更，必须明确授权、先记录旧值的非敏感状态并完成代表性模拟盘观察，不能由迁移脚本暗改。
 
 ## JoinQuant 平台配置
 
@@ -311,14 +485,14 @@ bash run_ubuntu.sh health
 cat output/joinquant_health_$(date +%Y%m%d).md
 ```
 
-`stock-joinquant-health.timer` 会每 5 分钟运行一次。它会检查信号文件、账户快照、今日 API 拉取/回传次数、失败订单原因、持仓一致性和稳定性评分；盘中发现信号/快照超时、文件异常、API 异常、持仓不一致或失败订单过多时，会通过企业微信发送去重后的异常报警。非交易时段如果只是信号/快照过期，只写健康报告，不反复推微信。`stock-notify-retry.timer` 会每 5 分钟重试失败的企业微信推送。
+`stock-joinquant-health.timer` 会每 5 分钟运行一次。它会检查信号文件、账户快照、今日 API 拉取/回传次数、失败订单原因、持仓一致性和稳定性评分；盘中发现信号/快照超时、文件异常、API 异常、持仓不一致或失败订单过多时，会通过企业微信发送去重后的异常报警。非交易时段如果只是信号/快照过期，只写健康报告，不反复推微信。服务器 schema 10 旧基线下，`stock-notify-retry.timer` 重试有界 JSON 队列；Batch B 部署后该兼容 unit 名实际执行 `notification_worker.py --once`，旧 JSON 只允许显式 legacy audit。
 
 ML 基础复盘报告：
 ```bash
 cat output/ml_signal_review.md
 ```
 
-当前 ML 只用于样本采集、基础复盘和信号级回测，不训练模型，也不会影响 JoinQuant 买入、卖出或仓位。
+最后记录的服务器 ML 基线仍只用于样本采集、基础复盘和信号级回测，不训练模型，也不会影响 JoinQuant 买入、卖出或仓位。当前本地 Batch C 代码已具备 strict 导入、标签、五头训练、治理、L0 旁路和维护命令，但尚未提交、安装依赖、部署或启用；没有可信/活动模型或服务器 L0 证据。未经 Task 12 单独授权，不得在服务器运行这些新入口或修改 ML 配置。
 
 ML 样本日志：
 ```bash
@@ -336,7 +510,7 @@ head output/backtest_trades.csv
 
 支持天数取决于输入文件里已经积累的信号天数：如果只有今天的 `signals.json`，就只能回测今天这一批；如果 `signal_samples.jsonl` 积累了 30/180 个交易日，就能覆盖对应区间。该信号级入口不自动下载历史行情，也不会按过去 6 个月逐日重跑全市场策略。
 
-独立完整历史回测框架使用 `historical_backtest.py` 和 `cache/backtest/history.db`，通过 `bash run_ubuntu.sh historical-backtest-validate ...` 校验、`bash run_ubuntu.sh historical-backtest ...` 运行；两个入口均为手动命令，没有 systemd timer。框架当前仅本地 `implemented`，服务器 `not deployed`，真实 6 个月/1 年 strict 数据 `not observed / not validated`。`price_core` 输出始终是代理证据，不能满足 Batch G。
+独立完整历史回测框架使用 `historical_backtest.py` 和 `cache/backtest/history.db`，通过 `bash run_ubuntu.sh historical-backtest-validate ...` 校验、`bash run_ubuntu.sh historical-backtest ...` 运行；两个入口均为手动命令，没有 systemd timer。框架已有服务器部署历史，但真实 6 个月/1 年 strict 数据尚未运行或验证。`price_core` 输出始终是代理证据，不能满足 Batch G。
 
 盘后信号追踪：
 ```bash
@@ -349,15 +523,16 @@ cat cache/signal_watchlist.json
 
 ```bash
 nano /opt/stock-analysis/stock-analysis.env
-bash /opt/stock-analysis/run_ubuntu.sh restart-all
 ```
+
+保存后先记录部署前单元状态，再只重启本次配置实际影响且已明确授权的服务；不得用 `restart-all` 代替影响分析，因为它会改变此前 inactive/disabled 的单元状态。
 ## 2026-07-09 阶段 1 补齐后的运维命令
 
 健康检查现在会同时生成和读取这些文件：
 
 - `cache/joinquant/api_events.jsonl`：JoinQuant 拉信号、访问 latest、回传快照和异常请求日志。
 - `cache/joinquant/health_history.jsonl`：每次健康检查结果，用于连续交易日稳定性观察。
-- `cache/notify_failed_queue.jsonl`：企业微信发送失败后的重试队列。
+- `cache/notify_failed_queue.jsonl`：服务器 schema 10 旧基线的有界失败队列；Batch B schema 12 目标改为 SQLite outbox，旧 JSON 只读且仅显式审计。
 - `output/joinquant_health_YYYYMMDD.md`：手机可读的健康日报，包含 API 拉取/回传次数、失败原因拆分、持仓一致性和稳定性评分。
 
 常用命令：
@@ -369,13 +544,6 @@ bash run_ubuntu.sh notify-retry
 bash run_ubuntu.sh status-all
 ```
 
-`stock-joinquant-health.timer` 每 5 分钟运行健康检查；`stock-notify-retry.timer` 每 5 分钟重试失败的企业微信推送。
+`stock-joinquant-health.timer` 每 5 分钟运行健康检查；服务器旧基线的 `stock-notify-retry.timer` 重试 JSON 队列，Batch B 部署后同名 unit 保留但执行 SQLite outbox worker。
 
-更新到包含新 timer 的版本后，需要刷新 systemd：
-
-```bash
-cd /opt/stock-analysis
-git pull origin main
-bash run_ubuntu.sh install --skip-install
-bash run_ubuntu.sh status-all
-```
+本段是 2026-07-09 的历史 timer 说明。已配置服务器不得用 `bash run_ubuntu.sh install --skip-install` 刷新 systemd：当前脚本会重写环境文件、在未传参数时生成新 Token，并可能改变既有配置。未来 timer 更新必须使用经专项测试、明确保证原样保留私有环境的安全刷新入口，或由当次授权的部署步骤逐个写入并核验 unit；该入口实现前停止操作。

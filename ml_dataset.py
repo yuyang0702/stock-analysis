@@ -22,17 +22,7 @@ FEATURE_COLUMNS = [
     "market_cap",
     "score",
     "final_score",
-    "enhanced_score",
-    "shadow_adjust_score",
-    "original_rank",
-    "shadow_rank",
-    "shadow_rank_change",
-    "shadow_base_score",
-    "news_catalyst_score",
-    "sector_position_score",
-    "market_emotion_score",
     "global_risk_score",
-    "shadow_reason",
     "trade_score",
     "news_score",
     "risk_reward",
@@ -221,6 +211,16 @@ def append_signal_samples(
     return len(rows_and_signals)
 
 
+def parse_legacy_signal_sample(item: dict[str, Any]) -> dict[str, Any]:
+    """Return a read-only-compatible copy of one historical JSONL sample."""
+    if not isinstance(item, dict):
+        raise ValueError("legacy sample must be an object")
+    parsed = dict(item)
+    if isinstance(item.get("features"), dict):
+        parsed["features"] = dict(item["features"])
+    return parsed
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -233,7 +233,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         except Exception:
             continue
         if isinstance(item, dict):
-            rows.append(item)
+            rows.append(parse_legacy_signal_sample(item))
     return rows
 
 
@@ -299,7 +299,6 @@ def build_review_report(sample_path: Path | None = None, report_path: Path | Non
     actions = Counter(_text(row.get("signal", {}).get("action")) for row in rows)
     statuses = Counter(_text(row.get("labels", {}).get("order_status")) for row in rows)
     score_buckets = Counter(_bucket(row.get("features", {}).get("final_score")) for row in rows)
-    shadow_buckets = Counter(_bucket(row.get("features", {}).get("enhanced_score")) for row in rows)
     success = sum(statuses.get(key, 0) for key in ("filled", "submitted", "held", "open", "done"))
     failed = sum(statuses.get(key, 0) for key in ("failed", "rejected", "cancelled", "skipped"))
 
@@ -310,19 +309,15 @@ def build_review_report(sample_path: Path | None = None, report_path: Path | Non
         f"- 样本 {len(rows)} | 买入 {actions.get('buy', 0)} | 卖出 {actions.get('sell', 0)}",
         f"- 成交/提交 {success} | 失败/跳过 {failed} | 未标注 {statuses.get('', 0)}",
         "",
-        "## 分数分布",
+        "## 规则分分布",
     ]
     for key in ("90+", "80-90", "70-80", "<70", "未知"):
         if score_buckets.get(key):
             lines.append(f"- {key}: {score_buckets[key]}")
-    lines.extend(["", "## 影子评分分布"])
-    for key in ("90+", "80-90", "70-80", "<70", "未知"):
-        if shadow_buckets.get(key):
-            lines.append(f"- {key}: {shadow_buckets[key]}")
     lines.extend(["", "## 订单状态"])
     for key, count in statuses.most_common():
         lines.append(f"- {key or '未标注'}: {count}")
-    lines.extend(["", "> 当前是 ML-3/ML-6 影子复盘：只统计样本、原分和影子分，不训练模型，不参与下单。"])
+    lines.extend(["", "> 当前只统计规则样本与执行结果；训练模型尚未由本报告创建或启用。"])
     md = "\n".join(lines)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(md, encoding="utf-8")

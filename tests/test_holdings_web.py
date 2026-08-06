@@ -24,6 +24,7 @@ class HoldingsWebTest(unittest.TestCase):
         store = TradingStore(self.db)
         store.initialize()
         with store.transaction() as conn:
+            store.get_or_create_account_scope(conn, "joinquant", "primary")
             store.reconcile_position_cycles(conn, [{
                 "code": "600000", "qty": 100, "cost_price": 10,
                 "current_price": 9.5, "stop_price": 9.3,
@@ -72,6 +73,28 @@ class HoldingsWebTest(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         store = TradingStore(self.db)
         self.assertEqual(store.get_active_position_cycles()["600000"]["manual_stop_price"], 9.6)
+
+    def test_dashboard_uses_active_one_lot_trailing_stop(self) -> None:
+        self.positions.write_text(json.dumps({"positions": [{
+            "code": "600000", "name": "test", "qty": 100,
+            "closeable_qty": 100, "cost_price": 10, "current_price": 12.1,
+            "updated_at": "2026-07-28 10:00:00",
+        }]}), encoding="utf-8")
+        with TradingStore(self.db).transaction() as conn:
+            conn.execute(
+                """UPDATE position_cycles SET mode='short', highest_price=13,
+                   atr14=0.4, profit_protection_activated_at=?,
+                   trailing_stop_active_from=?
+                   WHERE stock_code='600000' AND status='active'""",
+                (
+                    "2026-07-28T09:55:00+08:00",
+                    "2026-07-28T09:55:00.000001+08:00",
+                ),
+            )
+
+        position = holdings_web._dashboard_data()["positions"][0]
+        self.assertEqual(position["trailing"], "12.20")
+        self.assertEqual(position["effective"], "12.20")
 
     def test_dashboard_shows_independent_freshness_and_template_confirmation(self) -> None:
         with TradingStore(self.db).transaction() as conn:
@@ -182,6 +205,9 @@ class HoldingsWebTest(unittest.TestCase):
         self.assertIn("deployed", page)
         self.assertIn("observed", page)
         self.assertIn("validated", page)
+        self.assertIn("训练模型数据底座", page)
+        self.assertIn("训练模型 unavailable", page)
+        self.assertNotIn("影子", page)
         self.assertNotIn("启用模型", page)
         self.assertNotIn("自动解锁", page)
         self.assertNotIn("直接买入", page)

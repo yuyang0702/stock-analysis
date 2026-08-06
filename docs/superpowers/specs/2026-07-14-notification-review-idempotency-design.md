@@ -1,12 +1,14 @@
 # 企业微信执行回报幂等与全量信号复盘设计
 
-更新日期：2026-07-14
+更新日期：2026-08-05（状态复核）
 
 > 文档层级：本文件是企业微信成交回报、信号复盘和统一时间展示的专项设计从文档。
 >
 > 主文档：`docs/project_roadmap.md`。如项目状态、阶段或权限口径冲突，以主文档为准。
 >
-> 当前状态：`implemented（已推送） / deployed / not observed / not validated`。该能力已包含在服务器 `52b3653`；2026-07-15 本地后续增量把对账告警改为问题状态转换/恢复触发，见 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md`，后续增量尚未部署。
+> 历史基线状态：本专项的成交幂等、D+N 复盘和服务器时间展示曾随 `52b3653` 部署，历史部署证据仍有效；该状态不代表当前分支全部通知能力已部署。
+>
+> 当前状态分层：旧专项能力为 `implemented（已推送） / deployed（历史服务器基线） / not observed / not validated`。事务型通知 outbox、稳定计划/TTL、租约 worker、有限重试、容量控制和 CRITICAL 交易分钟复报已在 Batch B 本地实现，当前为 `implemented（本地功能分支，未提交） / not deployed / not observed / not validated`，见 `docs/superpowers/plans/2026-07-28-transactional-notification-outbox.md`。在 Batch B 提交、推送、schema 迁移和部署前，服务器仍按旧 JSON 兼容队列运行；不得把本地 outbox 语义写成服务器现状。
 
 ## 1. 背景与已确认问题
 
@@ -28,6 +30,8 @@
 - 复用现有 SQLite、`signal_watchlist.json` 和通知失败重试队列，不新增第三方依赖或第二套通知账本。
 
 ## 3. 非目标
+
+> 历史方案注记：本专项正文描述的是 schema 6/7 服务器基线下的成交事件与兼容 JSON 重试队列；它保留用于解释已部署历史和兼容字段。Batch B 的本地目标已由 schema 12 SQLite 事务 outbox、租约 worker、TTL、dead/tombstone/gap 和显式 legacy audit 取代。Batch B 尚未部署前，服务器与本地目标必须按双轨记录，不能把下文的旧 JSON 队列描述当成本地活动实现。
 
 - 不修改选股、评分、买点、卖点、仓位、止盈止损或 JoinQuant 撮合规则。
 - 不改变订单、成交、账户快照和对账的正式账本语义。

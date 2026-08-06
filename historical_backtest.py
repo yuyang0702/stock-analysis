@@ -13,13 +13,24 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import config as app_config
 from execution_contracts import FeeBreakdown, FeeSchedule, canonical_json
-from exit_policy import PositionExitState, evaluate_exit
-from historical_data import STRICT_FEATURES, HistoricalStore, validate_dataset
-from historical_strategy import Candidate, generate_daily_candidates
+from exit_policy import (
+    PositionExitState,
+    evaluate_exit,
+    first_take_profit_target_qty,
+    resolve_effective_stop,
+)
+from historical_data import (
+    STRICT_FEATURES,
+    HistoricalDataValidationError,
+    HistoricalStore,
+    validate_dataset,
+)
+from historical_strategy import Candidate, generate_candidates_at, generate_daily_candidates
+from ml_contracts import CandidateSample, canonical_hash
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,8 @@ class HistoricalPosition:
     highest_price: float
     entry_fee_remaining_yuan: float = 0.0
     take_profit_stage: int = 0
+    profit_protection_activated_at: str = ""
+    trailing_stop_active_from: str = ""
     last_adjust_factor: float = 1.0
     holding_trade_days: int = 0
 
@@ -175,6 +188,132 @@ class WalkForwardWindow:
     training_end: str
     validation_start: str
     validation_end: str
+
+
+@dataclass(frozen=True)
+class DecisionTimeReplayBatch:
+    decision_at: str
+    cohort_sha256: str
+    candidate_count: int
+    selected_count: int
+
+
+@dataclass(frozen=True)
+class DecisionTimeReplayResult:
+    dataset_id: str
+    dataset_sha256: str
+    start_at: str
+    end_at: str
+    strategy_config_sha256: str
+    batches: tuple[DecisionTimeReplayBatch, ...]
+
+    @property
+    def candidate_count(self) -> int:
+        return sum(batch.candidate_count for batch in self.batches)
+
+    @property
+    def selected_count(self) -> int:
+        return sum(batch.selected_count for batch in self.batches)
+
+
+_STRICT_REPLAY_VERSION_FIELDS = (
+    "strategy_version",
+    "parameter_version",
+    "feature_schema_version",
+    "market_data_version",
+    "code_hash",
+    "generator_hash",
+)
+
+
+def run_decision_time_replay(
+    store: HistoricalStore,
+    dataset_id: str,
+    start_at: str,
+    end_at: str,
+    *,
+    strategy_config: Mapping[str, object],
+    expected_dataset_hash: str,
+) -> DecisionTimeReplayResult:
+    """Replay imported five-minute cohorts at their exact decision timestamps."""
+    dataset = str(dataset_id).strip()
+    if not dataset:
+        raise HistoricalDataValidationError("STRICT_DATASET_REQUIRED")
+    normalized_config = _strict_replay_config(strategy_config)
+    expected_hash = _strict_sha256(expected_dataset_hash, "expected_dataset_hash")
+    actual_hash = store.dataset_hash(dataset)
+    if actual_hash != expected_hash:
+        raise HistoricalDataValidationError("STRICT_DATASET_HASH_MISMATCH")
+
+    normalized_start = _aware_replay_timestamp(start_at, "start_at")
+    normalized_end = _aware_replay_timestamp(end_at, "end_at")
+    decision_times = store.decision_times(dataset, normalized_start, normalized_end)
+    if not decision_times:
+        raise HistoricalDataValidationError("STRICT_DECISION_TIMES_NOT_FOUND")
+
+    batches = []
+    for decision_at in decision_times:
+        samples = tuple(
+            generate_candidates_at(
+                store,
+                dataset,
+                decision_at,
+                normalized_config,
+            )
+        )
+        batches.append(
+            DecisionTimeReplayBatch(
+                decision_at=decision_at,
+                cohort_sha256=canonical_hash(
+                    [canonical_hash(sample) for sample in samples]
+                ),
+                candidate_count=len(samples),
+                selected_count=sum(sample.selected for sample in samples),
+            )
+        )
+    return DecisionTimeReplayResult(
+        dataset_id=dataset,
+        dataset_sha256=actual_hash,
+        start_at=normalized_start,
+        end_at=normalized_end,
+        strategy_config_sha256=canonical_hash(normalized_config),
+        batches=tuple(batches),
+    )
+
+
+def _strict_replay_config(value: Mapping[str, object]) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise HistoricalDataValidationError("STRICT_STRATEGY_CONFIG_REQUIRED")
+    missing = [
+        field
+        for field in _STRICT_REPLAY_VERSION_FIELDS
+        if not str(value.get(field) or "").strip()
+    ]
+    if missing:
+        raise HistoricalDataValidationError(
+            "STRICT_STRATEGY_CONFIG_INCOMPLETE: " + ",".join(missing)
+        )
+    return {
+        field: str(value[field]).strip()
+        for field in _STRICT_REPLAY_VERSION_FIELDS
+    }
+
+
+def _strict_sha256(value: object, label: str) -> str:
+    text = str(value or "").strip().lower()
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise HistoricalDataValidationError(f"INVALID_{label.upper()}")
+    return text
+
+
+def _aware_replay_timestamp(value: object, label: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError as exc:
+        raise HistoricalDataValidationError(f"INVALID_{label.upper()}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HistoricalDataValidationError("TIMEZONE_AWARE_TIMESTAMP_REQUIRED")
+    return parsed.isoformat()
 
 
 def run_historical_backtest(
@@ -304,19 +443,52 @@ def run_historical_backtest(
             )
         pending = []
 
-        # Conservative same-bar ordering: hard stop is evaluated before profit-taking.
+        # Point-in-time ordering: hard stop, prior-batch trailing stop, then profit-taking;
+        # today's new high can tighten only the next decision batch.
         for code in sorted(tuple(positions)):
             position = positions[code]
             row = rows.get(code)
             if row is None or bool(row["suspended"]) or position.buy_date == trade_date:
                 continue
-            position.highest_price = max(position.highest_price, float(row["high"]))
+            prior_highest_price = position.highest_price
+            stop = resolve_effective_stop(
+                PositionExitState(
+                    code=code,
+                    mode=position.mode,
+                    initial_qty=position.initial_quantity,
+                    current_qty=position.quantity,
+                    entry_price=position.entry_price,
+                    initial_stop_price=position.stop_loss,
+                    highest_price=prior_highest_price,
+                    atr14=position.atr14,
+                    take_profit_stage=position.take_profit_stage,
+                    holding_trade_days=position.holding_trade_days,
+                    profit_protection_activated_at=(
+                        position.profit_protection_activated_at
+                    ),
+                    trailing_stop_active_from=position.trailing_stop_active_from,
+                    decision_batch_at=f"{trade_date}T15:00:00+08:00",
+                ),
+                position.market_regime,
+            )
+            position.highest_price = max(prior_highest_price, float(row["high"]))
             reason = ""
             raw_price = 0.0
             if float(row["low"]) <= position.stop_loss:
                 reason = "HARD_STOP"
                 raw_price = min(float(row["open"]), position.stop_loss)
-            elif position.take_profit > 0 and float(row["high"]) >= position.take_profit:
+            elif (
+                stop.trailing_stop_price > 0
+                and float(row["low"]) <= stop.trailing_stop_price
+            ):
+                reason = "TRAILING_STOP"
+                raw_price = min(float(row["open"]), stop.trailing_stop_price)
+            elif (
+                position.take_profit_stage == 0
+                and not position.profit_protection_activated_at
+                and position.take_profit > 0
+                and float(row["high"]) >= position.take_profit
+            ):
                 reason = "TAKE_PROFIT_1"
                 raw_price = max(float(row["open"]), position.take_profit)
             if not reason:
@@ -326,7 +498,16 @@ def run_historical_backtest(
                 continue
             price = round(raw_price, 4)
             if reason == "TAKE_PROFIT_1" and position.take_profit_stage == 0:
-                target_quantity = position.initial_quantity // 2 // 100 * 100
+                target_quantity = first_take_profit_target_qty(position.initial_quantity, 100)
+                if target_quantity >= position.quantity:
+                    if target_quantity == position.quantity:
+                        position.profit_protection_activated_at = (
+                            f"{trade_date}T15:00:00+08:00"
+                        )
+                        position.trailing_stop_active_from = (
+                            f"{trade_date}T15:00:00.000001+08:00"
+                        )
+                    continue
                 quantity = position.quantity - target_quantity
             else:
                 quantity = position.quantity
@@ -370,11 +551,23 @@ def run_historical_backtest(
                     atr14=position.atr14,
                     take_profit_stage=position.take_profit_stage,
                     holding_trade_days=position.holding_trade_days,
+                    profit_protection_activated_at=(
+                        position.profit_protection_activated_at
+                    ),
+                    trailing_stop_active_from=position.trailing_stop_active_from,
+                    decision_batch_at=f"{trade_date}T15:00:00+08:00",
                 ),
                 float(row["close"]),
                 position.market_regime,
             )
-            if decision.action != "hold":
+            if decision.action == "activate_profit_protection":
+                position.profit_protection_activated_at = (
+                    f"{trade_date}T15:00:00+08:00"
+                )
+                position.trailing_stop_active_from = (
+                    f"{trade_date}T15:00:00.000001+08:00"
+                )
+            elif decision.action != "hold":
                 target = decision.target_qty if decision.target_qty is not None else position.quantity
                 quantity = position.quantity if target == 0 else max(position.quantity - target, 0)
                 if quantity:
@@ -653,14 +846,52 @@ def _quality_payload(report) -> dict[str, object]:
     return asdict(report)
 
 
+def _decision_replay_payload(
+    replay: DecisionTimeReplayResult,
+) -> dict[str, object]:
+    return {
+        "status": "complete",
+        "replay_mode": "decision_time",
+        "dataset_id": replay.dataset_id,
+        "dataset_sha256": replay.dataset_sha256,
+        "implementation_sha256": _implementation_hash(),
+        "start_at": replay.start_at,
+        "end_at": replay.end_at,
+        "strategy_config_sha256": replay.strategy_config_sha256,
+        "batch_count": len(replay.batches),
+        "candidate_count": replay.candidate_count,
+        "selected_count": replay.selected_count,
+        "batches": [
+            {
+                "decision_at": batch.decision_at,
+                "cohort_sha256": batch.cohort_sha256,
+                "candidate_count": batch.candidate_count,
+                "selected_count": batch.selected_count,
+            }
+            for batch in replay.batches
+        ],
+    }
+
+
+def _implementation_paths() -> tuple[Path, ...]:
+    """Return the shared implementation files that affect historical results."""
+    root = Path(__file__).parent
+    names = (
+        "candidate_core.py",
+        "exit_policy.py",
+        "trade_safety.py",
+        "historical_data.py",
+        "historical_strategy.py",
+        "historical_backtest.py",
+        "ml_contracts.py",
+    )
+    return tuple(root / name for name in names if (root / name).is_file())
+
+
 def _implementation_hash(paths: Iterable[Path] | None = None) -> str:
-    selected = list(paths) if paths is not None else [
-        Path(__file__),
-        Path(__file__).with_name("historical_data.py"),
-        Path(__file__).with_name("historical_strategy.py"),
-    ]
+    selected = list(paths) if paths is not None else list(_implementation_paths())
     digest = hashlib.sha256()
-    for path in sorted(selected, key=lambda item: item.name):
+    for path in sorted(selected, key=lambda item: item.as_posix()):
         digest.update(path.name.encode("utf-8"))
         digest.update(path.read_bytes())
     return digest.hexdigest()
@@ -771,16 +1002,66 @@ def _csv_text(rows: list[dict], fields: list[str]) -> str:
     return output.getvalue()
 
 
+def _load_json_object(path: Path, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"INVALID_{label.upper().replace(' ', '_')}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _load_json_rows(path: Path) -> list[dict[str, object]]:
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("INVALID_STRICT_IMPORT_FILE") from exc
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            value = [json.loads(line) for line in text.splitlines() if line.strip()]
+        except json.JSONDecodeError as exc:
+            raise ValueError("INVALID_STRICT_IMPORT_JSON") from exc
+    if isinstance(value, dict) and isinstance(value.get("rows"), list):
+        value = value["rows"]
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise ValueError("strict import must contain a JSON row array")
+    return [dict(row) for row in value]
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Point-in-time A-share historical backtest")
     subparsers = parser.add_subparsers(dest="command", required=True)
     importer = subparsers.add_parser("import")
     importer.add_argument("--db", required=True)
     importer.add_argument("--dataset", required=True)
-    importer.add_argument("--kind", required=True, choices=("bars", "status", "universe", "features"))
+    importer.add_argument(
+        "--kind",
+        required=True,
+        choices=(
+            "bars", "status", "universe", "features",
+            "decision_candidates", "candidate_prices",
+        ),
+    )
     importer.add_argument("--file", required=True)
-    importer.add_argument("--source", required=True, choices=("joinquant", "akshare"))
+    importer.add_argument("--source", choices=("joinquant", "akshare"))
     importer.add_argument("--adjust", default="raw")
+    importer.add_argument("--manifest")
+    replay = subparsers.add_parser("replay")
+    replay.add_argument("--db", required=True)
+    replay.add_argument("--dataset", required=True)
+    replay.add_argument("--start-at", required=True)
+    replay.add_argument("--end-at", required=True)
+    replay.add_argument("--output-dir", required=True)
+    replay.add_argument("--expected-dataset-hash", required=True)
+    replay.add_argument("--strategy-version", required=True)
+    replay.add_argument("--parameter-version", required=True)
+    replay.add_argument("--feature-schema-version", required=True)
+    replay.add_argument("--market-data-version", required=True)
+    replay.add_argument("--code-hash", required=True)
+    replay.add_argument("--generator-hash", required=True)
     for command in ("validate", "run"):
         child = subparsers.add_parser(command)
         child.add_argument("--db", required=True)
@@ -805,7 +1086,63 @@ def main(argv: list[str] | None = None) -> int:
     store = HistoricalStore(Path(args.db))
     store.initialize()
     if args.command == "import":
-        print(store.import_csv(args.dataset, args.kind, Path(args.file), args.source, args.adjust))
+        if args.kind in {"decision_candidates", "candidate_prices"}:
+            if not args.manifest:
+                raise ValueError("STRICT_MANIFEST_REQUIRED")
+            rows = _load_json_rows(Path(args.file))
+            manifest = _load_json_object(Path(args.manifest), "strict manifest")
+            if str(manifest.get("dataset_id") or "") != str(args.dataset):
+                raise ValueError("STRICT_MANIFEST_DATASET_MISMATCH")
+            changed = (
+                store.import_candidate_cohorts(rows, manifest=manifest)
+                if args.kind == "decision_candidates"
+                else store.import_candidate_prices(rows, manifest=manifest)
+            )
+            print(changed)
+            return 0
+        if args.source is None:
+            raise ValueError("IMPORT_SOURCE_REQUIRED")
+        print(store.import_csv(
+            args.dataset, args.kind, Path(args.file), args.source, args.adjust,
+        ))
+        return 0
+    if args.command == "replay":
+        output_file = "historical_decision_replay_latest.json"
+        try:
+            replay = run_decision_time_replay(
+                store,
+                args.dataset,
+                args.start_at,
+                args.end_at,
+                strategy_config={
+                    "strategy_version": args.strategy_version,
+                    "parameter_version": args.parameter_version,
+                    "feature_schema_version": args.feature_schema_version,
+                    "market_data_version": args.market_data_version,
+                    "code_hash": args.code_hash,
+                    "generator_hash": args.generator_hash,
+                },
+                expected_dataset_hash=args.expected_dataset_hash,
+            )
+        except HistoricalDataValidationError as error:
+            _publish_atomic(
+                Path(args.output_dir),
+                {
+                    output_file: _json(
+                        {
+                            "status": "rejected",
+                            "replay_mode": "decision_time",
+                            "dataset_id": str(args.dataset),
+                            "error": " ".join(str(error).split())[:240],
+                        }
+                    )
+                },
+            )
+            return 2
+        _publish_atomic(
+            Path(args.output_dir),
+            {output_file: _json(_decision_replay_payload(replay))},
+        )
         return 0
     if args.command == "compare":
         with store.connect() as connection:
