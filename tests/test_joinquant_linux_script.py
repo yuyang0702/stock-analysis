@@ -21,6 +21,10 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
                 "config.py",
                 "trading_store.py",
                 "ledger_check.py",
+                "execution_contracts.py",
+                "notification_outbox.py",
+                "pre_trade_check.py",
+                "position_sizing.py",
             ):
                 shutil.copy2(name, app_dir / name)
             venv_python = app_dir / ".venv" / "bin" / "python"
