@@ -9,11 +9,21 @@ import pandas as pd
 
 import joinquant_exporter
 import joinquant_signal_server
+import config as app_config
 from execution_contracts import BrokerSnapshot
 from trading_store import TradingStore
 
 
 class JoinQuantSignalServerTest(unittest.TestCase):
+    @staticmethod
+    def _runtime_headers(run_type: str = "sim_trade") -> dict[str, str]:
+        return {
+            "Authorization": "Bearer secret",
+            "X-JoinQuant-Run-Type": run_type,
+            "X-JoinQuant-Template-Version": app_config.JOINQUANT_TEMPLATE_VERSION,
+            "X-JoinQuant-Protocol-Version": "1",
+        }
+
     @staticmethod
     def _normalized_keys(value) -> set[str]:
         keys: set[str] = set()
@@ -40,6 +50,77 @@ class JoinQuantSignalServerTest(unittest.TestCase):
             )
             response = app.test_client().get("/joinquant/signals", headers={"Authorization": "Bearer secret"})
             self.assertEqual(response.status_code, 200)
+
+    def test_strict_runtime_rejects_missing_and_backtest_identity_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            signal_file = root / "signals.json"
+            account_file = root / "account.json"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8"
+            )
+            app = joinquant_signal_server.create_app(
+                token="secret", signal_file=signal_file,
+                account_file=account_file, api_event_file=root / "events.jsonl",
+                require_runtime_identity=True,
+            )
+            client = app.test_client()
+
+            missing = client.get(
+                "/joinquant/signals", headers={"Authorization": "Bearer secret"},
+            )
+            backtest = client.post(
+                "/joinquant/account_snapshot",
+                headers=self._runtime_headers("full_backtest"),
+                json={"schema_version": 1, "positions": [], "orders": [], "trades": []},
+            )
+
+            self.assertEqual(missing.status_code, 409)
+            self.assertEqual(backtest.status_code, 409)
+            self.assertFalse(account_file.exists())
+
+    def test_strict_runtime_rejects_payload_identity_mismatch_and_accepts_exact_live(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            signal_file = root / "signals.json"
+            account_file = root / "account.json"
+            signal_file.write_text(
+                json.dumps({"schema_version": 1, "signals": []}), encoding="utf-8"
+            )
+            app = joinquant_signal_server.create_app(
+                token="secret", signal_file=signal_file,
+                account_file=account_file, api_event_file=root / "events.jsonl",
+                require_runtime_identity=True,
+            )
+            client = app.test_client()
+            payload = {
+                "schema_version": 1,
+                "trade_date": "2026-08-11",
+                "generated_at": "2026-08-11 15:05:00",
+                "runtime_mode": "full_backtest",
+                "runtime_protocol_version": "1",
+                "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
+                "cash": 100_000,
+                "available_cash": 100_000,
+                "total_value": 100_000,
+                "positions": [], "orders": [], "trades": [],
+            }
+
+            rejected = client.post(
+                "/joinquant/account_snapshot",
+                headers=self._runtime_headers(), json=payload,
+            )
+            self.assertEqual(rejected.status_code, 409)
+            self.assertFalse(account_file.exists())
+
+            payload["runtime_mode"] = "sim_trade"
+            accepted = client.post(
+                "/joinquant/account_snapshot",
+                headers=self._runtime_headers(), json=payload,
+            )
+            self.assertEqual(accepted.status_code, 200)
+            stored = json.loads(account_file.read_text(encoding="utf-8"))
+            self.assertEqual(stored["runtime_mode"], "sim_trade")
 
     @staticmethod
     def _write_exact_signal(base: Path, store: TradingStore) -> Path:

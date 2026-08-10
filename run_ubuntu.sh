@@ -54,7 +54,7 @@ Usage:
   bash run_ubuntu.sh install [--webhook URL] [--token TOKEN] [--cash NUM] [--web-port NUM] [--signal-port NUM] [--skip-install] [--no-start]
   bash run_ubuntu.sh start-all|stop-all|restart-all|status-all
   bash run_ubuntu.sh logs-strategy|logs-web|logs-joinquant
-  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|ledger-check|health|notify-retry|notify-status|notify-legacy-audit|notify-compact-dry-run|notify-compact-apply|notify-resolve-write-failure|readiness|ml-report|ml-labels|ml-train|ml-model-status|ml-backup|ml-restore-check|ml-retention-dry-run|ml-retention-apply|global-context|sector-context|strategy-compare|backtest|historical-backtest|historical-backtest-validate|backup|backup-drill|backup-status|test|show-env
+  bash run_ubuntu.sh run-strategy|run-web|run-joinquant-api|sync-joinquant|joinquant-cleanup-inspect|joinquant-cleanup-apply|ledger-check|health|notify-retry|notify-status|notify-legacy-audit|notify-compact-dry-run|notify-compact-apply|notify-resolve-write-failure|readiness|ml-report|ml-labels|ml-train|ml-model-status|ml-backup|ml-restore-check|ml-retention-dry-run|ml-retention-apply|global-context|sector-context|strategy-compare|backtest|historical-backtest|historical-backtest-validate|backup|backup-drill|backup-status|test|show-env
   bash run_ubuntu.sh trading-status|reconcile|unlock|stop-buy|resume-buy|kill-switch-on|kill-switch-off [options]
 
 First deploy:
@@ -264,7 +264,7 @@ env_value() {
 
 require_project_files() {
   for file in \
-    a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py \
+    a_share_strategy.py holdings_web.py joinquant_signal_server.py joinquant_sync.py joinquant_runtime_isolation.py joinquant_runtime_cleanup.py \
     joinquant_health.py notification_worker.py ledger_check.py backtest_engine.py historical_backtest.py trading_backup.py trading_control.py \
     joinquant_readiness_report.py ml_dataset.py ml_maintenance.py global_market_context.py strategy_compare_report.py requirements.txt; do
     [[ -f "${APP_DIR}/${file}" ]] || die "${file} not found in ${APP_DIR}"
@@ -967,6 +967,8 @@ handle_command() {
     run-web) run_foreground holdings_web.py ;;
     run-joinquant-api) run_foreground joinquant_signal_server.py --host 0.0.0.0 --port "$(env_value JOINQUANT_SIGNAL_PORT 8010)" ;;
     sync-joinquant) run_foreground joinquant_sync.py ;;
+    joinquant-cleanup-inspect) shift; run_foreground joinquant_runtime_cleanup.py inspect "$@" ;;
+    joinquant-cleanup-apply) shift; run_foreground joinquant_runtime_cleanup.py apply "$@" ;;
     ledger-check) ledger_check ;;
     health) run_foreground joinquant_health.py ;;
     notify-retry) run_foreground notification_worker.py --once ;;

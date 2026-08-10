@@ -12,6 +12,10 @@ from flask import Flask, abort, g, jsonify, request
 
 import config as app_config
 from execution_contracts import ExecutionIntent
+from joinquant_runtime_isolation import (
+    RuntimeIdentityError, validate_request_identity,
+    validate_snapshot_identity,
+)
 from joinquant_sync import (
     ingest_snapshot_payload,
     is_joinquant_event_only_payload,
@@ -337,6 +341,7 @@ def create_app(
     account_file: Path | None = None,
     api_event_file: Path | None = None,
     store: TradingStore | None = None,
+    require_runtime_identity: bool | None = None,
 ) -> Flask:
     app = Flask(__name__)
     expected_token = token if token is not None else app_config.JOINQUANT_SYNC_TOKEN
@@ -346,17 +351,48 @@ def create_app(
     ledger_store = store or TradingStore(
         app_config.TRADING_DB_FILE if account_file is None else account_path.parent / "trading.db"
     )
+    strict_runtime = (
+        token is None if require_runtime_identity is None
+        else require_runtime_identity
+    )
+
+    def require_live_runtime() -> dict[str, str]:
+        if not strict_runtime:
+            return {
+                "run_type": "sim_trade",
+                "template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
+                "protocol_version": "1",
+            }
+        try:
+            identity = validate_request_identity(
+                request.headers, app_config.JOINQUANT_TEMPLATE_VERSION,
+            )
+        except RuntimeIdentityError as exc:
+            g.runtime_identity_error = exc.code
+            abort(409, description=exc.code)
+        g.runtime_identity = identity
+        return identity
 
     @app.after_request
     def log_api_error(response):
         if request.path.startswith("/joinquant/") and not getattr(g, "api_event_logged", False):
             endpoint = request.path.rsplit("/", 1)[-1] or "unknown"
-            _append_api_event(event_path, endpoint, response.status_code)
+            _append_api_event(
+                event_path, endpoint, response.status_code,
+                runtime_mode=str(request.headers.get("X-JoinQuant-Run-Type") or "")[:32],
+                template_version=str(
+                    request.headers.get("X-JoinQuant-Template-Version") or ""
+                )[:80],
+                runtime_identity_error=str(
+                    getattr(g, "runtime_identity_error", "") or ""
+                )[:80],
+            )
         return response
 
     @app.get("/joinquant/signals")
     def signals():
         _check_token(expected_token)
+        require_live_runtime()
         payload = _filter_executable_signals(_read_json(signal_path), ledger_store)
         signal_count = len(payload.get("signals", [])) if isinstance(payload.get("signals"), list) else 0
         _append_api_event(event_path, "signals", 200, signal_count=signal_count)
@@ -365,6 +401,7 @@ def create_app(
     @app.get("/joinquant/latest")
     def latest():
         _check_token(expected_token)
+        require_live_runtime()
         payload = _filter_executable_signals(_read_json(signal_path), ledger_store)
         signal_count = len(payload.get("signals", [])) if isinstance(payload.get("signals"), list) else 0
         _append_api_event(event_path, "latest", 200, signal_count=signal_count)
@@ -382,9 +419,16 @@ def create_app(
     @app.post("/joinquant/account_snapshot")
     def account_snapshot():
         _check_token(expected_token)
+        runtime_identity = require_live_runtime()
         payload = sanitize_joinquant_payload(
             _validate_snapshot(request.get_json(silent=True))
         )
+        if strict_runtime:
+            try:
+                validate_snapshot_identity(payload, runtime_identity)
+            except RuntimeIdentityError as exc:
+                g.runtime_identity_error = exc.code
+                abort(409, description=exc.code)
         event_only = is_joinquant_event_only_payload(payload)
         try:
             ledger_result = ingest_snapshot_payload(

@@ -2,6 +2,8 @@
 
 > 本文是修改聚宽策略快照、原生回测脚本、严格历史导出器及上传链路前的必读文档。普通导出操作请阅读[严格历史数据三步说明](strict_history_three_step_guide.md)；数据包契约和用户排错请阅读[严格历史数据导出完整手册](joinquant_strict_history_export_manual.md)。
 
+> 如果任务涉及在线 `joinquant_strategy.py`、生产信号接口、账户回传、回测污染或事故清理，还必须阅读[聚宽回测与模拟盘隔离、污染识别和清理手册](joinquant_runtime_isolation_and_cleanup.md)。在线模板只允许 `sim_trade`；原生回测和 strict 导出不得访问生产服务器。
+
 ## 先确认这些边界
 
 - 聚宽最终运行环境按 Python 3.6 兼容处理。仓库里的构建器可以使用服务器 Python，但生成的三个便携脚本不得依赖 `dataclasses`、`from __future__ import annotations`、内置泛型写法或 Python 3.7 以后才有的日期 API。
@@ -9,6 +11,7 @@
 - `stock-analysis.env`、SSH 私钥、JoinQuant Token、Webhook、账户、持仓和数据库不得进入快照。生成、下载和部署都不得修改或轮换这些值。
 - 本地构建通过不等于已部署，聚宽回测结束不等于策略已验证。状态必须分别写为 `implemented`、`deployed`、`observed`、`validated`。
 - 当前工作区可能包含尚未提交的 P1 或多路径因子改动。接手者必须先看 `git status --short`，不得覆盖或回退不属于本次任务的改动。
+- 聚宽运行页面不能作为唯一安全边界。在线模板、服务器接口和落盘同步器必须同时验证运行类型；只有 Token 而没有匹配的 `sim_trade + 模板版本 + 协议版本` 不能读信号或写账户。
 
 ## 新窗口五分钟接管
 

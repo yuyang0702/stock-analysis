@@ -5,10 +5,32 @@ from decimal import Decimal, ROUND_DOWN, getcontext, localcontext
 from pathlib import Path
 
 import joinquant_sync
+import config as app_config
+from joinquant_runtime_isolation import RuntimeIdentityError
 from trading_store import TradingStore
 
 
 class JoinQuantSyncTest(unittest.TestCase):
+    def test_stored_snapshot_runtime_validation_fails_closed(self) -> None:
+        with self.assertRaises(RuntimeIdentityError):
+            joinquant_sync.validate_stored_snapshot_runtime(
+                {"schema_version": 1, "runtime_mode": "full_backtest"},
+                app_config.JOINQUANT_TEMPLATE_VERSION,
+            )
+
+        payload = {
+            "schema_version": 1,
+            "runtime_mode": "sim_trade",
+            "runtime_protocol_version": "1",
+            "strategy_template_version": app_config.JOINQUANT_TEMPLATE_VERSION,
+        }
+        joinquant_sync.validate_stored_snapshot_runtime(
+            payload, app_config.JOINQUANT_TEMPLATE_VERSION,
+        )
+        self.assertEqual(
+            joinquant_sync.sanitize_joinquant_payload(payload)["runtime_mode"],
+            "sim_trade",
+        )
     def test_cycle_risk_fields_include_active_one_lot_trailing_stop(self) -> None:
         positions = [{
             "code": "600000", "qty": 100, "cost_price": 10,

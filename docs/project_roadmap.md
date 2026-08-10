@@ -1,6 +1,8 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-08-10
+更新日期：2026-08-11
+
+> 2026-08-11 聚宽运行隔离与污染审计检查点：用户确认 8 月 8–10 日均运行过回测，但服务器生产证据显示只有 8 月 8 日 03:19:56–03:25:43 的旧在线模板向生产接口写入，形成 211 个账户快照、217 次对账、1 条当日权益和 1 份当前券商快照；8 月 9–10 日没有同类 API 写入，8 月 10 日 27 次真实扫描必须保留。代码已增加聚宽端 `sim_trade` fail-closed、服务器头部/正文双验证、落盘同步复核、项目外 verified backup 与有引用即拒绝的幂等隔离工具。当前本地状态为 `implemented / focused regression-tested / not committed / not pushed / not deployed / cleanup not applied`；正式隔离、全量 Linux 回归、提交推送、服务器受控重启和环境哈希不变仍需按本轮授权继续完成。
 
 > 2026-08-10 多路径因子与聚宽导出器发布检查点：B0-B7、聚宽原生回测、strict 历史导出、策略快照、一键脚本和开发手册已随提交 `f2c9441` 推送到 `origin/main`；三类输出继续由同一个确定性构建器生成，便携层保持 Python 3.6 兼容、逐时点反前视、真实 `prev_close` 回退、路径级容量/费用/退出和有界归因。Windows 全量发现共 1060 项，1057 项通过；其余 3 项仅因本机没有 Linux `bash`，无法启动 `run_ubuntu.sh ledger-check`，没有策略、导出器或数据契约测试失败。当前严格状态为 `implemented / regression-tested / committed / pushed / not deployed / not observed / not validated`。本轮未连接服务器、未部署或重启，未读取、打印、修改或轮换 SSH 私钥、JoinQuant Token、Webhook、`stock-analysis.env`、账户和正式数据库。任何后续服务器部署和重启必须按当次授权另行执行并重新验证外部状态。
 
@@ -24,6 +26,7 @@
 | `docs/strategy_snapshot_one_click_guide.md` | 从服务器当前运行策略一键生成去敏聚宽快照 | 策略更新后或首次准备 strict 历史导出前先读。 |
 | `docs/joinquant_strict_history_export_manual.md` | 聚宽 strict 月包契约、手工校验和故障排查 | 实现严格历史 provider 或自动流程报错时读取；普通上传不需要执行其中命令。 |
 | `docs/joinquant_exporter_development_manual.md` | 聚宽快照、原生回测、strict 导出、便携因子和上传链路的开发维护契约 | 修改或诊断上述代码前必读；集中记录 Python 3.6、反前视、版本联动、历史故障和回归清单。 |
+| `docs/joinquant_runtime_isolation_and_cleanup.md` | 在线模拟盘/回测运行身份隔离、污染识别、隔离清理和密钥不变部署契约 | 修改在线模板、信号 API、账户同步或处理回测污染前必读；记录 2026-08-08 至 10 日事故边界和恢复步骤。 |
 | `docs/superpowers/specs/2026-08-10-multipath-factor-simulation-design.md` | 动量、第三浪、跌停衰竭三路径的 B0–B7 业务与安全契约 | 修改多路径候选、因子阈值、费用、容量、退出、strict 归因或研究准入前必读；当前已随 `f2c9441` 提交并推送，尚未部署、观察或验证。 |
 | `docs/superpowers/plans/2026-08-10-multipath-factor-simulation.md` | B0–B7 文件级实施证据与发布边界 | 核验本轮实现范围或继续测试/发布时读取；外部状态不得由本地状态推断。 |
 | `docs/superpowers/specs/2026-07-11-simulation-stability-ledger-design.md` | SQLite 账本、幂等、对账、安全和 20 日验证 | 涉及账本、订单/成交、对账或稳定性门槛时读取；Batch 1 与后续目标状态必须分开。 |

@@ -125,10 +125,12 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
         config_text = Path("config.py").read_text(encoding="utf-8")
 
-        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-08-01.1-exact-intent"', text)
-        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-08-01.1-exact-intent"', config_text)
+        self.assertIn('STRATEGY_TEMPLATE_VERSION = "2026-08-11.1-runtime-isolation"', text)
+        self.assertIn('JOINQUANT_TEMPLATE_VERSION = "2026-08-11.1-runtime-isolation"', config_text)
         self.assertIn('"Authorization": "Bearer " + SYNC_TOKEN', text)
         self.assertIn('"strategy_template_version": STRATEGY_TEMPLATE_VERSION', text)
+        self.assertIn('"X-JoinQuant-Run-Type": LIVE_RUN_TYPE', text)
+        self.assertIn('"runtime_mode": LIVE_RUN_TYPE', text)
 
     def test_template_rechecks_five_positions_and_eighty_percent_total(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
@@ -150,8 +152,43 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
     def test_template_self_heals_runtime_globals_after_online_update(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
         self.assertIn("def _ensure_runtime_state(context):", text)
-        self.assertIn("_ensure_runtime_state(context)\n    fetch_and_execute(context)", text)
+        self.assertIn("_ensure_runtime_state(context)\n    if not _is_live_runtime(context):", text)
         self.assertIn('if not isinstance(getattr(g, "order_signal_ids", None), dict):', text)
+
+    def test_backtest_runtime_never_registers_callbacks_or_touches_network(self) -> None:
+        context = SimpleNamespace(
+            run_params=SimpleNamespace(type="full_backtest"),
+            portfolio=SimpleNamespace(total_value=100_000, positions={}),
+        )
+        with patch.object(joinquant_strategy, "run_daily", create=True) as run_daily, \
+             patch.object(joinquant_strategy, "startup_self_test") as startup, \
+             patch.object(joinquant_strategy, "fetch_signals") as fetch, \
+             patch.object(joinquant_strategy, "post_account_snapshot") as post:
+            joinquant_strategy.initialize(context)
+            joinquant_strategy.handle_data(context, None)
+
+        run_daily.assert_not_called()
+        startup.assert_not_called()
+        fetch.assert_not_called()
+        post.assert_not_called()
+        self.assertEqual(joinquant_strategy.g.runtime_mode, "full_backtest")
+
+    def test_unknown_runtime_fails_closed(self) -> None:
+        context = SimpleNamespace(
+            portfolio=SimpleNamespace(total_value=100_000, positions={}),
+        )
+        with patch.object(joinquant_strategy, "fetch_signals") as fetch:
+            self.assertEqual(joinquant_strategy.fetch_and_execute(context), 0)
+        fetch.assert_not_called()
+
+    def test_runtime_headers_bind_sim_trade_template_and_protocol(self) -> None:
+        headers = joinquant_strategy._runtime_headers()
+        self.assertEqual(headers["X-JoinQuant-Run-Type"], "sim_trade")
+        self.assertEqual(
+            headers["X-JoinQuant-Template-Version"],
+            joinquant_strategy.STRATEGY_TEMPLATE_VERSION,
+        )
+        self.assertEqual(headers["X-JoinQuant-Protocol-Version"], "1")
 
     def test_template_posts_startup_self_test_without_orders(self) -> None:
         text = Path("joinquant_strategy.py").read_text(encoding="utf-8")
@@ -557,7 +594,7 @@ class JoinQuantStrategyTemplateTest(unittest.TestCase):
         context = SimpleNamespace(portfolio=SimpleNamespace(
             cash=100_000, available_cash=100_000, total_value=100_000,
             positions={},
-        ))
+        ), run_params=SimpleNamespace(type="sim_trade"))
         joinquant_strategy.g.order_events = [{"id": "pending-local-event"}]
         with patch.object(joinquant_strategy, "get_trades", return_value={}, create=True), \
              patch.object(joinquant_strategy, "get_open_orders", return_value={}, create=True), \

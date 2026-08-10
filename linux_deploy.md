@@ -399,7 +399,7 @@ sha256sum -c /tmp/stock-env-before-schema11.sha256
 
 ### 4. JoinQuant 单独授权和启动前核验
 
-网站模板只能在单独授权后更新，并应在服务器交易进程仍停止时完成，避免旧模板先拉取新契约。更新时必须保留原 `SIGNAL_URL`、`SNAPSHOT_URL`、`SYNC_TOKEN` 和运行配置，不得显示或复制 Token 到日志、文档或聊天。编辑器代码应与仓库 `joinquant_strategy.py` 一致，并显示模板版本 `2026-08-01.1-exact-intent`。
+网站模板只能在单独授权后更新，并应在服务器交易进程仍停止时完成，避免旧模板先拉取新契约。更新时必须保留原 `SIGNAL_URL`、`SNAPSHOT_URL`、`SYNC_TOKEN` 和运行配置，不得显示或复制 Token 到日志、文档或聊天。编辑器代码应与仓库 `joinquant_strategy.py` 一致，并显示模板版本 `2026-08-11.1-runtime-isolation`；只有 `context.run_params.type == "sim_trade"` 才允许访问生产接口，服务器还会复核运行类型、模板和协议请求头。
 
 没有网站更新授权、编辑器保存失败或版本无法确认时，不得启动交易相关服务；服务器迁移只能记为待完成部署，不能写成端到端 `deployed`。
 
@@ -422,7 +422,7 @@ git status --short --branch
 git rev-parse HEAD
 ```
 
-等待一份新的完整账户快照，核对它回传模板版本 `2026-08-01.1-exact-intent`、账户 scope、snapshot 哈希和 current broker 子表均完整且一致。完整快照仍会执行既有对账控制：异常可自动停买或打开 kill switch，满足严格条件的 reconciliation-owned 停买也可能自动恢复。每收到一份验证快照都必须再次运行 `bash run_ubuntu.sh trading-status`，把控制值、reason/updated_at、自动恢复 owner、最近控制事件和最新对账与启动前基线逐项比较。版本不一致、快照不完整、仍在新鲜窗内的旧快照、控制状态意外恢复或 owner/事件无法解释时，均不得启动扫描器。不得靠启动扫描器来“试一下”模板。
+等待一份新的完整账户快照，核对它回传模板版本 `2026-08-11.1-runtime-isolation`、`runtime_mode=sim_trade`、协议版本 1、账户 scope、snapshot 哈希和 current broker 子表均完整且一致。完整快照仍会执行既有对账控制：异常可自动停买或打开 kill switch，满足严格条件的 reconciliation-owned 停买也可能自动恢复。每收到一份验证快照都必须再次运行 `bash run_ubuntu.sh trading-status`，把控制值、reason/updated_at、自动恢复 owner、最近控制事件和最新对账与启动前基线逐项比较。版本不一致、快照不完整、仍在新鲜窗内的旧快照、控制状态意外恢复或 owner/事件无法解释时，均不得启动扫描器。不得靠启动扫描器来“试一下”模板。
 
 完成上述核验后，才可启动获准的策略扫描服务：
 

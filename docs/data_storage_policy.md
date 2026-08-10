@@ -1,5 +1,7 @@
 # 数据存储、文件增长与保留规范
 
+> 2026-08-11 聚宽回测污染隔离增量：2026-08-08 03:19:56–03:25:43 的旧在线模板加速回测链被识别为 211 个账户快照、217 次对账、1 条当日权益和 1 份当前券商快照；8 月 9–10 日无同类生产 API 写入，8 月 10 日 27 次真实扫描不属于污染。`joinquant_runtime_cleanup.py` 只在零持仓/订单/成交/对账差异/控制与异常引用时自动处理，先创建项目外 verified backup，再把数据库行、命中 JSONL 和清理前完整文件长期隔离到 `/opt/stock-analysis-backups/quarantine/joinquant-backtest-20260808-20260810/`。隔离证据不自动清理，目录 700、文件 600，不含 Token/私钥/环境内容；正式部署和服务器清理状态以主文档最新检查点为准。
+
 > 2026-08-06 最新存储检查点：schema 11/12 增量与 Batch C ML-7 Tasks 4–10 已随 `5d2c4a2018ca95b9febd6751b4964fec507fe1bc` 部署服务器，正式交易库 schema 12。Linux 全量测试 1003/1003、`ledger-check` 健康/可写、迁移后在线备份 `/opt/stock-analysis-backups/daily/trading-2026-08-06-afbde6491e4d.db`（7,221,248 bytes、`integrity_check=ok`）、环境哈希和核心服务均通过。通知 outbox 已由 worker 消费 3 条，pending/dead/gap=0。ML 代码和依赖已部署但运行仍关闭，数据集未配置，标签/训练/ML 与历史库备份 timer 未启用；不能据部署推断已有真实 strict 数据、模型包或 L0 证据。当前为 `implemented / committed / deployed / not observed / not validated`。
 
 > 2026-07-26 schema 10 运行证据增量已推送并部署服务器：只给 `fills` 增加 `fee_data_status`，给 `daily_equity` 增加 `fee_data_status` 与 `realized_pnl_status`，历史值幂等回填 `unknown`；只有来源明确声明 `fee_data_status=reported` 且三个费用字段均可解析时才标记 `reported`，旧模板合成的兼容0仍为 `unknown`。不重建表、不猜测历史收益。`strategy_runs` 每轮一行；超过366天且无信号引用的空/失败运行由既有每日清理删除，有信号引用的运行长期保留，`signals` 只填充既有列。按约40轮/交易日估算约1万运行行/年，进入现有SQLite备份和年度容量复核。通知失败队列复用原文件，最多100项、保留30天、pending最多5次后转dead；旧 `errcode=40058` 直接转dead，避免部署后重放旧消息。没有新增逐扫描文件、秘密字段或第三方依赖。服务器部署前 schema 9 备份、迁移后 schema 10 备份及隔离恢复演练完整性均为 `ok`，表计数一致。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。

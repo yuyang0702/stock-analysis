@@ -23,7 +23,31 @@ MIN_SCORE = 75.0
 MAX_SIGNAL_AGE_MIN = 20
 MAX_POSITIONS = 5
 MAX_TOTAL_POSITION_PCT = 80.0
-STRATEGY_TEMPLATE_VERSION = "2026-08-01.1-exact-intent"
+STRATEGY_TEMPLATE_VERSION = "2026-08-11.1-runtime-isolation"
+RUNTIME_PROTOCOL_VERSION = "1"
+LIVE_RUN_TYPE = "sim_trade"
+
+
+def _joinquant_run_type(context):
+    run_params = getattr(context, "run_params", None)
+    if isinstance(run_params, dict):
+        return str(run_params.get("type") or "").strip()
+    return str(getattr(run_params, "type", "") or "").strip()
+
+
+def _is_live_runtime(context):
+    run_type = _joinquant_run_type(context)
+    g.runtime_mode = run_type
+    return run_type == LIVE_RUN_TYPE
+
+
+def _runtime_headers():
+    return {
+        "Authorization": "Bearer " + SYNC_TOKEN,
+        "X-JoinQuant-Run-Type": LIVE_RUN_TYPE,
+        "X-JoinQuant-Template-Version": STRATEGY_TEMPLATE_VERSION,
+        "X-JoinQuant-Protocol-Version": RUNTIME_PROTOCOL_VERSION,
+    }
 
 
 def _ensure_runtime_state(context):
@@ -65,6 +89,12 @@ def initialize(context):
     g.peak_value = g.day_start_value
     g.last_total_value = g.day_start_value
     g.consecutive_losses = 0
+    if not _is_live_runtime(context):
+        log.info(
+            "runtime %s: server sync and orders disabled"
+            % (getattr(g, "runtime_mode", "") or "unknown")
+        )
+        return
     run_daily(post_account_snapshot, time="15:05")
     if STARTUP_SELF_TEST:
         startup_self_test(context)
@@ -72,24 +102,30 @@ def initialize(context):
 
 def handle_data(context, data):
     _ensure_runtime_state(context)
+    if not _is_live_runtime(context):
+        return
     fetch_and_execute(context)
     post_account_snapshot(context)
 
 
 def fetch_and_execute(context):
     _ensure_runtime_state(context)
+    if not _is_live_runtime(context):
+        return 0
     fetch_signals(context)
     return execute_signals(context)
 
 
 def startup_self_test(context):
+    if not _is_live_runtime(context):
+        return
     fetch_signals(context)
     post_account_snapshot(context)
     log.info("startup self test ok")
 
 
 def _get_json(url):
-    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + SYNC_TOKEN})
+    request = urllib.request.Request(url, headers=_runtime_headers())
     with urllib.request.urlopen(request, timeout=8) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -99,7 +135,7 @@ def _post_json(url, payload):
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + SYNC_TOKEN},
+        headers=dict(_runtime_headers(), **{"Content-Type": "application/json"}),
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=8) as response:
@@ -478,6 +514,8 @@ def execute_signals(context):
 
 
 def post_account_snapshot(context):
+    if not _is_live_runtime(context):
+        return
     positions = []
     for jq_code, pos in context.portfolio.positions.items():
         positions.append(
@@ -507,6 +545,9 @@ def post_account_snapshot(context):
         "trade_date": datetime.now().strftime("%Y-%m-%d"),
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "joinquant",
+        "runtime_mode": LIVE_RUN_TYPE,
+        "run_type": LIVE_RUN_TYPE,
+        "runtime_protocol_version": RUNTIME_PROTOCOL_VERSION,
         "strategy_template_version": STRATEGY_TEMPLATE_VERSION,
         "cash": context.portfolio.cash,
         "available_cash": _position_attr(context.portfolio, "available_cash", context.portfolio.cash),

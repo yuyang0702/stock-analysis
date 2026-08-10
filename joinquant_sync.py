@@ -10,6 +10,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import config as app_config
+from joinquant_runtime_isolation import (
+    LIVE_RUN_TYPE, PROTOCOL_VERSION, RuntimeIdentityError,
+)
 from execution_contracts import BrokerPosition, BrokerSnapshot
 from notification_outbox import (
     NotificationEvent,
@@ -32,6 +35,7 @@ from execution_admission import (
 _SNAPSHOT_FIELDS = {
     "schema_version", "trade_date", "generated_at", "received_at", "source",
     "strategy_template_version", "template_version", "strategy_version",
+    "runtime_mode", "run_type", "runtime_protocol_version",
     "cash", "available_cash", "total_value", "daily_turnover_pct",
     "daily_pnl_pct", "account_drawdown_pct", "realized_pnl", "intraday_pnl",
     "consecutive_losses", "pending_buy_position_pct", "pending_buy_risk_pct",
@@ -141,6 +145,35 @@ def _load_snapshot(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict) or raw.get("schema_version") != 1:
         raise ValueError("invalid JoinQuant account snapshot")
     return raw
+
+
+def validate_stored_snapshot_runtime(
+    snapshot: dict[str, Any], required_template: str,
+) -> None:
+    run_type = str(
+        snapshot.get("runtime_mode") or snapshot.get("run_type") or ""
+    ).strip()
+    template = str(
+        snapshot.get("strategy_template_version")
+        or snapshot.get("template_version")
+        or ""
+    ).strip()
+    protocol = str(snapshot.get("runtime_protocol_version") or "").strip()
+    if run_type != LIVE_RUN_TYPE:
+        raise RuntimeIdentityError(
+            "JOINQUANT_STORED_RUNTIME_NOT_SIM_TRADE",
+            "stored snapshot is not an accepted sim_trade snapshot",
+        )
+    if template != required_template:
+        raise RuntimeIdentityError(
+            "JOINQUANT_STORED_TEMPLATE_VERSION_MISMATCH",
+            "stored snapshot template is not current",
+        )
+    if protocol != PROTOCOL_VERSION:
+        raise RuntimeIdentityError(
+            "JOINQUANT_STORED_PROTOCOL_VERSION_MISMATCH",
+            "stored snapshot protocol is not current",
+        )
 
 
 def _position(item: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1535,11 +1568,16 @@ def sync_account_snapshot(
     events_file: Path | None = None,
     store: TradingStore | None = None,
     migration_report_file: Path | None = None,
+    require_runtime_identity: bool = False,
 ) -> int:
     account_file = account_file or app_config.JOINQUANT_ACCOUNT_FILE
     positions_file = positions_file or app_config.POSITIONS_FILE
     events_file = events_file or app_config.PORTFOLIO_EVENTS_FILE
     snapshot = sanitize_joinquant_payload(_load_snapshot(account_file))
+    if require_runtime_identity:
+        validate_stored_snapshot_runtime(
+            snapshot, app_config.JOINQUANT_TEMPLATE_VERSION,
+        )
 
     positions = []
     for item in snapshot.get("positions", []):
@@ -1595,9 +1633,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if not args.account_file.exists():
+        print("JOINQUANT_SYNC_SKIPPED no_accepted_snapshot")
+        return
     count = sync_account_snapshot(
         args.account_file, args.positions_file, args.events_file,
         migration_report_file=app_config.OUTPUT_DIR / "position_migration.md",
+        require_runtime_identity=True,
     )
     payload = json.loads(args.positions_file.read_text(encoding="utf-8"))
     store = TradingStore(app_config.TRADING_DB_FILE)
