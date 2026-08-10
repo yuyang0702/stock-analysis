@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,10 @@ class StrictHistoryUploadScriptTest(unittest.TestCase):
         )
         self.assertIn("%~1", launcher)
 
+    @unittest.skipUnless(
+        shutil.which("powershell.exe"),
+        "PowerShell validation is available only on Windows test hosts",
+    )
     def test_validate_only_accepts_a_real_contract_package(self) -> None:
         root = Path(__file__).parents[1]
         with tempfile.TemporaryDirectory() as directory:
