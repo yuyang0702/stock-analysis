@@ -121,6 +121,31 @@ class JoinQuantRuntimeCleanupTest(unittest.TestCase):
             self.assertEqual(result["period_summary"]["strategy_runs"]["2026-08-10"], 1)
             self.assertFalse(any(result["blockers"].values()))
 
+    def test_retention_pruned_payload_is_audited_but_independent_material_evidence_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            self._seed_incident(paths)
+            with closing(sqlite3.connect(paths["db"])) as conn:
+                conn.execute("UPDATE account_snapshots SET raw_json=NULL")
+                conn.commit()
+
+            result = self._inspect(paths)
+
+            self.assertEqual(
+                result["warnings"]["retention_pruned_snapshot_payloads"], 1,
+            )
+            self.assertFalse(any(result["blockers"].values()))
+
+            with closing(sqlite3.connect(paths["db"])) as conn:
+                conn.execute(
+                    "UPDATE account_snapshots SET position_market_value=100"
+                )
+                conn.commit()
+            blocked = self._inspect(paths)
+            self.assertEqual(
+                blocked["blockers"]["nonzero_position_market_value_rows"], 1,
+            )
+
     def test_apply_creates_verified_quarantine_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))

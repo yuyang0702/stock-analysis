@@ -73,6 +73,8 @@ bash run_ubuntu.sh joinquant-cleanup-apply
 7. 再次执行完整性、外键和剩余污染计数验证；
 8. 写入只读隔离清单。重复执行返回 `already_completed`，不会重复删除。
 
+SQLite 的 366 天明细保留会把未变化快照的 `raw_json` 裁剪为 `NULL`；这必须记录为 `retention_pruned_snapshot_payloads` 警告，不能单独当成损坏。工具仍要用 `position_snapshots`、聚合仓位市值、源时间窗订单/成交、对账差异和控制引用独立验证；任何非零实质证据仍是硬阻断。
+
 默认隔离目录：
 
 ```text

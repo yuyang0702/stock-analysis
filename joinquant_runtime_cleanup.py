@@ -243,15 +243,24 @@ def inspect_incident(
             (AFFECTED_TRADE_DATE,),
         )
         material_payloads = 0
-        unknown_payloads = 0
+        pruned_payloads = 0
+        malformed_payloads = 0
         for row in snapshot_rows:
+            raw_json = str(row.get("raw_json") or "").strip()
+            if not raw_json:
+                pruned_payloads += 1
+                continue
             try:
-                payload = json.loads(str(row.get("raw_json") or ""))
+                payload = json.loads(raw_json)
             except json.JSONDecodeError:
-                unknown_payloads += 1
+                malformed_payloads += 1
                 continue
             if any(payload.get(name) for name in ("positions", "orders", "trades")):
                 material_payloads += 1
+        nonzero_position_value_rows = sum(
+            1 for row in snapshot_rows
+            if abs(float(row.get("position_market_value") or 0)) > 0.000001
+        )
         created_orders = int(conn.execute(
             """SELECT COUNT(*) FROM orders
                WHERE COALESCE(first_submitted_at, updated_at)>=?
@@ -299,7 +308,8 @@ def inspect_incident(
             "broker_order_rows": len(broker_orders),
             "other_broker_reconciliation_references": other_broker_reconciliation_refs,
             "material_snapshot_payloads": material_payloads,
-            "unreadable_snapshot_payloads": unknown_payloads,
+            "malformed_snapshot_payloads": malformed_payloads,
+            "nonzero_position_market_value_rows": nonzero_position_value_rows,
             "orders_created_in_source_window": created_orders,
             "fills_created_in_source_window": created_fills,
         }
@@ -338,6 +348,9 @@ def inspect_incident(
                 "portfolio_events": portfolio_invalid,
             },
             "blockers": blockers,
+            "warnings": {
+                "retention_pruned_snapshot_payloads": pruned_payloads,
+            },
             "selected_lines": {
                 "account_history": account_removed,
                 "api_events": api_removed,
