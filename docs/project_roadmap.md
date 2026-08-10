@@ -2,7 +2,7 @@
 
 更新日期：2026-08-10
 
-> 2026-08-10 本地多路径因子与聚宽导出器开发检查点：B0-B7 已在未提交工作区实现，聚宽原生回测、strict 历史导出和策略快照继续由同一个确定性构建器生成；便携层保持 Python 3.6 兼容、逐时点反前视、真实 `prev_close` 回退、路径级容量/费用/退出和有界归因。Windows 全量发现共 1060 项，1057 项通过；其余 3 项仅因本机没有 Linux `bash`，无法启动 `run_ubuntu.sh ledger-check`，没有策略、导出器或数据契约测试失败。当前严格状态为 `implemented / regression-tested / not committed / not pushed / not deployed / not observed / not validated`。本轮未连接服务器、未部署或重启，未读取、打印、修改或轮换 SSH 私钥、JoinQuant Token、Webhook、`stock-analysis.env`、账户和正式数据库。任何后续提交、部署和重启必须按当次授权另行执行并重新验证外部状态。
+> 2026-08-10 多路径因子与聚宽导出器发布检查点：B0-B7、聚宽原生回测、strict 历史导出、策略快照、一键脚本和开发手册已随提交 `f2c9441` 推送到 `origin/main`；三类输出继续由同一个确定性构建器生成，便携层保持 Python 3.6 兼容、逐时点反前视、真实 `prev_close` 回退、路径级容量/费用/退出和有界归因。Windows 全量发现共 1060 项，1057 项通过；其余 3 项仅因本机没有 Linux `bash`，无法启动 `run_ubuntu.sh ledger-check`，没有策略、导出器或数据契约测试失败。当前严格状态为 `implemented / regression-tested / committed / pushed / not deployed / not observed / not validated`。本轮未连接服务器、未部署或重启，未读取、打印、修改或轮换 SSH 私钥、JoinQuant Token、Webhook、`stock-analysis.env`、账户和正式数据库。任何后续服务器部署和重启必须按当次授权另行执行并重新验证外部状态。
 
 > 2026-08-09 P1 最终代码检查点：服务器当前运行策略现可通过桌面“**一键生成聚宽策略快照**”冻结为 Python 3.6 兼容、去敏、确定性的六成员证据包，并直接生成 `聚宽原生回测策略.py` 与 `聚宽严格历史导出.py`。逐 5 分钟时点内核版本为 `2026-08-09.11`，按当时可见的股票池、分钟行情、前一交易日前完整日线、历史 ST/上市状态、行业和组合状态重建约 30 只候选，记录选中/拒绝原因并按下一决策时点成交；未来时点字段一律拒绝。第一次真实整月 strict 运行在旧导出器触发 `INVALID_NUMBER: prev_close`；导出器 `2026-08-09.9` 现优先使用聚宽 `pre_close`，只回看真实有效的更早收盘价，无法取得核心日线证据的股票日会有界审计后排除，不用当日或未来价格补造。服务器 `/opt/stock-analysis` 基线仍为 `90f3495`，修复后 Linux 全量测试 1035/1035、Windows 可运行测试 1037 项通过，另 3 项 Linux `bash` 边界测试在 Windows 因缺少命令产生预期错误；主服务于 19:12:10 CST 受控重启并保持 active，信号服务 active，错误日志为空，`stock-analysis.env` SHA-256 前后均为 `5286a61bcdb7f632af3719fe17e629d53a088a954d1d4696e51ade247bfc5be1`。最终权威快照 ID 为 `ca19580c155150df28e0b448cb6e3243c871be8a8bea2a4f5978bcc23ded6dd2`，包 SHA-256 为 `2efff24f1007b3201da4a9fc8e1728755457e0873c757b75dd23432c2531d97c`，本机真实一键下载和逐成员复核通过。当前增量为 `implemented / server deployed / first full-month failure reproduced and fixed / not committed / not pushed`；正式 `cache/backtest/history.db` 仍不存在，修复后的首个整月包尚未生成和导入，也未完成整月、6 个月或 1 年回测，所以长期结果仍为 `not observed / not validated`。
 
@@ -24,7 +24,7 @@
 | `docs/strategy_snapshot_one_click_guide.md` | 从服务器当前运行策略一键生成去敏聚宽快照 | 策略更新后或首次准备 strict 历史导出前先读。 |
 | `docs/joinquant_strict_history_export_manual.md` | 聚宽 strict 月包契约、手工校验和故障排查 | 实现严格历史 provider 或自动流程报错时读取；普通上传不需要执行其中命令。 |
 | `docs/joinquant_exporter_development_manual.md` | 聚宽快照、原生回测、strict 导出、便携因子和上传链路的开发维护契约 | 修改或诊断上述代码前必读；集中记录 Python 3.6、反前视、版本联动、历史故障和回归清单。 |
-| `docs/superpowers/specs/2026-08-10-multipath-factor-simulation-design.md` | 动量、第三浪、跌停衰竭三路径的 B0–B7 业务与安全契约 | 修改多路径候选、因子阈值、费用、容量、退出、strict 归因或研究准入前必读；当前为本地 implemented，尚未提交、部署、观察或验证。 |
+| `docs/superpowers/specs/2026-08-10-multipath-factor-simulation-design.md` | 动量、第三浪、跌停衰竭三路径的 B0–B7 业务与安全契约 | 修改多路径候选、因子阈值、费用、容量、退出、strict 归因或研究准入前必读；当前已随 `f2c9441` 提交并推送，尚未部署、观察或验证。 |
 | `docs/superpowers/plans/2026-08-10-multipath-factor-simulation.md` | B0–B7 文件级实施证据与发布边界 | 核验本轮实现范围或继续测试/发布时读取；外部状态不得由本地状态推断。 |
 | `docs/superpowers/specs/2026-07-11-simulation-stability-ledger-design.md` | SQLite 账本、幂等、对账、安全和 20 日验证 | 涉及账本、订单/成交、对账或稳定性门槛时读取；Batch 1 与后续目标状态必须分开。 |
 | `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` | 当前买入、卖出、持仓周期、组合风险和安全降级规则 | 修改策略、交易、仓位、止盈止损或风险逻辑前必读。 |

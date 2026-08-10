@@ -170,7 +170,7 @@ STRICT_EXPORT_SCRIPT_VERSION
 - 原生回测使用 48 个闭合 5 分钟决策点、下一决策点下单、真实持仓和 T+1 可卖数量。
 - strict 月包保存候选选中/拒绝、稳定拒绝代码、D+10 价格路径、文件哈希和表哈希。
 - 一键脚本先确认服务器当前实际运行版本，再下载、校验和原子替换本机 `output/`；失败时不覆盖上一份有效文件。
-- 多路径因子相关的便携模块已进入本地构建器源文件与拼接清单。2026-08-10 在 Windows 执行 `python -m unittest discover -s tests -v` 共发现 1060 项：1057 项通过；另 3 项仅因本机没有 Linux `bash` 而无法启动 `run_ubuntu.sh ledger-check`，没有导出器、策略或数据契约测试失败。该增量仍只能称为本地 `implemented / regression-tested`，不能称为已提交、已部署、已观察或已验证。
+- 多路径因子相关的便携模块已进入构建器源文件与拼接清单，并随提交 `f2c9441` 推送到 `origin/main`。2026-08-10 在 Windows 执行 `python -m unittest discover -s tests -v` 共发现 1060 项：1057 项通过；另 3 项仅因本机没有 Linux `bash` 而无法启动 `run_ubuntu.sh ledger-check`，没有导出器、策略或数据契约测试失败。该增量当前为 `implemented / regression-tested / committed / pushed / not deployed / not observed / not validated`。
 
 本节只记录低频架构优化。每次具体外部部署状态仍以主路线图和交接文档为准，不在这里保存 Token、服务器地址、实时运行结果或每天的导出统计。
 

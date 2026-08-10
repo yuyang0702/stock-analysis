@@ -1,6 +1,6 @@
 # 项目接管与新环境恢复说明
 
-> 2026-08-10 本地接管检查点：当前工作区包含尚未提交的 P1/聚宽导出链路及 B0-B7 多路径因子改动，接手者不得覆盖或回退。修改或排查聚宽快照、原生回测、strict 导出、上传导入或便携因子前，必须先读 `docs/joinquant_exporter_development_manual.md`。Windows 全量发现共 1060 项，其中 1057 项通过；另 3 项仅因本机缺少 Linux `bash`，无法启动 `run_ubuntu.sh ledger-check`。当前新增内容为 `implemented / regression-tested / not committed / not pushed / not deployed / not observed / not validated`；本轮未连接或重启服务器，也未修改任何密钥、Token、Webhook、环境文件、账户或正式数据库。服务器和聚宽网站状态不可从本地工作区推断，接手后必须重新只读核验。
+> 2026-08-10 接管检查点：P1/聚宽导出链路及 B0-B7 多路径因子改动已随提交 `f2c9441` 推送到 `origin/main`。修改或排查聚宽快照、原生回测、strict 导出、上传导入或便携因子前，必须先读 `docs/joinquant_exporter_development_manual.md`。Windows 全量发现共 1060 项，其中 1057 项通过；另 3 项仅因本机缺少 Linux `bash`，无法启动 `run_ubuntu.sh ledger-check`。当前新增内容为 `implemented / regression-tested / committed / pushed / not deployed / not observed / not validated`；本轮未连接或重启服务器，也未修改任何密钥、Token、Webhook、环境文件、账户或正式数据库。服务器和聚宽网站状态不可从 Git 状态推断，接手后必须重新只读核验。
 
 > 2026-08-06 最新接管检查点：Batch A Tasks 1–8、Batch B Tasks 1–7 与 Batch C ML-7 Tasks 4–10 已合并并推送到 `origin/main`，服务器已部署 `5d2c4a2018ca95b9febd6751b4964fec507fe1bc`，正式库 schema 12。服务器 Linux 全量测试 1003/1003、`ledger-check` 健康/可写、迁移后在线备份完整性、环境文件哈希不变、三个核心服务 active、通知 timer active 且路由到 `notification_worker.py --once` 均已核验；outbox 部署后 sent=3、pending/dead/gap=0。Task 11 已完成。Task 12 只完成代码/依赖部署，ML 仍为 `enabled=0 / max_level=0 / dataset_configured=no`，标签、训练和 ML/history 备份 timer 未启用，未形成真实一年 strict 数据、可信/可批准模型、人工审批、活动模型或服务器 L0 证据。当前严格状态为 `implemented / committed / deployed / not observed / not validated`；JoinQuant 网站模板、Token、Webhook、私钥和 `stock-analysis.env` 内容均未在本次任务中修改。
 

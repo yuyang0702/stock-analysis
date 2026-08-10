@@ -13,6 +13,6 @@
 | B6 | `strategy_exit_runtime.py`、实时持仓路径恢复、PIT 原生回测、strict 导出、ML 特征与有界归因 | implemented |
 | B7 | `factor_research.py` 的样本、期望、利润因子、Top3、walk-forward 和回撤准入；无自动发布入口 | implemented |
 
-发布边界：当前代码必须先完成专项、集成和全量回归；随后是否 commit、push、部署服务器、受控重启和重新生成聚宽脚本，均按用户当次授权分别执行。部署成功后仍只能标记 `deployed / not observed / not validated`，直到出现足量真实模拟样本并通过 B7 人工复核。
+发布边界：专项、集成和 Windows 全量回归已经完成，代码已随 `f2c9441` 提交并推送。服务器部署、受控重启和重新生成聚宽脚本仍须按用户当次授权分别执行；部署成功后也只能标记 `deployed / not observed / not validated`，直到出现足量真实模拟样本并通过 B7 人工复核。
 
 本地回归证据（2026-08-10）：Windows 全量发现共 1060 项，1057 项通过；仅 `tests.test_joinquant_linux_script` 的 3 项因本机没有 `bash` 而无法启动，需在 Linux/服务器环境补验。没有因子、策略、导出器、快照、严格历史或训练数据测试失败。此证据不改变提交、部署、观察和验证状态。
