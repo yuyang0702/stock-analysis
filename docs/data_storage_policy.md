@@ -398,6 +398,30 @@ schema 11 曾在正式交易库设计中增加以下两类数据；这些结构�
 - schema 10 的迁移前备份是当次失败回滚依据，不能被迁移后的同名文件覆盖；只回滚 Git 而继续使用更高 schema 主库不构成安全回滚。未来迁移同理必须保存目标版本对应的迁移前副本。
 - `stock-analysis.env`、Token、Webhook 和私钥不进入交易库备份清单；部署只比较私有配置文件哈希，不输出或改写其内容。
 
+### 14.4 JoinQuant strict 历史月度导出
+
+2026-08-09 新增 `joinquant_strict_history_exporter.py`、`joinquant_point_in_time.py`、`strict_history_ingest.py` 和桌面拖拽上传入口，当前为 `implemented / server file deployed / JoinQuant real-point validated / first full-month run not completed / not committed / not pushed`。导出器 `2026-08-09.9` 与逐 5 分钟时点内核 `2026-08-09.11` 已在聚宽 Python 3.6.7 环境完成精确单时点验证：2025-07-01 10:00 生成 30 个候选、1 个入选，全部输入的最晚可用时间不晚于决策时间；2026-07-01 11:10 的真实原生回测还验证了分数截断后的候选补位会稳定记录 `buy_pool_score_below_cutoff`，不再形成无解释成员。第一次真实整月 strict 运行暴露旧版从前一日 `close` 推导 `prev_close` 时会被停牌或缺失值中断；`2026-08-09.9` 改为优先使用聚宽 `pre_close`，只以更早真实有效收盘价兜底，无法取得核心日线证据的股票日会被排除并记录有界审计，不伪造价格或放宽未来时间门。服务器已部署流式校验/导入器及 `strict_history` 来源门，但尚未运行修复后的真实整月导出或写入正式历史数据库。导出端按“数据集 + 月份”使用稳定目录和稳定 ZIP 名称，重复运行原子覆盖同一月，不为每次尝试创建永久时间戳文件。一个月最多 100,000 条候选和 2,000,000 条候选价格，原始文件合计或压缩包任一达到 3 GB 即拒绝发布；一年最多 12/13 个正式月包，不由脚本自动删除。
+
+每个月包固定包含 `bars.csv`、`status.csv`、`universe.csv`、`features.csv`、`decision_candidates.jsonl`、`candidate_prices.jsonl`、`strict_manifest.json` 和 `metadata.json`。`metadata.json` 保存逐文件 SHA-256、行数、导出器/生成器版本、`daily_features_required` / `daily_features_complete`、有界 `daily_core_audit` 和保留声明，不保存 Token、账户、Webhook、服务器 URL 或私钥。候选历史包只有在 metadata 显式声明不要求完整逐日特征时才允许 `features.csv` 仅含表头；旧包或声明含糊时保持失败关闭。审计只保存按原因计数和最多 20 个稳定排序样例，避免无界增长。最终 ZIP 先在临时路径完成表哈希、逐文件哈希和路径安全复核，再原子替换旧月包；失败时不得把临时包发布为有效证据。
+
+月包属于可重建但昂贵的人工导出证据，由用户决定电脑下载文件的保留与离线备份。服务器上传暂存文件始终使用 `.uploading` 后缀，成功或失败后均清理；正式归档按“数据集 + 月份”只保留一个稳定 ZIP，相同内容幂等接受，同月份不同内容拒绝覆盖。暂存解压目录和导入临时库在每次运行结束后清理，不形成永久时间戳副本。
+
+导入器先取得单实例锁并完成路径、符号链接、压缩比、3 GB 上限、成员清单、逐文件 SHA-256、表哈希、行数、时点和 strict 特征完整性校验。已有正式库时，先通过现有备份机制创建并验证备份，再复制到临时库流式导入；临时库通过行数、数据集哈希和 SQLite 完整性检查后才原子替换 `cache/backtest/history.db`。任何失败都不得改变正式库，首次导入失败也不得创建正式库。导入后的历史库继续使用独立在线备份、完整性检查和 7/4/12 轮转。
+
+本地私有上传配置只保存在被 Git 忽略的 `cache/strict_history_upload_config.json`，只记录 SSH 目标、密钥文件路径和服务器项目目录，不复制私钥内容；最近一次本地结果稳定覆盖 `cache/strict_history_upload_latest.json`，服务器最近一次导入报告稳定覆盖 `output/strict_history_ingest_latest.json`。Token、Webhook、环境变量和交易库不属于这条导入链路。除明确版本化的中性政策外，任何缺失或未来字段都必须失败关闭，不能为了覆盖率填 0 或复制当前缓存。当前中性政策只有两项：线上盘中观察池本来不展开个股新闻/LHB，历史回放因此记 `news_score=0` 和 `intraday_watch_unexpanded`；聚宽同日市场新闻缺少可证明的盘中发布时间，因此记 `neutral_no_intraday_timestamp` 并排除于当日盘中决策。行业、历史状态、行情、技术指标和组合状态仍必须从相应历史时点重建。
+
+当前自动化证据覆盖：精确时区、未来特征拒绝、完整 ML/规则审计字段、项目 `sample_id`/表哈希一致、schema v2 实际导入、重复月导出哈希一致、ZIP 内外哈希复核、失败不改正式库、首次失败不建库、重复导入幂等、危险 ZIP 拒绝，以及 `strict_history` 来源通过 L0 来源门。Windows 相关专项测试 33/33、服务器 Linux 全量测试 1032/1032 通过。聚宽真实验证覆盖最终精确产物的交易日、历史股票池/ST、分钟与日线字段、30 只时点候选、规则决策、次时点成交、分数截断补位拒绝解释和 manifest 哈希契约。真实整月 API 配额、月包实际大小、断网重跑和一年容量仍需平台运行观察；单时点与短程原生回测验证不能把整月数据标记为 observed/validated。
+
+### 14.5 当前运行策略快照
+
+2026-08-09 新增 `strategy_snapshot_runtime.py`、`strategy_snapshot_builder.py` 和桌面“一键生成聚宽策略快照”入口，当前为 `implemented / server deployed / locally end-to-end validated / not committed / not pushed`。服务器构建器只在 `stock-analysis.service` 为 active/running、入口仍为 `a_share_strategy.py`，且策略源码和 `stock-analysis.env` 均不晚于服务启动时间时生成快照。这样冻结的是当前实际加载版本，而不是尚未重启的磁盘版本。
+
+每个 ZIP 固定包含 `strategy_snapshot.py`、`joinquant_native_backtest.py`、`joinquant_strict_export.py`、`strategy_snapshot.json`、`README_聚宽使用.txt` 和 `manifest.json`。内容只允许出现便携决策运行时、两种聚宽入口、非敏感参数白名单、源码哈希、版本和时点契约；不得包含 SSH 目标、私钥、Token、Webhook、账户、持仓、数据库或环境文件内容。构建时扫描环境中的敏感值，发现任何值进入包即拒绝发布；下载后同时核对外层 SHA-256、固定成员、路径安全、压缩比、逐成员大小和哈希、快照 ID 与参数哈希。
+
+服务器归档固定为 `cache/backtest/strategy_snapshots/strategy-snapshot-<id>.zip`，相同代码和参数重复构建幂等复用；最多保留 24 个不同快照，达到上限失败关闭，不自动删除。服务器最近结果稳定覆盖 `output/strategy_snapshot_latest.json`。电脑稳定覆盖 `output/strategy_snapshot_latest.zip`、`output/聚宽原生回测策略.py`、`output/聚宽严格历史导出.py`、`output/聚宽策略快照.py` 和 `cache/strategy_snapshot_generate_latest.json`；下载或校验失败不覆盖上一份有效文件。快照可由服务器源码和有效参数重建，但作为正式历史包的版本证据时应随月包保留对应 ZIP 或哈希。
+
+最终权威快照 ID 为 `ca19580c155150df28e0b448cb6e3243c871be8a8bea2a4f5978bcc23ded6dd2`，包 SHA-256 为 `2efff24f1007b3201da4a9fc8e1728755457e0873c757b75dd23432c2531d97c`。该证据包含导出器 `2026-08-09.9` 的前收盘价修复，并证明服务器当前运行策略的两种聚宽入口、安全下载链路、真实单时点 strict 重建、原生次时点下单和 11:10 分数截断补位修复已经验证；它不等于修复后的首个真实整月包已生成，也不能据此把 6 个月/1 年数据和回测结果标记为 ready/validated。
+
 ### 存储治理 Batch A：低风险性能优化
 
 1. 健康历史按月轮转。

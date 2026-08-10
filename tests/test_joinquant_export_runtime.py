@@ -44,6 +44,7 @@ class JoinQuantExportRuntimeTest(unittest.TestCase):
             store.get_pending_buy_classification_exposures.return_value = [{
                 "code": "000001", "industry": "银行", "theme": "高股息", "position_pct": 5,
             }]
+            store.get_daily_factor_openings.return_value = []
             store.active_cooldown_codes.return_value = set()
             store.daily_activity.return_value = (0, 0)
             rows = pd.DataFrame([{"code": "600519"}])
@@ -74,6 +75,8 @@ class JoinQuantExportRuntimeTest(unittest.TestCase):
             self.assertEqual(kwargs["current_position_count"], 2)
             self.assertEqual(kwargs["sector_exposure_pct"], {"银行": 25.0})
             self.assertEqual(kwargs["theme_exposure_pct"], {"高股息": 25.0})
+            self.assertEqual(kwargs["factor_position_counts"], {})
+            self.assertEqual(kwargs["factor_new_positions_today"], {})
             self.assertEqual(exported_rows.iloc[0]["price"], 1500.0)
             self.assertEqual(
                 exported_rows.iloc[0]["quote_time"],

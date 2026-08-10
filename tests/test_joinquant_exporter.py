@@ -539,6 +539,11 @@ class JoinQuantExporterTest(unittest.TestCase):
             "a_share_strategy.py", "candidate_core.py", "joinquant_exporter.py",
             "ml_dataset.py", "trade_safety.py", "exit_policy.py",
             "trading_store.py", "gap_reentry.py", "config.py",
+            "strategy_snapshot_runtime.py", "factor_contracts.py",
+            "factor_registry.py", "factor_wave3.py", "factor_limitdown.py",
+            "candidate_channels.py", "strategy_economics.py",
+            "strategy_exit_runtime.py", "strategy_attribution.py",
+            "factor_research.py",
         )
         self.assertEqual(joinquant_exporter.IMPLEMENTATION_HASH_FILES, expected)
         joinquant_exporter._ml_code_hash.cache_clear()
@@ -548,6 +553,85 @@ class JoinQuantExporterTest(unittest.TestCase):
             second = joinquant_exporter._ml_code_hash()
         self.assertEqual(first, second)
         self.assertEqual(read.call_count, len(expected))
+
+    def test_factor_path_limits_require_and_update_portfolio_state(self) -> None:
+        first = self._strict_buy_row(
+            factor_path="wave3_v1",
+            factor_triggered=True,
+            factor_max_concurrent=2,
+            factor_max_new_per_day=1,
+            factor_risk_budget_pct=0.5,
+            factor_position_cap_pct=12.0,
+        )
+        with patch.object(
+            joinquant_exporter.app_config,
+            "JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT",
+            False,
+        ), patch.object(
+            joinquant_exporter.app_config,
+            "MULTIPATH_ECONOMIC_GATE_ENABLE_DEFAULT",
+            False,
+        ):
+            self.assertEqual(
+                joinquant_exporter._buy_reject_reason(
+                    pd.Series(first), 75,
+                    account_total_value=100_000,
+                    available_cash=100_000,
+                ),
+                "factor_portfolio_state_unavailable",
+            )
+            self.assertEqual(
+                joinquant_exporter._buy_reject_reason(
+                    pd.Series(first), 75,
+                    account_total_value=100_000,
+                    available_cash=100_000,
+                    factor_position_counts={"wave3_v1": 2},
+                    factor_new_positions_today={"wave3_v1": 0},
+                ),
+                "factor_path_position_limit",
+            )
+            self.assertEqual(
+                joinquant_exporter._buy_reject_reason(
+                    pd.Series(first), 75,
+                    account_total_value=100_000,
+                    available_cash=100_000,
+                    factor_position_counts={"wave3_v1": 0},
+                    factor_new_positions_today={"wave3_v1": 1},
+                ),
+                "factor_path_daily_limit",
+            )
+
+            rows = pd.DataFrame([
+                first,
+                {**first, "code": "600001", "name": "second"},
+            ])
+            with tempfile.TemporaryDirectory() as directory:
+                path = joinquant_exporter.export_signals(
+                    rows,
+                    run_id="factor-path-limits",
+                    output_path=Path(directory) / "signals.json",
+                    account_total_value=100_000,
+                    available_cash=100_000,
+                    factor_position_counts={},
+                    factor_new_positions_today={},
+                    store=TradingStore(Path(directory) / "trading.db"),
+                )
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["code"] for item in payload["signals"]], ["600000"]
+            )
+            self.assertEqual(
+                payload["diagnostics"]["reject_reasons"],
+                {"factor_path_daily_limit": 1},
+            )
+            attribution = payload["diagnostics"]["strategy_attribution"]["paths"][
+                "wave3_v1"
+            ]
+            self.assertEqual(attribution["opportunities"], 2)
+            self.assertEqual(attribution["selected"], 1)
+            self.assertEqual(
+                attribution["rejections"], {"factor_path_daily_limit": 1}
+            )
 
     def test_parameter_snapshot_covers_buy_thresholds_without_runtime_secrets(self) -> None:
         snapshot = joinquant_exporter._ml_parameter_snapshot(81.5, True)

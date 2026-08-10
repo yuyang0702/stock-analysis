@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping
-import math
+
+from strategy_snapshot_runtime import tradability_reject_reason as _portable_tradability_reject_reason
 
 
 def attainable_sell_target(current_qty: int, target_qty: int, closeable_qty: int) -> tuple[int | None, str]:
@@ -34,27 +35,4 @@ class MarketRegimeState:
 
 
 def tradability_reject_reason(row: Mapping[str, Any]) -> str:
-    def flag(name: str) -> bool:
-        value = row.get(name)
-        return value is not None and not (isinstance(value, float) and math.isnan(value)) and bool(value)
-
-    if flag("paused"):
-        return "buy_suspended"
-    if flag("is_st") or "ST" in str(row.get("name") or "").upper():
-        return "buy_st"
-    if flag("delisting"):
-        return "buy_delisting"
-    if flag("special_listing_stage"):
-        return "buy_special_listing_stage"
-    if 0 < float(row.get("listing_days") or 0) < 5:
-        return "buy_special_listing_stage"
-    if float(row.get("quote_age_sec") or 0) > 120:
-        return "buy_quote_stale"
-    entry = float(row.get("entry_price") or 0)
-    price = float(row.get("price") or 0)
-    atr = float(row.get("atr14") or 0)
-    if entry > 0 and price > entry * (1 + min(0.02, 0.5 * atr / entry if atr > 0 else 0.02)):
-        return "buy_chasing"
-    if row.get("amount") is not None and float(row.get("amount") or 0) < 20_000_000:
-        return "buy_illiquid"
-    return ""
+    return _portable_tradability_reject_reason(row)

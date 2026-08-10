@@ -6,6 +6,16 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from candidate_channels import (
+    CANDIDATE_CHANNEL_DEFAULTS,
+    build_factor_channel_rows,
+    merge_candidate_channels,
+)
+from strategy_snapshot_runtime import (
+    build_candidate_pool_frame,
+    score_candidate_frame as _portable_score_candidate_frame,
+)
+
 
 @dataclass(frozen=True)
 class CandidatePoolConfig:
@@ -18,59 +28,60 @@ class CandidatePoolConfig:
 def build_candidate_pool(
     frame: pd.DataFrame, config: CandidatePoolConfig
 ) -> pd.DataFrame:
-    active = frame.copy()
-    active = active[~active["name"].str.contains("ST|退", regex=True, na=False)]
-    active = active[
-        (active["price"] >= config.min_price)
-        & (active["amount"] >= config.min_amount)
-    ]
-
-    if config.mode == "pre":
-        active = active[(active["gap"] >= 1.5) & (active["gap"] <= 8.5)]
-        active["score"] = (
-            active["gap"].rank(pct=True) * 50
-            + active["amount"].rank(pct=True) * 50
-        )
-    elif config.mode == "after":
-        active = active[active["pct_chg"] >= 3]
-        active["score"] = (
-            active["pct_chg"].rank(pct=True) * 55
-            + active["amount"].rank(pct=True) * 35
-        )
-        if "turnover" in active.columns:
-            active["score"] += active["turnover"].rank(pct=True).fillna(0) * 10
-    else:
-        active = active[active["pct_chg"] >= 4]
-        active["score"] = (
-            active["pct_chg"].rank(pct=True) * 60
-            + active["amount"].rank(pct=True) * 40
-        )
-
-    return (
-        active.sort_values("score", ascending=False)
-        .head(int(config.limit))
-        .copy()
-    )
+    return build_candidate_pool_frame(frame, config)
 
 
 def score_candidate_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame.copy()
-    result["final_score"] = pd.to_numeric(
-        result["score"], errors="coerce"
-    ).fillna(0)
-    news_score = (
-        result["news_score"]
-        if "news_score" in result.columns
-        else pd.Series(0.0, index=result.index)
+    return _portable_score_candidate_frame(frame)
+
+
+def build_multipath_candidate_pool(
+    frame: pd.DataFrame,
+    config: CandidatePoolConfig,
+    *,
+    decision_at: str,
+    history_provider,
+    intraday_provider=None,
+    market_state: str = "NORMAL",
+    disclosure_provider=None,
+    wave3_enabled: bool = True,
+    limitdown_enabled: bool = True,
+    channel_settings: dict[str, int] | None = None,
+) -> tuple[pd.DataFrame, list[dict[str, object]]]:
+    """Build the bounded 30 + 10 + 5 candidate union.
+
+    The existing momentum pool is preserved byte-for-behaviour.  The two new
+    channels are evaluated from explicit point-in-time providers and deduped by
+    stock code with their full attribution retained.
+    """
+    settings = dict(CANDIDATE_CHANNEL_DEFAULTS)
+    settings.update(dict(channel_settings or {}))
+    momentum_config = CandidatePoolConfig(
+        config.mode,
+        config.min_price,
+        config.min_amount,
+        min(int(config.limit), int(settings["momentum_max"])),
     )
-    result["final_score"] += pd.to_numeric(
-        news_score, errors="coerce"
-    ).fillna(0) * 1.2
-    result["final_score"] += pd.to_numeric(
-        result["pct_chg"], errors="coerce"
-    ).rank(pct=True).fillna(0) * 5
-    if "turnover" in result.columns:
-        result["final_score"] += pd.to_numeric(
-            result["turnover"], errors="coerce"
-        ).rank(pct=True).fillna(0) * 2
-    return result
+    momentum = build_candidate_pool(frame, momentum_config)
+    factors, audit = build_factor_channel_rows(
+        frame,
+        decision_at,
+        history_provider,
+        intraday_provider,
+        market_state=market_state,
+        disclosure_provider=disclosure_provider,
+        wave3_enabled=wave3_enabled,
+        limitdown_enabled=limitdown_enabled,
+        settings=settings,
+    )
+    result = merge_candidate_channels(momentum, factors, settings)
+    audit_by_code: dict[str, list[dict[str, object]]] = {}
+    for item in audit:
+        audit_by_code.setdefault(str(item.get("code") or ""), []).append(item)
+    if not result.empty:
+        result["factor_screen_audit"] = result["code"].map(
+            lambda value: audit_by_code.get(
+                "".join(filter(str.isdigit, str(value or "")))[:6], []
+            )
+        )
+    return result, audit

@@ -3107,7 +3107,8 @@ class TradingStoreTest(unittest.TestCase):
             signal = SignalRecord(
                 "buy-1", "run-1", "2026-07-13", "600000", "600000.XSHG", "buy", 10,
                 "2026-07-13 09:31:00", "",
-                '{"id":"buy-1","industry":"银行","theme_label":"中特估"}',
+                '{"id":"buy-1","industry":"银行","theme_label":"中特估",'
+                '"factor_path":"wave3_v1"}',
             )
             with store.transaction() as conn:
                 store.record_strategy_run(conn, run)
@@ -3117,8 +3118,16 @@ class TradingStoreTest(unittest.TestCase):
                 }], "2026-07-13 09:32:00")
 
             self.assertEqual(store.get_active_position_classifications(), {
-                "600000": {"industry": "银行", "theme": "中特估"},
+                "600000": {
+                    "industry": "银行", "theme": "中特估",
+                    "factor_path": "wave3_v1",
+                },
             })
+            self.assertEqual(store.get_daily_factor_openings("2026-07-13"), [{
+                "position_cycle_id": store.get_active_position_cycles()["600000"]["position_cycle_id"],
+                "code": "600000",
+                "factor_path": "wave3_v1",
+            }])
 
     def test_pending_buy_exposure_is_recovered_from_signal_and_order(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -3139,7 +3148,8 @@ class TradingStoreTest(unittest.TestCase):
                 )
 
             self.assertEqual(store.get_pending_buy_classification_exposures(), [{
-                "code": "000001", "industry": "银行", "theme": "高股息", "position_pct": 8.0,
+                "code": "000001", "industry": "银行", "theme": "高股息",
+                "factor_path": "", "position_pct": 8.0,
             }])
 
     def test_online_backup_restores_schema_and_position_cycles(self) -> None:

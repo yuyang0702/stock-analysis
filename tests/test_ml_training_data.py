@@ -51,6 +51,7 @@ def _candidate(
     strategy_version: str = "strategy-v1",
     parameter_version: str = "params-v1",
     feature_schema_version: str = "features-v1",
+    source: str = "strict",
     extra_features: dict[str, object] | None = None,
 ) -> dict[str, object]:
     decision_at = decision_at or f"{trade_date}T10:00:00+08:00"
@@ -68,7 +69,7 @@ def _candidate(
     features.update(extra_features or {})
     return {
         "sample_id": sample_id,
-        "source": "strict",
+        "source": source,
         "dataset_id": "strict-year-v1",
         "trade_date": trade_date,
         "decision_at": decision_at,
@@ -108,6 +109,7 @@ def _ready_frame(
     *,
     trading_days: int = 270,
     stocks_per_day: int = 60,
+    source: str = "strict",
 ) -> TrainingFrame:
     dates = _business_dates(date(2024, 1, 2), trading_days)
     regimes = ("NORMAL", "CAUTION", "RISK_OFF")
@@ -123,6 +125,7 @@ def _ready_frame(
                 f"{stock_index:06d}",
                 feature_x=float(stock_index),
                 regime=regime,
+                source=source,
             )
             candidate["rule_order"] = stock_index
             candidates.append(candidate)
@@ -447,6 +450,16 @@ class MlTrainingDataTest(unittest.TestCase):
         for regime in ("NORMAL", "CAUTION", "RISK_OFF"):
             self.assertGreaterEqual(result.metrics["regimes"][regime]["trading_days"], 10)
             self.assertGreaterEqual(result.metrics["regimes"][regime]["stock_days"], 500)
+
+    def test_history_schema_strict_source_passes_the_same_l0_source_gate(self) -> None:
+        frame = _ready_frame(source="strict_history")
+        result = validate_training_data(
+            frame,
+            build_ml_splits(frame),
+            require_l0=True,
+        )
+        self.assertTrue(result.l0_ready)
+        self.assertNotIn("L0_CANDIDATE_SOURCE_NOT_STRICT", result.l0_reasons)
 
     def test_direct_frame_without_builder_provenance_cannot_pass_l0(self) -> None:
         verified = _ready_frame()

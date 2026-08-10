@@ -163,6 +163,33 @@ class HistoricalStorageLimitError(HistoricalDataError):
     """The independent history database reached its configured growth ceiling."""
 
 
+# One SQLite b-tree entry shares a page with many neighbouring entries.  Charging
+# a complete page per row makes large, narrow strict-history tables look tens of
+# gigabytes larger than they can be (for example 1.35M price rows were estimated
+# as 11 GB before any insert).  This ceiling still deliberately exceeds the key
+# sizes used by the history schema while avoiding that page-per-row distortion.
+_BTREE_ENTRY_RESERVE_BYTES = 256
+
+
+class _CanonicalListHasher:
+    """Incrementally hash the canonical JSON representation of one list."""
+
+    def __init__(self) -> None:
+        self.digest = hashlib.sha256()
+        self.digest.update(b"[")
+        self.count = 0
+
+    def add(self, value: object) -> None:
+        if self.count:
+            self.digest.update(b",")
+        self.digest.update(_canonical_json(value).encode("utf-8"))
+        self.count += 1
+
+    def finish(self) -> str:
+        self.digest.update(b"]")
+        return self.digest.hexdigest()
+
+
 @dataclass(frozen=True)
 class QualityIssue:
     code: str
@@ -575,6 +602,250 @@ class HistoricalStore:
             )
         return inserted
 
+    def import_candidate_cohorts_stream(
+        self,
+        rows: Iterable[Mapping[str, object]],
+        *,
+        manifest: Mapping[str, object],
+        expected_rows: int,
+        payload_bytes: int,
+    ) -> int:
+        """Import a sorted strict JSONL cohort stream in one transaction."""
+
+        if int(expected_rows) <= 0:
+            raise HistoricalDataValidationError("EMPTY_STRICT_IMPORT")
+        manifest_dataset = str(manifest.get("dataset_id") or "")
+        _validate_manifest_identity(manifest, manifest_dataset)
+        expected_versions = {
+            key: str(manifest.get(key) or "")
+            for key in (
+                "strategy_version",
+                "parameter_version",
+                "feature_schema_version",
+                "market_data_version",
+                "code_hash",
+                "generator_hash",
+            )
+        }
+        if any(not value for value in expected_versions.values()):
+            raise HistoricalDataValidationError("MANIFEST_VERSION_MISMATCH")
+        raw_cohorts = manifest.get("cohorts")
+        if not isinstance(raw_cohorts, Mapping):
+            raise HistoricalDataValidationError("MANIFEST_COHORTS_REQUIRED")
+        cohorts: dict[str, Mapping[str, object]] = {}
+        for raw_time, declaration in raw_cohorts.items():
+            decision_at = _aware_timestamp(str(raw_time), "manifest.decision_at")
+            if decision_at in cohorts or not isinstance(declaration, Mapping):
+                raise HistoricalDataValidationError("INVALID_COHORT_MANIFEST")
+            cohorts[decision_at] = declaration
+
+        inserted = 0
+        count = 0
+        previous_key: tuple[str, str] | None = None
+        current_decision = ""
+        current_codes: list[str] = []
+        current_universe_hashes: set[str] = set()
+        seen_decisions: set[str] = set()
+        table_hash = _CanonicalListHasher()
+
+        def declaration_for(decision_at: str) -> tuple[list[str], str]:
+            declaration = cohorts.get(decision_at)
+            if not isinstance(declaration, Mapping):
+                raise HistoricalDataValidationError("INCOMPLETE_COHORT")
+            codes = sorted(_code(str(code)) for code in declaration.get("codes", ()))
+            if len(codes) != len(set(codes)):
+                raise HistoricalDataValidationError("INCOMPLETE_COHORT")
+            universe_hash = str(declaration.get("universe_hash") or "")
+            if not universe_hash:
+                raise HistoricalDataValidationError("MANIFEST_UNIVERSE_HASH_MISMATCH")
+            return codes, universe_hash
+
+        def validate_current() -> None:
+            if not current_decision:
+                return
+            expected_codes, expected_universe = declaration_for(current_decision)
+            if current_codes != expected_codes:
+                raise HistoricalDataValidationError("INCOMPLETE_COHORT")
+            if current_universe_hashes != {expected_universe}:
+                raise HistoricalDataValidationError("MANIFEST_UNIVERSE_HASH_MISMATCH")
+
+        with self.transaction() as connection:
+            self._ensure_import_capacity(
+                connection,
+                max(0, int(payload_bytes)),
+                int(expected_rows),
+                btrees_per_row=3,
+            )
+            for raw in rows:
+                if str(raw.get("source") or "") != "strict_history":
+                    raise HistoricalDataValidationError("STRICT_HISTORY_SOURCE_REQUIRED")
+                sample = _candidate_sample(raw)
+                if sample.source != "strict_history":
+                    raise HistoricalDataValidationError("STRICT_HISTORY_SOURCE_REQUIRED")
+                if sample.dataset_id != manifest_dataset:
+                    raise HistoricalDataValidationError("MANIFEST_DATASET_MISMATCH")
+                if any(
+                    str(getattr(sample, key)) != expected
+                    for key, expected in expected_versions.items()
+                ):
+                    raise HistoricalDataValidationError("MANIFEST_VERSION_MISMATCH")
+                key = (sample.decision_at, sample.code)
+                if previous_key is not None and key <= previous_key:
+                    raise HistoricalDataValidationError(
+                        "STRICT_TABLE_NOT_SORTED_UNIQUE: decision_candidates"
+                    )
+                if sample.decision_at != current_decision:
+                    validate_current()
+                    current_decision = sample.decision_at
+                    current_codes = []
+                    current_universe_hashes = set()
+                    seen_decisions.add(current_decision)
+                    expected_codes, _ = declaration_for(current_decision)
+                    existing_codes = [
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT code FROM decision_candidates "
+                            "WHERE dataset_id=? AND decision_at=? ORDER BY code",
+                            (manifest_dataset, current_decision),
+                        )
+                    ]
+                    if existing_codes and existing_codes != expected_codes:
+                        raise HistoricalDataConflict(
+                            f"conflicting candidate cohort: "
+                            f"{manifest_dataset} {current_decision}"
+                        )
+                current_codes.append(sample.code)
+                current_universe_hashes.add(sample.universe_hash)
+                content_sha256 = canonical_hash(sample)
+                table_hash.add(content_sha256)
+                existing = connection.execute(
+                    "SELECT content_sha256 FROM decision_candidates "
+                    "WHERE dataset_id=? AND decision_at=? AND code=?",
+                    (manifest_dataset, sample.decision_at, sample.code),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0]) != content_sha256:
+                        raise HistoricalDataConflict(
+                            f"conflicting decision candidate: "
+                            f"{sample.decision_at} {sample.code}"
+                        )
+                else:
+                    features_json, feature_times_json, market = _candidate_values(sample)
+                    connection.execute(
+                        "INSERT INTO decision_candidates "
+                        "(dataset_id, sample_id, source, trade_date, decision_at, code, "
+                        "features_json, feature_times_json, selected, rejection_stage, "
+                        "rejection_code, final_action, strategy_version, parameter_version, "
+                        "feature_schema_version, market_regime, universe_hash, "
+                        "market_data_version, code_hash, generator_hash, content_sha256) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            manifest_dataset,
+                            sample.sample_id,
+                            sample.source,
+                            sample.trade_date,
+                            sample.decision_at,
+                            sample.code,
+                            features_json,
+                            feature_times_json,
+                            int(sample.selected),
+                            sample.rejection_stage,
+                            sample.rejection_code,
+                            sample.final_action,
+                            sample.strategy_version,
+                            sample.parameter_version,
+                            sample.feature_schema_version,
+                            market,
+                            sample.universe_hash,
+                            sample.market_data_version,
+                            sample.code_hash,
+                            sample.generator_hash,
+                            content_sha256,
+                        ),
+                    )
+                    inserted += 1
+                previous_key = key
+                count += 1
+            validate_current()
+            if count != int(expected_rows) or seen_decisions != set(cohorts):
+                raise HistoricalDataValidationError("INCOMPLETE_COHORT")
+            _validate_table_hash(
+                manifest, "decision_candidates", table_hash.finish()
+            )
+            self._record_strict_manifest(
+                connection, manifest_dataset, "decision_candidates", manifest, count
+            )
+        return inserted
+
+    def import_candidate_prices_stream(
+        self,
+        rows: Iterable[Mapping[str, object]],
+        *,
+        manifest: Mapping[str, object],
+        expected_rows: int,
+        payload_bytes: int,
+    ) -> int:
+        """Import a sorted strict price JSONL stream in one transaction."""
+
+        if int(expected_rows) <= 0:
+            raise HistoricalDataValidationError("EMPTY_STRICT_IMPORT")
+        manifest_dataset = str(manifest.get("dataset_id") or "")
+        _validate_manifest_identity(manifest, manifest_dataset)
+        adjustment_version = str(manifest.get("adjustment_version") or "")
+        if not adjustment_version:
+            raise HistoricalDataValidationError("MANIFEST_VERSION_MISMATCH")
+        inserted = 0
+        count = 0
+        previous_key: tuple[str, str] | None = None
+        table_hash = _CanonicalListHasher()
+        with self.transaction() as connection:
+            self._ensure_import_capacity(
+                connection,
+                max(0, int(payload_bytes)),
+                int(expected_rows),
+                btrees_per_row=2,
+            )
+            for raw in rows:
+                row = _candidate_price(raw)
+                if str(row["dataset_id"]) != manifest_dataset:
+                    raise HistoricalDataValidationError("MANIFEST_DATASET_MISMATCH")
+                if str(row["adjustment_version"]) != adjustment_version:
+                    raise HistoricalDataValidationError("MANIFEST_VERSION_MISMATCH")
+                key = (str(row["code"]), str(row["bar_at"]))
+                if previous_key is not None and key <= previous_key:
+                    raise HistoricalDataValidationError(
+                        "STRICT_TABLE_NOT_SORTED_UNIQUE: candidate_prices"
+                    )
+                table_hash.add(row)
+                content_sha256 = canonical_hash(row)
+                existing = connection.execute(
+                    "SELECT content_sha256 FROM candidate_prices "
+                    "WHERE dataset_id=? AND code=? AND bar_at=?",
+                    (manifest_dataset, row["code"], row["bar_at"]),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0]) != content_sha256:
+                        raise HistoricalDataConflict(
+                            f"conflicting candidate price: {row['bar_at']} {row['code']}"
+                        )
+                else:
+                    columns = tuple(row)
+                    connection.execute(
+                        f"INSERT INTO candidate_prices ({', '.join(columns)}, content_sha256) "
+                        f"VALUES ({', '.join('?' for _ in range(len(columns) + 1))})",
+                        (*[row[column] for column in columns], content_sha256),
+                    )
+                    inserted += 1
+                previous_key = key
+                count += 1
+            if count != int(expected_rows):
+                raise HistoricalDataValidationError("CANDIDATE_PRICE_ROW_COUNT_MISMATCH")
+            _validate_table_hash(manifest, "candidate_prices", table_hash.finish())
+            self._record_strict_manifest(
+                connection, manifest_dataset, "candidate_prices", manifest, count
+            )
+        return inserted
+
     def decision_times(self, dataset_id: str, start: str, end: str) -> list[str]:
         start_at = _aware_timestamp(start, "start")
         end_at = _aware_timestamp(end, "end")
@@ -665,7 +936,10 @@ class HistoricalStore:
         )
         reserve = max(
             page_size * 4,
-            page_size * (max(1, row_count) * btrees_per_row + 2),
+            max(1, row_count)
+            * max(0, btrees_per_row)
+            * _BTREE_ENTRY_RESERVE_BYTES
+            + page_size * 2,
             max(0, int(payload_bytes)) * 2 + page_size * 2,
         )
         if physical + reserve > self.max_db_bytes:

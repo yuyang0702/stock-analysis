@@ -131,6 +131,34 @@ class HoldingStopLossTest(unittest.TestCase):
         self.assertEqual(merged.iloc[0]["target_qty"], 500)
         self.assertEqual(merged.iloc[0]["exit_signal_id"], "cycle-1-take_profit_1-0")
 
+    def test_wave3_position_uses_path_specific_five_day_exit(self) -> None:
+        portfolio = {"600000": {
+            "code": "600000", "name": "PF Bank", "qty": 500,
+            "status": "holding", "cost_price": 10.0,
+            "current_price": 10.2, "stop_price": 9.0,
+        }}
+        cycles = {"600000": {
+            "position_cycle_id": "wave-cycle", "mode": "mid",
+            "initial_qty": 500, "current_qty": 500, "entry_price": 10.0,
+            "initial_stop_price": 9.0, "highest_price": 10.6, "atr14": 0.3,
+            "take_profit_stage": 0, "opened_at": "2026-08-03 09:35:00",
+        }}
+
+        merged = a_share_strategy.merge_holding_stop_loss_rows(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            portfolio,
+            cycles=cycles,
+            position_factor_paths={"600000": "wave3_v1"},
+            market_state="NORMAL",
+            current_day=date(2026, 8, 7),
+        )
+
+        self.assertEqual(merged.iloc[0]["signal_action"], "time_stop")
+        self.assertEqual(merged.iloc[0]["target_qty"], 0)
+        self.assertEqual(merged.iloc[0]["factor_path"], "wave3_v1")
+        self.assertIn("5日", merged.iloc[0]["signal_note"])
+
     def test_two_r_uses_ceiling_half_targets_for_odd_lot_counts(self) -> None:
         for initial_qty, target_qty in ((300, 200), (500, 300)):
             with self.subTest(initial_qty=initial_qty):

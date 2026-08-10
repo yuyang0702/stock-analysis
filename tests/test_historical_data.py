@@ -472,6 +472,23 @@ class HistoricalDataTest(unittest.TestCase):
 
             self.assertEqual(store.dataset_counts("strict-1")["decision_candidates"], 0)
 
+    def test_strict_import_preflight_does_not_charge_one_page_per_index_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "history.db"
+            store = HistoricalStore(path, max_db_bytes=3_000_000_000)
+            store.initialize()
+
+            # The production June package contains this many candidate-price
+            # rows.  A page-per-index-entry estimate incorrectly reserves about
+            # 11 GB; payload and bounded b-tree-entry reserves stay below 3 GB.
+            with store.transaction() as connection:
+                store._ensure_import_capacity(
+                    connection,
+                    payload_bytes=443_383_585,
+                    row_count=1_351_104,
+                    btrees_per_row=2,
+                )
+
     def test_conflicting_replay_rolls_back_the_entire_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

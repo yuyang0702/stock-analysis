@@ -1,0 +1,12 @@
+flowchart LR
+  export["① 聚宽<br/>运行正式导出单元格"] --> download["② 浏览器<br/>下载生成的 ZIP"]
+  download --> drag["③ Windows<br/>把 ZIP 拖到<br/>一键上传严格历史数据.cmd"]
+  drag --> automatic["脚本自动完成<br/>校验 → 上传 → 备份 → 导入"]
+  automatic --> success(["看到绿色的<br/>导入成功"])
+
+  classDef userStep fill:#EAF2FF,stroke:#2563EB,color:#102A56,stroke-width:2px;
+  classDef automaticStep fill:#FFF7E8,stroke:#D97706,color:#5A3200,stroke-width:2px;
+  classDef done fill:#EAF8EF,stroke:#16803A,color:#0C4A24,stroke-width:2px;
+  class export,download,drag userStep;
+  class automatic automaticStep;
+  class success done;

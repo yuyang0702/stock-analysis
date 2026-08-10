@@ -18,7 +18,12 @@ import akshare as ak
 import pandas as pd
 
 import config as app_config
-from candidate_core import CandidatePoolConfig, build_candidate_pool, score_candidate_frame
+from candidate_core import (
+    CandidatePoolConfig,
+    build_candidate_pool,
+    build_multipath_candidate_pool,
+    score_candidate_frame,
+)
 from exit_policy import (
     EXECUTION_PLAN_VERSION,
     PositionExitState,
@@ -38,6 +43,7 @@ from paper_trading import (
     save_account,
 )
 from risk_engine import RiskDecision, build_risk_decision, build_signal_lifecycle, classify_trade_mode
+from strategy_exit_runtime import evaluate_factor_exit
 from strategy_profile import build_strategy_profile
 from notifier import WeComNotifier
 from notification_outbox import NotificationEvent, notification_event_key
@@ -346,6 +352,7 @@ def merge_holding_stop_loss_rows(
     spot: pd.DataFrame,
     portfolio: dict[str, dict[str, Any]],
     cycles: dict[str, dict[str, Any]] | None = None,
+    position_factor_paths: dict[str, str] | None = None,
     exit_intents: dict[str, dict[str, Any]] | None = None,
     market_state: str = "NORMAL",
     current_day: date | None = None,
@@ -354,6 +361,7 @@ def merge_holding_stop_loss_rows(
 ) -> pd.DataFrame:
     """把全持仓退出动作合并到 JoinQuant 导出源。"""
     cycles = cycles or {}
+    position_factor_paths = position_factor_paths or {}
     exit_intents = exit_intents or {}
     current_day = current_day or datetime.now().date()
     decision_batch_at = decision_batch_at or datetime.now(
@@ -388,6 +396,13 @@ def merge_holding_stop_loss_rows(
         if status not in {"holding", "partial_sell"} or qty <= 0 or price <= 0:
             continue
         cycle = cycles.get(code)
+        factor_path = safe_text(
+            position_factor_paths.get(code)
+            or item.get("factor_path")
+            or item.get("entry_path")
+        )
+        if factor_path not in {"wave3_v1", "limitdown_exhaustion_v1"}:
+            factor_path = ""
         action = ""
         target_qty = 0
         exit_signal_id = ""
@@ -421,26 +436,87 @@ def merge_holding_stop_loss_rows(
                     if (opened_day + timedelta(days=offset)).weekday() < 5
                     and (opened_day + timedelta(days=offset)).isoformat() not in app_config.A_SHARE_HOLIDAYS_DEFAULT
                 )
-                decision = evaluate_exit(PositionExitState(
-                    code=code, mode=safe_text(cycle.get("mode")) or "mid",
-                    initial_qty=int(_float_value(cycle.get("initial_qty"))), current_qty=int(qty),
-                    entry_price=_float_value(cycle.get("entry_price")),
-                    initial_stop_price=_float_value(cycle.get("initial_stop_price"), stop_price),
-                    highest_price=max(_float_value(cycle.get("highest_price")), price),
-                    atr14=_float_value(cycle.get("atr14")),
-                    take_profit_stage=int(_float_value(cycle.get("take_profit_stage"))),
-                    holding_trade_days=holding_trade_days,
-                    manual_stop_price=_float_value(cycle.get("manual_stop_price")),
-                    profit_protection_activated_at=safe_text(
-                        cycle.get("profit_protection_activated_at")
-                    ),
-                    trailing_stop_active_from=safe_text(
-                        cycle.get("trailing_stop_active_from")
-                    ),
-                    decision_batch_at=decision_batch_at,
-                ), price, market_state)
-                if decision.action == "activate_profit_protection":
-                    if store is not None:
+                if factor_path:
+                    factor_decision = evaluate_factor_exit(
+                        factor_path,
+                        _float_value(cycle.get("entry_price")),
+                        _float_value(cycle.get("initial_stop_price"), stop_price),
+                        price,
+                        max(_float_value(cycle.get("highest_price")), price),
+                        _float_value(cycle.get("atr14")),
+                        holding_trade_days,
+                        market_state,
+                    )
+                    if factor_decision and factor_decision.get("action") == "exit_all":
+                        reason = safe_text(factor_decision.get("reason"))
+                        lowered = reason.lower()
+                        if "风险" in reason or "risk" in lowered:
+                            action = "market_risk_exit"
+                        elif "止损" in reason or "无效" in reason:
+                            action = "hard_stop"
+                        elif "交易日" in reason or "5日" in reason:
+                            action = "time_stop"
+                        else:
+                            action = "take_profit_1"
+                        target_qty = 0
+                        effective_stop = _float_value(
+                            cycle.get("initial_stop_price"), stop_price
+                        )
+                        note = reason
+                        exit_signal_id = (
+                            f"{cycle.get('position_cycle_id')}-factor-"
+                            f"{factor_path}-{holding_trade_days}"
+                        )
+                    elif factor_decision and factor_decision.get("action") == "raise_stop":
+                        raised_stop = _float_value(
+                            factor_decision.get("new_stop_price")
+                        )
+                        effective_stop = max(effective_stop, raised_stop)
+                        existing_manual = _float_value(cycle.get("manual_stop_price"))
+                        if (
+                            store is not None
+                            and raised_stop
+                            > max(
+                                existing_manual,
+                                _float_value(cycle.get("initial_stop_price")),
+                            ) + 0.005
+                        ):
+                            try:
+                                with store.transaction() as conn:
+                                    store.set_manual_stop(
+                                        conn,
+                                        code,
+                                        raised_stop,
+                                        safe_text(factor_decision.get("reason")),
+                                        operator="system:multipath-factor-exit",
+                                        now=decision_batch_at,
+                                    )
+                            except (OSError, sqlite3.Error, ValueError) as exc:
+                                print(
+                                    f"FACTOR_STOP update skipped code={code} "
+                                    f"error={exc}",
+                                    flush=True,
+                                )
+                else:
+                    decision = evaluate_exit(PositionExitState(
+                        code=code, mode=safe_text(cycle.get("mode")) or "mid",
+                        initial_qty=int(_float_value(cycle.get("initial_qty"))), current_qty=int(qty),
+                        entry_price=_float_value(cycle.get("entry_price")),
+                        initial_stop_price=_float_value(cycle.get("initial_stop_price"), stop_price),
+                        highest_price=max(_float_value(cycle.get("highest_price")), price),
+                        atr14=_float_value(cycle.get("atr14")),
+                        take_profit_stage=int(_float_value(cycle.get("take_profit_stage"))),
+                        holding_trade_days=holding_trade_days,
+                        manual_stop_price=_float_value(cycle.get("manual_stop_price")),
+                        profit_protection_activated_at=safe_text(
+                            cycle.get("profit_protection_activated_at")
+                        ),
+                        trailing_stop_active_from=safe_text(
+                            cycle.get("trailing_stop_active_from")
+                        ),
+                        decision_batch_at=decision_batch_at,
+                    ), price, market_state)
+                    if decision.action == "activate_profit_protection" and store is not None:
                         try:
                             with store.transaction() as conn:
                                 store.activate_profit_protection(
@@ -459,12 +535,12 @@ def merge_holding_stop_loss_rows(
                                 f"code={code} error={exc}",
                                 flush=True,
                             )
-                if decision.action not in {"hold", "activate_profit_protection"}:
-                    action = decision.action
-                    target_qty = int(decision.target_qty or 0)
-                    effective_stop = decision.effective_stop_price
-                    note = decision.reason
-                    exit_signal_id = f"{cycle.get('position_cycle_id')}-{decision.action}-{cycle.get('take_profit_stage', 0)}"
+                    if decision.action not in {"hold", "activate_profit_protection"}:
+                        action = decision.action
+                        target_qty = int(decision.target_qty or 0)
+                        effective_stop = decision.effective_stop_price
+                        note = decision.reason
+                        exit_signal_id = f"{cycle.get('position_cycle_id')}-{decision.action}-{cycle.get('take_profit_stage', 0)}"
         elif stop_price > 0 and price <= stop_price:
             action = "stop_loss"
             note = f"现价{price:.2f}已触及持仓止损价{stop_price:.2f}"
@@ -490,6 +566,8 @@ def merge_holding_stop_loss_rows(
                 "position_cycle_id": (
                     safe_text(cycle.get("position_cycle_id")) if cycle else ""
                 ),
+                "factor_path": factor_path,
+                "entry_path": factor_path,
                 "target_qty": target_qty,
                 "has_holding": True,
                 "hold_status": status,
@@ -1752,6 +1830,79 @@ def fetch_daily_history(code: str, cache: DiskCache | None = None, lookback_days
         return pd.DataFrame()
 
 
+def fetch_intraday_history(
+    code: str,
+    cache: DiskCache | None = None,
+    *,
+    previous_close: float = 0.0,
+    limit: int = 60,
+) -> pd.DataFrame:
+    """Fetch completed 5-minute bars for factor confirmation only.
+
+    The cache TTL is shorter than one decision interval and the current,
+    potentially unfinished minute is removed.  Any provider error returns an
+    empty frame, so a factor remains pending instead of weakening its trigger.
+    """
+    clean = clean_code(code)
+    now = datetime.now(SHANGHAI_TZ)
+    cache_key = f"factor_5m:{clean}:{now.strftime('%Y%m%d-%H%M')}"
+    if cache:
+        cached = cache.get_df(cache_key, ttl_sec=90)
+        if cached is not None:
+            return cached.copy()
+    try:
+        start = datetime.combine(now.date(), datetime_time(9, 30)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        end = now.strftime("%Y-%m-%d %H:%M:%S")
+        frame = ak.stock_zh_a_hist_min_em(
+            symbol=clean,
+            start_date=start,
+            end_date=end,
+            period="5",
+            adjust="qfq",
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        mapping = {
+            "time": ["时间", "日期", "datetime", "date", "time"],
+            "open": ["开盘", "open"],
+            "high": ["最高", "high"],
+            "low": ["最低", "low"],
+            "close": ["收盘", "close"],
+            "volume": ["成交量", "volume"],
+            "money": ["成交额", "amount", "money"],
+        }
+        renamed: dict[str, str] = {}
+        for target, candidates in mapping.items():
+            source = pick_col(frame, candidates)
+            if source:
+                renamed[source] = target
+        result = frame.rename(columns=renamed).copy()
+        required = {"time", "open", "high", "low", "close", "volume", "money"}
+        if required.difference(result.columns):
+            return pd.DataFrame()
+        result["time"] = pd.to_datetime(result["time"], errors="coerce")
+        result = result.dropna(subset=["time"]).copy()
+        decision_floor = now.replace(
+            minute=now.minute // 5 * 5, second=0, microsecond=0, tzinfo=None
+        )
+        result = result[result["time"] < decision_floor]
+        result = to_numeric(
+            result, ["open", "high", "low", "close", "volume", "money"]
+        ).dropna(subset=["open", "high", "low", "close"])
+        result["available_at"] = result["time"].map(
+            lambda value: value.replace(tzinfo=SHANGHAI_TZ).isoformat()
+        )
+        result["prev_close"] = float(previous_close or 0.0)
+        result = result.tail(max(4, int(limit))).reset_index(drop=True)
+        if cache:
+            cache.set_df(cache_key, result)
+        return result
+    except Exception:
+        return pd.DataFrame()
+
+
 POSITIVE_KEYWORDS = {
     "政策": ["政策", "支持", "印发", "发布", "试点", "规划", "批复", "落地", "启动", "推进"],
     "业绩": ["预增", "扭亏", "增长", "超预期", "盈利", "利润", "业绩"],
@@ -2034,17 +2185,62 @@ def lhb_status(code: str, cache: DiskCache | None = None) -> tuple[str, str]:
         return result
 
 
-def build_pool(df: pd.DataFrame, cfg: Config, limit: int | None = None) -> pd.DataFrame:
+def build_pool(
+    df: pd.DataFrame,
+    cfg: Config,
+    limit: int | None = None,
+    *,
+    cache: DiskCache | None = None,
+    market_state: str = "NORMAL",
+    multipath: bool = False,
+) -> pd.DataFrame:
     resolved_limit = cfg.top if limit is None else max(1, int(limit))
-    return build_candidate_pool(
-        df,
-        CandidatePoolConfig(
-            cfg.mode,
-            cfg.min_price,
-            cfg.min_amount,
-            resolved_limit,
-        ),
+    pool_config = CandidatePoolConfig(
+        cfg.mode,
+        cfg.min_price,
+        cfg.min_amount,
+        resolved_limit,
     )
+    if not (
+        multipath
+        and cache is not None
+        and app_config.MULTIPATH_ENABLE_DEFAULT
+        and cfg.mode in {"intraday", "after"}
+    ):
+        return build_candidate_pool(df, pool_config)
+    spot_by_code = {
+        clean_code(row.get("code")): row for _, row in df.iterrows()
+    }
+
+    def history_provider(code: str) -> pd.DataFrame:
+        return fetch_daily_history(code, cache=cache, lookback_days=260)
+
+    def intraday_provider(code: str) -> pd.DataFrame:
+        market = spot_by_code.get(clean_code(code))
+        previous = float(market.get("prev_close") or 0.0) if market is not None else 0.0
+        return fetch_intraday_history(
+            code, cache=cache, previous_close=previous, limit=60
+        )
+
+    result, audit = build_multipath_candidate_pool(
+        df,
+        pool_config,
+        decision_at=datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+        history_provider=history_provider,
+        intraday_provider=intraday_provider,
+        market_state=market_regime(market_state),
+        wave3_enabled=app_config.WAVE3_ENABLE_DEFAULT,
+        limitdown_enabled=app_config.LIMITDOWN_EXHAUSTION_ENABLE_DEFAULT,
+        channel_settings={
+            "momentum_max": app_config.MULTIPATH_MOMENTUM_MAX,
+            "wave3_max": app_config.MULTIPATH_WAVE3_MAX,
+            "limitdown_max": app_config.MULTIPATH_LIMITDOWN_MAX,
+            "total_max": app_config.MULTIPATH_TOTAL_MAX,
+            "factor_screen_max": app_config.MULTIPATH_FACTOR_SCREEN_MAX,
+        },
+    )
+    result.attrs["factor_audit"] = audit
+    return result
 
 
 def get_ai_client() -> tuple[OpenAI | None, str | None]:
@@ -3401,6 +3597,43 @@ def build_risk_bundle(row: pd.Series, market_info: dict[str, Any], market_news_s
         position_cap_pct=decision.position_pct,
         market_state=safe_text(row.get("market_state") or market_info.get("state")),
     )
+    factor_path = safe_text(row.get("factor_path"))
+    factor_triggered = bool(row.get("factor_triggered"))
+    if factor_path in {"wave3_v1", "limitdown_exhaustion_v1"}:
+        factor_entry = _float_value(row.get("entry_price"))
+        factor_stop = _float_value(row.get("stop_loss"))
+        factor_take = _float_value(row.get("take_profit"))
+        factor_cap = _float_value(row.get("factor_position_cap_pct"))
+        factor_risk_budget = _float_value(row.get("factor_risk_budget_pct"))
+        risk_per_share = max(factor_entry - factor_stop, 0.0)
+        stop_distance_pct = (
+            risk_per_share / factor_entry * 100.0 if factor_entry > 0 else 0.0
+        )
+        factor_position = (
+            min(factor_cap, factor_risk_budget / stop_distance_pct * 100.0)
+            if stop_distance_pct > 0 else 0.0
+        )
+        factor_valid = (
+            factor_triggered
+            and 0 < factor_stop < factor_entry < factor_take
+            and factor_position > 0
+        )
+        plan = replace(
+            plan,
+            entry_price=round(factor_entry, 2) if factor_valid else 0.0,
+            stop_loss=round(factor_stop, 2) if factor_valid else 0.0,
+            take_profit=round(factor_take, 2) if factor_valid else 0.0,
+            risk_per_share=round(risk_per_share, 2) if factor_valid else 0.0,
+            risk_reward=(
+                round((factor_take - factor_entry) / risk_per_share, 2)
+                if factor_valid and risk_per_share > 0 else 0.0
+            ),
+            position_pct=round(factor_position, 2) if factor_valid else 0.0,
+        )
+        decision = replace(
+            decision,
+            mode="mid" if factor_path == "wave3_v1" else "short",
+        )
     if not safe_text(row.get("industry")) and not safe_text(row.get("theme_label")):
         plan = replace(
             plan,
@@ -3410,8 +3643,12 @@ def build_risk_bundle(row: pd.Series, market_info: dict[str, Any], market_news_s
             ),
         )
     execution_allowed = bool(decision.allowed and plan.position_pct > 0)
+    if factor_path in {"wave3_v1", "limitdown_exhaustion_v1"}:
+        execution_allowed = execution_allowed and factor_triggered
     execution_reject_reason = "" if execution_allowed else (
-        decision.reason or "最终执行计划无有效仓位"
+        safe_text(row.get("factor_rejection_code"))
+        or decision.reason
+        or "最终执行计划无有效仓位"
     )
     buy_state, buy_reason = format_buy_state_text(decision, bool(row.get("has_holding")), row)
     return pd.Series(
@@ -3684,12 +3921,16 @@ def run_joinquant_export(
         cycles = store.get_active_position_cycles()
         position_classifications = store.get_active_position_classifications()
         pending_classification_exposures = store.get_pending_buy_classification_exposures()
+        daily_factor_openings = store.get_daily_factor_openings(
+            datetime.now().strftime("%Y-%m-%d")
+        )
         cooldown_codes = store.active_cooldown_codes(datetime.now().strftime("%Y-%m-%d")) if app_config.JOINQUANT_EXIT_COOLDOWN_ENABLE_DEFAULT else set()
         new_positions_today, orders_today = store.daily_activity(datetime.now().strftime("%Y-%m-%d"))
     except (OSError, sqlite3.Error):
         cycles = {}
         position_classifications = {}
         pending_classification_exposures = []
+        daily_factor_openings = []
         cooldown_codes = set()
         new_positions_today, orders_today = 0, 0
     account_metrics = load_portfolio_account_metrics()
@@ -3731,6 +3972,43 @@ def run_joinquant_export(
             theme_exposure_pct[theme] = theme_exposure_pct.get(theme, 0) + exposure
         if not sector and not theme:
             sector_exposure_pct["__UNCATEGORIZED__"] = sector_exposure_pct.get("__UNCATEGORIZED__", 0) + exposure
+    factor_position_counts: dict[str, int] = {}
+    factor_new_positions_today: dict[str, int] = {}
+    current_factor_codes: set[str] = set()
+    for code, item in positions.items():
+        path_name = safe_text(
+            item.get("factor_path")
+            or item.get("entry_path")
+            or position_classifications.get(code, {}).get("factor_path")
+        )
+        if path_name in {"wave3_v1", "limitdown_exhaustion_v1"}:
+            factor_position_counts[path_name] = factor_position_counts.get(path_name, 0) + 1
+            current_factor_codes.add(code)
+    for item in pending_classification_exposures:
+        pending_code = clean_code(item.get("code"))
+        path_name = safe_text(item.get("factor_path"))
+        if (
+            path_name in {"wave3_v1", "limitdown_exhaustion_v1"}
+            and pending_code not in current_factor_codes
+        ):
+            factor_position_counts[path_name] = factor_position_counts.get(path_name, 0) + 1
+            current_factor_codes.add(pending_code)
+    opened_factor_codes: set[str] = set()
+    for item in daily_factor_openings:
+        path_name = safe_text(item.get("factor_path"))
+        opened_code = clean_code(item.get("code"))
+        if path_name in {"wave3_v1", "limitdown_exhaustion_v1"}:
+            factor_new_positions_today[path_name] = factor_new_positions_today.get(path_name, 0) + 1
+            opened_factor_codes.add(opened_code)
+    for item in pending_classification_exposures:
+        path_name = safe_text(item.get("factor_path"))
+        pending_code = clean_code(item.get("code"))
+        if (
+            path_name in {"wave3_v1", "limitdown_exhaustion_v1"}
+            and pending_code not in opened_factor_codes
+        ):
+            factor_new_positions_today[path_name] = factor_new_positions_today.get(path_name, 0) + 1
+            opened_factor_codes.add(pending_code)
     path = export_signals(
         result,
         run_id=run_id,
@@ -3745,6 +4023,8 @@ def run_joinquant_export(
         current_open_risk_pct=current_open_risk_pct,
         sector_exposure_pct=sector_exposure_pct,
         theme_exposure_pct=theme_exposure_pct,
+        factor_position_counts=factor_position_counts,
+        factor_new_positions_today=factor_new_positions_today,
         cooldown_codes=cooldown_codes,
         available_cash=available_cash,
         new_positions_today=new_positions_today,
@@ -3785,7 +4065,13 @@ def run_once(
     if refreshed:
         print(f"已对一周以上未识别题材的票补充映射 {refreshed} 条。", flush=True)
     print("构建候选池...", flush=True)
-    pool = build_pool(spot, cfg)
+    pool = build_pool(
+        spot,
+        cfg,
+        cache=cache,
+        market_state=market_info["state"],
+        multipath=cfg.mode != "intraday",
+    )
     if pool.empty:
         print("没有筛到符合条件的股票，可以降低 --min-amount 或切换 --mode。", flush=True)
         return None
@@ -3793,7 +4079,14 @@ def run_once(
     watch_pool = pool
     if cfg.mode == "intraday":
         watch_limit = max(cfg.top * cfg.intraday_watch_multiplier, cfg.top + 12)
-        watch_pool = build_pool(spot, cfg, limit=watch_limit)
+        watch_pool = build_pool(
+            spot,
+            cfg,
+            limit=watch_limit,
+            cache=cache,
+            market_state=market_info["state"],
+            multipath=True,
+        )
 
     print("抓取市场新闻...", flush=True)
     market_news = pd.DataFrame()
@@ -4009,6 +4302,7 @@ def run_once(
     if cfg.joinquant:
         export_source = watch_result if cfg.mode == "intraday" and not watch_result.empty else result
         position_cycles: dict[str, dict[str, Any]] = {}
+        position_factor_paths: dict[str, str] = {}
         open_exit_intents: dict[str, dict[str, Any]] = {}
         confirmed_regime = market_regime(str(market_info.get("state") or ""))
         trading_store: TradingStore | None = None
@@ -4019,6 +4313,11 @@ def run_once(
             trading_store = TradingStore(app_config.TRADING_DB_FILE)
             trading_store.initialize()
             position_cycles = trading_store.get_active_position_cycles() if app_config.JOINQUANT_LAYERED_EXIT_ENABLE_DEFAULT else {}
+            position_factor_paths = {
+                code: safe_text(item.get("factor_path"))
+                for code, item in trading_store.get_active_position_classifications().items()
+                if safe_text(item.get("factor_path"))
+            }
             open_exit_intents = trading_store.get_open_exit_intents()
             confirmed_regime = trading_store.confirm_market_regime(
                 confirmed_regime,
@@ -4031,6 +4330,7 @@ def run_once(
             spot,
             portfolio_positions,
             cycles=position_cycles,
+            position_factor_paths=position_factor_paths,
             exit_intents=open_exit_intents,
             market_state=confirmed_regime,
             current_day=date.today(),

@@ -599,7 +599,9 @@ def validate_training_data(
     if trading_days < 240:
         l0_reasons.append("L0_TRADING_DAYS_LT_240")
     source_values = _column_values(rows, "source")
-    if source_values != {"strict"}:
+    if len(source_values) != 1 or not source_values.issubset(
+        {"strict", "strict_history"}
+    ):
         l0_reasons.append("L0_CANDIDATE_SOURCE_NOT_STRICT")
     label_source_values = _column_values(rows, "label_source")
     if len(label_source_values) != 1 or not label_source_values.issubset(

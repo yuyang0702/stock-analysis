@@ -5766,7 +5766,14 @@ class TradingStore:
             raw = {}
         industry = str(raw.get("industry") or raw.get("sector") or "").strip()
         theme = str(raw.get("theme") or raw.get("theme_label") or raw.get("concept") or industry).strip()
-        return {"industry": industry, "theme": theme}
+        factor_path = str(raw.get("factor_path") or raw.get("entry_path") or "").strip()
+        if factor_path not in {"wave3_v1", "limitdown_exhaustion_v1"}:
+            factor_path = ""
+        return {
+            "industry": industry,
+            "theme": theme,
+            "factor_path": factor_path,
+        }
 
     def get_active_position_classifications(self) -> dict[str, dict[str, str]]:
         with self.connect() as conn:
@@ -5803,6 +5810,31 @@ class TradingStore:
                 **self._signal_classification(row["raw_json"] or "{}"),
                 "position_pct": float(raw.get("position_pct") or 0),
             })
+        return result
+
+    def get_daily_factor_openings(self, trade_date: str) -> list[dict[str, str]]:
+        """Return bounded, indexed factor-path openings for one trade date."""
+        day = datetime.strptime(str(trade_date), "%Y-%m-%d").date()
+        next_day = day + timedelta(days=1)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT p.position_cycle_id, p.stock_code, s.raw_json
+                   FROM position_cycles p
+                   LEFT JOIN signals s ON s.signal_id=p.entry_signal_id
+                   WHERE p.opened_at>=? AND p.opened_at<?
+                   ORDER BY p.opened_at, p.position_cycle_id""",
+                (day.isoformat(), next_day.isoformat()),
+            ).fetchall()
+        result: list[dict[str, str]] = []
+        for row in rows:
+            classification = self._signal_classification(row["raw_json"] or "{}")
+            path = classification["factor_path"]
+            if path:
+                result.append({
+                    "position_cycle_id": str(row["position_cycle_id"]),
+                    "code": str(row["stock_code"]),
+                    "factor_path": path,
+                })
         return result
 
     def backup_to(self, destination: Path) -> None:

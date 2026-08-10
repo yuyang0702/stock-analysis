@@ -1,5 +1,7 @@
 # 项目接管与新环境恢复说明
 
+> 2026-08-10 本地接管检查点：当前工作区包含尚未提交的 P1/聚宽导出链路及 B0-B7 多路径因子改动，接手者不得覆盖或回退。修改或排查聚宽快照、原生回测、strict 导出、上传导入或便携因子前，必须先读 `docs/joinquant_exporter_development_manual.md`。Windows 全量发现共 1060 项，其中 1057 项通过；另 3 项仅因本机缺少 Linux `bash`，无法启动 `run_ubuntu.sh ledger-check`。当前新增内容为 `implemented / regression-tested / not committed / not pushed / not deployed / not observed / not validated`；本轮未连接或重启服务器，也未修改任何密钥、Token、Webhook、环境文件、账户或正式数据库。服务器和聚宽网站状态不可从本地工作区推断，接手后必须重新只读核验。
+
 > 2026-08-06 最新接管检查点：Batch A Tasks 1–8、Batch B Tasks 1–7 与 Batch C ML-7 Tasks 4–10 已合并并推送到 `origin/main`，服务器已部署 `5d2c4a2018ca95b9febd6751b4964fec507fe1bc`，正式库 schema 12。服务器 Linux 全量测试 1003/1003、`ledger-check` 健康/可写、迁移后在线备份完整性、环境文件哈希不变、三个核心服务 active、通知 timer active 且路由到 `notification_worker.py --once` 均已核验；outbox 部署后 sent=3、pending/dead/gap=0。Task 11 已完成。Task 12 只完成代码/依赖部署，ML 仍为 `enabled=0 / max_level=0 / dataset_configured=no`，标签、训练和 ML/history 备份 timer 未启用，未形成真实一年 strict 数据、可信/可批准模型、人工审批、活动模型或服务器 L0 证据。当前严格状态为 `implemented / committed / deployed / not observed / not validated`；JoinQuant 网站模板、Token、Webhook、私钥和 `stock-analysis.env` 内容均未在本次任务中修改。
 
 > 2026-07-26 运行证据完整性修复部署检查点：本地、`origin/main` 和服务器均已快进到
@@ -68,6 +70,10 @@ warning 及以上日志均已核验。当前为
 
 > 2026-07-16 ML-7 基础增量（历史）：实施计划 Task 1–3 已实现并推送，包括共享候选评分/严格样本契约、独立有界 `cache/ml/ml.db` schema v1、以及完整五分钟实时候选采集与发布来源审计；Windows 可运行回归 402 项和 Linux 静态测试 2 项通过，最终独立审查无 Critical/Important/Minor。该历史状态已被 2026-08-06 部署检查点取代：Tasks 4–10 已提交并部署为关闭状态代码，Task 11 已完成；Task 12 仅完成代码/依赖部署，L0 与交易日观察仍需单独授权。当前尚未形成可信/可批准或活动模型。
 
+> 2026-08-09 P1 最终代码检查点：桌面“**一键生成聚宽策略快照**”会经 SSH 冻结服务器当前实际加载的非敏感参数和便携决策运行时，校验外层/成员 SHA-256 后一次输出 `output/聚宽原生回测策略.py`、`output/聚宽严格历史导出.py`、兼容运行时与完整证据包。逐 5 分钟时点内核 `2026-08-09.11` 已实现候选、拒绝原因、组合回放、T+1、次时点成交和 D+10 价格路径；所有输入均受 `available_at <= decision_at` 约束。第一次真实整月 strict 运行在旧导出器触发 `INVALID_NUMBER: prev_close`；导出器 `2026-08-09.9` 已改为优先取聚宽 `pre_close`，只用真实更早收盘价兜底，缺少核心证据时审计并排除该股票日，不使用当日或未来价格补值。服务器基线仍为 `90f3495`，修复后 Linux 全量测试 1035/1035，Windows 可运行测试 1037 项通过，仅 3 项 Linux `bash` 边界测试因 Windows 缺少命令产生预期错误；主服务于 19:12:10 CST 受控重启后 active，信号服务 active，错误日志为空，私有环境文件哈希保持 `5286a61bcdb7f632af3719fe17e629d53a088a954d1d4696e51ade247bfc5be1`。最终权威快照 ID 为 `ca19580c155150df28e0b448cb6e3243c871be8a8bea2a4f5978bcc23ded6dd2`，包 SHA-256 为 `2efff24f1007b3201da4a9fc8e1728755457e0873c757b75dd23432c2531d97c`。代码仍未提交或推送；服务器正式 `cache/backtest/history.db` 不存在，修复后的首个真实整月包、数据库导入及整月/6个月/1年回测尚未完成。具体状态以主文档最新检查点为准。
+>
+> 修改或诊断聚宽快照、原生回测、strict 导出、便携因子及上传导入链路前，必须阅读 `docs/joinquant_exporter_development_manual.md`。该文档集中保存 Python 3.6 兼容、反前视、`prev_close`、版本联动、敏感信息隔离和回归测试经验，避免新对话依赖旧聊天记录。
+>
 > 本文件用于新电脑、新Codex对话和跨环境交接，是一个可提交到Git的时间点快照。`docs/project_roadmap.md`仍是唯一主文档；如两者冲突，以主文档为准。服务器、JoinQuant和运行数据状态必须重新验证，不能仅凭本文件认定为当前事实。
 
 ## 1. 接管目标

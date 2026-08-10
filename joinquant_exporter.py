@@ -50,6 +50,16 @@ from ml_runtime import observe_candidate_samples, runtime_dependency_versions
 from ml_store import MlCapacityError, MlDataConflict, MlStore
 from trading_store import SignalConflictError, SignalRecord, StrategyRunRecord, TradingStore, canonical_json
 from trade_safety import tradability_reject_reason
+from strategy_snapshot_runtime import (
+    REJECTION_STAGES as PORTABLE_REJECTION_STAGES,
+    build_ml_parameter_snapshot,
+    rejection_stage as portable_rejection_stage,
+)
+from strategy_economics import size_strategy_order
+from strategy_attribution import (
+    aggregate_strategy_attribution,
+    build_strategy_attribution,
+)
 from gap_reentry import (
     GapReentryDecision, GapReentryInput, estimated_limit_up_price, evaluate_gap_reentry,
     minimum_lot_position,
@@ -71,42 +81,19 @@ IMPLEMENTATION_HASH_FILES = (
     "trading_store.py",
     "gap_reentry.py",
     "config.py",
+    "strategy_snapshot_runtime.py",
+    "factor_contracts.py",
+    "factor_registry.py",
+    "factor_wave3.py",
+    "factor_limitdown.py",
+    "candidate_channels.py",
+    "strategy_economics.py",
+    "strategy_exit_runtime.py",
+    "strategy_attribution.py",
+    "factor_research.py",
 )
 
-_REJECTION_STAGES = {
-    "score": {"buy_low_score"},
-    "tradability": {
-        "buy_suspended", "buy_st", "buy_delisting", "buy_special_listing_stage",
-        "buy_quote_stale", "buy_chasing", "buy_illiquid", "buy_invalid_price",
-        "buy_near_limit_up",
-        "gap_reentry_locked_limit", "gap_reentry_open_observing",
-        "gap_reentry_resealed", "gap_reentry_too_far", "gap_reentry_falling",
-        "gap_reentry_attempts_exhausted", "gap_reentry_too_late",
-        "gap_reentry_parent_invalid", "gap_reentry_current_score_low",
-        "gap_reentry_quote_stale",
-    },
-    "risk": {
-        "buy_disabled", "buy_max_positions", "buy_daily_new_positions_limit",
-        "buy_daily_orders_limit", "buy_daily_turnover_limit", "buy_daily_loss_limit",
-        "buy_account_drawdown_limit", "buy_consecutive_loss_limit", "buy_cooldown",
-        "buy_risk_disallowed", "buy_bad_position", "buy_open_risk_limit",
-        "buy_sector_limit", "buy_theme_limit", "buy_uncategorized_limit",
-        "buy_insufficient_available_cash", "buy_total_position_limit",
-        "buy_too_small_for_board_lot", "buy_single_position_limit",
-        "gap_reentry_min_lot_risk_exceeded", "gap_reentry_insufficient_cash",
-        "gap_reentry_per_trade_risk_exceeded",
-        "gap_reentry_portfolio_open_risk_exceeded",
-        "gap_reentry_per_trade_and_portfolio_risk_exceeded",
-        "gap_reentry_fee_schedule_required",
-        "gap_reentry_pending_order", "gap_reentry_current_risk_disallowed",
-        "gap_reentry_state_unavailable",
-    },
-    "execution": {
-        "not_buy_sell_signal", "buy_execution_plan_missing", "buy_execution_plan_invalid",
-        "buy_invalid_take_profit", "buy_invalid_stop_loss", "buy_not_reached_entry",
-        "gap_reentry_rr_invalid",
-    },
-}
+_REJECTION_STAGES = PORTABLE_REJECTION_STAGES
 
 
 def _confirmed_gap_reentry(row: pd.Series) -> bool:
@@ -119,12 +106,7 @@ def _confirmed_gap_reentry(row: pd.Series) -> bool:
 
 
 def rejection_stage(reason: str) -> str:
-    if not reason:
-        return "selected"
-    for stage, reasons in _REJECTION_STAGES.items():
-        if reason in reasons:
-            return stage
-    raise ValueError(f"UNKNOWN_REJECTION_CODE: {reason}")
+    return portable_rejection_stage(reason)
 
 
 def _ml_decision_at(generated_at: str) -> str:
@@ -288,34 +270,11 @@ def _ml_parameter_snapshot(
     min_score: float,
     enforce_execution_contract: bool,
 ) -> dict[str, float | int | bool]:
-    return {
-        "min_score": float(min_score),
-        "caution_min_score": 85.0,
-        "near_limit_up_pct": 9.8,
-        "board_lot_size": 100,
-        "special_listing_days": 5,
-        "quote_stale_sec": 120,
-        "chasing_max_pct": 0.02,
-        "chasing_atr_multiplier": 0.5,
-        "min_tradable_amount": 20_000_000,
-        "enforce_execution_contract": bool(enforce_execution_contract),
-        "portfolio_risk_enabled": bool(app_config.JOINQUANT_PORTFOLIO_RISK_ENABLE_DEFAULT),
-        "max_positions": int(app_config.JOINQUANT_MAX_POSITIONS_DEFAULT),
-        "max_new_positions_per_day": int(app_config.MAX_NEW_POSITIONS_PER_DAY),
-        "max_orders_per_day": int(app_config.MAX_ORDERS_PER_DAY),
-        "max_daily_turnover_pct": float(app_config.MAX_DAILY_TURNOVER_PCT),
-        "daily_loss_warn_pct": float(app_config.DAILY_LOSS_WARN_PCT),
-        "account_drawdown_warn_pct": float(app_config.ACCOUNT_DRAWDOWN_WARN_PCT),
-        "max_consecutive_losses": int(app_config.MAX_CONSECUTIVE_LOSSES),
-        "exit_cooldown_enabled": bool(app_config.JOINQUANT_EXIT_COOLDOWN_ENABLE_DEFAULT),
-        "tradability_filter_enabled": bool(app_config.JOINQUANT_TRADABILITY_FILTER_ENABLE_DEFAULT),
-        "max_uncategorized_position_pct": float(app_config.MAX_UNCATEGORIZED_POSITION_PCT),
-        "max_open_risk_caution_pct": float(app_config.MAX_OPEN_RISK_CAUTION_PCT),
-        "max_open_risk_normal_pct": float(app_config.MAX_OPEN_RISK_NORMAL_PCT),
-        "max_industry_position_pct": float(app_config.MAX_INDUSTRY_POSITION_PCT),
-        "max_theme_position_pct": float(app_config.MAX_THEME_POSITION_PCT),
-        "max_total_position_pct": float(app_config.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT),
-    }
+    return build_ml_parameter_snapshot(
+        app_config,
+        min_score,
+        enforce_execution_contract,
+    )
 
 
 def _finalize_candidate_decisions(
@@ -505,6 +464,8 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
                        current_position_count: int = 0,
                        sector_exposure_pct: dict[str, float] | None = None,
                        theme_exposure_pct: dict[str, float] | None = None,
+                       factor_position_counts: dict[str, int] | None = None,
+                       factor_new_positions_today: dict[str, int] | None = None,
                        cooldown_codes: set[str] | None = None, available_cash: float | None = None,
                        new_positions_today: int = 0, orders_today: int = 0,
                        daily_turnover_pct: float = 0.0, daily_pnl_pct: float = 0.0,
@@ -592,6 +553,58 @@ def _buy_reject_reason(row: pd.Series, min_score: float, allow_buy: bool = True,
     adjusted_position_pct = float(plan["position_pct"])
     if stop <= 0 or stop >= entry:
         return "buy_invalid_stop_loss"
+    factor_path = _text(row.get("factor_path"))
+    if factor_path in {"wave3_v1", "limitdown_exhaustion_v1"}:
+        if not bool(row.get("factor_triggered")):
+            return _text(row.get("factor_rejection_code")) or "factor_trigger_required"
+        if not isinstance(factor_position_counts, dict) or not isinstance(
+            factor_new_positions_today, dict
+        ):
+            return "factor_portfolio_state_unavailable"
+        max_concurrent = int(_num(row.get("factor_max_concurrent")))
+        max_new_per_day = int(_num(row.get("factor_max_new_per_day")))
+        if max_concurrent <= 0 or max_new_per_day <= 0:
+            return "factor_portfolio_state_unavailable"
+        if int(factor_position_counts.get(factor_path, 0)) >= max_concurrent:
+            return "factor_path_position_limit"
+        if int(factor_new_positions_today.get(factor_path, 0)) >= max_new_per_day:
+            return "factor_path_daily_limit"
+        if app_config.MULTIPATH_ECONOMIC_GATE_ENABLE_DEFAULT:
+            if account_total_value <= 0 or available_cash is None:
+                return "factor_economic_state_unavailable"
+            sizing = size_strategy_order(
+                entry,
+                stop,
+                take,
+                account_total_value,
+                available_cash,
+                _num(row.get("factor_risk_budget_pct")),
+                min(
+                    adjusted_position_pct,
+                    _num(row.get("factor_position_cap_pct"), adjusted_position_pct),
+                ),
+                app_config.SIMULATION_FEE_SCHEDULE.to_dict(),
+                lot_size=100,
+                current_position_pct=current_position_pct,
+                max_total_position_pct=app_config.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT,
+                max_round_trip_rate=app_config.MULTIPATH_MAX_ROUND_TRIP_COST_RATE,
+                min_target_cost_multiple=app_config.MULTIPATH_MIN_TARGET_COST_MULTIPLE,
+            )
+            if not sizing["allowed"]:
+                return str(sizing["reason"])
+            row["target_qty"] = int(sizing["target_qty"])
+            row["position_pct"] = float(sizing["position_pct"])
+            row["factor_economics_version"] = str(sizing["version"])
+            row["factor_round_trip_cost_yuan"] = float(
+                sizing["target_economics"]["round_trip_cost_yuan"]
+            )
+            row["factor_round_trip_cost_rate"] = float(
+                sizing["target_economics"]["round_trip_cost_rate"]
+            )
+            row["factor_target_net_profit_yuan"] = float(
+                sizing["target_economics"]["net_profit_yuan"]
+            )
+            adjusted_position_pct = float(sizing["position_pct"])
     open_risk_limit = app_config.MAX_OPEN_RISK_CAUTION_PCT if regime == "CAUTION" else app_config.MAX_OPEN_RISK_NORMAL_PCT
     if account_total_value > 0 and account_total_value * adjusted_position_pct / 100.0 <= entry * 100:
         if not gap_reentry:
@@ -931,10 +944,18 @@ def _exact_policy(
     parameter_version: str,
 ) -> RiskPolicy:
     board = str(signal.get("board_type") or "main_active")
+    factor_path = str(signal.get("factor_path") or "")
+    factor_simulation = factor_path in {"wave3_v1", "limitdown_exhaustion_v1"}
+    factor_risk_pct = _num(signal.get("factor_risk_budget_pct"))
+    factor_position_cap = _num(signal.get("factor_position_cap_pct"))
     return RiskPolicy(
         checked_at=checked_at,
         policy_version="joinquant-exact-v1:" + parameter_version[-12:],
-        mode=app_config.RISK_MODE,
+        mode=(
+            "enforce"
+            if factor_simulation and app_config.MULTIPATH_ECONOMIC_GATE_ENABLE_DEFAULT
+            else app_config.RISK_MODE
+        ),
         adapter="joinquant",
         market_regime=market_regime,
         fee_schedule=app_config.SIMULATION_FEE_SCHEDULE,
@@ -942,11 +963,23 @@ def _exact_policy(
         broker_snapshot_max_age_sec=app_config.ACCOUNT_SNAPSHOT_MAX_AGE_SEC,
         quote_max_age_sec=120,
         decision_ttl_sec=app_config.JOINQUANT_EXECUTION_INTENT_TTL_SEC_DEFAULT,
-        per_trade_risk_fraction=_fraction(trade_risk_budget_pct(board, market_regime)),
-        normal_per_trade_risk_fraction=_fraction(trade_risk_budget_pct(board, "NORMAL")),
+        per_trade_risk_fraction=_fraction(
+            factor_risk_pct
+            if factor_simulation and factor_risk_pct > 0
+            else trade_risk_budget_pct(board, market_regime)
+        ),
+        normal_per_trade_risk_fraction=_fraction(
+            factor_risk_pct
+            if factor_simulation and factor_risk_pct > 0
+            else trade_risk_budget_pct(board, "NORMAL")
+        ),
         risk_cap_yuan=None,
         max_positions=app_config.JOINQUANT_MAX_POSITIONS_DEFAULT,
-        max_single_position_fraction=_fraction(app_config.MAX_SINGLE_POSITION_PCT),
+        max_single_position_fraction=_fraction(
+            min(app_config.MAX_SINGLE_POSITION_PCT, factor_position_cap)
+            if factor_simulation and factor_position_cap > 0
+            else app_config.MAX_SINGLE_POSITION_PCT
+        ),
         max_total_position_fraction=_fraction(app_config.JOINQUANT_MAX_TOTAL_POSITION_PCT_DEFAULT),
         min_cash_reserve_fraction=_fraction(app_config.MIN_CASH_RESERVE_PCT),
         max_industry_fraction=_fraction(app_config.MAX_INDUSTRY_POSITION_PCT),
@@ -1180,6 +1213,22 @@ def _buy_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, Any
         "industry": _industry(row),
         "theme": _theme(row),
     }
+    factor_path = _text(row.get("factor_path"))
+    if factor_path in {"wave3_v1", "limitdown_exhaustion_v1"}:
+        signal.update({
+            "entry_path": factor_path,
+            "factor_path": factor_path,
+            "factor_setup_id": _text(row.get("factor_setup_id")),
+            "factor_score": _num(row.get("factor_score")),
+            "factor_state": _text(row.get("factor_state")),
+            "factor_risk_budget_pct": _num(row.get("factor_risk_budget_pct")),
+            "factor_position_cap_pct": _num(row.get("factor_position_cap_pct")),
+            "factor_max_hold_days": int(_num(row.get("factor_max_hold_days"))),
+            "simulation_only": True,
+            "factor_economics_version": _text(row.get("factor_economics_version")),
+            "factor_round_trip_cost_yuan": _num(row.get("factor_round_trip_cost_yuan")),
+            "factor_round_trip_cost_rate": _num(row.get("factor_round_trip_cost_rate")),
+        })
     if _confirmed_gap_reentry(row):
         signal.update({
             "entry_path": "gap_reentry",
@@ -1221,6 +1270,10 @@ def _sell_signal(row: pd.Series, run_id: str | None, index: int) -> dict[str, An
     position_cycle_id = _text(row.get("position_cycle_id"))
     if position_cycle_id:
         signal["position_cycle_id"] = position_cycle_id
+    factor_path = _text(row.get("factor_path"))
+    if factor_path in {"wave3_v1", "limitdown_exhaustion_v1"}:
+        signal["factor_path"] = factor_path
+        signal["entry_path"] = factor_path
     return signal
 
 
@@ -1435,6 +1488,8 @@ def export_signals(
     current_open_risk_pct: float = 0.0,
     sector_exposure_pct: dict[str, float] | None = None,
     theme_exposure_pct: dict[str, float] | None = None,
+    factor_position_counts: dict[str, int] | None = None,
+    factor_new_positions_today: dict[str, int] | None = None,
     cooldown_codes: set[str] | None = None,
     available_cash: float | None = None,
     new_positions_today: int = 0,
@@ -1456,6 +1511,14 @@ def export_signals(
     parameter_snapshot = _ml_parameter_snapshot(min_score, enforce_execution_contract)
     candidate_generated_at = str(payload["generated_at"])
     store = store or TradingStore(app_config.TRADING_DB_FILE)
+    factor_position_counts = (
+        dict(factor_position_counts)
+        if isinstance(factor_position_counts, dict) else None
+    )
+    factor_new_positions_today = (
+        dict(factor_new_positions_today)
+        if isinstance(factor_new_positions_today, dict) else None
+    )
     gap_store_ready = False
     try:
         store.initialize()
@@ -1468,6 +1531,7 @@ def export_signals(
     candidate_decisions: list[dict[str, Any]] = []
     candidate_contract_error: ValueError | None = None
     reject_reasons: Counter[str] = Counter()
+    attribution_rows: list[dict[str, Any]] = []
     if df is not None and not df.empty:
         signals: list[dict[str, Any]] = []
         ordered_rows = []
@@ -1505,6 +1569,8 @@ def export_signals(
                 current_position_count=current_position_count,
                 sector_exposure_pct=sector_exposure_pct,
                 theme_exposure_pct=theme_exposure_pct,
+                factor_position_counts=factor_position_counts,
+                factor_new_positions_today=factor_new_positions_today,
                 cooldown_codes=cooldown_codes,
                 available_cash=available_cash,
                 new_positions_today=new_positions_today, orders_today=orders_today,
@@ -1529,6 +1595,24 @@ def export_signals(
                     "has_holding": _has_holding(row),
                 }
                 candidate_decisions.append(candidate_decision)
+            if not _is_sell(row):
+                attribution_rows.append(build_strategy_attribution(
+                    str(payload["trade_date"]),
+                    clean_code(row.get("code")),
+                    candidate_generated_at,
+                    _text(row.get("factor_path")) or "momentum_v1",
+                    _text(row.get("factor_setup_id")),
+                    not bool(buy_reject_reason),
+                    buy_reject_reason,
+                    _num(row.get("factor_score")),
+                    target_qty=int(_num(row.get("target_qty"))),
+                    round_trip_cost_yuan=(
+                        _num(row.get("factor_round_trip_cost_yuan"))
+                        if row.get("factor_round_trip_cost_yuan") is not None
+                        else None
+                    ),
+                    simulation_only=bool(row.get("simulation_only")),
+                ))
             if not buy_reject_reason:
                 signal = _buy_signal(row, run_id, index)
                 opportunity_id = _text(row.get("gap_reentry_opportunity_id"))
@@ -1566,6 +1650,16 @@ def export_signals(
                         if _confirmed_gap_reentry(row) and gap_cash_required > 0
                         else account_total_value * float(signal.get("position_pct") or 0) / 100.0
                     )
+                factor_path = _text(signal.get("factor_path"))
+                if factor_path in {"wave3_v1", "limitdown_exhaustion_v1"}:
+                    if factor_position_counts is not None:
+                        factor_position_counts[factor_path] = int(
+                            factor_position_counts.get(factor_path, 0)
+                        ) + 1
+                    if factor_new_positions_today is not None:
+                        factor_new_positions_today[factor_path] = int(
+                            factor_new_positions_today.get(factor_path, 0)
+                        ) + 1
                 sample_rows.append((row, signal))
             elif _is_sell(row) and _has_holding(row) and allow_sell:
                 sell = _sell_signal(row, run_id, index)
@@ -1613,6 +1707,9 @@ def export_signals(
             for row in (ordered_rows if df is not None and not df.empty else [])
             if bool(row.get("gap_reentry_transitioned"))
         ],
+        "strategy_attribution": aggregate_strategy_attribution(
+            attribution_rows
+        ),
     }
 
     rows_by_signal_id = {signal["id"]: row for row, signal in sample_rows}
@@ -1818,7 +1915,7 @@ def export_signals(
                 "parameter_version": (
                     f"risk-observe-v1:{canonical_hash(parameter_snapshot)[:12]}"
                 ),
-                "feature_schema_version": "live-candidate-v1",
+                "feature_schema_version": "live-candidate-v2-multipath",
                 "cohort_mode": cohort_mode,
                 "cohort_interval_sec": cohort_interval_sec,
                 "parameter_snapshot": parameter_snapshot,
