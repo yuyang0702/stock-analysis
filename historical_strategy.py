@@ -82,16 +82,32 @@ def generate_daily_candidates(
     mode: str,
     parameter_version: str,
     min_score: float = 75,
+    cooldown_codes: set[str] | None = None,
+    caution_min_score: float = 85,
 ) -> list[Candidate]:
     rows = [row for row in store.daily_slice(dataset_id, trade_date) if _eligible(row)]
     if mode == "strict":
-        candidates = _strict_candidates(store, dataset_id, trade_date, rows, parameter_version)
+        candidates = _strict_candidates(
+            store, dataset_id, trade_date, rows, parameter_version,
+            cooldown_codes=cooldown_codes,
+            caution_min_score=caution_min_score,
+        )
     elif mode == "price_core":
-        candidates = _price_core_candidates(store, dataset_id, trade_date, rows, parameter_version)
+        candidates = _price_core_candidates(
+            store, dataset_id, trade_date, rows, parameter_version,
+            cooldown_codes=cooldown_codes,
+        )
     else:
         raise HistoricalDataValidationError(f"unknown strategy mode: {mode}")
     return sorted(
-        (candidate for candidate in candidates if candidate.score >= min_score),
+        (
+            candidate for candidate in candidates
+            if candidate.score >= (
+                max(float(min_score), float(caution_min_score))
+                if candidate.market_regime == "CAUTION"
+                else float(min_score)
+            )
+        ),
         key=lambda candidate: (-candidate.score, candidate.code),
     )
 
@@ -112,11 +128,15 @@ def _strict_candidates(
     trade_date: str,
     rows: list[dict],
     parameter_version: str,
+    *,
+    cooldown_codes: set[str] | None = None,
+    caution_min_score: float = 85,
 ) -> list[Candidate]:
     all_features = store.features_for_date(dataset_id, trade_date)
     prepared = [
         (row, all_features.get(str(row["code"]), {}))
         for row in rows
+        if str(row["code"]) not in (cooldown_codes or set())
         if STRICT_FEATURES.issubset(all_features.get(str(row["code"]), {}))
     ]
     if not prepared:
@@ -181,9 +201,13 @@ def _price_core_candidates(
     trade_date: str,
     rows: list[dict],
     parameter_version: str,
+    *,
+    cooldown_codes: set[str] | None = None,
 ) -> list[Candidate]:
     prepared = []
     for row in rows:
+        if str(row["code"]) in (cooldown_codes or set()):
+            continue
         history = store.history_until(dataset_id, str(row["code"]), trade_date, 40)
         if len(history) < 21:
             continue
@@ -222,7 +246,7 @@ def _price_core_candidates(
                 stop_loss=stop,
                 take_profit=round(close + 2 * risk, 2),
                 atr14=atr,
-                mode="short",
+                mode="short" if breakout or returns[-1] >= 5 else "mid",
                 market_regime="NORMAL",
                 industry="unknown",
                 theme="unknown",

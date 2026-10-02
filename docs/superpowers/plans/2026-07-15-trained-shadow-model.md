@@ -433,7 +433,7 @@ Expected: clean. Suggested authorized commit: `feat: import strict five minute c
 - Modify: `tests/test_strategy_compare_report.py`
 
 **Interfaces:**
-- Produces `LabelCostModel(commission_rate=0.0003, min_commission=5, stamp_tax_rate=0.001, slippage_bps=10)`.
+- Produces `LabelCostModel(commission_rate=0.0003, min_commission=5, stamp_tax_rate=0.0005, transfer_fee_rate=0.00001, slippage_bps=10)`; broker-specific schedules override these simulation defaults.
 - Produces `label_historical_candidate(store, sample, costs) -> LabelRecord`.
 - Produces `update_mature_labels(ml_store, history_store, trading_store, as_of) -> LabelUpdateResult`.
 

@@ -159,12 +159,22 @@ class HistoricalStrategyTest(unittest.TestCase):
             first = generate_daily_candidates(
                 store, "d1", final_day, mode="price_core", parameter_version="v1", min_score=0
             )
+            cooled = generate_daily_candidates(
+                store,
+                "d1",
+                final_day,
+                mode="price_core",
+                parameter_version="v1",
+                min_score=0,
+                cooldown_codes={"600000"},
+            )
             second = generate_daily_candidates(
                 store, "d1", final_day, mode="price_core", parameter_version="v1", min_score=0
             )
 
             self.assertEqual(first, second)
             self.assertEqual([candidate.code for candidate in first], ["600000"])
+            self.assertEqual(cooled, [])
             self.assertTrue(first[0].evidence["proxy_only"])
             self.assertGreater(first[0].atr14, 0)
 

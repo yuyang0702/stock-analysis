@@ -426,7 +426,8 @@ class HistoricalBacktestTest(unittest.TestCase):
             self.assertEqual(trade.trade_date, "2025-01-03")
             self.assertEqual(trade.quantity, 1000)
             self.assertEqual(trade.price, 10.0)
-            self.assertEqual(trade.fee, 15.0)
+            self.assertEqual(trade.fee, 15.1)
+            self.assertEqual(trade.transfer_fee_yuan, 0.1)
             self.assertEqual(trade.slippage_yuan, 10.0)
 
     def test_suspension_and_limit_up_block_buy(self) -> None:

@@ -20,6 +20,7 @@ class ConfigEnvTest(unittest.TestCase):
                 self.assertEqual(fees.buy_minimum_commission_yuan, Decimal("5"))
                 self.assertEqual(fees.sell_minimum_commission_yuan, Decimal("5"))
                 self.assertEqual(fees.stamp_tax_rate, Decimal("0.0005"))
+                self.assertEqual(fees.transfer_fee_rate, Decimal("0.00001"))
                 self.assertEqual(fees.buy_slippage_rate, Decimal("0.001"))
                 self.assertEqual(fees.sell_slippage_rate, Decimal("0.001"))
         finally:

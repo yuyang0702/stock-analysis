@@ -82,7 +82,9 @@ SIMULATION_FEE_SCHEDULE = FeeSchedule(
         "FEE_SELL_MINIMUM_COMMISSION_YUAN", _LEGACY_MINIMUM_COMMISSION
     ),
     stamp_tax_rate=_env_decimal("FEE_STAMP_TAX_RATE", "0.0005"),
-    transfer_fee_rate=_env_decimal("FEE_TRANSFER_FEE_RATE", "0"),
+    # A-share stock transfer fee: 0.01‰ of turnover on both sides.
+    # The broker's current fee schedule can override this environment value.
+    transfer_fee_rate=_env_decimal("FEE_TRANSFER_FEE_RATE", "0.00001"),
     other_fee_rate=_env_decimal("FEE_OTHER_FEE_RATE", "0"),
     buy_slippage_rate=_env_decimal("FEE_BUY_SLIPPAGE_RATE", "0.001"),
     sell_slippage_rate=_env_decimal("FEE_SELL_SLIPPAGE_RATE", "0.001"),

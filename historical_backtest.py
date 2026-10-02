@@ -46,6 +46,9 @@ class HistoricalBacktestConfig:
     mode: str = "price_core"
     parameter_version: str = "v1"
     min_score: float = 75.0
+    caution_min_score: float = 85.0
+    cooldown_days: int = 3
+    max_new_positions_per_day: int = 10
     fee_schedule: FeeSchedule | None = None
 
     def __post_init__(self) -> None:
@@ -55,6 +58,12 @@ class HistoricalBacktestConfig:
             raise ValueError("max_positions must be a positive integer")
         if not math.isfinite(float(self.min_score)):
             raise ValueError("min_score must be finite")
+        if not math.isfinite(float(self.caution_min_score)):
+            raise ValueError("caution_min_score must be finite")
+        if int(self.cooldown_days) != self.cooldown_days or self.cooldown_days < 0:
+            raise ValueError("cooldown_days must be a non-negative integer")
+        if int(self.max_new_positions_per_day) != self.max_new_positions_per_day or self.max_new_positions_per_day <= 0:
+            raise ValueError("max_new_positions_per_day must be a positive integer")
         if not str(self.mode).strip():
             raise ValueError("mode is required")
         if not str(self.parameter_version).strip():
@@ -342,8 +351,12 @@ def run_historical_backtest(
     positions: dict[str, HistoricalPosition] = {}
     pending: list[PendingOrder] = []
     pending_sells: list[PendingSell] = []
+    date_index = {trade_date: index for index, trade_date in enumerate(dates)}
+    cooldown_until: dict[str, int] = {}
 
     for trade_date in dates:
+        current_index = date_index[trade_date]
+        new_positions_today = 0
         rows = {str(row["code"]): row for row in store.daily_slice(dataset_id, trade_date)}
 
         for code, position in positions.items():
@@ -396,6 +409,7 @@ def run_historical_backtest(
             )
             position.quantity -= quantity
             if position.quantity <= 0:
+                cooldown_until[order.code] = current_index + int(config.cooldown_days)
                 del positions[order.code]
             elif order.reason == "TAKE_PROFIT_1":
                 position.take_profit_stage = 1
@@ -413,6 +427,9 @@ def run_historical_backtest(
                 _blocked(result, "LIMIT_UP_BUY_BLOCKED")
                 continue
             if candidate.code in positions or len(positions) >= config.max_positions:
+                continue
+            if new_positions_today >= config.max_new_positions_per_day:
+                _blocked(result, "BUY_DAILY_NEW_POSITIONS_LIMIT")
                 continue
             price = round(open_price, 4)
             target = _account_value(cash, positions, rows) * candidate.position_pct / 100
@@ -453,6 +470,7 @@ def run_historical_backtest(
                     "SIGNAL", fee_schedule_version=fees.version, **_fee_fields(breakdown),
                 )
             )
+            new_positions_today += 1
         pending = []
 
         # Point-in-time ordering: hard stop, prior-batch trailing stop, then profit-taking;
@@ -540,6 +558,7 @@ def run_historical_backtest(
                 )
             )
             if quantity >= position.quantity:
+                cooldown_until[code] = current_index + int(config.cooldown_days)
                 del positions[code]
             else:
                 position.quantity -= quantity
@@ -592,6 +611,11 @@ def run_historical_backtest(
             mode=config.mode,
             parameter_version=config.parameter_version,
             min_score=config.min_score,
+            caution_min_score=config.caution_min_score,
+            cooldown_codes={
+                code for code, until in cooldown_until.items()
+                if current_index <= int(until)
+            },
         )
         pending = [PendingOrder(trade_date, candidate) for candidate in candidates]
         result.equity.append(
@@ -601,6 +625,9 @@ def run_historical_backtest(
         {
             "fee_schedule_version": fees.version,
             "fee_schedule_sha256": fees.contract_sha256,
+            "cooldown_days": int(config.cooldown_days),
+            "max_new_positions_per_day": int(config.max_new_positions_per_day),
+            "caution_min_score": float(config.caution_min_score),
             "fee_components": {
                 key: round(sum(trade.fee_components[key] for trade in result.trades), 2)
                 for key in (
@@ -1353,6 +1380,9 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--capital", type=float, default=100_000)
         child.add_argument("--max-positions", type=int, default=8)
         child.add_argument("--min-score", type=float, default=75.0)
+        child.add_argument("--caution-min-score", type=float, default=85.0)
+        child.add_argument("--cooldown-days", type=int, default=3)
+        child.add_argument("--max-new-positions-per-day", type=int, default=10)
     walk_forward = subparsers.add_parser(
         "walk-forward",
         help="select parameters on rolling training windows and evaluate unseen windows",
@@ -1368,6 +1398,9 @@ def _parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--capital", type=float, default=100_000)
     walk_forward.add_argument("--max-positions", type=int, default=8)
     walk_forward.add_argument("--min-score", type=float, default=75.0)
+    walk_forward.add_argument("--caution-min-score", type=float, default=85.0)
+    walk_forward.add_argument("--cooldown-days", type=int, default=3)
+    walk_forward.add_argument("--max-new-positions-per-day", type=int, default=10)
     walk_forward.add_argument("--folds", type=int, default=3)
     walk_forward.add_argument("--holdout-days", type=int, default=20)
     walk_forward.add_argument(
@@ -1471,6 +1504,7 @@ def main(argv: list[str] | None = None) -> int:
             for key in (
                 "initial_cash", "commission_rate", "minimum_commission", "stamp_tax_rate",
                 "slippage_bps", "max_positions", "min_score", "mode", "fee_schedule",
+                "caution_min_score", "cooldown_days", "max_new_positions_per_day",
                 "strategy_version", "code_hash", "parameter_version",
             ):
                 if left_config.get(key) != right_config.get(key):
@@ -1520,6 +1554,9 @@ def main(argv: list[str] | None = None) -> int:
                     parameter_version=args.parameter_version,
                     max_positions=args.max_positions,
                     min_score=args.min_score,
+                    caution_min_score=args.caution_min_score,
+                    cooldown_days=args.cooldown_days,
+                    max_new_positions_per_day=args.max_new_positions_per_day,
                 ),
                 folds=args.folds,
                 holdout_days=args.holdout_days,
@@ -1561,6 +1598,9 @@ def main(argv: list[str] | None = None) -> int:
         parameter_version=args.parameter_version,
         max_positions=args.max_positions,
         min_score=args.min_score,
+        caution_min_score=args.caution_min_score,
+        cooldown_days=args.cooldown_days,
+        max_new_positions_per_day=args.max_new_positions_per_day,
     )
     run_id = _run_id(store, args, config)
     try:
