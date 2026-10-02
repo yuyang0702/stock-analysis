@@ -5,7 +5,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from historical_data import HistoricalDataValidationError, HistoricalStore, STRICT_FEATURES
-from historical_strategy import generate_candidates_at, generate_daily_candidates
+from historical_strategy import (
+    _price_core_market_regime,
+    generate_candidates_at,
+    generate_daily_candidates,
+)
 from ml_contracts import CandidateSample, TimedFeature, canonical_hash
 
 
@@ -177,6 +181,11 @@ class HistoricalStrategyTest(unittest.TestCase):
             self.assertEqual(cooled, [])
             self.assertTrue(first[0].evidence["proxy_only"])
             self.assertGreater(first[0].atr14, 0)
+
+    def test_price_core_market_regime_reduces_risk_on_negative_tape(self) -> None:
+        self.assertEqual(_price_core_market_regime(0.01, 0.02), "NORMAL")
+        self.assertEqual(_price_core_market_regime(-0.01, 0.01), "CAUTION")
+        self.assertEqual(_price_core_market_regime(-0.01, -0.031), "RISK_OFF")
 
     def test_strict_returns_no_candidates_when_features_are_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

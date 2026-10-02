@@ -222,6 +222,14 @@ def _price_core_candidates(
         prepared.append((row, history, closes, amounts, returns, atr))
     pct_values = [item[4][-1] for item in prepared]
     amount_values = [item[3][-1] for item in prepared]
+    market_return_5 = _cross_sectional_return(prepared, 5)
+    market_return_20 = _cross_sectional_return(prepared, 20)
+    market_state = _price_core_market_regime(market_return_5, market_return_20)
+    # The price-core dataset has no point-in-time index membership or status
+    # history.  In that proxy mode, a broad negative tape is a reason to stay
+    # flat rather than manufacture long entries from relative strength.
+    if market_state == "RISK_OFF":
+        return []
     result = []
     for row, history, closes, amounts, returns, atr in prepared:
         close = closes[-1]
@@ -235,7 +243,7 @@ def _price_core_candidates(
         score = 70 + 10 * int(trend) + 8 * int(breakout) + 5 * pct_rank + 2 * amount_rank
         board = board_type(str(row["code"]), close, atr)
         stop = initial_stop_price(close, min(closes[-10:]), atr, board)
-        position = risk_position_pct(close, stop, board, 10, "NORMAL")
+        position = risk_position_pct(close, stop, board, 10, market_state)
         risk = max(close - stop, 0)
         result.append(
             Candidate(
@@ -247,7 +255,7 @@ def _price_core_candidates(
                 take_profit=round(close + 2 * risk, 2),
                 atr14=atr,
                 mode="short" if breakout or returns[-1] >= 5 else "mid",
-                market_regime="NORMAL",
+                market_regime=market_state,
                 industry="unknown",
                 theme="unknown",
                 evidence={
@@ -257,10 +265,31 @@ def _price_core_candidates(
                     "breakout": breakout,
                     "pct_rank": pct_rank,
                     "amount_rank": amount_rank,
+                    "market_return_5": round(market_return_5, 4),
+                    "market_return_20": round(market_return_20, 4),
                 },
             )
         )
     return result
+
+
+def _cross_sectional_return(prepared: list[tuple], lookback: int) -> float:
+    """Approximate broad market return from the available price-core universe."""
+    values = []
+    for item in prepared:
+        closes = item[2]
+        if len(closes) > lookback and closes[-lookback - 1] > 0:
+            values.append(closes[-1] / closes[-lookback - 1] - 1)
+    return sum(values) / len(values) if values else 0.0
+
+
+def _price_core_market_regime(return_5: float, return_20: float) -> str:
+    """Map broad tape momentum to the shared exit-policy risk states."""
+    if return_20 < -0.03 and return_5 < 0:
+        return "RISK_OFF"
+    if return_20 < 0 or return_5 < 0:
+        return "CAUTION"
+    return "NORMAL"
 
 
 def _atr14(history: list[dict]) -> float:

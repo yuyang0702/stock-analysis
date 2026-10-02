@@ -483,6 +483,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--walk-forward-json")
     parser.add_argument("--mode", choices=("strict", "price_core"), default="price_core")
+    parser.add_argument("--parameter-version", default="long-cycle-validation-v1")
     parser.add_argument("--capital", type=float, default=100_000)
     parser.add_argument("--max-positions", type=int, default=8)
     parser.add_argument("--min-score", type=float, default=75.0)
@@ -504,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
         cooldown_days=args.cooldown_days,
         max_new_positions_per_day=args.max_new_positions_per_day,
         mode=args.mode,
-        parameter_version="long-cycle-validation-v1",
+        parameter_version=args.parameter_version,
     )
     report = build_long_cycle_report(
         store,
