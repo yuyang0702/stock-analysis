@@ -114,6 +114,30 @@ SOURCE_COLUMNS = {
         "event_at": "事件时间",
         "available_at": "可用时间",
     },
+    # ``history_acquisition.py`` writes the normalized project schema so that
+    # the artifact can be inspected and replayed without a second conversion.
+    # Keep this source distinct from JoinQuant for auditability.
+    "akshare_canonical": {
+        "trade_date": "trade_date",
+        "code": "code",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "prev_close": "prev_close",
+        "volume": "volume",
+        "amount": "amount",
+        "adjust_factor": "adjust_factor",
+        "listed": "listed",
+        "st": "st",
+        "suspended": "suspended",
+        "limit_up": "limit_up",
+        "limit_down": "limit_down",
+        "feature_name": "feature_name",
+        "feature_value": "feature_value",
+        "event_at": "event_at",
+        "available_at": "available_at",
+    },
 }
 
 TABLE_SPECS = {

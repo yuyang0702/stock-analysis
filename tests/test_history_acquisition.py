@@ -10,6 +10,7 @@ from history_acquisition import (
     fetch_akshare_code,
     normalize_akshare_daily_frame,
 )
+from historical_data import HistoricalStore
 
 
 class HistoryAcquisitionTest(unittest.TestCase):
@@ -56,6 +57,30 @@ class HistoryAcquisitionTest(unittest.TestCase):
             self.assertTrue((Path(tmp) / "bars.csv").is_file())
             self.assertTrue((Path(tmp) / "acquisition_metadata.json").is_file())
             self.assertIn("historical_universe_membership_unavailable", metadata["warnings"])
+
+    def test_normalized_output_keeps_akshare_source_when_imported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AcquisitionConfig("ak-proxy", "2025-01-02", "2025-01-03", root / "export", sleep_seconds=0)
+            acquire_akshare_daily(config, ["600000"], fetcher=lambda **_: self._frame())
+
+            store = HistoricalStore(root / "history.db")
+            store.initialize()
+            for kind in ("bars", "status", "universe"):
+                store.import_csv(
+                    config.dataset_id,
+                    kind,
+                    config.output_dir / f"{kind}.csv",
+                    "akshare_canonical",
+                    "raw",
+                )
+
+            with store.connect() as connection:
+                sources = connection.execute(
+                    "SELECT DISTINCT source FROM dataset_manifests WHERE dataset_id = ?",
+                    (config.dataset_id,),
+                ).fetchall()
+            self.assertEqual([row[0] for row in sources], ["akshare_canonical"])
 
 
 if __name__ == "__main__":

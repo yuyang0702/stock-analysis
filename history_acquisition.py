@@ -298,7 +298,13 @@ def main(argv: list[str] | None = None) -> int:
         store = HistoricalStore(Path(args.db))
         store.initialize()
         for kind in ("bars", "status", "universe"):
-            store.import_csv(config.dataset_id, kind, config.output_dir / f"{kind}.csv", "joinquant", "raw")
+            store.import_csv(
+                config.dataset_id,
+                kind,
+                config.output_dir / f"{kind}.csv",
+                "akshare_canonical",
+                config.adjust or "raw",
+            )
     print(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if not metadata["failures"] and metadata["rows"]["bars"] > 0 else 2
 
