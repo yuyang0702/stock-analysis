@@ -70,7 +70,7 @@ class HistoryAcquisitionTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(report["tx_fallback_codes"], ["600000"])
         self.assertEqual(rows[0]["volume"], 110.0)
-        self.assertEqual(rows[0]["amount"], 1144.0)
+        self.assertEqual(rows[0]["amount"], 114400.0)
 
     def test_acquisition_writes_proxy_metadata_and_bounded_csvs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

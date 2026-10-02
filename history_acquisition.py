@@ -160,9 +160,9 @@ def fetch_akshare_code(
             # Eastmoney is the preferred AkShare endpoint, but it is often
             # unavailable from CI or a restricted network.  Tencent's AkShare
             # endpoint provides the same bounded OHLC history, though its
-            # sixth field is volume rather than traded amount.  Preserve that
-            # limitation explicitly by constructing a volume*close amount
-            # proxy and recording the fallback in acquisition metadata.
+            # sixth field is volume in lots rather than traded amount.
+            # Preserve that limitation explicitly by converting lots to
+            # shares and constructing a volume*close amount proxy.
             tx = getattr(ak, "stock_zh_a_hist_tx", None)
             if not callable(tx):
                 raise primary_error
@@ -179,7 +179,7 @@ def fetch_akshare_code(
                 close_column = _column(frame, ("收盘", "close"))
                 volume_column = _column(frame, ("成交量", "volume", "amount"))
                 frame["volume"] = frame[volume_column]
-                frame["amount"] = frame[volume_column] * frame[close_column]
+                frame["amount"] = frame[volume_column] * 100 * frame[close_column]
             if source_report is not None:
                 fallback_codes = source_report.setdefault("tx_fallback_codes", [])
                 if normalized not in fallback_codes:
