@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import pandas as pd
+from unittest.mock import patch
 
 from history_acquisition import (
     AcquisitionConfig,
@@ -45,6 +46,31 @@ class HistoryAcquisitionTest(unittest.TestCase):
         self.assertEqual(calls[0]["start_date"], "20241203")
         self.assertEqual(calls[0]["end_date"], "20250103")
         self.assertEqual(calls[0]["adjust"], "")
+
+    def test_default_fetch_falls_back_to_tencent_with_explicit_proxy_metadata(self) -> None:
+        class FakeAkShare:
+            @staticmethod
+            def stock_zh_a_hist(**_kwargs):
+                raise RuntimeError("eastmoney unavailable")
+
+            @staticmethod
+            def stock_zh_a_hist_tx(**_kwargs):
+                return pd.DataFrame([
+                    {"date": "2024-12-31", "open": 9.8, "high": 10.1,
+                     "low": 9.7, "close": 10.0, "amount": 100},
+                    {"date": "2025-01-02", "open": 10.1, "high": 10.5,
+                     "low": 10.0, "close": 10.4, "amount": 110},
+                ])
+
+        report: dict[str, object] = {}
+        with patch.dict("sys.modules", {"akshare": FakeAkShare()}):
+            rows = fetch_akshare_code(
+                "600000", "2025-01-02", "2025-01-03", source_report=report
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(report["tx_fallback_codes"], ["600000"])
+        self.assertEqual(rows[0]["volume"], 110.0)
+        self.assertEqual(rows[0]["amount"], 1144.0)
 
     def test_acquisition_writes_proxy_metadata_and_bounded_csvs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

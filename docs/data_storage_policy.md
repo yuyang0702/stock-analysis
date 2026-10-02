@@ -419,9 +419,11 @@ schema 11 曾在正式交易库设计中增加以下两类数据；这些结构�
 
 ### 14.5 点时数据采集与样本外验证增量
 
-2026-10-02 新增 `history_acquisition.py` 和 `historical_backtest.py walk-forward`。AkShare 采集器的输出只能写入 `cache/backtest/acquisition/<dataset_id>/` 或用户指定的 `cache/` 子目录，包含 `bars.csv`、`status.csv`、`universe.csv` 和稳定覆盖的 `acquisition_metadata.json`。每次采集按明确的代码列表、开始日期和结束日期有界运行，不创建无界追加文件；临时 CSV 和元数据使用原子替换，失败不覆盖上一份文件。
+2026-10-02 新增 `history_acquisition.py`、内置 `daily_feature_builder` 和 `historical_backtest.py walk-forward`。AkShare 采集器的输出只能写入 `cache/backtest/acquisition/<dataset_id>/` 或用户指定的 `cache/` 子目录，包含 `bars.csv`、`status.csv`、`universe.csv` 和稳定覆盖的 `acquisition_metadata.json`。每次采集按明确的代码列表、开始日期和结束日期有界运行，不创建无界追加文件；临时 CSV 和元数据使用原子替换，失败不覆盖上一份文件。
 
-AkShare 输出的 `status`、历史股票池和涨跌停属于代理构造，元数据必须保留 `strict_eligible=false`、`proxy_only=true` 及缺口警告。它可以导入独立 `cache/backtest/history.db` 做 `price_core` 研究；统一表头导入时使用 `akshare_canonical` 来源标识，不能伪装成 JoinQuant。它不得作为 strict 数据集或复制进正式交易库。正式 strict 数据仍由 JoinQuant 月包和 `strict_history_ingest.py` 负责校验、备份和原子导入。
+AkShare 输出的 `status`、历史股票池和涨跌停属于代理构造，元数据必须保留 `strict_eligible=false`、`proxy_only=true` 及缺口警告。首选 Eastmoney 日线接口不可用时允许回退 Tencent 接口，但回退时成交额由“成交量 × 收盘价”构造，必须记录 `akshare_tencent_fallback_amount_is_volume_price_proxy`。它可以导入独立 `cache/backtest/history.db` 做 `price_core` 研究；统一表头导入时使用 `akshare_canonical` 来源标识，不能伪装成 JoinQuant。它不得作为 strict 数据集或复制进正式交易库。正式 strict 数据仍由 JoinQuant 月包和 `strict_history_ingest.py` 负责校验、备份和原子导入。
+
+本轮实际导入数据集 `akshare-price-core-202401-202512-a3`，包含 3 只股票和 1,455 条日线；`validate --mode price_core`、本地回测、3 折/20 日 holdout walk-forward 均运行成功。该证据仍是代理价格核心研究，不能改变 strict 资格。
 
 Walk-forward 报告写入 `output/historical_walk_forward_latest.json`，采用原子覆盖，不保存每个参数候选的完整逐笔结果；明细只保留有界指标、窗口和参数身份。训练窗口只用于参数排序，验证窗口和最终 holdout 只读评价，不写 approved/active 状态。数据不足、点时缺口、未来字段或闭合交易不足时，报告状态为 `rejected` 或 `insufficient_evidence`，不得生成收益结论。
 

@@ -22,6 +22,7 @@ from joinquant_strict_history_exporter import (
     ExportConfig,
     StrictExportError,
     build_candidate_rows,
+    build_daily_feature_rows,
     build_strict_manifest,
     canonical_hash,
     export_month,
@@ -450,6 +451,20 @@ class _MissingDerivedPriorCloseSource(_FakeJoinQuantSource):
         return frame
 
 
+class _ContextFeatureSource(_FakeJoinQuantSource):
+    def industries(self, codes: list[str], day: date) -> dict[str, str]:
+        return {str(code).replace(".XSHE", "").replace(".XSHG", ""): "银行" for code in codes}
+
+    def valuations(self, codes: list[str], day: date) -> dict[str, dict[str, float]]:
+        return {
+            str(code).replace(".XSHE", "").replace(".XSHG", ""): {
+                "market_cap": 1_000_000_000.0,
+                "circulating_market_cap": 500_000_000.0,
+            }
+            for code in codes
+        }
+
+
 class JoinQuantStrictHistoryExporterIntegrationTest(unittest.TestCase):
     @staticmethod
     def _candidate_builder(context: DecisionContext) -> list[dict[str, object]]:
@@ -476,6 +491,98 @@ class JoinQuantStrictHistoryExporterIntegrationTest(unittest.TestCase):
             }
             for name in REQUIRED_DAILY_FEATURES
         ]
+
+    def test_builtin_daily_feature_builder_is_complete_and_point_in_time(self) -> None:
+        dates = pd.date_range("2025-05-01", periods=35, freq="B")
+        history = pd.DataFrame([
+            {
+                "time": value.to_pydatetime(),
+                "code": "000001.XSHE",
+                "open": 10.0 + index * 0.02,
+                "high": 10.2 + index * 0.02,
+                "low": 9.8 + index * 0.02,
+                "close": 10.1 + index * 0.02,
+                "volume": 100000.0,
+                "money": 1000000.0,
+                "factor": 1.0,
+            }
+            for index, value in enumerate(dates)
+        ])
+        trade_date = dates[-1].date().isoformat()
+        bar = {
+            "trade_date": trade_date,
+            "code": "000001",
+            "open": 10.7,
+            "high": 10.9,
+            "low": 10.6,
+            "close": 10.8,
+            "prev_close": 10.7,
+            "volume": 100000.0,
+            "amount": 1000000.0,
+            "adjust_factor": 1.0,
+        }
+        rows = build_daily_feature_rows(
+            trade_date,
+            "000001",
+            bar,
+            {
+                "trade_date": trade_date,
+                "history": history,
+                "market_frame": pd.DataFrame([{
+                    "time": dates[-1].to_pydatetime(),
+                    "code": "000001.XSHG",
+                    "close": 3500.0,
+                    "prev_close": 3490.0,
+                }]),
+                "today_frame": pd.DataFrame([{
+                    "code": "000001.XSHE",
+                    "pct_chg": 0.9,
+                }]),
+                "industry": "银行",
+                "theme": "银行",
+                "pct_rank": {"000001": 1.0},
+                "amount_rank": {"000001": 1.0},
+                "turnover": {"000001": 0.25},
+            },
+        )
+        self.assertEqual(
+            {row["feature_name"] for row in rows},
+            set(REQUIRED_DAILY_FEATURES),
+        )
+        self.assertTrue(all(row["available_at"].startswith(trade_date) for row in rows))
+        self.assertEqual(
+            {row["feature_name"]: row["feature_value"] for row in rows}["industry"],
+            "银行",
+        )
+
+    def test_month_export_wires_builtin_daily_builder_with_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(
+                output_root=directory,
+                require_daily_features=True,
+                max_candidate_rows=10_000,
+                max_candidate_price_rows=10_000,
+            )
+            result = export_month(
+                config,
+                candidate_builder=self._candidate_builder,
+                daily_feature_builder=build_daily_feature_rows,
+                source=_ContextFeatureSource(),  # type: ignore[arg-type]
+            )
+            self.assertTrue(result["complete_daily_features"])
+            metadata = json.loads(
+                (Path(result["output_dir"]) / "metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                metadata["daily_feature_builder_version"],
+                exporter_module.DAILY_FEATURE_BUILDER_VERSION,
+            )
+            self.assertEqual(
+                metadata["daily_feature_policy"]["valuation_date"],
+                "prior_trade_date",
+            )
 
     def test_month_export_is_hash_verified_and_idempotently_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

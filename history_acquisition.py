@@ -142,12 +142,49 @@ def fetch_akshare_code(
     *,
     adjust: str = "",
     fetcher: Callable[..., object] | None = None,
+    source_report: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
     """Fetch one code with a bounded lookback needed for ``prev_close``."""
     if fetcher is None:
         import akshare as ak  # type: ignore
 
-        fetcher = ak.stock_zh_a_hist
+        try:
+            frame = ak.stock_zh_a_hist(
+                symbol=str(code).zfill(6),
+                period="daily",
+                start_date=(date.fromisoformat(start) - timedelta(days=30)).strftime("%Y%m%d"),
+                end_date=date.fromisoformat(end).strftime("%Y%m%d"),
+                adjust=adjust,
+            )
+        except Exception as primary_error:
+            # Eastmoney is the preferred AkShare endpoint, but it is often
+            # unavailable from CI or a restricted network.  Tencent's AkShare
+            # endpoint provides the same bounded OHLC history, though its
+            # sixth field is volume rather than traded amount.  Preserve that
+            # limitation explicitly by constructing a volume*close amount
+            # proxy and recording the fallback in acquisition metadata.
+            tx = getattr(ak, "stock_zh_a_hist_tx", None)
+            if not callable(tx):
+                raise primary_error
+            normalized = str(code).zfill(6)
+            market = "sh" if normalized.startswith(("5", "6", "688", "689")) else "sz"
+            frame = tx(
+                symbol=market + normalized,
+                start_date=(date.fromisoformat(start) - timedelta(days=30)).strftime("%Y%m%d"),
+                end_date=date.fromisoformat(end).strftime("%Y%m%d"),
+                adjust=adjust,
+            )
+            if hasattr(frame, "copy"):
+                frame = frame.copy()
+                close_column = _column(frame, ("收盘", "close"))
+                volume_column = _column(frame, ("成交量", "volume", "amount"))
+                frame["volume"] = frame[volume_column]
+                frame["amount"] = frame[volume_column] * frame[close_column]
+            if source_report is not None:
+                fallback_codes = source_report.setdefault("tx_fallback_codes", [])
+                if normalized not in fallback_codes:
+                    fallback_codes.append(normalized)
+        return normalize_akshare_daily_frame(frame, code, start, end)
     lookback = date.fromisoformat(start) - timedelta(days=30)
     frame = fetcher(
         symbol=str(code).zfill(6),
@@ -210,9 +247,17 @@ def acquire_akshare_daily(
         raise ValueError("CODES_REQUIRED")
     bars: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
+    source_report: dict[str, object] = {"tx_fallback_codes": []}
     for index, code in enumerate(normalized_codes):
         try:
-            bars.extend(fetch_akshare_code(code, config.start, config.end, adjust=config.adjust, fetcher=fetcher))
+            bars.extend(fetch_akshare_code(
+                code,
+                config.start,
+                config.end,
+                adjust=config.adjust,
+                fetcher=fetcher,
+                source_report=source_report,
+            ))
         except Exception as exc:
             failures.append({"code": code, "error": " ".join(str(exc).split())[:240]})
         if config.sleep_seconds and index + 1 < len(normalized_codes):
@@ -264,6 +309,9 @@ def acquire_akshare_daily(
             for name in ("bars.csv", "status.csv", "universe.csv")
         },
     }
+    if source_report["tx_fallback_codes"]:
+        metadata["warnings"].append("akshare_tencent_fallback_amount_is_volume_price_proxy")
+        metadata["tx_fallback_codes"] = sorted(source_report["tx_fallback_codes"])
     temporary = output_dir / "acquisition_metadata.json.tmp"
     output_dir.mkdir(parents=True, exist_ok=True)
     temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")

@@ -37,7 +37,7 @@ from joinquant_point_in_time import (
 )
 
 
-BUILDER_VERSION = "2026-08-10.29-multipath"
+BUILDER_VERSION = "2026-10-02.1-daily-features"
 MAX_SNAPSHOTS = 24
 MAX_PACKAGE_BYTES = 20_000_000
 PACKAGE_MEMBERS = frozenset({
@@ -469,7 +469,7 @@ def _generated_strict_export(
     )
     wrapper = r'''
 
-STRICT_EXPORT_SCRIPT_VERSION = "2026-08-10.21-multipath"
+STRICT_EXPORT_SCRIPT_VERSION = "2026-10-02.1-daily-features"
 
 
 def default_strict_export_month(today=None):
@@ -515,7 +515,7 @@ def run_complete_strict_export(month=None):
         decision_times=DEFAULT_DECISION_TIMES,
         strict=True,
         export_daily_core=True,
-        require_daily_features=False,
+        require_daily_features=True,
         forward_trade_days=10,
         security_batch_size=300,
         max_candidate_rows=100000,
@@ -526,6 +526,7 @@ def run_complete_strict_export(month=None):
     result = export_month(
         config,
         candidate_builder=my_strict_candidate_builder,
+        daily_feature_builder=build_daily_feature_rows,
     )
     print("STRICT_EXPORT_OK")
     print("月份:", month)

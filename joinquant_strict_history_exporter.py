@@ -63,7 +63,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 
-EXPORTER_VERSION = "2026-08-10.28-multipath"
+EXPORTER_VERSION = "2026-10-02.1-daily-features"
+DAILY_FEATURE_BUILDER_VERSION = "2026-10-02.1-daily-features"
 STRICT_PRIOR_TRADE_DAYS = 90
 STRICT_PIT_HISTORY_BUCKETS = 256
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -760,6 +761,80 @@ class JoinQuantResearchSource:
         row = frame.iloc[-1]
         return {str(code): bool(row.get(code, False)) for code in codes}
 
+    def industries(self, codes, day):
+        """Return date-scoped industry names for the requested securities."""
+        getter = self.namespace.get("get_industry")
+        if not callable(getter):
+            try:
+                from jqdata import apis
+                getter = getattr(apis, "get_industry", None)
+            except ImportError:
+                getter = None
+        if not callable(getter):
+            raise StrictExportError("JOINQUANT_INDUSTRY_API_REQUIRED")
+        result = {}
+        for offset in range(0, len(codes), 500):
+            batch = [_jq_code(code) for code in codes[offset:offset + 500]]
+            values = getter(batch, date=day) or {}
+            for jq_code in batch:
+                details = values.get(jq_code) or {}
+                chosen = (
+                    details.get("sw_l1")
+                    or details.get("jq_l1")
+                    or details.get("zjw")
+                    or {}
+                )
+                result[_code(jq_code)] = str(chosen.get("industry_name") or "").strip()
+        missing = [str(code) for code in codes if not result.get(_code(code))]
+        if missing:
+            raise StrictExportError(
+                "HISTORICAL_INDUSTRY_MISSING: " + ",".join(missing[:10])
+            )
+        return result
+
+    def valuations(self, codes, day):
+        """Return date-scoped market-cap evidence for turnover calculation."""
+        try:
+            from jqdata import apis
+            get_fundamentals = self.namespace.get("get_fundamentals") or getattr(
+                apis, "get_fundamentals", None
+            )
+            query = self.namespace.get("query") or getattr(apis, "query", None)
+            valuation = self.namespace.get("valuation") or getattr(apis, "valuation", None)
+        except ImportError:
+            get_fundamentals = self.namespace.get("get_fundamentals")
+            query = self.namespace.get("query")
+            valuation = self.namespace.get("valuation")
+        if not callable(get_fundamentals) or not callable(query) or valuation is None:
+            raise StrictExportError("JOINQUANT_VALUATION_API_REQUIRED")
+        result = {}
+        for offset in range(0, len(codes), 500):
+            batch = [_jq_code(code) for code in codes[offset:offset + 500]]
+            request = query(
+                valuation.code,
+                valuation.market_cap,
+                valuation.circulating_market_cap,
+            ).filter(valuation.code.in_(batch))
+            frame = get_fundamentals(request, date=day)
+            if frame is None:
+                continue
+            for _, row in frame.iterrows():
+                code = _code(row.get("code"))
+                result[code] = {
+                    "market_cap": _finite(row.get("market_cap"), "market_cap") * 100000000.0,
+                    "circulating_market_cap": _finite(
+                        row.get("circulating_market_cap"), "circulating_market_cap"
+                    ) * 100000000.0,
+                }
+        missing = [str(code) for code in codes if _positive_finite_or_none(
+            result.get(_code(code), {}).get("circulating_market_cap")
+        ) is None]
+        if missing:
+            raise StrictExportError(
+                "HISTORICAL_CIRCULATING_MARKET_CAP_MISSING: " + ",".join(missing[:10])
+            )
+        return result
+
     def prices(
         self,
         codes,
@@ -1050,6 +1125,7 @@ def export_month(
             source,
             daily_feature_builder,
             sink=daily_spill,
+            market_frame=market_daily_frame,
         )
     finally:
         daily_spill.close()
@@ -1126,6 +1202,10 @@ def export_month(
         "decision_candidates", staged_jsonl_files["decision_candidates.jsonl"]
     )
     candidate_builder_sha256 = _callable_hash(candidate_builder)
+    daily_feature_builder_sha256 = (
+        _callable_hash(daily_feature_builder)
+        if callable(daily_feature_builder) else ""
+    )
     for day_number, day in enumerate(trade_days, start=1):
         day_key = day.isoformat()
         st_codes = st_codes_by_day.get(day_key, set())
@@ -1369,6 +1449,19 @@ def export_month(
             "daily_core_audit": daily_core_audit,
             "exporter_version": EXPORTER_VERSION,
             "candidate_builder_sha256": candidate_builder_sha256,
+            "daily_feature_builder_version": (
+                DAILY_FEATURE_BUILDER_VERSION if daily_feature_builder is not None else ""
+            ),
+            "daily_feature_builder_sha256": daily_feature_builder_sha256,
+            "daily_feature_policy": (
+                {
+                    "decision_timestamp": "trade_dateT15:00:00+08:00",
+                    "news_score": "neutral_zero_without_date_scoped_news_feed",
+                    "theme": "historical_industry_fallback_without_date_scoped_concept_feed",
+                    "valuation_date": "prior_trade_date",
+                }
+                if daily_feature_builder is not None else {}
+            ),
             "retention": {
                 "unit": "one stable package per dataset month",
                 "rerun": "atomic overwrite of the same monthly archive",
@@ -1436,6 +1529,210 @@ def derive_callable_hash(function):
     return _callable_hash(function)
 
 
+def _daily_builder_accepts_context(builder):
+    try:
+        parameters = inspect.signature(builder).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    positional = [item for item in parameters if item.kind in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )]
+    return any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters) or len(positional) >= 4
+
+
+def _daily_timestamp(day_text):
+    return str(day_text)[:10] + "T15:00:00+08:00"
+
+
+def _daily_numeric_frame(history):
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise StrictExportError("PANDAS_REQUIRED") from exc
+    if history is None or getattr(history, "empty", True):
+        raise StrictExportError("STRICT_DAILY_HISTORY_INSUFFICIENT")
+    frame = history.copy().sort_values("time")
+    for column in ("open", "high", "low", "close", "factor"):
+        if column not in frame.columns:
+            raise StrictExportError("STRICT_DAILY_HISTORY_FIELD_MISSING: " + column)
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["open", "high", "low", "close", "factor"])
+    frame = frame[frame["factor"] > 0]
+    if len(frame) < 30:
+        raise StrictExportError("STRICT_DAILY_HISTORY_INSUFFICIENT")
+    return frame
+
+
+def _daily_technical_features(history, current_price):
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise StrictExportError("PANDAS_REQUIRED") from exc
+    frame = _daily_numeric_frame(history)
+    current_factor = float(frame.iloc[-1]["factor"])
+    for column in ("open", "high", "low", "close"):
+        frame["adj_" + column] = frame[column] * frame["factor"] / current_factor
+    closes = frame["adj_close"]
+    previous = closes.shift(1)
+    true_range = pd.concat([
+        (frame["adj_high"] - frame["adj_low"]).abs(),
+        (frame["adj_high"] - previous).abs(),
+        (frame["adj_low"] - previous).abs(),
+    ], axis=1).max(axis=1)
+    ma5 = float(closes.tail(5).mean())
+    ma10 = float(closes.tail(10).mean())
+    ma20 = float(closes.tail(20).mean())
+    ma30 = float(closes.tail(30).mean())
+    atr14 = float(true_range.tail(14).mean())
+    pressure = float(frame["adj_high"].tail(20).max())
+    support_candidates = [
+        float(frame["adj_low"].tail(10).min()), ma20, ma30,
+    ]
+    support_candidates = [
+        value for value in support_candidates
+        if value > 0 and value <= float(current_price) * 1.05
+    ]
+    support = max(support_candidates) if support_candidates else float(current_price) * 0.97
+    if float(current_price) >= ma5 >= ma10 >= ma20 >= ma30:
+        trend = "STRONG_UP"
+    elif float(current_price) >= ma20 and ma5 >= ma10:
+        trend = "RECOVERY"
+    elif float(current_price) < ma20 and ma5 < ma10:
+        trend = "WEAK"
+    else:
+        trend = "SIDEWAYS"
+    return {
+        "ma5": round(ma5, 6),
+        "ma10": round(ma10, 6),
+        "ma20": round(ma20, 6),
+        "ma30": round(ma30, 6),
+        "atr14": round(max(atr14, 0.0001), 6),
+        "support_level": round(max(support, 0.01), 6),
+        "pressure_level": round(max(pressure, 0.01), 6),
+        "trend_state": trend,
+        "breakout": bool(float(current_price) >= float(closes.tail(21).iloc[:-1].max()))
+        if len(closes) >= 21 else False,
+    }
+
+
+def _daily_market_regime(context):
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise StrictExportError("PANDAS_REQUIRED") from exc
+    market = context.get("market_frame")
+    day = _date_value(context["trade_date"])
+    if market is None or getattr(market, "empty", True):
+        return "NORMAL"
+    rows = market.loc[market["time"].map(_date_value) <= day].copy()
+    if rows.empty:
+        return "NORMAL"
+    row = rows.sort_values("time").iloc[-1]
+    close = _positive_finite_or_none(row.get("close"))
+    previous = _positive_finite_or_none(row.get("prev_close"))
+    if previous is None:
+        previous = _positive_finite_or_none(row.get("pre_close"))
+    if previous is None:
+        previous = _positive_finite_or_none(row.get("_derived_prev_close"))
+    if close is None or previous is None:
+        return "NORMAL"
+    index_pct = (close / previous - 1.0) * 100.0
+    snapshot = context.get("today_frame")
+    if snapshot is None or getattr(snapshot, "empty", True):
+        return "CAUTION" if index_pct <= 0 else "NORMAL"
+    pct = snapshot.get("pct_chg")
+    if pct is None:
+        return "CAUTION" if index_pct <= 0 else "NORMAL"
+    pct = pd.to_numeric(pct, errors="coerce").dropna()
+    if pct.empty:
+        return "CAUTION" if index_pct <= 0 else "NORMAL"
+    up = int((pct > 0).sum())
+    down = int((pct < 0).sum())
+    median = float(pct.median())
+    if index_pct > 0.8 and up > down and median >= 0:
+        return "NORMAL"
+    if index_pct <= -0.8:
+        return "RISK_OFF"
+    return "CAUTION"
+
+
+def build_daily_feature_rows(trade_date, code, bar, context):
+    """Build the full daily feature contract from data visible on trade_date.
+
+    ``context`` is prepared by :func:`_daily_exports` and contains only bars
+    whose dates are no later than ``trade_date``.  Current-day close data is
+    considered available at the post-close decision timestamp; no future bar
+    or current snapshot is consulted.
+    """
+    history = context.get("history")
+    technical = _daily_technical_features(history, float(bar["close"]))
+    previous = _positive_finite_or_none(bar.get("prev_close"))
+    close = _finite(bar.get("close"), "close")
+    if previous is None or close <= 0:
+        raise StrictExportError("STRICT_DAILY_PREVIOUS_CLOSE_REQUIRED")
+    pct_chg = (close / previous - 1.0) * 100.0
+    amount = _finite(bar.get("amount"), "amount")
+    pct_rank = float(context.get("pct_rank", {}).get(_code(code), 0.0))
+    amount_rank = float(context.get("amount_rank", {}).get(_code(code), 0.0))
+    score = 70.0 + 10.0 * float(
+        technical["trend_state"] in ("STRONG_UP", "RECOVERY")
+    ) + 8.0 * float(technical["breakout"]) + 5.0 * pct_rank + 2.0 * amount_rank
+    mode = "short" if technical["breakout"] or pct_chg >= 5.0 else "mid"
+    cap = 20.0 if mode == "short" else 15.0
+    board = (
+        "growth" if _code(code).startswith(("300", "301", "688"))
+        else ("main_low" if technical["atr14"] / close <= 0.02 else "main_active")
+    )
+    atr_mult, max_loss = {
+        "main_low": (1.8, 0.06),
+        "main_active": (2.0, 0.07),
+        "growth": (2.5, 0.09),
+    }[board]
+    entry = round(close, 6)
+    stop_candidates = [
+        technical["support_level"] * 0.99,
+        entry - atr_mult * technical["atr14"],
+        entry * (1.0 - max_loss),
+    ]
+    stop = round(min(max(min(stop_candidates), 0.01), entry - 0.01), 6)
+    risk = max(entry - stop, 0.01)
+    take = round(entry + risk * 2.0, 6)
+    regime = _daily_market_regime(context)
+    if regime == "RISK_OFF":
+        cap = 0.0
+    industry = str(context.get("industry") or "UNKNOWN").strip() or "UNKNOWN"
+    # The live PIT policy currently uses industry as the deterministic theme
+    # fallback when no date-scoped concept feed is available.
+    theme = str(context.get("theme") or industry).strip() or "UNKNOWN"
+    available_at = _daily_timestamp(trade_date)
+    values = {
+        "score": round(score, 6),
+        "news_score": 0.0,
+        "pct_chg": round(pct_chg, 6),
+        "turnover": round(float(context.get("turnover", {}).get(_code(code), 0.0)), 6),
+        "position_pct": round(cap, 6),
+        "entry_price": entry,
+        "stop_loss": stop,
+        "take_profit": take,
+        "atr14": technical["atr14"],
+        "support_level": technical["support_level"],
+        "strategy_mode": mode,
+        "market_regime": regime,
+        "industry": industry,
+        "theme": theme,
+    }
+    return [
+        {
+            "feature_name": name,
+            "feature_value": value,
+            "event_at": available_at,
+            "available_at": available_at,
+        }
+        for name, value in sorted(values.items())
+    ]
+
+
 def _daily_exports(
     config,
     trade_days,
@@ -1444,13 +1741,21 @@ def _daily_exports(
     source,
     feature_builder,
     sink=None,
+    market_frame=None,
 ):
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise StrictExportError("PANDAS_REQUIRED") from exc
     bars = []
     statuses = []
     universe_rows = []
     feature_rows = []
     skip_counts = {}
     skip_examples = []
+    builder_accepts_context = (
+        feature_builder is not None and _daily_builder_accepts_context(feature_builder)
+    )
 
     def record_skip(day_text, code, reason):
         skip_counts[reason] = int(skip_counts.get(reason, 0)) + 1
@@ -1476,9 +1781,70 @@ def _daily_exports(
         universe_frame = _load_universe_context(universes[day_text])
         jq_codes = sorted(str(code) for code in universe_frame.index)
         st = source.st_flags(jq_codes, day)
-        today = frame[frame["_trade_date"] == day]
+        today_all = frame[frame["_trade_date"] == day].copy()
+        today = today_all
         if not today.empty:
             today = today.groupby("code", as_index=False).tail(1).set_index("code")
+        industries = {}
+        valuations = {}
+        pct_rank = {}
+        amount_rank = {}
+        turnover = {}
+        if builder_accepts_context:
+            if not callable(getattr(source, "industries", None)):
+                raise StrictExportError("JOINQUANT_INDUSTRY_API_REQUIRED")
+            if not callable(getattr(source, "valuations", None)):
+                raise StrictExportError("JOINQUANT_VALUATION_API_REQUIRED")
+            industries = source.industries([_code(code) for code in jq_codes], day)
+            prior_days = sorted({
+                _date_value(value) for value in frame.loc[
+                    frame["_trade_date"] < day, "_trade_date"
+                ].tolist()
+            })
+            if not prior_days:
+                raise StrictExportError("PREVIOUS_TRADE_DAY_REQUIRED")
+            valuations = source.valuations(
+                [_code(code) for code in jq_codes], prior_days[-1]
+            )
+            if not today_all.empty:
+                previous_column = (
+                    "pre_close" if "pre_close" in today_all.columns
+                    else (
+                        "prev_close" if "prev_close" in today_all.columns
+                        else "_derived_prev_close"
+                    )
+                )
+                previous_values = pd.to_numeric(
+                    today_all[previous_column].map(_positive_finite_or_none),
+                    errors="coerce",
+                )
+                today_all["_pct_chg"] = (
+                    pd.to_numeric(today_all["close"], errors="coerce")
+                    / previous_values
+                    - 1.0
+                ) * 100.0
+                today_all["_amount"] = today_all["money"].astype(float)
+                pct_values = today_all.set_index("code")["_pct_chg"]
+                amount_values = today_all.set_index("code")["_amount"]
+                pct_rank = {
+                    _code(code): float(value)
+                    for code, value in pct_values.rank(pct=True).fillna(0.0).items()
+                }
+                amount_rank = {
+                    _code(code): float(value)
+                    for code, value in amount_values.rank(pct=True).fillna(0.0).items()
+                }
+                for raw_code, value in amount_values.items():
+                    clean = _code(raw_code)
+                    cap = _positive_finite_or_none(
+                        valuations.get(clean, {}).get("circulating_market_cap")
+                    )
+                    turnover[clean] = (
+                        float(value) / cap * 100.0 if cap is not None else 0.0
+                    )
+            market_for_day = market_frame
+        else:
+            market_for_day = None
         current = None
         bar = None
         status = None
@@ -1530,15 +1896,41 @@ def _daily_exports(
                     raise
                 record_skip(day_text, code, "INVALID_DAILY_EVIDENCE:" + reason)
                 continue
-            if sink is None:
-                bars.append(bar)
-                statuses.append(status)
-            else:
-                sink.write_bar(bar)
-                sink.write_status(status)
             built_features = []
             if feature_builder is not None:
-                built = list(feature_builder(day_text, code, bar))
+                context = {
+                    "trade_date": day_text,
+                    "code": code,
+                    "bar": dict(bar),
+                    "status": dict(status),
+                    "history": frame[
+                        (frame["code"].map(_code) == code)
+                        & (frame["_trade_date"] <= day)
+                    ].copy(),
+                    "today_frame": today_all.copy(),
+                    "market_frame": market_for_day,
+                    "industry": industries.get(code, ""),
+                    "theme": industries.get(code, ""),
+                    "valuation": valuations.get(code, {}),
+                    "pct_rank": pct_rank,
+                    "amount_rank": amount_rank,
+                    "turnover": turnover,
+                }
+                try:
+                    built = list(
+                        feature_builder(day_text, code, bar, context)
+                        if builder_accepts_context
+                        else feature_builder(day_text, code, bar)
+                    )
+                except StrictExportError as exc:
+                    reason = str(exc)
+                    if reason in (
+                        "STRICT_DAILY_HISTORY_INSUFFICIENT",
+                        "STRICT_DAILY_PREVIOUS_CLOSE_REQUIRED",
+                    ):
+                        record_skip(day_text, code, reason)
+                        continue
+                    raise
                 for item in built:
                     row = dict(item)
                     row.setdefault("trade_date", day_text)
@@ -1547,6 +1939,15 @@ def _daily_exports(
             built_features.sort(key=lambda row: (
                 str(row["feature_name"]), str(row["available_at"]),
             ))
+            if builder_accepts_context and not built_features:
+                record_skip(day_text, code, "EMPTY_DAILY_FEATURES")
+                continue
+            if sink is None:
+                bars.append(bar)
+                statuses.append(status)
+            else:
+                sink.write_bar(bar)
+                sink.write_status(status)
             if sink is None:
                 feature_rows.extend(built_features)
             else:
@@ -2523,6 +2924,7 @@ def main(argv=None):
 
 __all__ = [
     "ADJUSTMENT_VERSION",
+    "DAILY_FEATURE_BUILDER_VERSION",
     "DecisionContext",
     "EXPORTER_VERSION",
     "ExportConfig",
@@ -2533,6 +2935,7 @@ __all__ = [
     "REQUIRED_RULE_AUDIT_FEATURES",
     "StrictExportError",
     "build_candidate_rows",
+    "build_daily_feature_rows",
     "build_strict_manifest",
     "candidate_sample_id",
     "canonical_hash",
