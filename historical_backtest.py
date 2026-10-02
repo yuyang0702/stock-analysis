@@ -718,6 +718,233 @@ def build_walk_forward_windows(trade_dates: Iterable[str], count: int = 3) -> li
     return windows
 
 
+def _result_metrics(result: HistoricalBacktestResult) -> dict[str, object]:
+    """Return bounded, JSON-friendly metrics for a research fold."""
+    metrics = asdict(compute_metrics(result.equity, result.trades))
+    metrics.update(
+        {
+            "trade_count": len(result.trades),
+            "closed_trade_count": sum(
+                1 for trade in result.trades if trade.action == "sell" and trade.pnl is not None
+            ),
+            "equity_points": len(result.equity),
+            "blocked_counts": dict(sorted(result.blocked_counts.items())),
+        }
+    )
+    return metrics
+
+
+def _walk_forward_objective(metrics: Mapping[str, object]) -> float:
+    """Select parameters using training data only and penalise drawdown."""
+    return float(metrics.get("net_return", 0.0) or 0.0) - float(
+        metrics.get("max_drawdown", 0.0) or 0.0
+    )
+
+
+def _aggregate_walk_forward_metrics(folds: Iterable[Mapping[str, object]]) -> dict[str, object]:
+    rows = [dict(row) for row in folds]
+    if not rows:
+        return {
+            "fold_count": 0,
+            "trade_count": 0,
+            "closed_trade_count": 0,
+            "compounded_net_return": 0.0,
+            "max_drawdown": 0.0,
+            "profit_factor": 0.0,
+            "average_holding_days": 0.0,
+        }
+    returns = [float(row.get("net_return", 0.0) or 0.0) for row in rows]
+    compounded = 1.0
+    for value in returns:
+        compounded *= 1.0 + value
+    closed_count = sum(int(row.get("closed_trade_count", 0) or 0) for row in rows)
+    gross_profit = sum(
+        float(row.get("average_win", 0.0) or 0.0)
+        * int(row.get("win_rate", 0.0) * row.get("closed_trade_count", 0) or 0)
+        for row in rows
+    )
+    gross_loss = sum(
+        abs(float(row.get("average_loss", 0.0) or 0.0))
+        * max(
+            0,
+            int(row.get("closed_trade_count", 0) or 0)
+            - int(row.get("win_rate", 0.0) * row.get("closed_trade_count", 0) or 0),
+        )
+        for row in rows
+    )
+    holding_days = sum(
+        float(row.get("average_holding_days", 0.0) or 0.0)
+        * int(row.get("closed_trade_count", 0) or 0)
+        for row in rows
+    )
+    return {
+        "fold_count": len(rows),
+        "trade_count": sum(int(row.get("trade_count", 0) or 0) for row in rows),
+        "closed_trade_count": closed_count,
+        "compounded_net_return": compounded - 1.0,
+        "max_drawdown": max(float(row.get("max_drawdown", 0.0) or 0.0) for row in rows),
+        "profit_factor": gross_profit / gross_loss if gross_loss else (math.inf if gross_profit else 0.0),
+        "average_holding_days": holding_days / closed_count if closed_count else 0.0,
+    }
+
+
+def run_walk_forward(
+    store: HistoricalStore,
+    dataset_id: str,
+    start: str,
+    end: str,
+    base_config: HistoricalBacktestConfig,
+    *,
+    folds: int = 3,
+    holdout_days: int = 20,
+    min_score_grid: Iterable[float] | None = None,
+    max_positions_grid: Iterable[int] | None = None,
+) -> dict[str, object]:
+    """Run train-only parameter selection, rolling validation and final holdout.
+
+    The function deliberately keeps each fold independent and never writes a
+    parameter as approved or active.  The final holdout is evaluated using the
+    configuration selected by the last training fold, so it remains unseen
+    during parameter selection.
+    """
+    if folds < 3:
+        raise HistoricalDataValidationError("WALK_FORWARD_REQUIRES_THREE_FOLDS")
+    if holdout_days < 0:
+        raise HistoricalDataValidationError("HOLDOUT_DAYS_MUST_NOT_BE_NEGATIVE")
+    dates = store.trade_dates(dataset_id, start, end)
+    if holdout_days >= len(dates):
+        raise HistoricalDataValidationError("HOLDOUT_EXCEEDS_DATASET_WINDOW")
+    holdout = dates[-holdout_days:] if holdout_days else []
+    research_dates = dates[:-holdout_days] if holdout_days else dates
+    minimum_dates = 21 + folds * 5
+    if len(research_dates) < minimum_dates:
+        raise HistoricalDataValidationError(
+            f"INSUFFICIENT_WALK_FORWARD_DATES:{len(research_dates)}<{minimum_dates}"
+        )
+    windows = build_walk_forward_windows(research_dates, count=folds)
+    if len(windows) != folds:
+        raise HistoricalDataValidationError("INSUFFICIENT_WALK_FORWARD_WINDOWS")
+
+    scores = sorted(
+        {float(base_config.min_score), *(float(value) for value in (min_score_grid or ())) }
+    )
+    positions = sorted(
+        {int(base_config.max_positions), *(int(value) for value in (max_positions_grid or ())) }
+    )
+    if not scores or any(not math.isfinite(value) for value in scores):
+        raise HistoricalDataValidationError("INVALID_MIN_SCORE_GRID")
+    if not positions or any(value <= 0 for value in positions):
+        raise HistoricalDataValidationError("INVALID_MAX_POSITIONS_GRID")
+
+    fold_reports: list[dict[str, object]] = []
+    selected_config = base_config
+    for index, window in enumerate(windows, start=1):
+        training_candidates: list[dict[str, object]] = []
+        for max_positions in positions:
+            for min_score in scores:
+                candidate_config = replace(
+                    base_config,
+                    max_positions=max_positions,
+                    min_score=min_score,
+                    parameter_version=f"{base_config.parameter_version}:wf{index}:train",
+                )
+                training_result = run_historical_backtest(
+                    store,
+                    dataset_id,
+                    window.training_start,
+                    window.training_end,
+                    candidate_config,
+                )
+                training_metrics = _result_metrics(training_result)
+                training_candidates.append(
+                    {
+                        "max_positions": max_positions,
+                        "min_score": min_score,
+                        "objective": _walk_forward_objective(training_metrics),
+                        "metrics": training_metrics,
+                    }
+                )
+        selected = max(
+            training_candidates,
+            key=lambda row: (
+                float(row["objective"]),
+                float(row["metrics"].get("net_return", 0.0) or 0.0),
+                -float(row["metrics"].get("max_drawdown", 0.0) or 0.0),
+                -int(row["max_positions"]),
+                -float(row["min_score"]),
+            ),
+        )
+        selected_config = replace(
+            base_config,
+            max_positions=int(selected["max_positions"]),
+            min_score=float(selected["min_score"]),
+            parameter_version=f"{base_config.parameter_version}:wf{index}:validation",
+        )
+        validation_result = run_historical_backtest(
+            store,
+            dataset_id,
+            window.validation_start,
+            window.validation_end,
+            selected_config,
+        )
+        fold_reports.append(
+            {
+                "fold": index,
+                "window": asdict(window),
+                "selected_parameters": {
+                    "max_positions": selected_config.max_positions,
+                    "min_score": selected_config.min_score,
+                },
+                "training_candidates": training_candidates,
+                "validation": _result_metrics(validation_result),
+            }
+        )
+
+    holdout_report: dict[str, object] | None = None
+    if holdout:
+        holdout_config = replace(
+            selected_config,
+            parameter_version=f"{base_config.parameter_version}:holdout",
+        )
+        holdout_result = run_historical_backtest(
+            store, dataset_id, holdout[0], holdout[-1], holdout_config
+        )
+        holdout_report = {
+            "window": {"start": holdout[0], "end": holdout[-1]},
+            "selected_parameters": {
+                "max_positions": holdout_config.max_positions,
+                "min_score": holdout_config.min_score,
+            },
+            "metrics": _result_metrics(holdout_result),
+        }
+
+    validation_rows = [dict(row["validation"]) for row in fold_reports]
+    evidence_ready = all(
+        int(row.get("closed_trade_count", 0) or 0) > 0 for row in validation_rows
+    ) and (holdout_report is None or int(holdout_report["metrics"].get("closed_trade_count", 0) or 0) > 0)
+    return {
+        "status": "complete" if evidence_ready else "insufficient_evidence",
+        "dataset_id": str(dataset_id),
+        "dataset_hash": store.dataset_hash(dataset_id),
+        "mode": base_config.mode,
+        "base_parameters": {
+            "max_positions": base_config.max_positions,
+            "min_score": base_config.min_score,
+            "parameter_version": base_config.parameter_version,
+        },
+        "folds": fold_reports,
+        "validation_aggregate": _aggregate_walk_forward_metrics(validation_rows),
+        "holdout": holdout_report,
+        "evidence_ready": evidence_ready,
+        "rules": {
+            "training_selection_objective": "net_return_minus_max_drawdown",
+            "holdout_is_unseen": True,
+            "parameter_approval": "not_performed",
+            "minimum_training_warmup_days": 21,
+        },
+    }
+
+
 def compare_results(
     baseline: HistoricalBacktestResult, candidate: HistoricalBacktestResult
 ) -> dict[str, object]:
@@ -1126,6 +1353,33 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--capital", type=float, default=100_000)
         child.add_argument("--max-positions", type=int, default=8)
         child.add_argument("--min-score", type=float, default=75.0)
+    walk_forward = subparsers.add_parser(
+        "walk-forward",
+        help="select parameters on rolling training windows and evaluate unseen windows",
+    )
+    walk_forward.add_argument("--db", required=True)
+    walk_forward.add_argument("--dataset", required=True)
+    walk_forward.add_argument("--start", required=True)
+    walk_forward.add_argument("--end", required=True)
+    walk_forward.add_argument("--mode", required=True, choices=("strict", "price_core"))
+    walk_forward.add_argument("--output-dir", required=True)
+    walk_forward.add_argument("--strategy-version", default="historical-v1")
+    walk_forward.add_argument("--parameter-version", default="v1")
+    walk_forward.add_argument("--capital", type=float, default=100_000)
+    walk_forward.add_argument("--max-positions", type=int, default=8)
+    walk_forward.add_argument("--min-score", type=float, default=75.0)
+    walk_forward.add_argument("--folds", type=int, default=3)
+    walk_forward.add_argument("--holdout-days", type=int, default=20)
+    walk_forward.add_argument(
+        "--min-score-grid",
+        default="",
+        help="comma-separated training candidates, e.g. 70,75,80",
+    )
+    walk_forward.add_argument(
+        "--max-positions-grid",
+        default="",
+        help="comma-separated training candidates, e.g. 4,8,12",
+    )
     compare = subparsers.add_parser("compare")
     compare.add_argument("--db", required=True)
     compare.add_argument("--baseline", required=True)
@@ -1227,6 +1481,75 @@ def main(argv: list[str] | None = None) -> int:
         return code
 
     quality = validate_dataset(store, args.dataset, args.start, args.end, args.mode, STRICT_FEATURES)
+    if args.command == "walk-forward":
+        report_name = "historical_walk_forward_latest.json"
+        if not quality.accepted:
+            _publish_atomic(
+                Path(args.output_dir),
+                {
+                    "historical_backtest_quality.json": _json(_quality_payload(quality)),
+                    report_name: _json(
+                        {
+                            "status": "rejected",
+                            "reason": "DATASET_QUALITY_REJECTED",
+                            "quality": _quality_payload(quality),
+                        }
+                    ),
+                },
+            )
+            return 2
+        try:
+            min_score_grid = (
+                [float(value.strip()) for value in args.min_score_grid.split(",") if value.strip()]
+                if args.min_score_grid
+                else None
+            )
+            max_positions_grid = (
+                [int(value.strip()) for value in args.max_positions_grid.split(",") if value.strip()]
+                if args.max_positions_grid
+                else None
+            )
+            report = run_walk_forward(
+                store,
+                args.dataset,
+                args.start,
+                args.end,
+                HistoricalBacktestConfig(
+                    initial_cash=args.capital,
+                    mode=args.mode,
+                    parameter_version=args.parameter_version,
+                    max_positions=args.max_positions,
+                    min_score=args.min_score,
+                ),
+                folds=args.folds,
+                holdout_days=args.holdout_days,
+                min_score_grid=min_score_grid,
+                max_positions_grid=max_positions_grid,
+            )
+        except (HistoricalDataValidationError, ValueError) as error:
+            report = {
+                "status": "rejected",
+                "reason": " ".join(str(error).split())[:240],
+                "dataset_id": args.dataset,
+                "mode": args.mode,
+                "quality": _quality_payload(quality),
+            }
+            _publish_atomic(
+                Path(args.output_dir),
+                {
+                    "historical_backtest_quality.json": _json(_quality_payload(quality)),
+                    report_name: _json(report),
+                },
+            )
+            return 2
+        _publish_atomic(
+            Path(args.output_dir),
+            {
+                "historical_backtest_quality.json": _json(_quality_payload(quality)),
+                report_name: _json(report),
+            },
+        )
+        return 0 if report.get("status") == "complete" else 2
     quality_file = {"historical_backtest_quality.json": _json(_quality_payload(quality))}
     if args.command == "validate" or not quality.accepted:
         _publish_atomic(Path(args.output_dir), quality_file)

@@ -285,6 +285,31 @@ class HistoricalBacktestCliTest(unittest.TestCase):
             )
             self.assertTrue(json.loads((output / "historical_backtest_quality.json").read_text(encoding="utf-8"))["proxy_only"])
 
+    def test_walk_forward_rejects_insufficient_dates_without_fabricating_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = self._database(root)
+            output = root / "output"
+
+            code = main([
+                "walk-forward",
+                "--db", str(db),
+                "--dataset", "d1",
+                "--start", "2025-01-02",
+                "--end", "2025-01-02",
+                "--mode", "price_core",
+                "--output-dir", str(output),
+                "--folds", "3",
+                "--holdout-days", "0",
+            ])
+
+            self.assertEqual(code, 2)
+            payload = json.loads(
+                (output / "historical_walk_forward_latest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["status"], "rejected")
+            self.assertIn("INSUFFICIENT_WALK_FORWARD_DATES", payload["reason"])
+
     def test_atomic_publication_restores_previous_outputs_on_replace_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)

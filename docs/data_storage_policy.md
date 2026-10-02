@@ -417,7 +417,15 @@ schema 11 曾在正式交易库设计中增加以下两类数据；这些结构�
 
 当前自动化证据覆盖：精确时区、未来特征拒绝、完整 ML/规则审计字段、项目 `sample_id`/表哈希一致、schema v2 实际导入、重复月导出哈希一致、ZIP 内外哈希复核、失败不改正式库、首次失败不建库、重复导入幂等、危险 ZIP 拒绝，以及 `strict_history` 来源通过 L0 来源门。Windows 相关专项测试 33/33、服务器 Linux 全量测试 1032/1032 通过。聚宽真实验证覆盖最终精确产物的交易日、历史股票池/ST、分钟与日线字段、30 只时点候选、规则决策、次时点成交、分数截断补位拒绝解释和 manifest 哈希契约。真实整月 API 配额、月包实际大小、断网重跑和一年容量仍需平台运行观察；单时点与短程原生回测验证不能把整月数据标记为 observed/validated。
 
-### 14.5 当前运行策略快照
+### 14.5 点时数据采集与样本外验证增量
+
+2026-10-02 新增 `history_acquisition.py` 和 `historical_backtest.py walk-forward`。AkShare 采集器的输出只能写入 `cache/backtest/acquisition/<dataset_id>/` 或用户指定的 `cache/` 子目录，包含 `bars.csv`、`status.csv`、`universe.csv` 和稳定覆盖的 `acquisition_metadata.json`。每次采集按明确的代码列表、开始日期和结束日期有界运行，不创建无界追加文件；临时 CSV 和元数据使用原子替换，失败不覆盖上一份文件。
+
+AkShare 输出的 `status`、历史股票池和涨跌停属于代理构造，元数据必须保留 `strict_eligible=false`、`proxy_only=true` 及缺口警告。它可以导入独立 `cache/backtest/history.db` 做 `price_core` 研究，但不得作为 strict 数据集或复制进正式交易库。正式 strict 数据仍由 JoinQuant 月包和 `strict_history_ingest.py` 负责校验、备份和原子导入。
+
+Walk-forward 报告写入 `output/historical_walk_forward_latest.json`，采用原子覆盖，不保存每个参数候选的完整逐笔结果；明细只保留有界指标、窗口和参数身份。训练窗口只用于参数排序，验证窗口和最终 holdout 只读评价，不写 approved/active 状态。数据不足、点时缺口、未来字段或闭合交易不足时，报告状态为 `rejected` 或 `insufficient_evidence`，不得生成收益结论。
+
+### 14.6 当前运行策略快照
 
 2026-08-09 新增 `strategy_snapshot_runtime.py`、`strategy_snapshot_builder.py` 和桌面“一键生成聚宽策略快照”入口，当前为 `implemented / server deployed / locally end-to-end validated / not committed / not pushed`。服务器构建器只在 `stock-analysis.service` 为 active/running、入口仍为 `a_share_strategy.py`，且策略源码和 `stock-analysis.env` 均不晚于服务启动时间时生成快照。这样冻结的是当前实际加载版本，而不是尚未重启的磁盘版本。
 

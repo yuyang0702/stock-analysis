@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +22,7 @@ from historical_backtest import (
     group_metrics,
     run_decision_time_replay,
     run_historical_backtest,
+    run_walk_forward,
     sensitivity_matrix,
 )
 from historical_data import HistoricalDataValidationError, HistoricalStore, strict_table_hash
@@ -532,6 +534,50 @@ class HistoricalBacktestTest(unittest.TestCase):
         for window in windows:
             self.assertLess(window.training_end, window.validation_start)
         self.assertLess(windows[0].validation_end, windows[1].validation_start)
+
+    def test_walk_forward_selects_on_training_and_keeps_holdout_unseen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dates = [
+                (date(2025, 1, 1) + timedelta(days=day)).isoformat()
+                for day in range(60)
+            ]
+            store = self._store(
+                Path(tmp),
+                [(day, 10, 10.2, 9.8, 10, 0, 11, 9) for day in dates],
+            )
+
+            def fake_backtest(_store, _dataset, start, end, config):
+                edge = 0.20 if config.min_score == 70 else 0.05
+                if "holdout" in config.parameter_version:
+                    edge = 0.01
+                return HistoricalBacktestResult(
+                    trades=[
+                        HistoricalTrade(
+                            start, end, "600000", "sell", 100, 10, 0, "TEST", edge * 100,
+                            holding_days=1,
+                        )
+                    ],
+                    equity=[EquityPoint(start, 100, 100), EquityPoint(end, 100 * (1 + edge), 100 * (1 + edge))],
+                )
+
+            with patch("historical_backtest.run_historical_backtest", side_effect=fake_backtest):
+                report = run_walk_forward(
+                    store,
+                    "d1",
+                    dates[0],
+                    dates[-1],
+                    HistoricalBacktestConfig(min_score=75),
+                    folds=3,
+                    holdout_days=5,
+                    min_score_grid=[70, 80],
+                    max_positions_grid=[4, 8],
+                )
+
+            self.assertEqual(report["status"], "complete")
+            self.assertEqual(len(report["folds"]), 3)
+            self.assertEqual(report["folds"][0]["selected_parameters"]["min_score"], 70)
+            self.assertEqual(report["holdout"]["window"]["start"], dates[-5])
+            self.assertTrue(report["holdout"]["metrics"]["closed_trade_count"])
 
     def test_comparison_contract_mismatch_is_rejected(self) -> None:
         baseline = HistoricalBacktestResult(metadata={"dataset_hash": "a", "window": "w", "fees": 1})

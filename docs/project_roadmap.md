@@ -1,6 +1,8 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-08-11
+更新日期：2026-10-02
+
+> 2026-10-02 本地历史验证增量：新增 `history_acquisition.py`，提供有界 AkShare 日线代理采集；输出明确标记 `proxy_only=true`、`strict_eligible=false`，不补造历史 ST、停牌、股票池或完整涨跌停事实。`historical_backtest.py walk-forward` 已支持训练窗口选参、至少 3 个滚动验证窗口和最终 holdout，当前本机 `jq-strict-probe-202607` 只有 23 个交易日，3 折加 5 日 holdout 以 `INSUFFICIENT_WALK_FORWARD_DATES:18<36` 失败关闭。真实 strict 数据仍必须通过 JoinQuant 月包导出和 `strict_history_ingest.py` 导入，当前没有可审计的 6–12 个月样本外结果。
 
 > 2026-08-11 聚宽运行隔离与污染清理检查点：用户确认 8 月 8–10 日均运行过回测，但生产证据显示只有 8 月 8 日 03:19:56–03:25:43 的旧在线模板写入生产接口，形成 211 个账户快照、217 次对账、1 条当日权益和 1 份当前券商快照；8 月 9–10 日无同类 API 写入，8 月 10 日 27 次真实扫描已核对并保留。服务器已部署 `97d251b`，聚宽端 `sim_trade` fail-closed、服务器头部/正文双验证和落盘同步复核均已生效；污染数据库行、241 条账户历史、482 条 API 事件、3539 条陈旧网页同步事件及两个活动快照文件已从活动数据移入 `/opt/stock-analysis-backups/quarantine/joinquant-backtest-20260808-20260810/`，manifest 状态 `completed`、目录/文件权限 700/600。清理前 verified backup 为 `trading-2026-08-11-614bea4fcd03.db`，`integrity_check=ok`。Linux 1069 项全量测试通过（2 项平台限定跳过），账本 schema 12 健康可写，三个核心服务与相关 timer active、`NRestarts=0`、warning 日志 0，API 缺运行身份返回 409、精确身份返回 200；`stock-analysis.env` SHA-256 前后均为 `5286a61bcdb7f632af3719fe17e629d53a088a954d1d4696e51ade247bfc5be1`，密钥和 Token 未修改。服务器和本地提交已完成，推送 `origin/main` 仍受当前外发审批阻断；聚宽网站在线模拟盘尚未更新到 `2026-08-11.1-runtime-isolation`，所以当前无活动账户快照，同步器会安全输出 `JOINQUANT_SYNC_SKIPPED no_accepted_snapshot`，不能把该状态误写成模拟盘已恢复观察。
 
@@ -20,6 +22,7 @@
 | --- | --- | --- |
 | `docs/project_handoff.md` | 新电脑、新对话和外部状态恢复 | 时间点快照；接管任务必读，服务器状态仍需重新验证。 |
 | `docs/2026-10-02_本地策略优先实施计划.md` | 本地策略、数据、回测、组合风控和模拟盘优先改造顺序 | 当前改造任务的执行计划；券商自动下单只保留接口边界，按阶段验收。 |
+| `docs/2026-10-02_点时数据获取与样本外验证报告.md` | 点时历史数据获取、代理数据边界、样本外和 walk-forward 运行方式 | 当前数据采集和验证任务的唯一专项说明；涉及历史库补数、walk-forward 或数据源切换时读取。 |
 | `docs/live_trading_execution_plan.md` | 模拟盘稳定性、完整历史回测、实盘级风控、交易适配和真实资金前门槛 | 涉及阶段推进、部署验收或实盘化时读取。 |
 | `docs/codex_simulation_observation_plan.md` | Codex 定时只读审核、证据、报告和权限 | 涉及自动审查、服务器只读访问或阶段评估时读取。 |
 | `docs/data_storage_policy.md` | 数据分类、增长、保留、轮转、备份恢复和敏感信息 | 任何新增或修改持久化数据时必读。 |
