@@ -54,6 +54,28 @@ function Save-LatestResult {
     Move-Item -LiteralPath $temporary -Destination $LatestResult -Force
 }
 
+function Get-Sha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $fileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+    if ($null -ne $fileHash) {
+        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    }
+
+    # Windows PowerShell installations can omit the Microsoft.PowerShell.Utility
+    # module when launched with -NoProfile.  Keep validation usable without
+    # weakening the hash check by using the .NET implementation as a fallback.
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        return ([System.BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $algorithm.Dispose()
+    }
+}
+
 if (-not $PackagePath) {
     Add-Type -AssemblyName System.Windows.Forms
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -104,7 +126,7 @@ $datasetId = [string]$verification.dataset_id
 if ($datasetId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$') {
     Stop-Friendly "ZIP 中的数据集名称不符合安全规则。"
 }
-$packageSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $PackagePath).Hash.ToLowerInvariant()
+$packageSha256 = Get-Sha256 -Path $PackagePath
 Write-Host "ZIP 完整，数据集：$datasetId" -ForegroundColor Green
 Write-Host "文件指纹：$packageSha256"
 

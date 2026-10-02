@@ -65,6 +65,12 @@ class MlStoreTest(unittest.TestCase):
         store.initialize()
         return store
 
+    def test_sqlite_full_detection_supports_python310_error_text(self) -> None:
+        self.assertTrue(
+            ml_store._is_sqlite_full(sqlite3.OperationalError("database or disk is full"))
+        )
+        self.assertFalse(ml_store._is_sqlite_full(sqlite3.OperationalError("database is locked")))
+
     def create_v1_store(self, *, with_label: bool = True) -> Path:
         path = self.root / "legacy" / "ml.db"
         path.parent.mkdir(parents=True, exist_ok=True)

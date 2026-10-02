@@ -1,5 +1,8 @@
 import unittest
+import tempfile
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pandas as pd
 
@@ -7,12 +10,38 @@ from execution_contracts import FeeSchedule
 from paper_trading import (
     apply_paper_trades,
     build_paper_trade_markdown,
+    load_account,
     new_account,
+    save_account,
     summarize_account,
 )
 
 
 class PaperTradingTest(unittest.TestCase):
+    def test_account_persistence_is_versioned_bounded_and_clock_injectable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "paper.json"
+            now = datetime(2026, 10, 2, 9, 30, 0)
+            account = new_account(10_000, now=now)
+            account["trades"] = [{"index": index} for index in range(5_100)]
+            account["equity_curve"] = [{"index": index} for index in range(2_100)]
+            save_account(path, account, now=now)
+
+            restored = load_account(path)
+            self.assertEqual(restored["schema_version"], 2)
+            self.assertEqual(restored["created_at"], "2026-10-02 09:30:00")
+            self.assertEqual(len(restored["trades"]), 5_000)
+            self.assertEqual(restored["trades"][0]["index"], 100)
+            self.assertEqual(len(restored["equity_curve"]), 2_000)
+            self.assertEqual(restored["updated_at"], "2026-10-02 09:30:00")
+
+    def test_corrupt_account_does_not_silently_reset_to_cash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "paper.json"
+            path.write_text("{broken", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "PAPER_ACCOUNT_CORRUPT"):
+                load_account(path)
+
     def test_reports_versioned_fee_components(self) -> None:
         fees = FeeSchedule(
             version="test-v1", effective_from="2026-01-01",
@@ -166,6 +195,24 @@ class PaperTradingTest(unittest.TestCase):
 
         self.assertEqual(events, [])
         self.assertEqual(account["positions"]["600000"]["qty"], 1000)
+
+    def test_repeated_scan_does_not_reenter_after_same_day_take_profit(self) -> None:
+        account = new_account(100_000)
+        buy = {
+            "code": "600000", "price": 10.0, "entry_price": 10.0,
+            "stop_loss": 9.5, "take_profit": 11.0, "position_pct": 10,
+            "final_score": 90,
+        }
+        apply_paper_trades(account, pd.DataFrame([buy]), trade_date="2026-07-07",
+                           commission_rate=0, stamp_tax_rate=0, slippage_pct=0)
+        sell = {"code": "600000", "price": 11.2, "stop_loss": 9.5, "take_profit": 11.0}
+        first = apply_paper_trades(account, pd.DataFrame([sell]), trade_date="2026-07-08",
+                                   commission_rate=0, stamp_tax_rate=0, slippage_pct=0)
+        second = apply_paper_trades(account, pd.DataFrame([buy]), trade_date="2026-07-08",
+                                    commission_rate=0, stamp_tax_rate=0, slippage_pct=0)
+        self.assertEqual([event["action"] for event in first], ["sell"])
+        self.assertEqual(second, [])
+        self.assertEqual(len(account["equity_curve"]), 2)
 
     def test_sells_next_day_when_stop_loss_hits(self) -> None:
         account = new_account(100_000)

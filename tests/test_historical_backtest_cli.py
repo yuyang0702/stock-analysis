@@ -2,9 +2,17 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from historical_backtest import _implementation_hash, _implementation_paths, _publish_atomic, main
+from historical_backtest import (
+    HistoricalBacktestConfig,
+    _implementation_hash,
+    _implementation_paths,
+    _publish_atomic,
+    _run_id,
+    main,
+)
 from historical_data import HistoricalStore, strict_table_hash
 from ml_contracts import CandidateSample, TimedFeature
 
@@ -334,6 +342,21 @@ class HistoricalBacktestCliTest(unittest.TestCase):
             code.write_text("two", encoding="utf-8")
             self.assertNotEqual(first, _implementation_hash([code]))
 
+    def test_run_id_changes_when_position_or_score_config_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = self._database(root)
+            args = SimpleNamespace(
+                dataset="d1", start="2025-01-02", end="2025-01-02",
+                mode="price_core", strategy_version="historical-v1",
+            )
+            base = HistoricalBacktestConfig()
+            positions = HistoricalBacktestConfig(max_positions=4)
+            score = HistoricalBacktestConfig(min_score=80.0)
+            first = _run_id(HistoricalStore(db), args, base)
+            self.assertNotEqual(first, _run_id(HistoricalStore(db), args, positions))
+            self.assertNotEqual(first, _run_id(HistoricalStore(db), args, score))
+
     def test_implementation_hash_covers_strict_candidate_and_execution_contract(self) -> None:
         names = {path.name for path in _implementation_paths()}
         self.assertTrue(
@@ -364,6 +387,28 @@ class HistoricalBacktestCliTest(unittest.TestCase):
             self.assertLessEqual(len(error), 240)
             self.assertNotIn("\n", error)
             self.assertEqual({path.name for path in output.iterdir()}, {"historical_backtest_quality.json"})
+
+    def test_failed_run_can_be_retried_and_replaced_by_complete_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = self._database(root)
+            output = root / "output"
+            args = [
+                "run", "--db", str(db), "--dataset", "d1", "--start", "2025-01-02",
+                "--end", "2025-01-02", "--mode", "price_core", "--output-dir", str(output),
+            ]
+            with patch(
+                "historical_backtest.run_historical_backtest",
+                side_effect=RuntimeError("transient"),
+            ):
+                self.assertNotEqual(main(args), 0)
+            self.assertEqual(main(args), 0)
+            with HistoricalStore(db).connect() as connection:
+                status, error = connection.execute(
+                    "SELECT status, error FROM backtest_runs"
+                ).fetchone()
+            self.assertEqual(status, "complete")
+            self.assertEqual(error, "")
 
     def test_compare_rejects_different_execution_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

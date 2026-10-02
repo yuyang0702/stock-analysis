@@ -12,17 +12,30 @@ import config as app_config
 from execution_contracts import FeeBreakdown, FeeSchedule
 
 
-def new_account(initial_cash: float = 100_000) -> dict[str, Any]:
+PAPER_ACCOUNT_SCHEMA_VERSION = 2
+PAPER_MAX_TRADE_HISTORY = 5_000
+PAPER_MAX_EQUITY_POINTS = 2_000
+
+
+def _clock_text(now: datetime | None = None) -> str:
+    return (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def new_account(
+    initial_cash: float = 100_000, *, now: datetime | None = None
+) -> dict[str, Any]:
     cash = round(float(initial_cash), 2)
     return {
+        "schema_version": PAPER_ACCOUNT_SCHEMA_VERSION,
         "initial_cash": cash,
         "cash": cash,
         "positions": {},
         "trades": [],
         "cooldown": {},
+        "sold_codes_today": {},
         "equity_curve": [],
         "realized_pnl": 0.0,
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at": _clock_text(now),
         "updated_at": "",
     }
 
@@ -32,25 +45,47 @@ def load_account(path: Path, initial_cash: float = 100_000) -> dict[str, Any]:
         return new_account(initial_cash)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return new_account(initial_cash)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # Never silently reset a paper account: doing so would erase local
+        # position and P&L evidence and could cause duplicate simulated buys.
+        raise ValueError("PAPER_ACCOUNT_CORRUPT") from exc
     if not isinstance(raw, dict):
-        return new_account(initial_cash)
+        raise ValueError("PAPER_ACCOUNT_SCHEMA_INVALID")
+    version = int(raw.get("schema_version", 1) or 1)
+    if version > PAPER_ACCOUNT_SCHEMA_VERSION:
+        raise ValueError("PAPER_ACCOUNT_SCHEMA_UNSUPPORTED")
+    raw["schema_version"] = PAPER_ACCOUNT_SCHEMA_VERSION
     raw.setdefault("initial_cash", float(initial_cash))
     raw.setdefault("cash", float(initial_cash))
     raw.setdefault("positions", {})
     raw.setdefault("trades", [])
     raw.setdefault("cooldown", {})
+    raw.setdefault("sold_codes_today", {})
     raw.setdefault("equity_curve", [])
     raw.setdefault("realized_pnl", 0.0)
+    if not isinstance(raw.get("positions"), dict):
+        raise ValueError("PAPER_ACCOUNT_POSITIONS_INVALID")
+    if not isinstance(raw.get("sold_codes_today"), dict):
+        raise ValueError("PAPER_ACCOUNT_SOLD_CODES_INVALID")
+    if not isinstance(raw.get("trades"), list) or not isinstance(raw.get("equity_curve"), list):
+        raise ValueError("PAPER_ACCOUNT_HISTORY_INVALID")
+    raw["trades"] = raw["trades"][-PAPER_MAX_TRADE_HISTORY:]
+    raw["equity_curve"] = raw["equity_curve"][-PAPER_MAX_EQUITY_POINTS:]
     return raw
 
 
-def save_account(path: Path, account: dict[str, Any]) -> None:
+def save_account(
+    path: Path, account: dict[str, Any], *, now: datetime | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    account["schema_version"] = PAPER_ACCOUNT_SCHEMA_VERSION
+    account["trades"] = list(account.get("trades", []))[-PAPER_MAX_TRADE_HISTORY:]
+    account["equity_curve"] = list(account.get("equity_curve", []))[-PAPER_MAX_EQUITY_POINTS:]
+    account["updated_at"] = _clock_text(now)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(account, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    tmp.write_text(
+        json.dumps(account, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
     tmp.replace(path)
 
 
@@ -232,6 +267,8 @@ def apply_paper_trades(
     max_position_pct: float = 20.0,
     max_total_position_pct: float = 80.0,
     fee_schedule: FeeSchedule | None = None,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
     fees = record_active_fee_schedule(
@@ -243,6 +280,12 @@ def apply_paper_trades(
     )
     rows_by_code = _row_map(rows)
     positions = account.setdefault("positions", {})
+    sold_today = account.setdefault("sold_codes_today", {})
+    # Keep re-runs of the same scan idempotent within one trading day.  A
+    # take-profit exit must not be immediately re-entered by the next scan.
+    for code in list(sold_today):
+        if _txt(sold_today.get(code)) != trade_date:
+            sold_today.pop(code, None)
     events: list[dict[str, Any]] = []
 
     for code, pos in list(positions.items()):
@@ -267,6 +310,7 @@ def apply_paper_trades(
         account["cash"] = round(_num(account.get("cash")) + proceeds, 2)
         account["realized_pnl"] = round(_num(account.get("realized_pnl")) + pnl, 2)
         del positions[code]
+        sold_today[code] = trade_date
         if reason == "stop_loss":
             account.setdefault("cooldown", {})[code] = _date_add(trade_date, cooldown_days)
         event = {
@@ -291,7 +335,11 @@ def apply_paper_trades(
     for code, row in rows_by_code.items():
         if len(positions) >= max_positions:
             break
-        if code in positions or not _can_buy(row, account, trade_date, min_score):
+        if (
+            code in positions
+            or _txt(sold_today.get(code)) == trade_date
+            or not _can_buy(row, account, trade_date, min_score)
+        ):
             continue
         price = round(_num(row.get("price")), 3)
         qty = _buy_qty(
@@ -340,8 +388,17 @@ def apply_paper_trades(
         account.setdefault("trades", []).append(event)
         events.append(event)
 
-    account.setdefault("equity_curve", []).append({"date": trade_date, "equity": _equity(account)})
-    account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    account.setdefault("trades", [])
+    point = {"date": trade_date, "equity": _equity(account)}
+    curve = account.setdefault("equity_curve", [])
+    if curve and _txt(curve[-1].get("date")) == trade_date:
+        curve[-1] = point
+    else:
+        curve.append(point)
+    account["trades"] = account["trades"][-PAPER_MAX_TRADE_HISTORY:]
+    account["equity_curve"] = account["equity_curve"][-PAPER_MAX_EQUITY_POINTS:]
+    account["schema_version"] = PAPER_ACCOUNT_SCHEMA_VERSION
+    account["updated_at"] = _clock_text(now)
     return events
 
 

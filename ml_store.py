@@ -20,6 +20,21 @@ from ml_contracts import (
 )
 
 
+# Python 3.10 does not expose SQLite error codes on exception instances or
+# export every symbolic constant from sqlite3.  SQLITE_FULL is stable in the
+# SQLite result-code table, so keep capacity handling portable across the
+# supported local (3.10) and server (3.12) runtimes.
+_SQLITE_FULL = getattr(sqlite3, "SQLITE_FULL", 13)
+
+
+def _is_sqlite_full(error: BaseException) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if code == _SQLITE_FULL:
+        return True
+    message = str(error).lower()
+    return "database or disk is full" in message or "database full" in message
+
+
 SCHEMA_VERSION = 2
 BTREE_RESERVE_BYTES = 128 * 1024
 RUNTIME_RESERVE_BYTES = 64 * 1024
@@ -1519,7 +1534,7 @@ class MlStore:
             conn.commit()
         except sqlite3.OperationalError as exc:
             conn.rollback()
-            if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL:
+            if _is_sqlite_full(exc):
                 raise MlCapacityError(
                     f"ML database capacity reached: {self.max_bytes} bytes"
                 ) from exc

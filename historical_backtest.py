@@ -48,6 +48,18 @@ class HistoricalBacktestConfig:
     min_score: float = 75.0
     fee_schedule: FeeSchedule | None = None
 
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.initial_cash)) or self.initial_cash <= 0:
+            raise ValueError("initial_cash must be finite and positive")
+        if int(self.max_positions) != self.max_positions or self.max_positions <= 0:
+            raise ValueError("max_positions must be a positive integer")
+        if not math.isfinite(float(self.min_score)):
+            raise ValueError("min_score must be finite")
+        if not str(self.mode).strip():
+            raise ValueError("mode is required")
+        if not str(self.parameter_version).strip():
+            raise ValueError("parameter_version is required")
+
     def resolved_fee_schedule(self) -> FeeSchedule:
         if self.fee_schedule is not None:
             return self.fee_schedule
@@ -839,7 +851,9 @@ def _publish_atomic(output_dir: Path, files: dict[str, str]) -> None:
 
 
 def _json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    return json.dumps(
+        _json_safe(value), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
+    ) + "\n"
 
 
 def _quality_payload(report) -> dict[str, object]:
@@ -877,6 +891,10 @@ def _implementation_paths() -> tuple[Path, ...]:
     """Return the shared implementation files that affect historical results."""
     root = Path(__file__).parent
     names = (
+        # These modules supply execution costs and canonical contract
+        # serialization.  They are part of the historical result identity.
+        "config.py",
+        "execution_contracts.py",
         "candidate_core.py",
         "exit_policy.py",
         "trade_safety.py",
@@ -906,12 +924,9 @@ def _run_id(store: HistoricalStore, args, config: HistoricalBacktestConfig) -> s
         "strategy_version": args.strategy_version,
         "code_hash": _implementation_hash(),
         "parameter_version": config.parameter_version,
-        "capital": config.initial_cash,
-        "commission": config.commission_rate,
-        "minimum_commission": config.minimum_commission,
-        "stamp_tax": config.stamp_tax_rate,
-        "slippage_bps": config.slippage_bps,
-        "fee_schedule": config.resolved_fee_schedule().to_dict(),
+        # Include the complete normalized config.  In particular, max_positions
+        # and min_score must change the identity of a run.
+        "config": _config_payload(config),
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:24]
 
@@ -920,6 +935,32 @@ def _config_payload(config: HistoricalBacktestConfig) -> dict[str, object]:
     payload = asdict(config)
     payload["fee_schedule"] = config.resolved_fee_schedule().to_dict()
     return payload
+
+
+def _json_safe(value: object) -> object:
+    """Convert non-finite floats to JSON null instead of invalid JSON tokens."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _strict_json(value: object) -> str:
+    return json.dumps(
+        _json_safe(value), ensure_ascii=False, sort_keys=True, allow_nan=False
+    )
+
+
+def _result_sha256(result: HistoricalBacktestResult) -> str:
+    payload = {
+        "equity": [asdict(point) for point in result.equity],
+        "trades": [asdict(trade) for trade in result.trades],
+        "blocked_counts": result.blocked_counts,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def _persist_failure(
@@ -966,14 +1007,24 @@ def _persist_result(
         "code_hash": _implementation_hash(),
     }
     with store.transaction() as connection:
-        exists = connection.execute("SELECT 1 FROM backtest_runs WHERE run_id = ?", (run_id,)).fetchone()
-        if exists:
+        existing = connection.execute(
+            "SELECT status FROM backtest_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if existing and str(existing[0]) == "complete":
             return
+        if existing:
+            # A failed attempt is retryable with the same deterministic
+            # identity. Remove any partial children before replacing it.
+            connection.execute("DELETE FROM backtest_runs WHERE run_id = ?", (run_id,))
+        summary = {"metrics": metrics, "result_sha256": _result_sha256(result)}
         connection.execute(
             "INSERT INTO backtest_runs "
             "(run_id, dataset_id, dataset_hash, start_date, end_date, mode, config_json, status, "
             "summary_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'complete', ?, ?, ?)",
-            (run_id, dataset_id, store.dataset_hash(dataset_id), start, end, config.mode, json.dumps(config_payload, sort_keys=True), json.dumps(metrics, sort_keys=True), now, now),
+            (
+                run_id, dataset_id, store.dataset_hash(dataset_id), start, end,
+                config.mode, _strict_json(config_payload), _strict_json(summary), now, now,
+            ),
         )
         connection.executemany(
             "INSERT INTO backtest_equity(run_id, trade_date, equity, cash) VALUES (?, ?, ?, ?)",
@@ -1073,6 +1124,8 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--strategy-version", default="historical-v1")
         child.add_argument("--parameter-version", default="v1")
         child.add_argument("--capital", type=float, default=100_000)
+        child.add_argument("--max-positions", type=int, default=8)
+        child.add_argument("--min-score", type=float, default=75.0)
     compare = subparsers.add_parser("compare")
     compare.add_argument("--db", required=True)
     compare.add_argument("--baseline", required=True)
@@ -1163,7 +1216,8 @@ def main(argv: list[str] | None = None) -> int:
             right_config = json.loads(right["config_json"])
             for key in (
                 "initial_cash", "commission_rate", "minimum_commission", "stamp_tax_rate",
-                "slippage_bps", "fee_schedule", "strategy_version", "code_hash", "parameter_version",
+                "slippage_bps", "max_positions", "min_score", "mode", "fee_schedule",
+                "strategy_version", "code_hash", "parameter_version",
             ):
                 if left_config.get(key) != right_config.get(key):
                     mismatches.append(f"config:{key}")
@@ -1182,6 +1236,8 @@ def main(argv: list[str] | None = None) -> int:
         initial_cash=args.capital,
         mode=args.mode,
         parameter_version=args.parameter_version,
+        max_positions=args.max_positions,
+        min_score=args.min_score,
     )
     run_id = _run_id(store, args, config)
     try:

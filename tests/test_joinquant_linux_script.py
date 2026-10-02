@@ -10,6 +10,10 @@ import unittest
 from trading_store import SCHEMA_VERSION, TradingStore
 
 
+_GIT_BASH = Path(r"C:\Program Files\Git\bin\bash.exe")
+_BASH_AVAILABLE = _GIT_BASH.exists() or shutil.which("bash") is not None
+
+
 class JoinQuantLinuxScriptTest(unittest.TestCase):
     def run_ledger_check(
         self, db_path: Path, *, schema_version: int = SCHEMA_VERSION
@@ -42,7 +46,7 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
                 with sqlite3.connect(db_path) as conn:
                     conn.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
                     conn.execute("INSERT INTO schema_migrations VALUES (?, datetime('now'))", (schema_version,))
-            git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+            git_bash = _GIT_BASH
             bash = str(git_bash) if git_bash.exists() else (shutil.which("bash") or "bash")
             env = os.environ.copy()
             if git_bash.exists():
@@ -197,6 +201,7 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
         self.assertFalse(Path("start_linux_all.sh").exists())
         self.assertFalse(Path("start_joinquant_linux.sh").exists())
 
+    @unittest.skipUnless(_BASH_AVAILABLE, "Linux ledger-check tests require bash")
     def test_ledger_check_routes_and_probes_current_schema_database(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "trading.db"
@@ -207,6 +212,7 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
                 f"schema_version={SCHEMA_VERSION} health=ok writable_probe=ok", result.stdout
             )
 
+    @unittest.skipUnless(_BASH_AVAILABLE, "Linux ledger-check tests require bash")
     def test_ledger_check_rejects_schema_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             result = self.run_ledger_check(
@@ -215,6 +221,7 @@ class JoinQuantLinuxScriptTest(unittest.TestCase):
 
             self.assertNotEqual(0, result.returncode)
 
+    @unittest.skipUnless(_BASH_AVAILABLE, "Linux ledger-check tests require bash")
     def test_ledger_check_preserves_existing_system_state(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "trading.db"

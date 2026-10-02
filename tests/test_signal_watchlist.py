@@ -670,8 +670,19 @@ class SignalWatchlistTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            strat.sync_buy_plan_watchlist(signal_path, watchlist_path, mode="intraday")
-            strat.sync_buy_plan_watchlist(signal_path, watchlist_path, mode="intraday")
+            fixed_now = datetime(2026, 8, 4, 15, 0, 0)
+            strat.sync_buy_plan_watchlist(
+                signal_path,
+                watchlist_path,
+                mode="intraday",
+                now=fixed_now,
+            )
+            strat.sync_buy_plan_watchlist(
+                signal_path,
+                watchlist_path,
+                mode="intraday",
+                now=fixed_now,
+            )
 
             items = strat.load_signal_watchlist(watchlist_path)["items"]
             self.assertEqual(len(items), 1)

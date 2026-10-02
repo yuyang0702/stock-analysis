@@ -864,6 +864,8 @@ def record_signal_watchlist(
     kind: str,
     mode: str,
     pushed_at: datetime | None = None,
+    *,
+    now: datetime | None = None,
 ) -> None:
     code = clean_code(row.get("code"))
     if not code:
@@ -912,7 +914,7 @@ def record_signal_watchlist(
             break
     else:
         items.append({**item, "last_reviewed_at": "", "active": True})
-    save_signal_watchlist(path, {"items": prune_signal_watchlist_items(items)})
+    save_signal_watchlist(path, {"items": prune_signal_watchlist_items(items, now=now)})
 
 
 def sync_buy_plan_watchlist(
@@ -920,6 +922,7 @@ def sync_buy_plan_watchlist(
     watchlist_path: Path = SIGNAL_WATCHLIST_FILE,
     *,
     mode: str,
+    now: datetime | None = None,
 ) -> None:
     try:
         payload = json.loads(Path(signal_path).read_text(encoding="utf-8"))
@@ -956,6 +959,7 @@ def sync_buy_plan_watchlist(
                 pd.Series(signal),
                 "买点",
                 mode,
+                now=now,
             )
         except OSError:
             return
@@ -3774,7 +3778,7 @@ def run_paper_trading(
             stamp_tax_rate=cfg.paper_trade_stamp_tax_rate,
             slippage_pct=cfg.paper_trade_slippage_pct,
         )
-        save_account(app_config.PAPER_TRADE_FILE, account)
+        save_account(app_config.PAPER_TRADE_FILE, account, now=now)
         md = build_paper_trade_markdown(account, [])
         md += f"\n> 非A股交易时间，本地模拟盘本轮不执行买卖。当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
         print(md.replace("\n", " | "), flush=True)
@@ -3792,8 +3796,9 @@ def run_paper_trading(
         max_positions=cfg.paper_trade_max_positions,
         max_position_pct=cfg.paper_trade_max_position_pct,
         max_total_position_pct=cfg.paper_trade_max_total_position_pct,
+        now=now,
     )
-    save_account(app_config.PAPER_TRADE_FILE, account)
+    save_account(app_config.PAPER_TRADE_FILE, account, now=now)
     md = build_paper_trade_markdown(account, events)
     print(md.replace("\n", " | "), flush=True)
     return md

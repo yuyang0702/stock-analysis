@@ -273,7 +273,9 @@ def _passing_gate_metrics() -> dict[str, object]:
 class MlTrainTest(unittest.TestCase):
     def test_dependency_is_pinned_without_requiring_local_install(self) -> None:
         requirements = Path("requirements.txt").read_text(encoding="utf-8")
-        self.assertIn("scikit-learn==1.9.0", requirements.splitlines())
+        lines = requirements.splitlines()
+        self.assertIn('scikit-learn==1.7.2; python_version < "3.11"', lines)
+        self.assertIn('scikit-learn==1.9.0; python_version >= "3.11"', lines)
 
     def test_config_fixes_seed_and_limits_search_to_three_configs(self) -> None:
         with self.assertRaisesRegex(ValueError, "TRAINING_SEED_MUST_BE_7"):
