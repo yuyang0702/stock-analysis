@@ -2,7 +2,7 @@
 
 更新日期：2026-10-04
 
-> 2026-10-04 JQData 自动增强与 GitHub 工程复核：`JQDataProvider` 已增加历史 `is_st` 和按日期证券主数据能力，`history_acquisition.py` 默认自动尝试补齐 ST 与日期股票池；JQData 每日查询配额由 `--max-universe-query-days` 默认 20 保护，超过配额时只降级该增强并记录警告，不伪造 strict 结果。真实账号小窗口增强成功（5 个交易日、100 条 ST/股票池记录）；247 个交易日窗口成功采集 4,940 条价格与 ST 记录，`universe.csv` 仅保留价格行的降级对齐、没有逐日历史股票池证明，价格核心回测仍通过。新增 `docs/github_quant_references.md`，记录 Qlib、RQAlpha、Backtrader 和 vn.py 的工程借鉴边界。
+> 2026-10-04 JQData 自动增强与 GitHub 工程复核：`JQDataProvider` 已增加历史 `is_st` 和按日期证券主数据能力，`history_acquisition.py` 默认自动尝试补齐 ST 与日期股票池；JQData 每日查询配额由 `--max-universe-query-days` 默认 20 保护，超过配额时只降级该增强并记录警告，不伪造 strict 结果。真实账号小窗口增强成功（5 个交易日、100 条 ST/股票池记录）；247 个交易日窗口的验证采集发生在配额保护加入前，触发配额后采集到 4,940 条价格与 ST 记录，`universe.csv` 仅保留价格行的降级对齐、没有逐日历史股票池证明，价格核心回测仍通过；保护逻辑已加入，后续长窗口会在超过 20 个日期时安全跳过逐日股票池查询。新增 `docs/github_quant_references.md`，记录 Qlib、RQAlpha、Backtrader 和 vn.py 的工程借鉴边界。
 
 > 2026-10-04 多数据源增量：新增 `market_data_provider.py` 统一 Provider 协议和本地凭据加载、`data_source_registry.py` 有界数据集注册、JQData 本地 API 适配器、券商历史导出适配器和 `cross_source_compare.py`。AkShare、JQData 和未来券商历史数据均先落成独立 `dataset_id` 再进入同一 `HistoricalStore`；实时行情和真实下单仍保持未实现边界。JQData 账号认证成功，当前权限可用窗口为 2025-06-27 至 2026-07-03，已采集 20 只股票/4,940 条日线。与同窗口 AkShare 对照后，relative_v1 + liquidity_v1 均为负，JQData 净收益 -3.18%、AkShare -2.96%；两者均为 `proxy_only`，不具备 strict 或生产资格。
 
