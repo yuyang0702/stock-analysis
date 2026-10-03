@@ -10,6 +10,10 @@
 
 > 文档边界：本文负责阶段路线和真实资金前门槛；当前买入、卖出和风险规则以 `docs/superpowers/specs/2026-07-13-layered-exit-risk-management-design.md` 为基础，五项执行正确性 P0 以 `docs/superpowers/specs/2026-07-14-execution-contract-p0-fixes-design.md` 为最新增量，具体实施以对应计划为准。已归档的早期 JoinQuant、硬止损和实施计划不再定义当前流程。
 
+## 决策层和执行层边界
+
+本项目的首要定位是本地量化决策层。策略、特征、组合和风险代码只生成带版本、时效、数量、价格约束和风险结果的交易意图；外部执行程序或券商平台负责实时行情复核、下单、撤单、成交回报和持仓同步。JoinQuant 模拟盘、vn.py 或未来券商接口都只是可替换的执行端，不能反向改变策略判断，也不能让策略假设订单必然成交。
+
 > 2026-07-15 执行链增量以 `docs/superpowers/specs/2026-07-15-execution-timing-reconciliation-recovery-design.md` 为准：schema 7、开盘边界调度、逐信号时效、退出阶段对账、转换告警和受限自动恢复买入已随 `e2ce5b5` 推送并部署服务器。服务器备份、Linux 324/324 测试、schema 7 `ledger-check`、配置哈希和三个服务状态已核验；用户报告 JoinQuant 网站模板已手动更新，但新模板快照尚待交易日回传。当前为 `implemented（已推送） / deployed / not observed / not validated`。自动恢复仍只适用于 ERROR 对账自己实际造成的停买；CRITICAL 与任何人工控制均要求人工恢复。
 
 > 2026-07-15 成交对账修复当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`：完整模式只对当前快照交易日做成交存在性比较，不改变 SQLite 历史账本、交易策略、控制严重度或自动恢复门槛。代码提交 `cd83f26` 的 Linux全量326/326、正式账本检查、配置不变、三个服务重启和启动后ERROR日志均已通过；真实交易日行为仍待观察。
