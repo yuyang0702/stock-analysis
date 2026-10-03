@@ -226,9 +226,11 @@ def _price_core_candidates(
     market_return_20 = _cross_sectional_return(prepared, 20)
     market_state = _price_core_market_regime(market_return_5, market_return_20)
     # The price-core dataset has no point-in-time index membership or status
-    # history.  In that proxy mode, a broad negative tape is a reason to stay
-    # flat rather than manufacture long entries from relative strength.
-    if market_state == "RISK_OFF":
+    # history.  In that proxy mode, a weak broad tape is a reason to stay flat
+    # rather than manufacture long entries from relative strength.  The signal
+    # research pass showed that CAUTION entries stayed negative after costs,
+    # so only NORMAL conditions can open new long positions.
+    if market_state in {"CAUTION", "RISK_OFF"}:
         return []
     result = []
     for row, history, closes, amounts, returns, atr in prepared:
