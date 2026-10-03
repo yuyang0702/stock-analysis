@@ -76,14 +76,20 @@ class MarketDataProviderTest(unittest.TestCase):
                     index=["000001.XSHE"],
                 )
 
+            @staticmethod
+            def get_industry(securities, **_kwargs):
+                return {securities[0]: {"sw_l1": {"industry_name": "银行"}}}
+
         with patch("market_data_provider.importlib.import_module", return_value=FakeJQ):
             provider = JQDataProvider("u", "p")
             provider.connect()
             flags = provider.fetch_st_flags(["000001"], "2025-01-02", "2025-01-03")
             universe = provider.fetch_universe_membership(["000001"], ["2025-01-02"])
+            industry = provider.fetch_industry(["000001"], ["2025-01-02"])
         self.assertFalse(flags[("2025-01-02", "000001")])
         self.assertTrue(flags[("2025-01-03", "000001")])
         self.assertEqual(universe["2025-01-02"], {"000001"})
+        self.assertEqual(industry[("2025-01-02", "000001")], "银行")
 
     def test_broker_export_provider_reads_canonical_bars(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

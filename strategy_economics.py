@@ -12,6 +12,54 @@ class StrategyEconomicsError(ValueError):
     """Stable fail-closed economic calculation error."""
 
 
+def expected_net_return_gate(
+    entry_price,
+    quantity,
+    expected_gross_return_bps,
+    schedule,
+    *,
+    minimum_net_return_bps=0,
+):
+    """Check whether a calibrated expected edge survives A-share costs.
+
+    ``expected_gross_return_bps`` must come from a training-window calibration
+    or an externally supplied model.  This function deliberately does not
+    infer expected returns from the current bar, which would make a decision
+    threshold look predictive without evidence.
+    """
+    entry = _econ_decimal(entry_price, "entry_price", allow_zero=False)
+    if isinstance(quantity, bool) or int(quantity) <= 0:
+        raise StrategyEconomicsError("INVALID_QTY")
+    gross_bps = _econ_decimal(expected_gross_return_bps, "expected_gross_return_bps")
+    minimum_bps = _econ_decimal(minimum_net_return_bps, "minimum_net_return_bps")
+    qty = int(quantity)
+    exit_price = entry * (Decimal("1") + gross_bps / Decimal("10000"))
+    if exit_price <= 0:
+        return {
+            "allowed": False,
+            "reason": "expected_exit_price_non_positive",
+            "expected_gross_return_bps": float(gross_bps),
+            "expected_net_return_bps": -999999.0,
+        }
+    buy_cost = economic_fee_total("buy", entry, qty, schedule)
+    sell_cost = economic_fee_total("sell", exit_price, qty, schedule)
+    notional = entry * Decimal(qty)
+    gross_profit = (exit_price - entry) * Decimal(qty)
+    net_profit = gross_profit - buy_cost - sell_cost
+    net_bps = net_profit / notional * Decimal("10000")
+    allowed = net_bps >= minimum_bps
+    return {
+        "allowed": bool(allowed),
+        "reason": "" if allowed else "expected_net_return_below_threshold",
+        "expected_gross_return_bps": float(gross_bps),
+        "expected_cost_bps": float((buy_cost + sell_cost) / notional * Decimal("10000")),
+        "expected_net_return_bps": float(net_bps),
+        "minimum_net_return_bps": float(minimum_bps),
+        "buy_cost_yuan": float(buy_cost),
+        "sell_cost_yuan": float(sell_cost),
+    }
+
+
 def _econ_decimal(value, name, allow_zero=True):
     try:
         result = value if isinstance(value, Decimal) else Decimal(str(value))

@@ -14,7 +14,7 @@ from typing import Mapping
 
 from execution_contracts import FeeSchedule
 from ml_contracts import canonical_hash
-from strategy_economics import estimate_round_trip_economics
+from strategy_economics import estimate_round_trip_economics, expected_net_return_gate
 
 
 @dataclass(frozen=True)
@@ -29,11 +29,13 @@ class LocalEntryPolicy:
     min_correlation_observations: int = 15
     min_target_cost_multiple: float = 3.0
     max_round_trip_cost_rate: float = 0.004
+    min_expected_net_return_bps: float = 20.0
     require_correlation_history: bool = True
 
     def __post_init__(self):
         for name in ("max_price_gap_pct", "max_portfolio_risk_pct", "max_industry_pct",
-                     "max_total_position_pct", "min_target_cost_multiple", "max_round_trip_cost_rate"):
+                     "max_total_position_pct", "min_target_cost_multiple", "max_round_trip_cost_rate",
+                     "min_expected_net_return_bps"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
                 raise ValueError("invalid local policy: " + name)
@@ -112,6 +114,17 @@ def check_local_entry(*, candidate, price, quantity, equity, holdings,
         return "BUY_ROUND_TRIP_COST_LIMIT"
     if cost["gross_profit_yuan"] <= policy.min_target_cost_multiple * cost["round_trip_cost_yuan"]:
         return "BUY_TARGET_COST_COVERAGE"
+    expected_gross_bps = candidate.evidence.get("expected_gross_return_bps")
+    if expected_gross_bps is not None:
+        gate = expected_net_return_gate(
+            price,
+            quantity,
+            expected_gross_bps,
+            fees.to_dict(),
+            minimum_net_return_bps=policy.min_expected_net_return_bps,
+        )
+        if not gate["allowed"]:
+            return "BUY_EXPECTED_NET_RETURN_BELOW_THRESHOLD"
     stop_cost = float(fees.estimate_round_trip(price, candidate.stop_loss, quantity).total_yuan)
     open_risk = sum(max(item.price - item.stop_price, 0) * item.quantity for item in holdings)
     risk = (price - candidate.stop_loss) * quantity + stop_cost

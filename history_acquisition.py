@@ -52,6 +52,7 @@ STATUS_FIELDS = [
     "limit_down",
 ]
 UNIVERSE_FIELDS = ["trade_date", "code"]
+FEATURE_FIELDS = ["trade_date", "code", "feature_name", "feature_value", "event_at", "available_at"]
 
 
 def discover_akshare_a_share_codes(fetcher: Callable[..., object] | None = None) -> list[str]:
@@ -405,6 +406,7 @@ def acquire_jqdata_daily(
     enrichment_warnings: list[str] = []
     st_flags: dict[tuple[str, str], bool] = {}
     memberships: dict[str, set[str]] = {}
+    industries: dict[tuple[str, str], str] = {}
     if pit_enrichment and raw_bars:
         dates = sorted({str(row["trade_date"])[:10] for row in raw_bars})
         codes_for_enrichment = sorted({str(row["code"]).zfill(6) for row in raw_bars})
@@ -417,8 +419,10 @@ def acquire_jqdata_daily(
         else:
             enrichment_warnings.append("jqdata_historical_st_enrichment_unavailable")
         fetch_universe_membership = getattr(client, "fetch_universe_membership", None)
+        fetch_industry = getattr(client, "fetch_industry", None)
         if len(dates) > max(0, int(max_universe_query_days)):
             enrichment_warnings.append("jqdata_historical_universe_enrichment_skipped_query_budget")
+            enrichment_warnings.append("jqdata_historical_industry_enrichment_skipped_query_budget")
         elif callable(fetch_universe_membership):
             try:
                 memberships = fetch_universe_membership(codes_for_enrichment, dates)
@@ -426,6 +430,13 @@ def acquire_jqdata_daily(
                 enrichment_warnings.append("jqdata_historical_universe_enrichment_failed")
         else:
             enrichment_warnings.append("jqdata_historical_universe_enrichment_unavailable")
+        if len(dates) <= max(0, int(max_universe_query_days)) and callable(fetch_industry):
+            try:
+                industries = fetch_industry(codes_for_enrichment, dates)
+            except Exception:
+                enrichment_warnings.append("jqdata_historical_industry_enrichment_failed")
+        elif len(dates) <= max(0, int(max_universe_query_days)):
+            enrichment_warnings.append("jqdata_historical_industry_enrichment_unavailable")
     elif not pit_enrichment:
         enrichment_warnings.extend([
             "jqdata_pit_enrichment_disabled",
@@ -461,10 +472,23 @@ def acquire_jqdata_daily(
             universe.append({"trade_date": trade_date, "code": code})
     status = _canonical_rows(status, STATUS_FIELDS)
     universe = _canonical_rows(universe, UNIVERSE_FIELDS)
+    features = [
+        {
+            "trade_date": trade_date,
+            "code": code,
+            "feature_name": "industry",
+            "feature_value": value,
+            "event_at": f"{trade_date}T15:00:00+08:00",
+            "available_at": f"{trade_date}T15:00:00+08:00",
+        }
+        for (trade_date, code), value in sorted(industries.items())
+        if value
+    ]
     output_dir = Path(config.output_dir)
     _write_csv_atomic(output_dir / "bars.csv", BAR_FIELDS, bars)
     _write_csv_atomic(output_dir / "status.csv", STATUS_FIELDS, status)
     _write_csv_atomic(output_dir / "universe.csv", UNIVERSE_FIELDS, universe)
+    _write_csv_atomic(output_dir / "features.csv", FEATURE_FIELDS, features)
     metadata = {
         "dataset_id": config.dataset_id,
         "source": "jqdata",
@@ -473,14 +497,14 @@ def acquire_jqdata_daily(
         "end": config.end,
         "codes_requested": len(normalized_codes),
         "codes_with_rows": len({str(row["code"]) for row in bars}),
-        "rows": {"bars": len(bars), "status": len(status), "universe": len(universe)},
+        "rows": {"bars": len(bars), "status": len(status), "universe": len(universe), "features": len(features)},
         "failures": failures,
         "strict_eligible": False,
         "proxy_only": True,
         "warnings": [
             *enrichment_warnings,
             "point_in_time_features_not_collected",
-            "industry_and_fundamental_availability_not_collected",
+            "fundamental_availability_not_collected",
             "use_joinquant_strict_export_for_strict_mode",
         ],
         "pit_enrichment": {
@@ -488,12 +512,13 @@ def acquire_jqdata_daily(
             "st_rows": len(st_flags),
             "universe_dates": len(memberships),
             "universe_rows": sum(len(values) for values in memberships.values()),
+            "industry_rows": len(industries),
             "requested_universe_dates": len({str(row["trade_date"])[:10] for row in raw_bars}),
             "max_universe_query_days": int(max_universe_query_days),
         },
         "sha256": {
             name: _sha256(output_dir / name)
-            for name in ("bars.csv", "status.csv", "universe.csv")
+            for name in ("bars.csv", "status.csv", "universe.csv", "features.csv")
         },
     }
     temporary = output_dir / "acquisition_metadata.json.tmp"
@@ -652,7 +677,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.db and not metadata["failures"] and metadata["rows"]["bars"] > 0:
         store = HistoricalStore(Path(args.db))
         store.initialize()
-        for kind in ("bars", "status", "universe"):
+        for kind in ("bars", "status", "universe", "features"):
+            if not (config.output_dir / f"{kind}.csv").is_file():
+                continue
             store.import_csv(
                 config.dataset_id,
                 kind,

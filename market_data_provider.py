@@ -299,6 +299,42 @@ class JQDataProvider:
             }
         return result
 
+    def fetch_industry(self, codes: list[str], trade_dates: list[str]) -> dict[tuple[str, str], str]:
+        """Fetch date-scoped first-level industry labels from JQData.
+
+        The result is intentionally a simple keyed mapping so the acquisition
+        layer can persist it as a point-in-time feature without depending on
+        JQData's nested response shape.
+        """
+        jq = self._api()
+        normalized = sorted({self.plain_code(code) for code in codes})
+        result: dict[tuple[str, str], str] = {}
+        for trade_date in sorted({str(value)[:10] for value in trade_dates}):
+            try:
+                payload = jq.get_industry(
+                    [self.jq_code(code) for code in normalized],
+                    date=trade_date,
+                )
+            except Exception as exc:
+                raise MarketDataProviderError("JQDATA_INDUSTRY_QUERY_FAILED") from exc
+            if not isinstance(payload, dict):
+                continue
+            for raw_code, values in payload.items():
+                if not isinstance(values, dict):
+                    continue
+                label = ""
+                for level in ("sw_l1", "zjw", "jq_l1", "industry"):
+                    candidate = values.get(level)
+                    if isinstance(candidate, dict):
+                        label = str(candidate.get("industry_name") or candidate.get("industry_code") or "").strip()
+                    elif candidate:
+                        label = str(candidate).strip()
+                    if label:
+                        break
+                if label:
+                    result[(trade_date, self.plain_code(raw_code))] = label
+        return result
+
     def fetch_daily(self, code: str, start: str, end: str, *, adjust: str = "") -> list[dict[str, object]]:
         jq = self._api()
         fields = [

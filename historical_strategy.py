@@ -182,6 +182,15 @@ def _strict_candidates(
         position = risk_position_pct(
             entry, stop, board, _float(features["position_pct"]), state
         )
+        expected_gross = _float(features.get("expected_gross_return_bps"))
+        evidence = {
+            "proxy_only": False,
+            "parameter_version": parameter_version,
+            "pct_rank": pct_rank,
+            "turnover_rank": turnover_rank,
+        }
+        if expected_gross is not None and math.isfinite(expected_gross) and expected_gross >= 0:
+            evidence["expected_gross_return_bps"] = expected_gross
         result.append(
             Candidate(
                 code=str(row["code"]),
@@ -195,12 +204,7 @@ def _strict_candidates(
                 market_regime=state,
                 industry=str(features["industry"] or "unknown"),
                 theme=str(features["theme"] or "unknown"),
-                evidence={
-                    "proxy_only": False,
-                    "parameter_version": parameter_version,
-                    "pct_rank": pct_rank,
-                    "turnover_rank": turnover_rank,
-                },
+                evidence=evidence,
             )
         )
     return result

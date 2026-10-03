@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import config as app_config
+from benchmark_data import load_benchmark_csv
 from execution_contracts import FeeSchedule
 from historical_data import HistoricalDataValidationError, HistoricalStore
 from historical_strategy import Candidate, generate_daily_candidates
@@ -35,6 +36,8 @@ class SignalObservation:
     breakout: bool
     amount_rank: float
     forward_returns: dict[int, float]
+    excess_returns: dict[int, float]
+    factor_values: dict[str, float]
 
 
 def _metric(values: Sequence[float]) -> dict[str, float | int]:
@@ -74,6 +77,78 @@ def _group_metrics(
         if value is not None:
             groups[str(key(observation))].append(float(value))
     return {name: _metric(values) for name, values in sorted(groups.items())}
+
+
+def _rank(values: Sequence[float]) -> list[float]:
+    """Average-rank values without adding a scipy dependency."""
+    indexed = sorted(enumerate(float(value) for value in values), key=lambda item: item[1])
+    ranks = [0.0] * len(indexed)
+    cursor = 0
+    while cursor < len(indexed):
+        end = cursor + 1
+        while end < len(indexed) and indexed[end][1] == indexed[cursor][1]:
+            end += 1
+        average = (cursor + 1 + end) / 2.0
+        for index, _ in indexed[cursor:end]:
+            ranks[index] = average
+        cursor = end
+    return ranks
+
+
+def _spearman(values: Sequence[tuple[float, float]]) -> float | None:
+    clean = [(float(left), float(right)) for left, right in values if math.isfinite(float(left)) and math.isfinite(float(right))]
+    if len(clean) < 3:
+        return None
+    left = _rank([item[0] for item in clean])
+    right = _rank([item[1] for item in clean])
+    left_mean = sum(left) / len(left)
+    right_mean = sum(right) / len(right)
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
+    left_var = sum((a - left_mean) ** 2 for a in left)
+    right_var = sum((b - right_mean) ** 2 for b in right)
+    if left_var <= 0 or right_var <= 0:
+        return None
+    return numerator / math.sqrt(left_var * right_var)
+
+
+def _factor_ic(
+    observations: Iterable[SignalObservation],
+    factor: str,
+    horizon: int,
+    *,
+    excess: bool = False,
+) -> dict[str, float | int | None]:
+    pairs: list[tuple[float, float]] = []
+    for observation in observations:
+        forward = observation.excess_returns if excess else observation.forward_returns
+        if factor in observation.factor_values and horizon in forward:
+            pairs.append((observation.factor_values[factor], forward[horizon]))
+    return {"count": len(pairs), "ic": _spearman(pairs)}
+
+
+def _factor_groups(
+    observations: Iterable[SignalObservation],
+    factor: str,
+    horizon: int,
+    *,
+    groups: int = 5,
+    excess: bool = False,
+) -> dict[str, dict[str, float | int]]:
+    rows = [
+        observation for observation in observations
+        if factor in observation.factor_values
+        and horizon in (observation.excess_returns if excess else observation.forward_returns)
+    ]
+    if not rows:
+        return {}
+    values = [observation.factor_values[factor] for observation in rows]
+    ranks = _rank(values)
+    grouped: dict[str, list[float]] = defaultdict(list)
+    for observation, rank in zip(rows, ranks):
+        bucket = min(groups, max(1, int(math.ceil(rank / len(rows) * groups))))
+        forward = observation.excess_returns if excess else observation.forward_returns
+        grouped[f"Q{bucket}"] .append(forward[horizon])
+    return {name: _metric(values) for name, values in sorted(grouped.items())}
 
 
 def _next_open(rows: Mapping[str, Mapping[str, object]], code: str) -> float:
@@ -119,6 +194,9 @@ def research_signals(
     notional_per_signal: float = 100_000.0,
     fee_schedule: FeeSchedule | None = None,
     alpha_profile: str = "legacy",
+    benchmark_csv: Path | str | None = None,
+    benchmark: str | None = None,
+    min_expected_net_return_bps: float = 0.0,
 ) -> dict[str, object]:
     if not horizons or any(int(value) <= 0 for value in horizons):
         raise ValueError("horizons must contain positive integers")
@@ -134,6 +212,12 @@ def research_signals(
         for date in dates
     }
     schedule = fee_schedule or app_config.SIMULATION_FEE_SCHEDULE
+    benchmark_values = load_benchmark_csv(benchmark_csv) if benchmark_csv else {}
+    benchmark_name = str(benchmark or "").strip()
+    if benchmark_name and benchmark_name not in benchmark_values:
+        raise ValueError(f"benchmark not found: {benchmark_name}")
+    if benchmark_values and not benchmark_name:
+        benchmark_name = sorted(benchmark_values)[0]
     observations: list[SignalObservation] = []
     for index, trade_date in enumerate(dates):
         candidates = generate_daily_candidates(
@@ -157,6 +241,7 @@ def research_signals(
             if entry <= 0:
                 continue
             forward: dict[int, float] = {}
+            excess: dict[int, float] = {}
             for horizon in sorted({int(value) for value in horizons}):
                 exit_index = entry_date_index + horizon - 1
                 if exit_index >= len(dates):
@@ -166,8 +251,21 @@ def research_signals(
                 value = _net_forward_return(schedule, entry, exit_price, notional_per_signal)
                 if value is not None:
                     forward[horizon] = value
+                    if benchmark_name:
+                        benchmark_entry = benchmark_values[benchmark_name].get(entry_date)
+                        benchmark_exit = benchmark_values[benchmark_name].get(dates[exit_index])
+                        if benchmark_entry and benchmark_exit and benchmark_entry > 0:
+                            excess[horizon] = value - (benchmark_exit / benchmark_entry - 1.0)
             if not forward:
                 continue
+            factor_values = {
+                "score": float(candidate.score),
+                "pct_rank": float(candidate.evidence.get("pct_rank") or 0.0),
+                "relative_rank": float(candidate.evidence.get("relative_rank") or 0.0),
+                "amount_rank": float(candidate.evidence.get("amount_rank") or 0.0),
+                "liquidity_ratio": float(candidate.evidence.get("liquidity_ratio") or 0.0),
+                "volatility_20": float(candidate.evidence.get("volatility_20") or 0.0),
+            }
             observations.append(
                 SignalObservation(
                     trade_date=trade_date,
@@ -179,6 +277,8 @@ def research_signals(
                     breakout=bool(candidate.evidence.get("breakout")),
                     amount_rank=float(candidate.evidence.get("amount_rank") or 0.0),
                     forward_returns=forward,
+                    excess_returns=excess,
+                    factor_values=factor_values,
                 )
             )
     horizon_metrics = {
@@ -188,6 +288,7 @@ def research_signals(
         for horizon in sorted({int(value) for value in horizons})
     }
     by_horizon: dict[str, object] = {}
+    factor_names = ("score", "pct_rank", "relative_rank", "amount_rank", "liquidity_ratio", "volatility_20")
     for horizon in sorted({int(value) for value in horizons}):
         by_horizon[str(horizon)] = {
             "score_bucket": _group_metrics(observations, lambda item: _bucket(item.score), horizon),
@@ -195,7 +296,28 @@ def research_signals(
             "mode": _group_metrics(observations, lambda item: item.mode, horizon),
             "trend": _group_metrics(observations, lambda item: item.trend, horizon),
             "breakout": _group_metrics(observations, lambda item: item.breakout, horizon),
+            "factor_groups": {
+                factor: _factor_groups(observations, factor, horizon)
+                for factor in factor_names
+            },
+            "factor_ic": {
+                factor: _factor_ic(observations, factor, horizon)
+                for factor in factor_names
+            },
+            "excess_return": _metric(
+                [observation.excess_returns[horizon] for observation in observations if horizon in observation.excess_returns]
+            ),
+            "excess_factor_ic": {
+                factor: _factor_ic(observations, factor, horizon, excess=True)
+                for factor in factor_names
+            },
         }
+    gate_count = sum(
+        1 for observation in observations
+        for value in observation.forward_returns.values()
+        if value * 10000 >= float(min_expected_net_return_bps)
+    )
+    possible_gate_count = sum(len(observation.forward_returns) for observation in observations)
     return {
         "report_version": "signal-research-v1",
         "dataset_id": dataset_id,
@@ -203,7 +325,16 @@ def research_signals(
         "mode": mode,
         "parameter_version": parameter_version,
         "alpha_profile": alpha_profile,
+        "benchmark": benchmark_name or None,
+        "benchmark_csv": str(benchmark_csv) if benchmark_csv else None,
         "fee_schedule": schedule.to_dict(),
+        "min_expected_net_return_bps": float(min_expected_net_return_bps),
+        "realized_cost_gate_diagnostic": {
+            "passed": gate_count,
+            "total": possible_gate_count,
+            "pass_rate": gate_count / possible_gate_count if possible_gate_count else 0.0,
+            "note": "Diagnostic on realized forward returns; decision-time gates must use a training-window calibration.",
+        },
         "notional_per_signal": notional_per_signal,
         "horizons": sorted({int(value) for value in horizons}),
         "observation_count": len(observations),
@@ -229,6 +360,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizons", default="1,3,5,10")
     parser.add_argument("--notional-per-signal", type=float, default=100_000.0)
     parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+    parser.add_argument("--benchmark-csv")
+    parser.add_argument("--benchmark", default="")
+    parser.add_argument("--min-expected-net-return-bps", type=float, default=0.0)
     return parser
 
 
@@ -245,6 +379,9 @@ def main(argv: list[str] | None = None) -> int:
         horizons=tuple(int(value.strip()) for value in args.horizons.split(",") if value.strip()),
         notional_per_signal=args.notional_per_signal,
         alpha_profile=args.alpha_profile,
+        benchmark_csv=args.benchmark_csv,
+        benchmark=args.benchmark or None,
+        min_expected_net_return_bps=args.min_expected_net_return_bps,
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

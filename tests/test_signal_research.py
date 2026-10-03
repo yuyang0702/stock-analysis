@@ -1,6 +1,6 @@
 import unittest
 
-from signal_research import _bucket, _metric
+from signal_research import _bucket, _metric, _spearman
 
 
 class SignalResearchTest(unittest.TestCase):
@@ -14,6 +14,9 @@ class SignalResearchTest(unittest.TestCase):
     def test_score_bucket_is_stable(self) -> None:
         self.assertEqual(_bucket(79.99), "75-80")
         self.assertEqual(_bucket(80.0), "80-85")
+
+    def test_spearman_ic_detects_monotonic_factor(self) -> None:
+        self.assertAlmostEqual(_spearman([(1, 0.1), (2, 0.2), (3, 0.3)]), 1.0)
 
 
 if __name__ == "__main__":

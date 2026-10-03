@@ -207,6 +207,49 @@ class HistoryAcquisitionTest(unittest.TestCase):
         self.assertIn("jqdata_historical_universe_enrichment_skipped_query_budget", metadata["warnings"])
         self.assertEqual(metadata["pit_enrichment"]["st_rows"], 1)
 
+    def test_jqdata_pit_enrichment_writes_point_in_time_industry_features(self) -> None:
+        class FakeProvider:
+            @staticmethod
+            def connect():
+                return None
+
+            @staticmethod
+            def plain_code(value):
+                return str(value).zfill(6)
+
+            @staticmethod
+            def fetch_daily(code, start, end, *, adjust=""):
+                return [{
+                    "trade_date": "2025-01-02", "code": str(code).zfill(6),
+                    "open": 10, "high": 11, "low": 9, "close": 10.5,
+                    "prev_close": 10, "volume": 100, "amount": 1000,
+                    "adjust_factor": 1, "limit_up": 11, "limit_down": 9,
+                    "suspended": 0,
+                }]
+
+            @staticmethod
+            def fetch_st_flags(codes, start, end):
+                return {}
+
+            @staticmethod
+            def fetch_universe_membership(codes, dates):
+                return {"2025-01-02": {"600000"}}
+
+            @staticmethod
+            def fetch_industry(codes, dates):
+                return {("2025-01-02", "600000"): "银行"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            config = AcquisitionConfig("jq-industry", "2025-01-02", "2025-01-02", output, sleep_seconds=0)
+            metadata = acquire_jqdata_daily(
+                config, ["600000"], username="u", password="p", provider=FakeProvider()
+            )
+            features = (output / "features.csv").read_text(encoding="utf-8")
+        self.assertEqual(metadata["pit_enrichment"]["industry_rows"], 1)
+        self.assertIn("industry", features)
+        self.assertIn("银行", features)
+
     def test_broker_historical_export_is_a_separate_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "broker"

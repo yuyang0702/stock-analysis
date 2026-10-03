@@ -48,6 +48,18 @@ class LocalEntryPolicyTest(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_rejects_calibrated_expected_return_below_net_threshold(self):
+        candidate = Candidate(
+            "600000", 90.0, 10.0, 10.0, 9.0, 12.0, 0.3,
+            "short", "NORMAL", "bank", "value", {"expected_gross_return_bps": 30},
+        )
+        reason = check_local_entry(
+            candidate=candidate, price=10.0, quantity=100,
+            equity=100_000, holdings=(), returns={}, fees=self.fees,
+            policy=self.policy,
+        )
+        self.assertEqual(reason, "BUY_EXPECTED_NET_RETURN_BELOW_THRESHOLD")
+
 
 if __name__ == "__main__":
     unittest.main()

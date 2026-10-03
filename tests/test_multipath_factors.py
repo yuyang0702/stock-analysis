@@ -11,7 +11,7 @@ from factor_contracts import FactorContractError, normalize_factor_bars
 from factor_limitdown import evaluate_limitdown_exhaustion_factor
 from factor_research import evaluate_factor_release_gate
 from factor_wave3 import evaluate_wave3_factor
-from strategy_economics import estimate_round_trip_economics, size_strategy_order
+from strategy_economics import estimate_round_trip_economics, expected_net_return_gate, size_strategy_order
 from strategy_exit_runtime import evaluate_factor_exit
 
 
@@ -91,6 +91,14 @@ def _intraday(base: float, prices: list[float], previous_close: float) -> list[d
 
 
 class MultipathFactorTest(unittest.TestCase):
+
+    def test_expected_net_return_gate_subtracts_round_trip_costs(self) -> None:
+        rejected = expected_net_return_gate(10, 100, 20, FEE, minimum_net_return_bps=20)
+        accepted = expected_net_return_gate(10, 100, 200, FEE, minimum_net_return_bps=20)
+        self.assertFalse(rejected["allowed"])
+        self.assertEqual(rejected["reason"], "expected_net_return_below_threshold")
+        self.assertTrue(accepted["allowed"])
+        self.assertLess(accepted["expected_net_return_bps"], 200)
     def test_future_factor_bar_is_rejected(self) -> None:
         with self.assertRaisesRegex(FactorContractError, "FACTOR_BAR_FROM_FUTURE"):
             normalize_factor_bars(
