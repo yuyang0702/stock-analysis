@@ -151,6 +151,62 @@ class HistoryAcquisitionTest(unittest.TestCase):
             self.assertTrue(metadata["proxy_only"])
             self.assertEqual(metadata["rows"]["bars"], 1)
 
+    def test_jqdata_pit_enrichment_has_a_universe_query_budget(self) -> None:
+        class FakeProvider:
+            universe_calls = 0
+
+            @staticmethod
+            def connect():
+                return None
+
+            @staticmethod
+            def plain_code(value):
+                return str(value).zfill(6)
+
+            @staticmethod
+            def fetch_daily(code, start, end, *, adjust=""):
+                return [
+                    {
+                        "trade_date": day,
+                        "code": str(code).zfill(6),
+                        "open": 10,
+                        "high": 11,
+                        "low": 9,
+                        "close": 10.5,
+                        "prev_close": 10,
+                        "volume": 100,
+                        "amount": 1000,
+                        "adjust_factor": 1,
+                        "limit_up": 11,
+                        "limit_down": 9,
+                        "suspended": 0,
+                    }
+                    for day in ("2025-01-02", "2025-01-03")
+                ]
+
+            @staticmethod
+            def fetch_st_flags(codes, start, end):
+                return {("2025-01-02", "600000"): True}
+
+            @classmethod
+            def fetch_universe_membership(cls, codes, dates):
+                cls.universe_calls += 1
+                return {day: {"600000"} for day in dates}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AcquisitionConfig("jq-budget", "2025-01-02", "2025-01-03", Path(tmp), sleep_seconds=0)
+            metadata = acquire_jqdata_daily(
+                config,
+                ["600000"],
+                username="u",
+                password="p",
+                provider=FakeProvider(),
+                max_universe_query_days=1,
+            )
+        self.assertEqual(FakeProvider.universe_calls, 0)
+        self.assertIn("jqdata_historical_universe_enrichment_skipped_query_budget", metadata["warnings"])
+        self.assertEqual(metadata["pit_enrichment"]["st_rows"], 1)
+
     def test_broker_historical_export_is_a_separate_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "broker"

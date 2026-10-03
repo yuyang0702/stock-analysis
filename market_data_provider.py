@@ -160,6 +160,7 @@ class JQDataProvider:
         self.password = str(password)
         self._jq: Any | None = None
         self._connected = False
+        self._security_master_cache: dict[str, dict[str, dict[str, str]]] = {}
 
     def connect(self) -> None:
         try:
@@ -225,6 +226,77 @@ class JQDataProvider:
         result = sorted({value for value in values if re.fullmatch(r"\d{6}", value)})
         if not result:
             raise MarketDataProviderError("JQDATA_UNIVERSE_EMPTY")
+        return result
+
+    def fetch_st_flags(self, codes: list[str], start: str, end: str) -> dict[tuple[str, str], bool]:
+        """Fetch date-scoped ST flags in bounded batches.
+
+        JQData exposes this as an ``is_st`` extra rather than a price field.
+        Returning a keyed mapping keeps the acquisition layer independent of
+        pandas and lets it record a clear fallback if a provider lacks it.
+        """
+        jq = self._api()
+        result: dict[tuple[str, str], bool] = {}
+        normalized = sorted({self.plain_code(code) for code in codes})
+        for offset in range(0, len(normalized), 200):
+            batch = normalized[offset:offset + 200]
+            try:
+                frame = jq.get_extras(
+                    "is_st",
+                    [self.jq_code(code) for code in batch],
+                    start_date=start,
+                    end_date=end,
+                    df=True,
+                )
+            except Exception as exc:
+                raise MarketDataProviderError("JQDATA_ST_QUERY_FAILED") from exc
+            if frame is None or getattr(frame, "empty", True):
+                continue
+            columns = {str(column).strip().upper(): column for column in getattr(frame, "columns", ())}
+            for raw_date, row in frame.iterrows():
+                trade_date = str(raw_date)[:10]
+                for plain, column in columns.items():
+                    if plain.split(".", 1)[0].zfill(6) not in normalized:
+                        continue
+                    value = row[column]
+                    try:
+                        result[(trade_date, plain.split(".", 1)[0].zfill(6))] = bool(value)
+                    except (TypeError, ValueError):
+                        result[(trade_date, plain.split(".", 1)[0].zfill(6))] = False
+        return result
+
+    def fetch_security_master(self, as_of: str) -> dict[str, dict[str, str]]:
+        """Return the historical listed interval for each security on a date."""
+        cached = self._security_master_cache.get(str(as_of)[:10])
+        if cached is not None:
+            return cached
+        jq = self._api()
+        try:
+            frame = jq.get_all_securities(types=["stock"], date=str(as_of)[:10])
+        except Exception as exc:
+            raise MarketDataProviderError("JQDATA_UNIVERSE_QUERY_FAILED") from exc
+        if frame is None or getattr(frame, "empty", True):
+            raise MarketDataProviderError("JQDATA_UNIVERSE_EMPTY")
+        result: dict[str, dict[str, str]] = {}
+        for raw_code, row in frame.iterrows():
+            code = self.plain_code(raw_code)
+            start_date = str(row.get("start_date") or "1900-01-01")[:10]
+            end_date = str(row.get("end_date") or "2200-01-01")[:10]
+            result[code] = {"start_date": start_date, "end_date": end_date}
+        self._security_master_cache[str(as_of)[:10]] = result
+        return result
+
+    def fetch_universe_membership(self, codes: list[str], trade_dates: list[str]) -> dict[str, set[str]]:
+        """Resolve requested codes against the provider's dated security master."""
+        normalized = sorted({self.plain_code(code) for code in codes})
+        result: dict[str, set[str]] = {}
+        for trade_date in sorted({str(value)[:10] for value in trade_dates}):
+            master = self.fetch_security_master(trade_date)
+            result[trade_date] = {
+                code for code in normalized
+                if code in master
+                and master[code]["start_date"] <= trade_date <= master[code]["end_date"]
+            }
         return result
 
     def fetch_daily(self, code: str, start: str, end: str, *, adjust: str = "") -> list[dict[str, object]]:

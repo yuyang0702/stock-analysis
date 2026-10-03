@@ -357,6 +357,8 @@ def acquire_jqdata_daily(
     username: str,
     password: str,
     provider: JQDataProvider | None = None,
+    pit_enrichment: bool = True,
+    max_universe_query_days: int = 20,
 ) -> dict[str, object]:
     """Fetch JQData daily bars into the same bounded canonical artifacts.
 
@@ -400,10 +402,43 @@ def acquire_jqdata_daily(
         if start_date <= date.fromisoformat(str(row["trade_date"])[:10]) <= end_date
     ]
     raw_bars = list(bars)
+    enrichment_warnings: list[str] = []
+    st_flags: dict[tuple[str, str], bool] = {}
+    memberships: dict[str, set[str]] = {}
+    if pit_enrichment and raw_bars:
+        dates = sorted({str(row["trade_date"])[:10] for row in raw_bars})
+        codes_for_enrichment = sorted({str(row["code"]).zfill(6) for row in raw_bars})
+        fetch_st_flags = getattr(client, "fetch_st_flags", None)
+        if callable(fetch_st_flags):
+            try:
+                st_flags = fetch_st_flags(codes_for_enrichment, config.start, config.end)
+            except Exception:
+                enrichment_warnings.append("jqdata_historical_st_enrichment_failed")
+        else:
+            enrichment_warnings.append("jqdata_historical_st_enrichment_unavailable")
+        fetch_universe_membership = getattr(client, "fetch_universe_membership", None)
+        if len(dates) > max(0, int(max_universe_query_days)):
+            enrichment_warnings.append("jqdata_historical_universe_enrichment_skipped_query_budget")
+        elif callable(fetch_universe_membership):
+            try:
+                memberships = fetch_universe_membership(codes_for_enrichment, dates)
+            except Exception:
+                enrichment_warnings.append("jqdata_historical_universe_enrichment_failed")
+        else:
+            enrichment_warnings.append("jqdata_historical_universe_enrichment_unavailable")
+    elif not pit_enrichment:
+        enrichment_warnings.extend([
+            "jqdata_pit_enrichment_disabled",
+            "historical_st_status_not_collected",
+            "historical_universe_membership_not_proven",
+        ])
     bars = _canonical_rows(bars, BAR_FIELDS)
     status: list[dict[str, object]] = []
     universe: list[dict[str, object]] = []
     for row in raw_bars:
+        trade_date = str(row["trade_date"])[:10]
+        code = str(row["code"]).zfill(6)
+        listed = int(code in memberships.get(trade_date, set())) if memberships else 1
         previous = float(row["prev_close"])
         limit_up = float(row.get("limit_up") or 0.0)
         limit_down = float(row.get("limit_down") or 0.0)
@@ -414,15 +449,16 @@ def acquire_jqdata_daily(
         status.append(
             {
                 "trade_date": row["trade_date"],
-                "code": row["code"],
-                "listed": 1,
-                "st": 0,
+                "code": code,
+                "listed": listed,
+                "st": int(st_flags.get((trade_date, code), False)),
                 "suspended": int(row.get("suspended") or 0),
                 "limit_up": limit_up,
                 "limit_down": limit_down,
             }
         )
-        universe.append({"trade_date": row["trade_date"], "code": row["code"]})
+        if listed:
+            universe.append({"trade_date": trade_date, "code": code})
     status = _canonical_rows(status, STATUS_FIELDS)
     universe = _canonical_rows(universe, UNIVERSE_FIELDS)
     output_dir = Path(config.output_dir)
@@ -442,11 +478,19 @@ def acquire_jqdata_daily(
         "strict_eligible": False,
         "proxy_only": True,
         "warnings": [
-            "historical_st_status_not_collected",
-            "historical_universe_membership_not_proven",
+            *enrichment_warnings,
             "point_in_time_features_not_collected",
+            "industry_and_fundamental_availability_not_collected",
             "use_joinquant_strict_export_for_strict_mode",
         ],
+        "pit_enrichment": {
+            "enabled": bool(pit_enrichment),
+            "st_rows": len(st_flags),
+            "universe_dates": len(memberships),
+            "universe_rows": sum(len(values) for values in memberships.values()),
+            "requested_universe_dates": len({str(row["trade_date"])[:10] for row in raw_bars}),
+            "max_universe_query_days": int(max_universe_query_days),
+        },
         "sha256": {
             name: _sha256(output_dir / name)
             for name in ("bars.csv", "status.csv", "universe.csv")
@@ -548,6 +592,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-dir", help="canonical broker export directory for broker_historical")
     parser.add_argument("--db")
     parser.add_argument("--registry", default="cache/backtest/datasets.json")
+    parser.add_argument(
+        "--no-pit-enrichment",
+        action="store_true",
+        help="skip JQData historical ST and dated-universe enrichment",
+    )
+    parser.add_argument(
+        "--max-universe-query-days",
+        type=int,
+        default=20,
+        help="maximum dated get_all_securities calls per acquisition (JQData quota guard)",
+    )
     parser.add_argument("--sleep-seconds", type=float, default=0.2)
     return parser
 
@@ -585,6 +640,8 @@ def main(argv: list[str] | None = None) -> int:
             codes,
             username=settings.username,
             password=settings.password,
+            pit_enrichment=not args.no_pit_enrichment,
+            max_universe_query_days=args.max_universe_query_days,
         )
         source_name = "jqdata_canonical"
     else:

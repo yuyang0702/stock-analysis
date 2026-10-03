@@ -1,6 +1,8 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-10-03
+更新日期：2026-10-04
+
+> 2026-10-04 JQData 自动增强与 GitHub 工程复核：`JQDataProvider` 已增加历史 `is_st` 和按日期证券主数据能力，`history_acquisition.py` 默认自动尝试补齐 ST 与日期股票池；JQData 每日查询配额由 `--max-universe-query-days` 默认 20 保护，超过配额时只降级该增强并记录警告，不伪造 strict 结果。真实账号小窗口增强成功（5 个交易日、100 条 ST/股票池记录）；247 个交易日窗口成功采集 4,940 条价格与 ST 记录，`universe.csv` 仅保留价格行的降级对齐、没有逐日历史股票池证明，价格核心回测仍通过。新增 `docs/github_quant_references.md`，记录 Qlib、RQAlpha、Backtrader 和 vn.py 的工程借鉴边界。
 
 > 2026-10-04 多数据源增量：新增 `market_data_provider.py` 统一 Provider 协议和本地凭据加载、`data_source_registry.py` 有界数据集注册、JQData 本地 API 适配器、券商历史导出适配器和 `cross_source_compare.py`。AkShare、JQData 和未来券商历史数据均先落成独立 `dataset_id` 再进入同一 `HistoricalStore`；实时行情和真实下单仍保持未实现边界。JQData 账号认证成功，当前权限可用窗口为 2025-06-27 至 2026-07-03，已采集 20 只股票/4,940 条日线。与同窗口 AkShare 对照后，relative_v1 + liquidity_v1 均为负，JQData 净收益 -3.18%、AkShare -2.96%；两者均为 `proxy_only`，不具备 strict 或生产资格。
 
@@ -29,6 +31,7 @@
 | `docs/project_handoff.md` | 新电脑、新对话和外部状态恢复 | 时间点快照；接管任务必读，服务器状态仍需重新验证。 |
 | `docs/2026-10-02_本地策略优先实施计划.md` | 本地策略、数据、回测、组合风控和模拟盘优先改造顺序 | 当前改造任务的执行计划；券商自动下单只保留接口边界，按阶段验收。 |
 | `docs/2026-10-02_点时数据获取与样本外验证报告.md` | 点时历史数据获取、代理数据边界、样本外和 walk-forward 运行方式 | 当前数据采集和验证任务的唯一专项说明；涉及历史库补数、walk-forward 或数据源切换时读取。 |
+| `docs/github_quant_references.md` | GitHub 开源量化项目的工程借鉴和许可证边界 | 修改数据层、特征层、回测撮合、风险或券商网关前参考；不直接复制未经验证的策略代码和参数。 |
 | `docs/live_trading_execution_plan.md` | 模拟盘稳定性、完整历史回测、实盘级风控、交易适配和真实资金前门槛 | 涉及阶段推进、部署验收或实盘化时读取。 |
 | `docs/codex_simulation_observation_plan.md` | Codex 定时只读审核、证据、报告和权限 | 涉及自动审查、服务器只读访问或阶段评估时读取。 |
 | `docs/data_storage_policy.md` | 数据分类、增长、保留、轮转、备份恢复和敏感信息 | 任何新增或修改持久化数据时必读。 |

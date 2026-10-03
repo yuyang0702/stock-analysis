@@ -53,6 +53,38 @@ class MarketDataProviderTest(unittest.TestCase):
         self.assertEqual(rows[0]["amount"], 1000.0)
         self.assertEqual(rows[0]["prev_close"], 10.0)
 
+    def test_jqdata_provider_fetches_historical_status_and_universe(self) -> None:
+        class FakeJQ:
+            @staticmethod
+            def auth(_username, _password):
+                return True
+
+            @staticmethod
+            def get_extras(_field, securities, **_kwargs):
+                return pd.DataFrame(
+                    {securities[0]: [False, True]},
+                    index=pd.to_datetime(["2025-01-02", "2025-01-03"]),
+                )
+
+            @staticmethod
+            def get_all_securities(**_kwargs):
+                return pd.DataFrame(
+                    {
+                        "start_date": pd.to_datetime(["2020-01-01"]),
+                        "end_date": pd.to_datetime(["2200-01-01"]),
+                    },
+                    index=["000001.XSHE"],
+                )
+
+        with patch("market_data_provider.importlib.import_module", return_value=FakeJQ):
+            provider = JQDataProvider("u", "p")
+            provider.connect()
+            flags = provider.fetch_st_flags(["000001"], "2025-01-02", "2025-01-03")
+            universe = provider.fetch_universe_membership(["000001"], ["2025-01-02"])
+        self.assertFalse(flags[("2025-01-02", "000001")])
+        self.assertTrue(flags[("2025-01-03", "000001")])
+        self.assertEqual(universe["2025-01-02"], {"000001"})
+
     def test_broker_export_provider_reads_canonical_bars(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
