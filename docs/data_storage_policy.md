@@ -10,6 +10,8 @@
 
 > 主文档：`docs/project_roadmap.md`。本文是项目所有运行数据、日志、缓存、快照、报告和数据库的长期开发约束；如业务状态与主文档冲突，以主文档为准。
 
+> 2026-10-04 本地策略改进：`paper_replay.py` 的输出是用户指定路径下的单份本地模拟回放报告，事件只保留最近100条，账户状态仍遵循 `paper_trading.py` 的交易历史/净值上限；它不写正式 `trading.db`、不追加逐扫描 JSONL、不保存秘密，也不替代 JoinQuant 或券商成交审计。
+
 > 2026-07-15 schema 7 增量：`signals` 与 `exit_intents` 增加生命周期时间列，`execution_issue_state` 按问题对象保存一行最高严重度的当前/恢复状态及最近成功通知时间，`system_state` 保存一个有界的 ERROR 对账自动恢复所有权标记。它不逐分钟追加重复问题事件；CRITICAL 不持有自动恢复所有权，粘性 CRITICAL 只能由有审计原因的人工恢复确认处理。订单、成交、对账差异和控制事件继续作为长期证据，高频账户/持仓仍执行366天热保留。服务器已在完整 schema 6 备份后幂等迁移到7并通过健康/可写检查。当前为 `implemented（已推送） / deployed（服务器） / not observed / not validated`。
 
 > 2026-07-16 schema 8 增量：只给 `position_cycles` 增加一个可空 `manual_stop_price`，人工修改和旧周期只收紧修复复用长期 `control_events`；effective/trailing stop 均为派生值，不新增重复列、表、JSONL、截图或逐轮文件。OCR 新写入与 Tesseract 依赖已移除，历史上传目录只读保留、不自动删除。部署前 schema 7 在线备份完整性为 `ok`，迁移后 schema 8 健康/可写且环境文件哈希不变；366天高频保留和7/4/12备份轮转不变。当前为 `implemented（已推送） / deployed / not observed / not validated`。

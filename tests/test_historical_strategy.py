@@ -187,6 +187,33 @@ class HistoricalStrategyTest(unittest.TestCase):
         self.assertEqual(_price_core_market_regime(-0.01, 0.01), "CAUTION")
         self.assertEqual(_price_core_market_regime(-0.01, -0.031), "RISK_OFF")
 
+    def test_relative_profile_records_market_width_and_execution_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            start = date(2024, 11, 20)
+            prior = 8.0
+            for offset in range(35):
+                day = (start + timedelta(days=offset)).isoformat()
+                close = round(8.0 + offset * 0.1, 2)
+                self._insert_market_day(store, day, "600000", close, prev_close=prior)
+                prior = close
+            final_day = (start + timedelta(days=34)).isoformat()
+            candidates = generate_daily_candidates(
+                store,
+                "d1",
+                final_day,
+                mode="price_core",
+                parameter_version="relative-v1",
+                min_score=0,
+                alpha_profile="relative_v1",
+            )
+            self.assertEqual([item.code for item in candidates], ["600000"])
+            evidence = candidates[0].evidence
+            self.assertEqual(evidence["alpha_profile"], "relative_v1")
+            self.assertIn("market_breadth", evidence)
+            self.assertIn("volatility_20", evidence)
+            self.assertIn("liquidity_ratio", evidence)
+
     def test_strict_returns_no_candidates_when_features_are_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(Path(tmp))

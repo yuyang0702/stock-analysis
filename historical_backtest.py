@@ -72,6 +72,10 @@ class HistoricalBacktestConfig:
     max_pairwise_correlation: float = 0.9
     market_risk_exit_enabled: bool = False
     local_entry_gates_enabled: bool = False
+    alpha_profile: str = "legacy"
+    slippage_model: str = "fixed"
+    max_participation_pct: float = 100.0
+    min_holding_days: int = 0
     fee_schedule: FeeSchedule | None = None
     entry_fee_schedule: FeeSchedule | None = None
 
@@ -100,6 +104,14 @@ class HistoricalBacktestConfig:
             raise ValueError("max_same_industry_positions must be a positive integer")
         if not math.isfinite(float(self.max_pairwise_correlation)) or not 0 <= self.max_pairwise_correlation <= 1:
             raise ValueError("max_pairwise_correlation must be between 0 and 1")
+        if self.alpha_profile not in {"legacy", "relative_v1"}:
+            raise ValueError("unknown alpha_profile")
+        if self.slippage_model not in {"fixed", "liquidity_v1"}:
+            raise ValueError("unknown slippage_model")
+        if not math.isfinite(float(self.max_participation_pct)) or self.max_participation_pct <= 0:
+            raise ValueError("max_participation_pct must be finite and positive")
+        if int(self.min_holding_days) != self.min_holding_days or self.min_holding_days < 0:
+            raise ValueError("min_holding_days must be a non-negative integer")
         if not str(self.mode).strip():
             raise ValueError("mode is required")
         if not str(self.parameter_version).strip():
@@ -377,6 +389,45 @@ def _aware_replay_timestamp(value: object, label: str) -> str:
     return parsed.isoformat()
 
 
+def _execution_fee_schedule(
+    config: HistoricalBacktestConfig,
+    base: FeeSchedule,
+    row: Mapping[str, object],
+    price: float,
+    quantity: int,
+    side: str,
+) -> FeeSchedule:
+    """Return a deterministic fee contract for one simulated fill.
+
+    ``liquidity_v1`` keeps the configured commission/tax contract and scales
+    only slippage using participation and the observed daily range.  This is
+    deliberately conservative and remains a research model until broker
+    fills are available.
+    """
+    if config.slippage_model == "fixed":
+        return base
+    amount = max(float(row.get("amount") or 0.0), 0.0)
+    notional = max(float(price) * max(int(quantity), 0), 0.0)
+    participation = notional / amount if amount > 0 else 1.0
+    close = max(float(row.get("close") or price), 0.0001)
+    high = float(row.get("high") or close)
+    low = float(row.get("low") or close)
+    range_pct = max(high - low, 0.0) / close
+    base_bps = float(base.buy_slippage_rate if side == "buy" else base.sell_slippage_rate) * 10000
+    impact_bps = base_bps * (
+        1.0
+        + min(4.0, participation / 0.01)
+        + min(2.0, range_pct / 0.03)
+    )
+    change = {
+        "buy_slippage_rate": Decimal(str(impact_bps / 10000))
+        if side == "buy" else base.buy_slippage_rate,
+        "sell_slippage_rate": Decimal(str(impact_bps / 10000))
+        if side == "sell" else base.sell_slippage_rate,
+    }
+    return base.derive_variant(f"liquidity-{side}", **change)
+
+
 def run_historical_backtest(
     store: HistoricalStore,
     dataset_id: str,
@@ -438,7 +489,8 @@ def run_historical_backtest(
             quantity = min(order.quantity, position.quantity)
             price = round(float(row["open"]), 4)
             value = price * quantity
-            breakdown = fees.estimate("sell", Decimal(str(price)), quantity)
+            execution_fees = _execution_fee_schedule(config, fees, row, price, quantity, "sell")
+            breakdown = execution_fees.estimate("sell", Decimal(str(price)), quantity)
             fee = float(breakdown.total_yuan)
             entry_fee = _allocate_entry_fee(position, quantity)
             cash += value - fee
@@ -449,7 +501,7 @@ def run_historical_backtest(
                     order.reason, pnl, holding_days=position.holding_trade_days,
                     strategy_mode=position.mode, market_regime=position.market_regime,
                     industry=position.industry, theme=position.theme,
-                    fee_schedule_version=fees.version,
+                    fee_schedule_version=execution_fees.version,
                     entry_fee_allocated_yuan=entry_fee,
                     **_fee_fields(breakdown),
                 )
@@ -504,6 +556,19 @@ def run_historical_backtest(
             if quantity <= 0:
                 _blocked(result, "LOT_TOO_SMALL")
                 continue
+            if config.slippage_model == "liquidity_v1":
+                amount = float(row.get("amount") or 0.0)
+                if amount <= 0:
+                    _blocked(result, "BUY_LIQUIDITY_MISSING")
+                    continue
+                max_quantity = int(
+                    amount * float(config.max_participation_pct) / 100 / price / 100
+                ) * 100
+                if max_quantity <= 0:
+                    _blocked(result, "BUY_LIQUIDITY_LIMIT")
+                    continue
+                if quantity > max_quantity:
+                    quantity = max_quantity
             if config.local_entry_gates_enabled:
                 holdings = tuple(
                     EntryHolding(
@@ -529,11 +594,13 @@ def run_historical_backtest(
                 if reason:
                     _blocked(result, reason)
                     continue
-            breakdown = fees.estimate("buy", Decimal(str(price)), quantity)
+            execution_fees = _execution_fee_schedule(config, fees, row, price, quantity, "buy")
+            breakdown = execution_fees.estimate("buy", Decimal(str(price)), quantity)
             fee = float(breakdown.total_yuan)
             while quantity > 0 and price * quantity + fee > cash:
                 quantity -= 100
-                breakdown = fees.estimate("buy", Decimal(str(price)), quantity)
+                execution_fees = _execution_fee_schedule(config, fees, row, price, quantity, "buy")
+                breakdown = execution_fees.estimate("buy", Decimal(str(price)), quantity)
                 fee = float(breakdown.total_yuan)
             if quantity <= 0:
                 _blocked(result, "INSUFFICIENT_CASH")
@@ -560,7 +627,7 @@ def run_historical_backtest(
             result.trades.append(
                 HistoricalTrade(
                     order.decision_date, trade_date, candidate.code, "buy", quantity, price, fee,
-                    "SIGNAL", fee_schedule_version=fees.version, **_fee_fields(breakdown),
+                    "SIGNAL", fee_schedule_version=execution_fees.version, **_fee_fields(breakdown),
                 )
             )
             new_positions_today += 1
@@ -635,7 +702,8 @@ def run_historical_backtest(
             else:
                 quantity = position.quantity
             value = price * quantity
-            breakdown = fees.estimate("sell", Decimal(str(price)), quantity)
+            execution_fees = _execution_fee_schedule(config, fees, row, price, quantity, "sell")
+            breakdown = execution_fees.estimate("sell", Decimal(str(price)), quantity)
             fee = float(breakdown.total_yuan)
             entry_fee = _allocate_entry_fee(position, quantity)
             cash += value - fee
@@ -645,7 +713,7 @@ def run_historical_backtest(
                     trade_date, trade_date, code, "sell", quantity, price, fee, reason, pnl,
                     holding_days=position.holding_trade_days, strategy_mode=position.mode,
                     market_regime=position.market_regime, industry=position.industry, theme=position.theme,
-                    fee_schedule_version=fees.version,
+                    fee_schedule_version=execution_fees.version,
                     entry_fee_allocated_yuan=entry_fee,
                     **_fee_fields(breakdown),
                 )
@@ -663,6 +731,8 @@ def run_historical_backtest(
             if row is None or position.buy_date == trade_date:
                 continue
             position.holding_trade_days += 1
+            if position.holding_trade_days < int(config.min_holding_days):
+                continue
             if config.market_risk_exit_enabled and current_market_state == "RISK_OFF":
                 pending_sells.append(
                     PendingSell(trade_date, code, position.quantity, "MARKET_RISK_EXIT")
@@ -714,6 +784,7 @@ def run_historical_backtest(
             require_breakout_confirmation=config.require_breakout_confirmation,
             max_chase_atr=config.max_chase_atr,
             max_entry_score=config.max_entry_score,
+            alpha_profile=config.alpha_profile,
             cooldown_codes={
                 code for code, until in cooldown_until.items()
                 if current_index <= int(until)
@@ -755,6 +826,10 @@ def run_historical_backtest(
             "max_pairwise_correlation": float(config.max_pairwise_correlation),
             "market_risk_exit_enabled": bool(config.market_risk_exit_enabled),
             "local_entry_gates_enabled": bool(config.local_entry_gates_enabled),
+            "alpha_profile": config.alpha_profile,
+            "slippage_model": config.slippage_model,
+            "max_participation_pct": float(config.max_participation_pct),
+            "min_holding_days": int(config.min_holding_days),
             "local_entry_policy_sha256": local_policy_for_config(config).policy_sha256,
             "fee_components": {
                 key: round(sum(trade.fee_components[key] for trade in result.trades), 2)
@@ -981,6 +1056,8 @@ def run_walk_forward(
     holdout_days: int = 20,
     min_score_grid: Iterable[float] | None = None,
     max_positions_grid: Iterable[int] | None = None,
+    alpha_profile_grid: Iterable[str] | None = None,
+    slippage_model_grid: Iterable[str] | None = None,
 ) -> dict[str, object]:
     """Run train-only parameter selection, rolling validation and final holdout.
 
@@ -1013,10 +1090,16 @@ def run_walk_forward(
     positions = sorted(
         {int(base_config.max_positions), *(int(value) for value in (max_positions_grid or ())) }
     )
+    alpha_profiles = sorted({base_config.alpha_profile, *(str(value) for value in (alpha_profile_grid or ()))})
+    slippage_models = sorted({base_config.slippage_model, *(str(value) for value in (slippage_model_grid or ()))})
     if not scores or any(not math.isfinite(value) for value in scores):
         raise HistoricalDataValidationError("INVALID_MIN_SCORE_GRID")
     if not positions or any(value <= 0 for value in positions):
         raise HistoricalDataValidationError("INVALID_MAX_POSITIONS_GRID")
+    if any(value not in {"legacy", "relative_v1"} for value in alpha_profiles):
+        raise HistoricalDataValidationError("INVALID_ALPHA_PROFILE_GRID")
+    if any(value not in {"fixed", "liquidity_v1"} for value in slippage_models):
+        raise HistoricalDataValidationError("INVALID_SLIPPAGE_MODEL_GRID")
 
     fold_reports: list[dict[str, object]] = []
     selected_config = base_config
@@ -1024,28 +1107,34 @@ def run_walk_forward(
         training_candidates: list[dict[str, object]] = []
         for max_positions in positions:
             for min_score in scores:
-                candidate_config = replace(
-                    base_config,
-                    max_positions=max_positions,
-                    min_score=min_score,
-                    parameter_version=f"{base_config.parameter_version}:wf{index}:train",
-                )
-                training_result = run_historical_backtest(
-                    store,
-                    dataset_id,
-                    window.training_start,
-                    window.training_end,
-                    candidate_config,
-                )
-                training_metrics = _result_metrics(training_result)
-                training_candidates.append(
-                    {
-                        "max_positions": max_positions,
-                        "min_score": min_score,
-                        "objective": _walk_forward_objective(training_metrics),
-                        "metrics": training_metrics,
-                    }
-                )
+                for alpha_profile in alpha_profiles:
+                    for slippage_model in slippage_models:
+                        candidate_config = replace(
+                            base_config,
+                            max_positions=max_positions,
+                            min_score=min_score,
+                            alpha_profile=alpha_profile,
+                            slippage_model=slippage_model,
+                            parameter_version=f"{base_config.parameter_version}:wf{index}:train",
+                        )
+                        training_result = run_historical_backtest(
+                            store,
+                            dataset_id,
+                            window.training_start,
+                            window.training_end,
+                            candidate_config,
+                        )
+                        training_metrics = _result_metrics(training_result)
+                        training_candidates.append(
+                            {
+                                "max_positions": max_positions,
+                                "min_score": min_score,
+                                "alpha_profile": alpha_profile,
+                                "slippage_model": slippage_model,
+                                "objective": _walk_forward_objective(training_metrics),
+                                "metrics": training_metrics,
+                            }
+                        )
         selected = max(
             training_candidates,
             key=lambda row: (
@@ -1060,6 +1149,8 @@ def run_walk_forward(
             base_config,
             max_positions=int(selected["max_positions"]),
             min_score=float(selected["min_score"]),
+            alpha_profile=str(selected["alpha_profile"]),
+            slippage_model=str(selected["slippage_model"]),
             parameter_version=f"{base_config.parameter_version}:wf{index}:validation",
         )
         validation_result = run_historical_backtest(
@@ -1076,6 +1167,8 @@ def run_walk_forward(
                 "selected_parameters": {
                     "max_positions": selected_config.max_positions,
                     "min_score": selected_config.min_score,
+                    "alpha_profile": selected_config.alpha_profile,
+                    "slippage_model": selected_config.slippage_model,
                 },
                 "training_candidates": training_candidates,
                 "validation": _result_metrics(validation_result),
@@ -1096,6 +1189,8 @@ def run_walk_forward(
             "selected_parameters": {
                 "max_positions": holdout_config.max_positions,
                 "min_score": holdout_config.min_score,
+                "alpha_profile": holdout_config.alpha_profile,
+                "slippage_model": holdout_config.slippage_model,
             },
             "metrics": _result_metrics(holdout_result),
         }
@@ -1112,6 +1207,8 @@ def run_walk_forward(
         "base_parameters": {
             "max_positions": base_config.max_positions,
             "min_score": base_config.min_score,
+            "alpha_profile": base_config.alpha_profile,
+            "slippage_model": base_config.slippage_model,
             "parameter_version": base_config.parameter_version,
         },
         "folds": fold_reports,
@@ -1550,6 +1647,10 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--max-pairwise-correlation", type=float, default=0.9)
         child.add_argument("--market-risk-exit", action="store_true")
         child.add_argument("--local-entry-gates", action="store_true")
+        child.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+        child.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")
+        child.add_argument("--max-participation-pct", type=float, default=100.0)
+        child.add_argument("--min-holding-days", type=int, default=0)
     walk_forward = subparsers.add_parser(
         "walk-forward",
         help="select parameters on rolling training windows and evaluate unseen windows",
@@ -1578,6 +1679,10 @@ def _parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--max-pairwise-correlation", type=float, default=0.9)
     walk_forward.add_argument("--market-risk-exit", action="store_true")
     walk_forward.add_argument("--local-entry-gates", action="store_true")
+    walk_forward.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+    walk_forward.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")
+    walk_forward.add_argument("--max-participation-pct", type=float, default=100.0)
+    walk_forward.add_argument("--min-holding-days", type=int, default=0)
     walk_forward.add_argument("--folds", type=int, default=3)
     walk_forward.add_argument("--holdout-days", type=int, default=20)
     walk_forward.add_argument(
@@ -1589,6 +1694,16 @@ def _parser() -> argparse.ArgumentParser:
         "--max-positions-grid",
         default="",
         help="comma-separated training candidates, e.g. 4,8,12",
+    )
+    walk_forward.add_argument(
+        "--alpha-profile-grid",
+        default="",
+        help="comma-separated training profiles, e.g. legacy,relative_v1",
+    )
+    walk_forward.add_argument(
+        "--slippage-model-grid",
+        default="",
+        help="comma-separated execution models, e.g. fixed,liquidity_v1",
     )
     compare = subparsers.add_parser("compare")
     compare.add_argument("--db", required=True)
@@ -1689,6 +1804,10 @@ def main(argv: list[str] | None = None) -> int:
                 "max_pairwise_correlation",
                 "market_risk_exit_enabled",
                 "local_entry_gates_enabled",
+                "alpha_profile",
+                "slippage_model",
+                "max_participation_pct",
+                "min_holding_days",
                 "entry_fee_schedule",
             ):
                 if left_config.get(key) != right_config.get(key):
@@ -1727,6 +1846,16 @@ def main(argv: list[str] | None = None) -> int:
                 if args.max_positions_grid
                 else None
             )
+            alpha_profile_grid = (
+                [value.strip() for value in args.alpha_profile_grid.split(",") if value.strip()]
+                if args.alpha_profile_grid
+                else None
+            )
+            slippage_model_grid = (
+                [value.strip() for value in args.slippage_model_grid.split(",") if value.strip()]
+                if args.slippage_model_grid
+                else None
+            )
             report = run_walk_forward(
                 store,
                 args.dataset,
@@ -1751,11 +1880,17 @@ def main(argv: list[str] | None = None) -> int:
                     max_pairwise_correlation=args.max_pairwise_correlation,
                     market_risk_exit_enabled=args.market_risk_exit,
                     local_entry_gates_enabled=args.local_entry_gates,
+                    alpha_profile=args.alpha_profile,
+                    slippage_model=args.slippage_model,
+                    max_participation_pct=args.max_participation_pct,
+                    min_holding_days=args.min_holding_days,
                 ),
                 folds=args.folds,
                 holdout_days=args.holdout_days,
                 min_score_grid=min_score_grid,
                 max_positions_grid=max_positions_grid,
+                alpha_profile_grid=alpha_profile_grid,
+                slippage_model_grid=slippage_model_grid,
             )
         except (HistoricalDataValidationError, ValueError) as error:
             report = {
@@ -1805,6 +1940,10 @@ def main(argv: list[str] | None = None) -> int:
         max_pairwise_correlation=args.max_pairwise_correlation,
         market_risk_exit_enabled=args.market_risk_exit,
         local_entry_gates_enabled=args.local_entry_gates,
+        alpha_profile=args.alpha_profile,
+        slippage_model=args.slippage_model,
+        max_participation_pct=args.max_participation_pct,
+        min_holding_days=args.min_holding_days,
     )
     run_id = _run_id(store, args, config)
     try:

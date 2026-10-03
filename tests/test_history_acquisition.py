@@ -8,6 +8,7 @@ from unittest.mock import patch
 from history_acquisition import (
     AcquisitionConfig,
     acquire_akshare_daily,
+    discover_akshare_a_share_codes,
     fetch_akshare_code,
     normalize_akshare_daily_frame,
 )
@@ -83,6 +84,13 @@ class HistoryAcquisitionTest(unittest.TestCase):
             self.assertTrue((Path(tmp) / "bars.csv").is_file())
             self.assertTrue((Path(tmp) / "acquisition_metadata.json").is_file())
             self.assertIn("historical_universe_membership_unavailable", metadata["warnings"])
+
+    def test_discover_current_universe_is_explicitly_not_historical_membership(self) -> None:
+        frame = pd.DataFrame([{"代码": "600000"}, {"代码": "000001"}, {"代码": "600000"}])
+        self.assertEqual(
+            discover_akshare_a_share_codes(lambda: frame),
+            ["000001", "600000"],
+        )
 
     def test_normalized_output_keeps_akshare_source_when_imported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -118,6 +118,7 @@ def research_signals(
     horizons: Sequence[int] = (1, 3, 5, 10),
     notional_per_signal: float = 100_000.0,
     fee_schedule: FeeSchedule | None = None,
+    alpha_profile: str = "legacy",
 ) -> dict[str, object]:
     if not horizons or any(int(value) <= 0 for value in horizons):
         raise ValueError("horizons must contain positive integers")
@@ -142,6 +143,7 @@ def research_signals(
             mode=mode,
             parameter_version=parameter_version,
             min_score=min_score,
+            alpha_profile=alpha_profile,
         )
         if not candidates:
             continue
@@ -200,6 +202,7 @@ def research_signals(
         "window": {"start": start, "end": end},
         "mode": mode,
         "parameter_version": parameter_version,
+        "alpha_profile": alpha_profile,
         "fee_schedule": schedule.to_dict(),
         "notional_per_signal": notional_per_signal,
         "horizons": sorted({int(value) for value in horizons}),
@@ -225,6 +228,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-score", type=float, default=75.0)
     parser.add_argument("--horizons", default="1,3,5,10")
     parser.add_argument("--notional-per-signal", type=float, default=100_000.0)
+    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
     return parser
 
 
@@ -240,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         min_score=args.min_score,
         horizons=tuple(int(value.strip()) for value in args.horizons.split(",") if value.strip()),
         notional_per_signal=args.notional_per_signal,
+        alpha_profile=args.alpha_profile,
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

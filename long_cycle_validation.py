@@ -513,6 +513,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pairwise-correlation", type=float, default=0.9)
     parser.add_argument("--market-risk-exit", action="store_true")
     parser.add_argument("--local-entry-gates", action="store_true")
+    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+    parser.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")
+    parser.add_argument("--max-participation-pct", type=float, default=100.0)
+    parser.add_argument("--min-holding-days", type=int, default=0)
     parser.add_argument("--no-stress", action="store_true")
     return parser
 
@@ -539,6 +543,10 @@ def main(argv: list[str] | None = None) -> int:
         max_pairwise_correlation=args.max_pairwise_correlation,
         market_risk_exit_enabled=args.market_risk_exit,
         local_entry_gates_enabled=args.local_entry_gates,
+        alpha_profile=args.alpha_profile,
+        slippage_model=args.slippage_model,
+        max_participation_pct=args.max_participation_pct,
+        min_holding_days=args.min_holding_days,
     )
     report = build_long_cycle_report(
         store,

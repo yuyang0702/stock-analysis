@@ -48,6 +48,27 @@ STATUS_FIELDS = [
 UNIVERSE_FIELDS = ["trade_date", "code"]
 
 
+def discover_akshare_a_share_codes(fetcher: Callable[..., object] | None = None) -> list[str]:
+    """Discover the current A-share code universe for bounded research.
+
+    This is intentionally a *current* universe discovery helper.  It never
+    claims historical membership; strict runs must still import a dated PIT
+    universe from the strict-history provider.
+    """
+    if fetcher is None:
+        import akshare as ak  # type: ignore
+
+        fetcher = getattr(ak, "stock_info_a_code_name", None)
+    if not callable(fetcher):
+        raise RuntimeError("AKSHARE_A_SHARE_UNIVERSE_UNAVAILABLE")
+    frame = fetcher()
+    code_col = _column(frame, ("code", "代码", "证券代码", "股票代码"))
+    values = sorted({str(value).strip().zfill(6) for value in frame[code_col].tolist() if str(value).strip()})
+    if not values:
+        raise RuntimeError("AKSHARE_A_SHARE_UNIVERSE_EMPTY")
+    return values
+
+
 @dataclass(frozen=True)
 class AcquisitionConfig:
     dataset_id: str
@@ -198,7 +219,11 @@ def fetch_akshare_code(
 
 def _limit_rate(code: str) -> float:
     normalized = str(code).zfill(6)
-    return 0.20 if normalized.startswith(("300", "301", "688")) else 0.10
+    if normalized.startswith(("300", "301", "688")):
+        return 0.20
+    if normalized.startswith(("8", "4", "43")):
+        return 0.30
+    return 0.10
 
 
 def _canonical_rows(rows: Iterable[Mapping[str, object]], fields: list[str]) -> list[dict[str, object]]:
@@ -321,7 +346,12 @@ def acquire_akshare_daily(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Acquire bounded AkShare daily bars for price_core research")
-    parser.add_argument("--codes-file", required=True)
+    parser.add_argument("--codes-file")
+    parser.add_argument(
+        "--all-a-shares",
+        action="store_true",
+        help="discover the current A-share universe; historical membership remains proxy-only",
+    )
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--dataset", required=True)
@@ -333,7 +363,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    codes = [line.strip() for line in Path(args.codes_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+    if args.all_a_shares:
+        codes = discover_akshare_a_share_codes()
+    elif args.codes_file:
+        codes = [line.strip() for line in Path(args.codes_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+    else:
+        raise ValueError("CODES_FILE_OR_ALL_A_SHARES_REQUIRED")
     config = AcquisitionConfig(
         dataset_id=args.dataset,
         start=args.start,

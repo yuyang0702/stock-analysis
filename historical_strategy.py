@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Mapping
 
 import pandas as pd
@@ -88,6 +89,7 @@ def generate_daily_candidates(
     require_breakout_confirmation: bool = False,
     max_chase_atr: float = 0.0,
     max_entry_score: float = 100.0,
+    alpha_profile: str = "legacy",
 ) -> list[Candidate]:
     rows = [row for row in store.daily_slice(dataset_id, trade_date) if _eligible(row)]
     if mode == "strict":
@@ -103,6 +105,7 @@ def generate_daily_candidates(
             require_trend_confirmation=require_trend_confirmation,
             require_breakout_confirmation=require_breakout_confirmation,
             max_chase_atr=max_chase_atr,
+            alpha_profile=alpha_profile,
         )
     else:
         raise HistoricalDataValidationError(f"unknown strategy mode: {mode}")
@@ -214,6 +217,7 @@ def _price_core_candidates(
     require_trend_confirmation: bool = False,
     require_breakout_confirmation: bool = False,
     max_chase_atr: float = 0.0,
+    alpha_profile: str = "legacy",
 ) -> list[Candidate]:
     prepared = []
     for row in rows:
@@ -231,17 +235,31 @@ def _price_core_candidates(
         ]
         atr = _atr14(history)
         prepared.append((row, history, closes, amounts, returns, atr))
+    if alpha_profile not in {"legacy", "relative_v1"}:
+        raise HistoricalDataValidationError(f"UNKNOWN_ALPHA_PROFILE:{alpha_profile}")
     pct_values = [item[4][-1] for item in prepared]
+    relative_values = [_return_over(item[2], 20) for item in prepared]
     amount_values = [item[3][-1] for item in prepared]
     market_return_5 = _cross_sectional_return(prepared, 5)
     market_return_20 = _cross_sectional_return(prepared, 20)
-    market_state = _price_core_market_regime(market_return_5, market_return_20)
+    breadth = _trend_breadth(prepared)
+    volatility = _median_volatility(prepared)
+    liquidity_ratio = _median_liquidity_ratio(prepared)
+    market_state = _price_core_market_regime(
+        market_return_5,
+        market_return_20,
+        breadth=breadth,
+        volatility=volatility,
+        liquidity_ratio=liquidity_ratio,
+    )
     # The price-core dataset has no point-in-time index membership or status
     # history.  In that proxy mode, a weak broad tape is a reason to stay flat
     # rather than manufacture long entries from relative strength.  The signal
     # research pass showed that CAUTION entries stayed negative after costs,
     # so only NORMAL conditions can open new long positions.
-    if market_state in {"CAUTION", "RISK_OFF"}:
+    if market_state == "RISK_OFF" or (
+        market_state == "CAUTION" and alpha_profile == "legacy"
+    ):
         return []
     result = []
     for row, history, closes, amounts, returns, atr in prepared:
@@ -259,8 +277,29 @@ def _price_core_candidates(
         if max_chase_atr > 0 and chase_atr > max_chase_atr:
             continue
         pct_rank = _percentile(returns[-1], pct_values)
+        relative_strength_20 = _return_over(closes, 20)
+        relative_rank = _percentile(relative_strength_20, relative_values)
         amount_rank = _percentile(amounts[-1], amount_values)
-        score = 70 + 10 * int(trend) + 8 * int(breakout) + 5 * pct_rank + 2 * amount_rank
+        volatility_values = [_realized_volatility(item[4][-20:]) for item in prepared]
+        volatility_rank = _percentile(_realized_volatility(returns[-20:]), volatility_values)
+        liquidity_ratio_stock = _liquidity_ratio(amounts)
+        liquidity_values = [_liquidity_ratio(item[3]) for item in prepared]
+        liquidity_rank = _percentile(liquidity_ratio_stock, liquidity_values)
+        if alpha_profile == "relative_v1":
+            # Cross-sectional strength is more useful than an absolute score
+            # when the A-share market rotates between styles.  Volatility and
+            # liquidity are included as execution-aware quality terms.
+            score = (
+                55
+                + 12 * int(trend)
+                + 10 * int(breakout)
+                + 12 * relative_rank
+                + 6 * amount_rank
+                + 5 * liquidity_rank
+                + 5 * (1 - volatility_rank)
+            )
+        else:
+            score = 70 + 10 * int(trend) + 8 * int(breakout) + 5 * pct_rank + 2 * amount_rank
         board = board_type(str(row["code"]), close, atr)
         stop = initial_stop_price(close, min(closes[-10:]), atr, board)
         position = risk_position_pct(close, stop, board, 10, market_state)
@@ -286,6 +325,14 @@ def _price_core_candidates(
                     "chase_atr": round(chase_atr, 4),
                     "pct_rank": pct_rank,
                     "amount_rank": amount_rank,
+                    "alpha_profile": alpha_profile,
+                    "relative_strength_20": round(relative_strength_20, 6),
+                    "relative_rank": round(relative_rank, 6),
+                    "volatility_20": round(_realized_volatility(returns[-20:]), 6),
+                    "liquidity_ratio": round(liquidity_ratio_stock, 6),
+                    "market_breadth": round(breadth, 6),
+                    "market_volatility": round(volatility, 6),
+                    "market_liquidity_ratio": round(liquidity_ratio, 6),
                     "market_return_5": round(market_return_5, 4),
                     "market_return_20": round(market_return_20, 4),
                     "recent_returns": {
@@ -309,6 +356,53 @@ def _cross_sectional_return(prepared: list[tuple], lookback: int) -> float:
         if len(closes) > lookback and closes[-lookback - 1] > 0:
             values.append(closes[-1] / closes[-lookback - 1] - 1)
     return sum(values) / len(values) if values else 0.0
+
+
+def _return_over(closes: list[float], lookback: int) -> float:
+    if len(closes) <= lookback or closes[-lookback - 1] <= 0:
+        return 0.0
+    return closes[-1] / closes[-lookback - 1] - 1
+
+
+def _realized_volatility(returns: list[float]) -> float:
+    values = [float(value) for value in returns if math.isfinite(float(value))]
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    return (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+
+
+def _liquidity_ratio(amounts: list[float]) -> float:
+    if len(amounts) < 2:
+        return 1.0
+    baseline = sorted(float(value) for value in amounts[:-1] if float(value) > 0)
+    if not baseline:
+        return 0.0
+    median = baseline[len(baseline) // 2]
+    return float(amounts[-1]) / median if median > 0 else 0.0
+
+
+def _trend_breadth(prepared: list[tuple]) -> float:
+    eligible = 0
+    positive = 0
+    for item in prepared:
+        closes = item[2]
+        if len(closes) < 20:
+            continue
+        eligible += 1
+        if closes[-1] > sum(closes[-20:]) / 20:
+            positive += 1
+    return positive / eligible if eligible else 0.0
+
+
+def _median_volatility(prepared: list[tuple]) -> float:
+    values = sorted(_realized_volatility(item[4][-20:]) for item in prepared)
+    return values[len(values) // 2] if values else 0.0
+
+
+def _median_liquidity_ratio(prepared: list[tuple]) -> float:
+    values = sorted(_liquidity_ratio(item[3]) for item in prepared)
+    return values[len(values) // 2] if values else 0.0
 
 
 def price_core_market_state(
@@ -337,14 +431,33 @@ def price_core_market_state(
     return _price_core_market_regime(
         _cross_sectional_return(prepared, 5),
         _cross_sectional_return(prepared, 20),
+        breadth=_trend_breadth(prepared),
+        volatility=_median_volatility(prepared),
+        liquidity_ratio=_median_liquidity_ratio(prepared),
     )
 
 
-def _price_core_market_regime(return_5: float, return_20: float) -> str:
+def _price_core_market_regime(
+    return_5: float,
+    return_20: float,
+    *,
+    breadth: float | None = None,
+    volatility: float | None = None,
+    liquidity_ratio: float | None = None,
+) -> str:
     """Map broad tape momentum to the shared exit-policy risk states."""
-    if return_20 < -0.03 and return_5 < 0:
+    if (
+        (return_20 < -0.03 and return_5 < 0)
+        or (breadth is not None and breadth < 0.30)
+        or (volatility is not None and volatility > 0.05 and return_20 < 0)
+    ):
         return "RISK_OFF"
-    if return_20 < 0 or return_5 < 0:
+    if (
+        return_20 < 0
+        or return_5 < 0
+        or (breadth is not None and breadth < 0.50)
+        or (liquidity_ratio is not None and liquidity_ratio < 0.70)
+    ):
         return "CAUTION"
     return "NORMAL"
 

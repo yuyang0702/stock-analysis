@@ -430,6 +430,31 @@ class HistoricalBacktestTest(unittest.TestCase):
             self.assertEqual(trade.transfer_fee_yuan, 0.1)
             self.assertEqual(trade.slippage_yuan, 10.0)
 
+    def test_liquidity_slippage_caps_participation_and_records_dynamic_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(
+                Path(tmp),
+                [
+                    ("2025-01-02", 9.8, 10.2, 9.7, 10, 0, 11, 9),
+                    ("2025-01-03", 10.0, 10.8, 9.8, 10.4, 0, 11, 9),
+                ],
+            )
+            with patch("historical_backtest.generate_daily_candidates", side_effect=[[self._candidate()], []]):
+                result = run_historical_backtest(
+                    store,
+                    "d1",
+                    "2025-01-02",
+                    "2025-01-03",
+                    HistoricalBacktestConfig(
+                        slippage_model="liquidity_v1",
+                        max_participation_pct=2.0,
+                    ),
+                )
+            trade = result.trades[0]
+            self.assertLessEqual(trade.quantity * trade.price / 1_000_000, 0.02)
+            self.assertGreater(trade.slippage_yuan, 0.0)
+            self.assertIn("liquidity-buy", trade.fee_schedule_version)
+
     def test_suspension_and_limit_up_block_buy(self) -> None:
         for suspended, limit_up in [(1, 11), (0, 10)]:
             with self.subTest(suspended=suspended, limit_up=limit_up), tempfile.TemporaryDirectory() as tmp:
