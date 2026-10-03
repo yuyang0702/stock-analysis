@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
 from historical_data import HistoricalStore
+from data_source_registry import register_dataset
+from market_data_provider import (
+    BrokerHistoricalProvider,
+    JQDataProvider,
+    load_data_source_settings,
+)
 
 
 BAR_FIELDS = [
@@ -344,8 +350,191 @@ def acquire_akshare_daily(
     return metadata
 
 
+def acquire_jqdata_daily(
+    config: AcquisitionConfig,
+    codes: Iterable[str],
+    *,
+    username: str,
+    password: str,
+    provider: JQDataProvider | None = None,
+) -> dict[str, object]:
+    """Fetch JQData daily bars into the same bounded canonical artifacts.
+
+    JQData's local API is a better raw price source than the free AkShare
+    fallback, but this collector intentionally remains ``proxy_only`` until a
+    dated point-in-time universe/status/features package is exported and
+    verified.  It is therefore safe to compare providers without weakening
+    the strict quality gate.
+    """
+    client = provider or JQDataProvider(username, password)
+    client.connect()
+    normalized_codes = sorted(
+        {
+            client.plain_code(code)
+            for code in codes
+            if str(code).strip()
+        }
+    )
+    if not normalized_codes:
+        normalized_codes = client.discover_codes(as_of=config.end)
+    bars: list[dict[str, object]] = []
+    failures: list[dict[str, str]] = []
+    for index, code in enumerate(normalized_codes):
+        try:
+            bars.extend(
+                client.fetch_daily(
+                    code,
+                    config.start,
+                    config.end,
+                    adjust=config.adjust,
+                )
+            )
+        except Exception as exc:
+            failures.append({"code": code, "error": " ".join(str(exc).split())[:240]})
+        if config.sleep_seconds and index + 1 < len(normalized_codes):
+            time.sleep(config.sleep_seconds)
+    start_date = date.fromisoformat(config.start)
+    end_date = date.fromisoformat(config.end)
+    bars = [
+        row for row in bars
+        if start_date <= date.fromisoformat(str(row["trade_date"])[:10]) <= end_date
+    ]
+    raw_bars = list(bars)
+    bars = _canonical_rows(bars, BAR_FIELDS)
+    status: list[dict[str, object]] = []
+    universe: list[dict[str, object]] = []
+    for row in raw_bars:
+        previous = float(row["prev_close"])
+        limit_up = float(row.get("limit_up") or 0.0)
+        limit_down = float(row.get("limit_down") or 0.0)
+        if limit_up <= 0:
+            limit_up = round(previous * (1 + _limit_rate(str(row["code"]))), 2)
+        if limit_down <= 0:
+            limit_down = round(previous * (1 - _limit_rate(str(row["code"]))), 2)
+        status.append(
+            {
+                "trade_date": row["trade_date"],
+                "code": row["code"],
+                "listed": 1,
+                "st": 0,
+                "suspended": int(row.get("suspended") or 0),
+                "limit_up": limit_up,
+                "limit_down": limit_down,
+            }
+        )
+        universe.append({"trade_date": row["trade_date"], "code": row["code"]})
+    status = _canonical_rows(status, STATUS_FIELDS)
+    universe = _canonical_rows(universe, UNIVERSE_FIELDS)
+    output_dir = Path(config.output_dir)
+    _write_csv_atomic(output_dir / "bars.csv", BAR_FIELDS, bars)
+    _write_csv_atomic(output_dir / "status.csv", STATUS_FIELDS, status)
+    _write_csv_atomic(output_dir / "universe.csv", UNIVERSE_FIELDS, universe)
+    metadata = {
+        "dataset_id": config.dataset_id,
+        "source": "jqdata",
+        "adjust": config.adjust or "raw",
+        "start": config.start,
+        "end": config.end,
+        "codes_requested": len(normalized_codes),
+        "codes_with_rows": len({str(row["code"]) for row in bars}),
+        "rows": {"bars": len(bars), "status": len(status), "universe": len(universe)},
+        "failures": failures,
+        "strict_eligible": False,
+        "proxy_only": True,
+        "warnings": [
+            "historical_st_status_not_collected",
+            "historical_universe_membership_not_proven",
+            "point_in_time_features_not_collected",
+            "use_joinquant_strict_export_for_strict_mode",
+        ],
+        "sha256": {
+            name: _sha256(output_dir / name)
+            for name in ("bars.csv", "status.csv", "universe.csv")
+        },
+    }
+    temporary = output_dir / "acquisition_metadata.json.tmp"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(output_dir / "acquisition_metadata.json")
+    return metadata
+
+
+def acquire_broker_historical(
+    config: AcquisitionConfig,
+    *,
+    input_dir: Path | str,
+    provider: BrokerHistoricalProvider | None = None,
+) -> dict[str, object]:
+    """Normalize an audited broker historical export without calling a broker.
+
+    This is the future broker-history seam.  A concrete broker connector only
+    needs to write canonical ``bars.csv`` (and, when available, status and
+    universe files) into the input directory; no strategy code changes.
+    """
+    client = provider or BrokerHistoricalProvider(input_dir)
+    client.connect()
+    source = Path(input_dir)
+    with (source / "bars.csv").open("r", encoding="utf-8-sig", newline="") as handle:
+        raw_codes = sorted({str(row.get("code") or "").strip() for row in csv.DictReader(handle) if row.get("code")})
+    if not raw_codes:
+        raise ValueError("BROKER_HISTORICAL_CODES_REQUIRED")
+    bars: list[dict[str, object]] = []
+    failures: list[dict[str, str]] = []
+    for code in raw_codes:
+        try:
+            bars.extend(client.fetch_daily(code, config.start, config.end, adjust=config.adjust))
+        except Exception as exc:
+            failures.append({"code": code, "error": " ".join(str(exc).split())[:240]})
+    bars = _canonical_rows(bars, BAR_FIELDS)
+    status: list[dict[str, object]] = []
+    universe: list[dict[str, object]] = []
+    for row in bars:
+        status.append({
+            "trade_date": row["trade_date"], "code": row["code"], "listed": 1,
+            "st": 0, "suspended": 0,
+            "limit_up": round(float(row["prev_close"]) * (1 + _limit_rate(str(row["code"]))), 2),
+            "limit_down": round(float(row["prev_close"]) * (1 - _limit_rate(str(row["code"]))), 2),
+        })
+        universe.append({"trade_date": row["trade_date"], "code": row["code"]})
+    output_dir = Path(config.output_dir)
+    _write_csv_atomic(output_dir / "bars.csv", BAR_FIELDS, bars)
+    _write_csv_atomic(output_dir / "status.csv", STATUS_FIELDS, _canonical_rows(status, STATUS_FIELDS))
+    _write_csv_atomic(output_dir / "universe.csv", UNIVERSE_FIELDS, _canonical_rows(universe, UNIVERSE_FIELDS))
+    metadata = {
+        "dataset_id": config.dataset_id,
+        "source": "broker",
+        "adjust": config.adjust or "raw",
+        "start": config.start,
+        "end": config.end,
+        "codes_requested": len(raw_codes),
+        "codes_with_rows": len({str(row["code"]) for row in bars}),
+        "rows": {"bars": len(bars), "status": len(status), "universe": len(universe)},
+        "failures": failures,
+        "strict_eligible": False,
+        "proxy_only": True,
+        "warnings": [
+            "broker_history_adapter_is_export_only",
+            "historical_status_and_universe_must_be_supplied_by_broker",
+            "point_in_time_features_not_collected",
+        ],
+        "sha256": {name: _sha256(output_dir / name) for name in ("bars.csv", "status.csv", "universe.csv")},
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temporary = output_dir / "acquisition_metadata.json.tmp"
+    temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(output_dir / "acquisition_metadata.json")
+    return metadata
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Acquire bounded AkShare daily bars for price_core research")
+    parser = argparse.ArgumentParser(description="Acquire bounded market data for price_core research")
+    parser.add_argument(
+        "--provider",
+        choices=("akshare", "jqdata", "broker_historical"),
+        default=None,
+        help="override BACKTEST_DATA_PROVIDER from the env file",
+    )
+    parser.add_argument("--env-file", default="stock-analysis.env")
     parser.add_argument("--codes-file")
     parser.add_argument(
         "--all-a-shares",
@@ -356,15 +545,26 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--input-dir", help="canonical broker export directory for broker_historical")
     parser.add_argument("--db")
+    parser.add_argument("--registry", default="cache/backtest/datasets.json")
     parser.add_argument("--sleep-seconds", type=float, default=0.2)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    settings = load_data_source_settings(env_file=args.env_file, provider=args.provider)
+    provider_name = settings.provider
     if args.all_a_shares:
-        codes = discover_akshare_a_share_codes()
+        if provider_name == "akshare":
+            codes = discover_akshare_a_share_codes()
+        elif provider_name == "jqdata":
+            jq_provider = JQDataProvider(settings.username, settings.password)
+            jq_provider.connect()
+            codes = jq_provider.discover_codes(as_of=args.end)
+        else:
+            codes = []
     elif args.codes_file:
         codes = [line.strip() for line in Path(args.codes_file).read_text(encoding="utf-8").splitlines() if line.strip()]
     else:
@@ -376,7 +576,22 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=Path(args.output_dir),
         sleep_seconds=args.sleep_seconds,
     )
-    metadata = acquire_akshare_daily(config, codes)
+    if provider_name == "akshare":
+        metadata = acquire_akshare_daily(config, codes)
+        source_name = "akshare_canonical"
+    elif provider_name == "jqdata":
+        metadata = acquire_jqdata_daily(
+            config,
+            codes,
+            username=settings.username,
+            password=settings.password,
+        )
+        source_name = "jqdata_canonical"
+    else:
+        if not args.input_dir:
+            raise ValueError("BROKER_HISTORICAL_INPUT_DIR_REQUIRED")
+        metadata = acquire_broker_historical(config, input_dir=args.input_dir)
+        source_name = "broker_canonical"
     if args.db and not metadata["failures"] and metadata["rows"]["bars"] > 0:
         store = HistoricalStore(Path(args.db))
         store.initialize()
@@ -385,9 +600,10 @@ def main(argv: list[str] | None = None) -> int:
                 config.dataset_id,
                 kind,
                 config.output_dir / f"{kind}.csv",
-                "akshare_canonical",
+                source_name,
                 config.adjust or "raw",
             )
+    register_dataset(metadata, output_dir=config.output_dir, registry_path=args.registry)
     print(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if not metadata["failures"] and metadata["rows"]["bars"] > 0 else 2
 

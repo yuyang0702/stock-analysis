@@ -8,6 +8,8 @@ from unittest.mock import patch
 from history_acquisition import (
     AcquisitionConfig,
     acquire_akshare_daily,
+    acquire_broker_historical,
+    acquire_jqdata_daily,
     discover_akshare_a_share_codes,
     fetch_akshare_code,
     normalize_akshare_daily_frame,
@@ -115,6 +117,54 @@ class HistoryAcquisitionTest(unittest.TestCase):
                     (config.dataset_id,),
                 ).fetchall()
             self.assertEqual([row[0] for row in sources], ["akshare_canonical"])
+
+    def test_jqdata_acquisition_writes_bounded_proxy_artifacts(self) -> None:
+        class FakeProvider:
+            @staticmethod
+            def connect():
+                return None
+
+            @staticmethod
+            def plain_code(value):
+                return str(value).zfill(6)
+
+            @staticmethod
+            def fetch_daily(code, start, end, *, adjust=""):
+                return [{
+                    "trade_date": "2025-01-02", "code": str(code).zfill(6),
+                    "open": 10, "high": 11, "low": 9, "close": 10.5,
+                    "prev_close": 10, "volume": 100, "amount": 1000,
+                    "adjust_factor": 1, "limit_up": 11, "limit_down": 9,
+                    "suspended": 0,
+                }]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AcquisitionConfig("jq-proxy", "2025-01-02", "2025-01-02", Path(tmp), sleep_seconds=0)
+            metadata = acquire_jqdata_daily(
+                config,
+                ["600000"],
+                username="u",
+                password="p",
+                provider=FakeProvider(),
+            )
+            self.assertEqual(metadata["source"], "jqdata")
+            self.assertTrue(metadata["proxy_only"])
+            self.assertEqual(metadata["rows"]["bars"], 1)
+
+    def test_broker_historical_export_is_a_separate_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "broker"
+            source.mkdir()
+            (source / "bars.csv").write_text(
+                "trade_date,code,open,high,low,close,prev_close,volume,amount,adjust_factor\n"
+                "2025-01-02,600000,10,11,9,10.5,10,100,1000,1\n",
+                encoding="utf-8",
+            )
+            output = Path(tmp) / "out"
+            config = AcquisitionConfig("broker-proxy", "2025-01-02", "2025-01-02", output, sleep_seconds=0)
+            metadata = acquire_broker_historical(config, input_dir=source)
+            self.assertEqual(metadata["source"], "broker")
+            self.assertTrue((output / "bars.csv").is_file())
 
 
 if __name__ == "__main__":

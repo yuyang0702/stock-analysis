@@ -2,6 +2,8 @@
 
 更新日期：2026-10-03
 
+> 2026-10-04 多数据源增量：新增 `market_data_provider.py` 统一 Provider 协议和本地凭据加载、`data_source_registry.py` 有界数据集注册、JQData 本地 API 适配器、券商历史导出适配器和 `cross_source_compare.py`。AkShare、JQData 和未来券商历史数据均先落成独立 `dataset_id` 再进入同一 `HistoricalStore`；实时行情和真实下单仍保持未实现边界。JQData 账号认证成功，当前权限可用窗口为 2025-06-27 至 2026-07-03，已采集 20 只股票/4,940 条日线。与同窗口 AkShare 对照后，relative_v1 + liquidity_v1 均为负，JQData 净收益 -3.18%、AkShare -2.96%；两者均为 `proxy_only`，不具备 strict 或生产资格。
+
 > 2026-10-04 本地策略改进增量：`historical_strategy.py` 增加 `relative_v1` 横截面相对强度、20日波动、流动性质量和市场宽度 regime；`historical_backtest.py` 增加 `liquidity_v1` 动态滑点、成交额参与率上限、最短持有期，并允许 Walk-forward 在 alpha/滑点 profile 上只用训练窗口选参。`history_acquisition.py` 增加当前 A 股代码发现能力，但仍明确标记为 proxy，不能替代历史点时股票池。新增 `paper_replay.py` 将同一候选生成器回放到有界本地模拟账户。2025 年代理数据初测的 `relative_v1 + liquidity_v1` 净收益为负且落后等权代理，因此该 profile 仍为候选实验，未替换基线，也不具备生产资格。
 
 > 2026-10-03 本地策略候选增量：新增 `local_entry_policy.py`，将价格跳空、组合暴露、行业/相关性、成本覆盖和开放风险门抽为可供回测与未来券商准入复用的纯函数；`historical_backtest.py` 的候选参数增加趋势确认、追涨 ATR、信号连续确认、分数上限、组合风险和可选市场风险退出，开盘定仓不再读取当日收盘市值。`trend-confirmation-v4` 在 2018–2025 AkShare price_core 代理数据上净收益 +1.60%、最大回撤 4.69%、Profit Factor 1.112、换手 20.64 倍，但相对等权代理仍为 -12.35%，去掉最高三笔收益后净收益为负，且 strict、holdout、券商成交观察和压力测试仍未通过；状态仍为研究候选，不得推断生产可用。

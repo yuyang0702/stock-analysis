@@ -138,6 +138,52 @@ SOURCE_COLUMNS = {
         "event_at": "event_at",
         "available_at": "available_at",
     },
+    # JQData is normalized before import; retaining a source-specific label
+    # keeps provenance distinct from the AkShare proxy path.
+    "jqdata_canonical": {
+        "trade_date": "trade_date",
+        "code": "code",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "prev_close": "prev_close",
+        "volume": "volume",
+        "amount": "amount",
+        "adjust_factor": "adjust_factor",
+        "listed": "listed",
+        "st": "st",
+        "suspended": "suspended",
+        "limit_up": "limit_up",
+        "limit_down": "limit_down",
+        "feature_name": "feature_name",
+        "feature_value": "feature_value",
+        "event_at": "event_at",
+        "available_at": "available_at",
+    },
+    # Future broker historical feeds must pass through the same canonical
+    # contract and retain a separate audit source.
+    "broker_canonical": {
+        "trade_date": "trade_date",
+        "code": "code",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "prev_close": "prev_close",
+        "volume": "volume",
+        "amount": "amount",
+        "adjust_factor": "adjust_factor",
+        "listed": "listed",
+        "st": "st",
+        "suspended": "suspended",
+        "limit_up": "limit_up",
+        "limit_down": "limit_down",
+        "feature_name": "feature_name",
+        "feature_value": "feature_value",
+        "event_at": "event_at",
+        "available_at": "available_at",
+    },
 }
 
 TABLE_SPECS = {

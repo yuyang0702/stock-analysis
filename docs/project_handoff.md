@@ -444,3 +444,7 @@ Batch A/B 与 Batch C 服务器代码部署完成
 # 2026-10-04 本地策略改进接管点
 
 本轮已实现价格核心 `relative_v1`、市场宽度 regime、动态流动性滑点、参与率约束、最短持有期、Walk-forward profile 选择和 `paper_replay.py`。代理验证结果没有超过基线：2018–2025 新 profile 净收益约 `-3.25%`，2025 窗口约 `-2.31%`，2024–2025 三折验证复合约 `-2.46%`、60 日 holdout 约 `-0.61%`。严格验证仍因缺少点时 features 被拒绝；该 profile 保留为可回退研究候选，不得推断生产可用。
+
+# 2026-10-04 多数据源接管点
+
+`market_data_provider.py`、`data_source_registry.py` 和 `cross_source_compare.py` 已进入本地实现。AkShare、JQData 和未来券商历史导出都通过规范化表进入独立 `dataset_id`；策略/回测只依赖 `HistoricalStore`。JQData 本地账号认证成功，当前可用窗口为 2025-06-27 至 2026-07-03，20 只股票采集已完成。实时行情、真实券商 SDK、下单和成交回报仍未实现。
