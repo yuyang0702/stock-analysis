@@ -84,6 +84,10 @@ def generate_daily_candidates(
     min_score: float = 75,
     cooldown_codes: set[str] | None = None,
     caution_min_score: float = 85,
+    require_trend_confirmation: bool = False,
+    require_breakout_confirmation: bool = False,
+    max_chase_atr: float = 0.0,
+    max_entry_score: float = 100.0,
 ) -> list[Candidate]:
     rows = [row for row in store.daily_slice(dataset_id, trade_date) if _eligible(row)]
     if mode == "strict":
@@ -96,6 +100,9 @@ def generate_daily_candidates(
         candidates = _price_core_candidates(
             store, dataset_id, trade_date, rows, parameter_version,
             cooldown_codes=cooldown_codes,
+            require_trend_confirmation=require_trend_confirmation,
+            require_breakout_confirmation=require_breakout_confirmation,
+            max_chase_atr=max_chase_atr,
         )
     else:
         raise HistoricalDataValidationError(f"unknown strategy mode: {mode}")
@@ -107,6 +114,7 @@ def generate_daily_candidates(
                 if candidate.market_regime == "CAUTION"
                 else float(min_score)
             )
+            and candidate.score <= float(max_entry_score)
         ),
         key=lambda candidate: (-candidate.score, candidate.code),
     )
@@ -203,6 +211,9 @@ def _price_core_candidates(
     parameter_version: str,
     *,
     cooldown_codes: set[str] | None = None,
+    require_trend_confirmation: bool = False,
+    require_breakout_confirmation: bool = False,
+    max_chase_atr: float = 0.0,
 ) -> list[Candidate]:
     prepared = []
     for row in rows:
@@ -240,6 +251,13 @@ def _price_core_candidates(
         ma20 = sum(closes[-20:]) / 20
         trend = close > ma5 > ma10 > ma20
         breakout = close >= max(closes[-21:-1])
+        chase_atr = (close - ma20) / atr if atr > 0 else 0.0
+        if require_trend_confirmation and not trend:
+            continue
+        if require_breakout_confirmation and not breakout:
+            continue
+        if max_chase_atr > 0 and chase_atr > max_chase_atr:
+            continue
         pct_rank = _percentile(returns[-1], pct_values)
         amount_rank = _percentile(amounts[-1], amount_values)
         score = 70 + 10 * int(trend) + 8 * int(breakout) + 5 * pct_rank + 2 * amount_rank
@@ -265,10 +283,18 @@ def _price_core_candidates(
                     "parameter_version": parameter_version,
                     "trend": trend,
                     "breakout": breakout,
+                    "chase_atr": round(chase_atr, 4),
                     "pct_rank": pct_rank,
                     "amount_rank": amount_rank,
                     "market_return_5": round(market_return_5, 4),
                     "market_return_20": round(market_return_20, 4),
+                    "recent_returns": {
+                        str(item["trade_date"]): round(
+                            float(item["close"]) / float(item["prev_close"]) - 1, 6
+                        )
+                        for item in history[-20:]
+                        if float(item["prev_close"]) > 0
+                    },
                 },
             )
         )
@@ -283,6 +309,35 @@ def _cross_sectional_return(prepared: list[tuple], lookback: int) -> float:
         if len(closes) > lookback and closes[-lookback - 1] > 0:
             values.append(closes[-1] / closes[-lookback - 1] - 1)
     return sum(values) / len(values) if values else 0.0
+
+
+def price_core_market_state(
+    store: HistoricalStore, dataset_id: str, trade_date: str
+) -> str:
+    """Return the same point-in-time tape state used by price-core entries.
+
+    Keeping this calculation in the strategy module lets the backtest and a
+    future broker adapter apply the same market-risk exit without duplicating
+    regime logic in an execution layer.
+    """
+    rows = [row for row in store.daily_slice(dataset_id, trade_date) if _eligible(row)]
+    prepared = []
+    for row in rows:
+        history = store.history_until(dataset_id, str(row["code"]), trade_date, 40)
+        if len(history) < 21:
+            continue
+        closes = [float(item["close"]) for item in history]
+        amounts = [float(item["amount"]) for item in history]
+        returns = [
+            (float(item["close"]) / float(item["prev_close"]) - 1) * 100
+            for item in history
+            if float(item["prev_close"]) > 0
+        ]
+        prepared.append((row, history, closes, amounts, returns, _atr14(history)))
+    return _price_core_market_regime(
+        _cross_sectional_return(prepared, 5),
+        _cross_sectional_return(prepared, 20),
+    )
 
 
 def _price_core_market_regime(return_5: float, return_20: float) -> str:

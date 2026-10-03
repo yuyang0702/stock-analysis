@@ -29,8 +29,19 @@ from historical_data import (
     HistoricalStore,
     validate_dataset,
 )
-from historical_strategy import Candidate, generate_candidates_at, generate_daily_candidates
+from historical_strategy import (
+    Candidate,
+    generate_candidates_at,
+    generate_daily_candidates,
+    price_core_market_state,
+)
 from ml_contracts import CandidateSample, canonical_hash
+from local_entry_policy import (
+    EntryHolding,
+    LocalEntryPolicy,
+    aligned_correlation,
+    check_local_entry,
+)
 
 
 @dataclass(frozen=True)
@@ -49,7 +60,20 @@ class HistoricalBacktestConfig:
     caution_min_score: float = 85.0
     cooldown_days: int = 3
     max_new_positions_per_day: int = 10
+    require_trend_confirmation: bool = False
+    require_breakout_confirmation: bool = False
+    max_chase_atr: float = 0.0
+    max_entry_score: float = 100.0
+    signal_confirmation_days: int = 1
+    # Direct library callers historically allowed arbitrary test position
+    # sizes. CLI and the production research profile pass the safer 4% cap.
+    max_portfolio_risk_pct: float = 100.0
+    max_same_industry_positions: int = 2
+    max_pairwise_correlation: float = 0.9
+    market_risk_exit_enabled: bool = False
+    local_entry_gates_enabled: bool = False
     fee_schedule: FeeSchedule | None = None
+    entry_fee_schedule: FeeSchedule | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.initial_cash)) or self.initial_cash <= 0:
@@ -64,6 +88,18 @@ class HistoricalBacktestConfig:
             raise ValueError("cooldown_days must be a non-negative integer")
         if int(self.max_new_positions_per_day) != self.max_new_positions_per_day or self.max_new_positions_per_day <= 0:
             raise ValueError("max_new_positions_per_day must be a positive integer")
+        if int(self.signal_confirmation_days) != self.signal_confirmation_days or self.signal_confirmation_days <= 0:
+            raise ValueError("signal_confirmation_days must be a positive integer")
+        if not math.isfinite(float(self.max_chase_atr)) or self.max_chase_atr < 0:
+            raise ValueError("max_chase_atr must be finite and non-negative")
+        if not math.isfinite(float(self.max_entry_score)):
+            raise ValueError("max_entry_score must be finite")
+        if not math.isfinite(float(self.max_portfolio_risk_pct)) or self.max_portfolio_risk_pct < 0:
+            raise ValueError("max_portfolio_risk_pct must be finite and non-negative")
+        if int(self.max_same_industry_positions) != self.max_same_industry_positions or self.max_same_industry_positions <= 0:
+            raise ValueError("max_same_industry_positions must be a positive integer")
+        if not math.isfinite(float(self.max_pairwise_correlation)) or not 0 <= self.max_pairwise_correlation <= 1:
+            raise ValueError("max_pairwise_correlation must be between 0 and 1")
         if not str(self.mode).strip():
             raise ValueError("mode is required")
         if not str(self.parameter_version).strip():
@@ -96,6 +132,9 @@ class HistoricalBacktestConfig:
             other_fee_rate=0 if no_costs else base.other_fee_rate,
         )
 
+    def resolved_entry_fee_schedule(self) -> FeeSchedule:
+        return self.entry_fee_schedule or self.resolved_fee_schedule()
+
 
 @dataclass
 class HistoricalPosition:
@@ -118,6 +157,7 @@ class HistoricalPosition:
     trailing_stop_active_from: str = ""
     last_adjust_factor: float = 1.0
     holding_trade_days: int = 0
+    recent_returns: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -353,11 +393,18 @@ def run_historical_backtest(
     pending_sells: list[PendingSell] = []
     date_index = {trade_date: index for index, trade_date in enumerate(dates)}
     cooldown_until: dict[str, int] = {}
+    signal_streak: dict[str, int] = {}
+    previous_candidate_codes: set[str] = set()
 
     for trade_date in dates:
         current_index = date_index[trade_date]
         new_positions_today = 0
         rows = {str(row["code"]): row for row in store.daily_slice(dataset_id, trade_date)}
+        current_market_state = (
+            price_core_market_state(store, dataset_id, trade_date)
+            if config.mode == "price_core" and positions and config.market_risk_exit_enabled
+            else ""
+        )
 
         for code, position in positions.items():
             row = rows.get(code)
@@ -432,11 +479,56 @@ def run_historical_backtest(
                 _blocked(result, "BUY_DAILY_NEW_POSITIONS_LIMIT")
                 continue
             price = round(open_price, 4)
-            target = _account_value(cash, positions, rows) * candidate.position_pct / 100
+            if config.local_entry_gates_enabled:
+                if (
+                    candidate.industry
+                    and candidate.industry.lower() != "unknown"
+                    and sum(
+                        1
+                        for position in positions.values()
+                        if position.industry.lower() == candidate.industry.lower()
+                    ) >= config.max_same_industry_positions
+                ):
+                    _blocked(result, "BUY_INDUSTRY_CONCENTRATION")
+                    continue
+                if _candidate_correlated_with_positions(
+                    candidate, positions, config.max_pairwise_correlation
+                ):
+                    _blocked(result, "BUY_CORRELATED_POSITION")
+                    continue
+            # At the open, today's close/high/low are unavailable for sizing.
+            open_rows = {code: {"close": bar["open"]} for code, bar in rows.items()}
+            account_value = _account_value(cash, positions, open_rows)
+            target = account_value * candidate.position_pct / 100
             quantity = int(target / price / 100) * 100
             if quantity <= 0:
                 _blocked(result, "LOT_TOO_SMALL")
                 continue
+            if config.local_entry_gates_enabled:
+                holdings = tuple(
+                    EntryHolding(
+                        code=position.code,
+                        quantity=position.quantity,
+                        price=float(open_rows.get(position.code, {}).get("close", position.entry_price)),
+                        stop_price=position.stop_loss,
+                        industry=position.industry,
+                        returns=position.recent_returns,
+                    )
+                    for position in positions.values()
+                )
+                reason = check_local_entry(
+                    candidate=candidate,
+                    price=price,
+                    quantity=quantity,
+                    equity=account_value,
+                    holdings=holdings,
+                    returns=_prior_returns(store, dataset_id, candidate.code, order.decision_date),
+                    fees=config.resolved_entry_fee_schedule(),
+                    policy=local_policy_for_config(config),
+                )
+                if reason:
+                    _blocked(result, reason)
+                    continue
             breakdown = fees.estimate("buy", Decimal(str(price)), quantity)
             fee = float(breakdown.total_yuan)
             while quantity > 0 and price * quantity + fee > cash:
@@ -463,6 +555,7 @@ def run_historical_backtest(
                 highest_price=float(row["high"]),
                 entry_fee_remaining_yuan=fee,
                 last_adjust_factor=float(row["adjust_factor"]),
+                recent_returns=_prior_returns(store, dataset_id, candidate.code, order.decision_date),
             )
             result.trades.append(
                 HistoricalTrade(
@@ -570,6 +663,11 @@ def run_historical_backtest(
             if row is None or position.buy_date == trade_date:
                 continue
             position.holding_trade_days += 1
+            if config.market_risk_exit_enabled and current_market_state == "RISK_OFF":
+                pending_sells.append(
+                    PendingSell(trade_date, code, position.quantity, "MARKET_RISK_EXIT")
+                )
+                continue
             decision = evaluate_exit(
                 PositionExitState(
                     code=code,
@@ -612,12 +710,29 @@ def run_historical_backtest(
             parameter_version=config.parameter_version,
             min_score=config.min_score,
             caution_min_score=config.caution_min_score,
+            require_trend_confirmation=config.require_trend_confirmation,
+            require_breakout_confirmation=config.require_breakout_confirmation,
+            max_chase_atr=config.max_chase_atr,
+            max_entry_score=config.max_entry_score,
             cooldown_codes={
                 code for code, until in cooldown_until.items()
                 if current_index <= int(until)
             },
         )
-        pending = [PendingOrder(trade_date, candidate) for candidate in candidates]
+        candidate_codes = {candidate.code for candidate in candidates}
+        for code in list(signal_streak):
+            if code not in candidate_codes:
+                del signal_streak[code]
+        for code in candidate_codes:
+            signal_streak[code] = signal_streak.get(code, 0) + (1 if code in previous_candidate_codes else 0)
+            if code not in previous_candidate_codes:
+                signal_streak[code] = 1
+        confirmed = [
+            candidate for candidate in candidates
+            if signal_streak.get(candidate.code, 0) >= config.signal_confirmation_days
+        ]
+        previous_candidate_codes = candidate_codes
+        pending = [PendingOrder(trade_date, candidate) for candidate in confirmed]
         result.equity.append(
             EquityPoint(trade_date, round(_account_value(cash, positions, rows), 2), round(cash, 2))
         )
@@ -625,9 +740,22 @@ def run_historical_backtest(
         {
             "fee_schedule_version": fees.version,
             "fee_schedule_sha256": fees.contract_sha256,
+            "entry_fee_schedule_version": config.resolved_entry_fee_schedule().version,
+            "entry_fee_schedule_sha256": config.resolved_entry_fee_schedule().contract_sha256,
             "cooldown_days": int(config.cooldown_days),
             "max_new_positions_per_day": int(config.max_new_positions_per_day),
             "caution_min_score": float(config.caution_min_score),
+            "require_trend_confirmation": bool(config.require_trend_confirmation),
+            "require_breakout_confirmation": bool(config.require_breakout_confirmation),
+            "max_chase_atr": float(config.max_chase_atr),
+            "max_entry_score": float(config.max_entry_score),
+            "signal_confirmation_days": int(config.signal_confirmation_days),
+            "max_portfolio_risk_pct": float(config.max_portfolio_risk_pct),
+            "max_same_industry_positions": int(config.max_same_industry_positions),
+            "max_pairwise_correlation": float(config.max_pairwise_correlation),
+            "market_risk_exit_enabled": bool(config.market_risk_exit_enabled),
+            "local_entry_gates_enabled": bool(config.local_entry_gates_enabled),
+            "local_entry_policy_sha256": local_policy_for_config(config).policy_sha256,
             "fee_components": {
                 key: round(sum(trade.fee_components[key] for trade in result.trades), 2)
                 for key in (
@@ -665,6 +793,33 @@ def _account_value(cash: float, positions: dict[str, HistoricalPosition], rows: 
         position.quantity * float(rows.get(code, {}).get("close", position.entry_price))
         for code, position in positions.items()
     )
+
+
+def _prior_returns(store, dataset_id, code, decision_date):
+    history = store.history_until(dataset_id, code, decision_date, 20)
+    return {
+        str(bar["trade_date"]): float(bar["close"]) / float(bar["prev_close"]) - 1
+        for bar in history if float(bar["prev_close"]) > 0
+    }
+
+
+def local_policy_for_config(config):
+    return LocalEntryPolicy(
+        max_portfolio_risk_pct=config.max_portfolio_risk_pct,
+        max_same_industry_positions=config.max_same_industry_positions,
+        max_pairwise_correlation=config.max_pairwise_correlation,
+    )
+
+
+def _candidate_correlated_with_positions(candidate, positions, threshold):
+    candidate_returns = candidate.evidence.get("recent_returns", {})
+    if not candidate_returns:
+        return False
+    for position in positions.values():
+        correlation = aligned_correlation(candidate_returns, position.recent_returns, 5)
+        if correlation is not None and correlation >= threshold:
+            return True
+    return False
 
 
 def _blocked(result: HistoricalBacktestResult, reason: str) -> None:
@@ -1155,6 +1310,7 @@ def _implementation_paths() -> tuple[Path, ...]:
         "historical_data.py",
         "historical_strategy.py",
         "historical_backtest.py",
+        "local_entry_policy.py",
         "ml_contracts.py",
     )
     return tuple(root / name for name in names if (root / name).is_file())
@@ -1188,6 +1344,7 @@ def _run_id(store: HistoricalStore, args, config: HistoricalBacktestConfig) -> s
 def _config_payload(config: HistoricalBacktestConfig) -> dict[str, object]:
     payload = asdict(config)
     payload["fee_schedule"] = config.resolved_fee_schedule().to_dict()
+    payload["entry_fee_schedule"] = config.resolved_entry_fee_schedule().to_dict()
     return payload
 
 
@@ -1383,6 +1540,16 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--caution-min-score", type=float, default=85.0)
         child.add_argument("--cooldown-days", type=int, default=3)
         child.add_argument("--max-new-positions-per-day", type=int, default=10)
+        child.add_argument("--require-trend-confirmation", action="store_true")
+        child.add_argument("--require-breakout-confirmation", action="store_true")
+        child.add_argument("--max-chase-atr", type=float, default=0.0)
+        child.add_argument("--max-entry-score", type=float, default=100.0)
+        child.add_argument("--signal-confirmation-days", type=int, default=1)
+        child.add_argument("--max-portfolio-risk-pct", type=float, default=4.0)
+        child.add_argument("--max-same-industry-positions", type=int, default=2)
+        child.add_argument("--max-pairwise-correlation", type=float, default=0.9)
+        child.add_argument("--market-risk-exit", action="store_true")
+        child.add_argument("--local-entry-gates", action="store_true")
     walk_forward = subparsers.add_parser(
         "walk-forward",
         help="select parameters on rolling training windows and evaluate unseen windows",
@@ -1401,6 +1568,16 @@ def _parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--caution-min-score", type=float, default=85.0)
     walk_forward.add_argument("--cooldown-days", type=int, default=3)
     walk_forward.add_argument("--max-new-positions-per-day", type=int, default=10)
+    walk_forward.add_argument("--require-trend-confirmation", action="store_true")
+    walk_forward.add_argument("--require-breakout-confirmation", action="store_true")
+    walk_forward.add_argument("--max-chase-atr", type=float, default=0.0)
+    walk_forward.add_argument("--max-entry-score", type=float, default=100.0)
+    walk_forward.add_argument("--signal-confirmation-days", type=int, default=1)
+    walk_forward.add_argument("--max-portfolio-risk-pct", type=float, default=4.0)
+    walk_forward.add_argument("--max-same-industry-positions", type=int, default=2)
+    walk_forward.add_argument("--max-pairwise-correlation", type=float, default=0.9)
+    walk_forward.add_argument("--market-risk-exit", action="store_true")
+    walk_forward.add_argument("--local-entry-gates", action="store_true")
     walk_forward.add_argument("--folds", type=int, default=3)
     walk_forward.add_argument("--holdout-days", type=int, default=20)
     walk_forward.add_argument(
@@ -1506,6 +1683,13 @@ def main(argv: list[str] | None = None) -> int:
                 "slippage_bps", "max_positions", "min_score", "mode", "fee_schedule",
                 "caution_min_score", "cooldown_days", "max_new_positions_per_day",
                 "strategy_version", "code_hash", "parameter_version",
+                "require_trend_confirmation", "require_breakout_confirmation",
+                "max_chase_atr", "max_entry_score", "signal_confirmation_days",
+                "max_portfolio_risk_pct", "max_same_industry_positions",
+                "max_pairwise_correlation",
+                "market_risk_exit_enabled",
+                "local_entry_gates_enabled",
+                "entry_fee_schedule",
             ):
                 if left_config.get(key) != right_config.get(key):
                     mismatches.append(f"config:{key}")
@@ -1557,6 +1741,16 @@ def main(argv: list[str] | None = None) -> int:
                     caution_min_score=args.caution_min_score,
                     cooldown_days=args.cooldown_days,
                     max_new_positions_per_day=args.max_new_positions_per_day,
+                    require_trend_confirmation=args.require_trend_confirmation,
+                    require_breakout_confirmation=args.require_breakout_confirmation,
+                    max_chase_atr=args.max_chase_atr,
+                    max_entry_score=args.max_entry_score,
+                    signal_confirmation_days=args.signal_confirmation_days,
+                    max_portfolio_risk_pct=args.max_portfolio_risk_pct,
+                    max_same_industry_positions=args.max_same_industry_positions,
+                    max_pairwise_correlation=args.max_pairwise_correlation,
+                    market_risk_exit_enabled=args.market_risk_exit,
+                    local_entry_gates_enabled=args.local_entry_gates,
                 ),
                 folds=args.folds,
                 holdout_days=args.holdout_days,
@@ -1601,6 +1795,16 @@ def main(argv: list[str] | None = None) -> int:
         caution_min_score=args.caution_min_score,
         cooldown_days=args.cooldown_days,
         max_new_positions_per_day=args.max_new_positions_per_day,
+        require_trend_confirmation=args.require_trend_confirmation,
+        require_breakout_confirmation=args.require_breakout_confirmation,
+        max_chase_atr=args.max_chase_atr,
+        max_entry_score=args.max_entry_score,
+        signal_confirmation_days=args.signal_confirmation_days,
+        max_portfolio_risk_pct=args.max_portfolio_risk_pct,
+        max_same_industry_positions=args.max_same_industry_positions,
+        max_pairwise_correlation=args.max_pairwise_correlation,
+        market_risk_exit_enabled=args.market_risk_exit,
+        local_entry_gates_enabled=args.local_entry_gates,
     )
     run_id = _run_id(store, args, config)
     try:

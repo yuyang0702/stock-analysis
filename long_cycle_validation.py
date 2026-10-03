@@ -326,7 +326,20 @@ def _stress_run(
         )
     else:
         raise ValueError(f"unknown stress label: {label}")
-    result = run_historical_backtest(store, dataset_id, start, end, replace(base_config, fee_schedule=schedule))
+    # Keep the candidate's entry economics fixed while changing execution
+    # costs. Otherwise a stress run silently changes which signals are
+    # admitted and ceases to be a comparable cost sensitivity test.
+    result = run_historical_backtest(
+        store,
+        dataset_id,
+        start,
+        end,
+        replace(
+            base_config,
+            fee_schedule=schedule,
+            entry_fee_schedule=fees if base_config.local_entry_gates_enabled else None,
+        ),
+    )
     metrics = compute_metrics(result.equity, result.trades)
     return {"label": label, "metrics": asdict(metrics), "fee_components": result.metadata.get("fee_components", {})}
 
@@ -490,6 +503,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--caution-min-score", type=float, default=85.0)
     parser.add_argument("--cooldown-days", type=int, default=3)
     parser.add_argument("--max-new-positions-per-day", type=int, default=3)
+    parser.add_argument("--require-trend-confirmation", action="store_true")
+    parser.add_argument("--require-breakout-confirmation", action="store_true")
+    parser.add_argument("--max-chase-atr", type=float, default=0.0)
+    parser.add_argument("--max-entry-score", type=float, default=100.0)
+    parser.add_argument("--signal-confirmation-days", type=int, default=1)
+    parser.add_argument("--max-portfolio-risk-pct", type=float, default=4.0)
+    parser.add_argument("--max-same-industry-positions", type=int, default=2)
+    parser.add_argument("--max-pairwise-correlation", type=float, default=0.9)
+    parser.add_argument("--market-risk-exit", action="store_true")
+    parser.add_argument("--local-entry-gates", action="store_true")
     parser.add_argument("--no-stress", action="store_true")
     return parser
 
@@ -506,6 +529,16 @@ def main(argv: list[str] | None = None) -> int:
         max_new_positions_per_day=args.max_new_positions_per_day,
         mode=args.mode,
         parameter_version=args.parameter_version,
+        require_trend_confirmation=args.require_trend_confirmation,
+        require_breakout_confirmation=args.require_breakout_confirmation,
+        max_chase_atr=args.max_chase_atr,
+        max_entry_score=args.max_entry_score,
+        signal_confirmation_days=args.signal_confirmation_days,
+        max_portfolio_risk_pct=args.max_portfolio_risk_pct,
+        max_same_industry_positions=args.max_same_industry_positions,
+        max_pairwise_correlation=args.max_pairwise_correlation,
+        market_risk_exit_enabled=args.market_risk_exit,
+        local_entry_gates_enabled=args.local_entry_gates,
     )
     report = build_long_cycle_report(
         store,

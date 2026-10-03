@@ -1,6 +1,8 @@
 # A 股策略项目规划与状态
 
-更新日期：2026-10-02
+更新日期：2026-10-03
+
+> 2026-10-03 本地策略候选增量：新增 `local_entry_policy.py`，将价格跳空、组合暴露、行业/相关性、成本覆盖和开放风险门抽为可供回测与未来券商准入复用的纯函数；`historical_backtest.py` 的候选参数增加趋势确认、追涨 ATR、信号连续确认、分数上限、组合风险和可选市场风险退出，开盘定仓不再读取当日收盘市值。`trend-confirmation-v4` 在 2018–2025 AkShare price_core 代理数据上净收益 +1.60%、最大回撤 4.69%、Profit Factor 1.112、换手 20.64 倍，但相对等权代理仍为 -12.35%，去掉最高三笔收益后净收益为负，且 strict、holdout、券商成交观察和压力测试仍未通过；状态仍为研究候选，不得推断生产可用。
 
 > 2026-10-02 本地历史验证增量：新增 `history_acquisition.py`，提供有界 AkShare 日线代理采集；输出明确标记 `proxy_only=true`、`strict_eligible=false`，不补造历史 ST、停牌、股票池或完整涨跌停事实。`historical_backtest.py walk-forward` 已支持训练窗口选参、至少 3 个滚动验证窗口和最终 holdout，当前本机 `jq-strict-probe-202607` 只有 23 个交易日，3 折加 5 日 holdout 以 `INSUFFICIENT_WALK_FORWARD_DATES:18<36` 失败关闭。真实 strict 数据仍必须通过 JoinQuant 月包导出和 `strict_history_ingest.py` 导入，当前没有可审计的 6–12 个月样本外结果。
 
