@@ -214,6 +214,33 @@ class HistoricalStrategyTest(unittest.TestCase):
             self.assertIn("volatility_20", evidence)
             self.assertIn("liquidity_ratio", evidence)
 
+    def test_relative_v2_requires_independent_benchmark_and_records_excess_strength(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            start = date(2024, 11, 20)
+            prior = 8.0
+            benchmark = {}
+            for offset in range(35):
+                day = (start + timedelta(days=offset)).isoformat()
+                close = round(8.0 + offset * 0.1, 2)
+                self._insert_market_day(store, day, "600000", close, prev_close=prior)
+                prior = close
+                benchmark[day] = 100.0 + offset * 0.01
+            final_day = (start + timedelta(days=34)).isoformat()
+            candidates = generate_daily_candidates(
+                store,
+                "d1",
+                final_day,
+                mode="price_core",
+                parameter_version="relative-v2",
+                min_score=0,
+                alpha_profile="relative_v2",
+                benchmark_closes=benchmark,
+            )
+            self.assertEqual([item.code for item in candidates], ["600000"])
+            self.assertEqual(candidates[0].evidence["alpha_profile"], "relative_v2")
+            self.assertGreater(candidates[0].evidence["excess_strength_20"], 0)
+
     def test_strict_returns_no_candidates_when_features_are_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(Path(tmp))

@@ -19,10 +19,11 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import config as app_config
-from benchmark_data import load_benchmark_csv
+from benchmark_data import load_benchmark_bars
 from execution_contracts import FeeSchedule
 from historical_data import HistoricalDataValidationError, HistoricalStore
 from historical_strategy import Candidate, generate_daily_candidates
+from signal_calibration import calibrate_score_buckets
 
 
 @dataclass(frozen=True)
@@ -212,12 +213,16 @@ def research_signals(
         for date in dates
     }
     schedule = fee_schedule or app_config.SIMULATION_FEE_SCHEDULE
-    benchmark_values = load_benchmark_csv(benchmark_csv) if benchmark_csv else {}
+    benchmark_values = load_benchmark_bars(benchmark_csv) if benchmark_csv else {}
     benchmark_name = str(benchmark or "").strip()
     if benchmark_name and benchmark_name not in benchmark_values:
         raise ValueError(f"benchmark not found: {benchmark_name}")
     if benchmark_values and not benchmark_name:
         benchmark_name = sorted(benchmark_values)[0]
+    benchmark_closes = (
+        {day: float(row["close"]) for day, row in benchmark_values[benchmark_name].items()}
+        if benchmark_name else None
+    )
     observations: list[SignalObservation] = []
     for index, trade_date in enumerate(dates):
         candidates = generate_daily_candidates(
@@ -228,6 +233,7 @@ def research_signals(
             parameter_version=parameter_version,
             min_score=min_score,
             alpha_profile=alpha_profile,
+            benchmark_closes=benchmark_closes,
         )
         if not candidates:
             continue
@@ -243,7 +249,10 @@ def research_signals(
             forward: dict[int, float] = {}
             excess: dict[int, float] = {}
             for horizon in sorted({int(value) for value in horizons}):
-                exit_index = entry_date_index + horizon - 1
+                # A horizon is a number of completed sessions after the
+                # executable next-open entry.  Horizon 1 therefore exits on
+                # the following session, never at the same day's close.
+                exit_index = entry_date_index + horizon
                 if exit_index >= len(dates):
                     continue
                 exit_row = daily_rows[dates[exit_index]].get(candidate.code)
@@ -252,8 +261,8 @@ def research_signals(
                 if value is not None:
                     forward[horizon] = value
                     if benchmark_name:
-                        benchmark_entry = benchmark_values[benchmark_name].get(entry_date)
-                        benchmark_exit = benchmark_values[benchmark_name].get(dates[exit_index])
+                        benchmark_entry = benchmark_values[benchmark_name].get(entry_date, {}).get("open")
+                        benchmark_exit = benchmark_values[benchmark_name].get(dates[exit_index], {}).get("close")
                         if benchmark_entry and benchmark_exit and benchmark_entry > 0:
                             excess[horizon] = value - (benchmark_exit / benchmark_entry - 1.0)
             if not forward:
@@ -318,8 +327,16 @@ def research_signals(
         if value * 10000 >= float(min_expected_net_return_bps)
     )
     possible_gate_count = sum(len(observation.forward_returns) for observation in observations)
+    calibration = {
+        str(horizon): calibrate_score_buckets(
+            {"horizon_metrics": horizon_metrics, "by_horizon": by_horizon},
+            horizon=int(horizon),
+        )
+        for horizon in sorted({int(value) for value in horizons})
+        if str(horizon) in horizon_metrics
+    }
     return {
-        "report_version": "signal-research-v1",
+        "report_version": "signal-research-v2",
         "dataset_id": dataset_id,
         "window": {"start": start, "end": end},
         "mode": mode,
@@ -340,6 +357,7 @@ def research_signals(
         "observation_count": len(observations),
         "horizon_metrics": horizon_metrics,
         "by_horizon": by_horizon,
+        "score_calibration": calibration,
         "interpretation": (
             "Forward returns use the next available open for entry and later close for exit; "
             "they subtract the configured simulation fee schedule and do not authorize deployment."
@@ -359,7 +377,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-score", type=float, default=75.0)
     parser.add_argument("--horizons", default="1,3,5,10")
     parser.add_argument("--notional-per-signal", type=float, default=100_000.0)
-    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="legacy")
     parser.add_argument("--benchmark-csv")
     parser.add_argument("--benchmark", default="")
     parser.add_argument("--min-expected-net-return-bps", type=float, default=0.0)

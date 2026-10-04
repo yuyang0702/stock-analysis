@@ -11,6 +11,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 from datetime import date
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
@@ -115,7 +116,13 @@ def write_benchmark_csv(path: Path | str, rows: Iterable[Mapping[str, object]]) 
 
 def load_benchmark_csv(path: Path | str) -> dict[str, dict[str, float]]:
     """Load a canonical benchmark CSV keyed by benchmark/date."""
-    values: dict[str, dict[str, float]] = {}
+    return {name: {day: row['close'] for day, row in rows.items()}
+            for name, rows in load_benchmark_bars(path).items()}
+
+
+def load_benchmark_bars(path: Path | str) -> dict[str, dict[str, dict[str, float]]]:
+    """Validate an independent index series, retaining open/close alignment."""
+    values: dict[str, dict[str, dict[str, float]]] = {}
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         missing = set(BENCHMARK_FIELDS) - set(reader.fieldnames or ())
@@ -124,9 +131,13 @@ def load_benchmark_csv(path: Path | str) -> dict[str, dict[str, float]]:
         for row in reader:
             benchmark = str(row["benchmark"]).strip()
             trade_date = str(row["trade_date"])[:10]
-            close = float(row["close"])
-            if benchmark and close > 0:
-                values.setdefault(benchmark, {})[trade_date] = close
+            date.fromisoformat(trade_date)
+            prices = {key: float(row[key]) for key in ('open', 'high', 'low', 'close')}
+            if not benchmark or any(not math.isfinite(value) or value <= 0 for value in prices.values()):
+                raise ValueError('INVALID_BENCHMARK_PRICE')
+            if trade_date in values.setdefault(benchmark, {}):
+                raise ValueError('DUPLICATE_BENCHMARK_DATE')
+            values[benchmark][trade_date] = prices
     return values
 
 

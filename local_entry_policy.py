@@ -115,7 +115,16 @@ def check_local_entry(*, candidate, price, quantity, equity, holdings,
     if cost["gross_profit_yuan"] <= policy.min_target_cost_multiple * cost["round_trip_cost_yuan"]:
         return "BUY_TARGET_COST_COVERAGE"
     expected_gross_bps = candidate.evidence.get("expected_gross_return_bps")
-    if expected_gross_bps is not None:
+    expected_net_bps = candidate.evidence.get("expected_net_return_bps")
+    if expected_net_bps is not None:
+        try:
+            if not math.isfinite(float(expected_net_bps)):
+                return "BUY_EXPECTED_NET_RETURN_UNAVAILABLE"
+        except (TypeError, ValueError):
+            return "BUY_EXPECTED_NET_RETURN_UNAVAILABLE"
+        if float(expected_net_bps) < policy.min_expected_net_return_bps:
+            return "BUY_EXPECTED_NET_RETURN_BELOW_THRESHOLD"
+    elif expected_gross_bps is not None:
         gate = expected_net_return_gate(
             price,
             quantity,

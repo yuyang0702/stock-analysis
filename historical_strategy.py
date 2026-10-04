@@ -90,6 +90,7 @@ def generate_daily_candidates(
     max_chase_atr: float = 0.0,
     max_entry_score: float = 100.0,
     alpha_profile: str = "legacy",
+    benchmark_closes: Mapping[str, float] | None = None,
 ) -> list[Candidate]:
     rows = [row for row in store.daily_slice(dataset_id, trade_date) if _eligible(row)]
     if mode == "strict":
@@ -106,6 +107,7 @@ def generate_daily_candidates(
             require_breakout_confirmation=require_breakout_confirmation,
             max_chase_atr=max_chase_atr,
             alpha_profile=alpha_profile,
+            benchmark_closes=benchmark_closes,
         )
     else:
         raise HistoricalDataValidationError(f"unknown strategy mode: {mode}")
@@ -183,6 +185,7 @@ def _strict_candidates(
             entry, stop, board, _float(features["position_pct"]), state
         )
         expected_gross = _float(features.get("expected_gross_return_bps"))
+        expected_net = _float(features.get("expected_net_return_bps"))
         evidence = {
             "proxy_only": False,
             "parameter_version": parameter_version,
@@ -191,6 +194,8 @@ def _strict_candidates(
         }
         if expected_gross is not None and math.isfinite(expected_gross) and expected_gross >= 0:
             evidence["expected_gross_return_bps"] = expected_gross
+        if expected_net is not None and math.isfinite(expected_net):
+            evidence["expected_net_return_bps"] = expected_net
         result.append(
             Candidate(
                 code=str(row["code"]),
@@ -222,6 +227,7 @@ def _price_core_candidates(
     require_breakout_confirmation: bool = False,
     max_chase_atr: float = 0.0,
     alpha_profile: str = "legacy",
+    benchmark_closes: Mapping[str, float] | None = None,
 ) -> list[Candidate]:
     prepared = []
     for row in rows:
@@ -239,8 +245,20 @@ def _price_core_candidates(
         ]
         atr = _atr14(history)
         prepared.append((row, history, closes, amounts, returns, atr))
-    if alpha_profile not in {"legacy", "relative_v1"}:
+    if alpha_profile not in {"legacy", "relative_v1", "relative_v2"}:
         raise HistoricalDataValidationError(f"UNKNOWN_ALPHA_PROFILE:{alpha_profile}")
+    benchmark_return = None
+    if alpha_profile == "relative_v2":
+        sessions = store.trade_dates(dataset_id, "1900-01-01", trade_date)[-21:]
+        if len(sessions) < 21 or any(day not in (benchmark_closes or {}) for day in sessions):
+            # The first 20 sessions are a normal warm-up period.  A missing
+            # benchmark after warm-up is a fail-closed data quality issue, but
+            # should not abort an otherwise reproducible backtest run.
+            return []
+        values = [float(benchmark_closes[day]) for day in sessions]
+        if any(not math.isfinite(value) or value <= 0 for value in values):
+            raise HistoricalDataValidationError("BENCHMARK_HISTORY_INVALID")
+        benchmark_return = values[-1] / values[0] - 1
     pct_values = [item[4][-1] for item in prepared]
     relative_values = [_return_over(item[2], 20) for item in prepared]
     amount_values = [item[3][-1] for item in prepared]
@@ -262,9 +280,12 @@ def _price_core_candidates(
     # research pass showed that CAUTION entries stayed negative after costs,
     # so only NORMAL conditions can open new long positions.
     if market_state == "RISK_OFF" or (
-        market_state == "CAUTION" and alpha_profile == "legacy"
+        market_state == "CAUTION" and alpha_profile in {"legacy", "relative_v2"}
     ):
         return []
+    if alpha_profile == "relative_v2" and benchmark_return < 0:
+        return []
+    industry_features = store.features_for_date(dataset_id, trade_date)
     result = []
     for row, history, closes, amounts, returns, atr in prepared:
         close = closes[-1]
@@ -289,7 +310,14 @@ def _price_core_candidates(
         liquidity_ratio_stock = _liquidity_ratio(amounts)
         liquidity_values = [_liquidity_ratio(item[3]) for item in prepared]
         liquidity_rank = _percentile(liquidity_ratio_stock, liquidity_values)
-        if alpha_profile == "relative_v1":
+        if alpha_profile == "relative_v2":
+            # Experimental ablation: volume/volatility stay in execution risk,
+            # not alpha. Independent benchmark strength must also be positive.
+            excess_strength = relative_strength_20 - benchmark_return
+            if excess_strength <= 0:
+                continue
+            score = min(100.0, 60 + 12 * int(trend) + 8 * int(breakout) + 20 * relative_rank)
+        elif alpha_profile == "relative_v1":
             # Cross-sectional strength is more useful than an absolute score
             # when the A-share market rotates between styles.  Volatility and
             # liquidity are included as execution-aware quality terms.
@@ -319,7 +347,7 @@ def _price_core_candidates(
                 atr14=atr,
                 mode="short" if breakout or returns[-1] >= 5 else "mid",
                 market_regime=market_state,
-                industry="unknown",
+                industry=str(industry_features.get(str(row["code"]), {}).get("industry") or "unknown"),
                 theme="unknown",
                 evidence={
                     "proxy_only": True,
@@ -331,6 +359,8 @@ def _price_core_candidates(
                     "amount_rank": amount_rank,
                     "alpha_profile": alpha_profile,
                     "relative_strength_20": round(relative_strength_20, 6),
+                    "benchmark_return_20": benchmark_return,
+                    "excess_strength_20": (relative_strength_20 - benchmark_return) if benchmark_return is not None else None,
                     "relative_rank": round(relative_rank, 6),
                     "volatility_20": round(_realized_volatility(returns[-20:]), 6),
                     "liquidity_ratio": round(liquidity_ratio_stock, 6),

@@ -15,6 +15,7 @@ from historical_backtest import (
     run_historical_backtest,
 )
 from historical_data import HistoricalStore
+from benchmark_data import load_benchmark_csv
 
 
 def _numbers(values: Iterable[float]) -> tuple[float, ...]:
@@ -80,16 +81,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--commission-multipliers", default="0.8,1,1.2")
     parser.add_argument("--slippage-multipliers", default="0.5,1,2")
-    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="relative_v1")
+    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="relative_v1")
+    parser.add_argument("--benchmark-csv", default="")
+    parser.add_argument("--benchmark", default="")
     parser.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="liquidity_v1")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    benchmark_closes = None
+    if args.alpha_profile == "relative_v2" and not args.benchmark_csv:
+        raise ValueError("BENCHMARK_CSV_REQUIRED_FOR_RELATIVE_V2")
+    if args.benchmark_csv:
+        values = load_benchmark_csv(args.benchmark_csv)
+        name = args.benchmark or (sorted(values)[0] if values else "")
+        if name not in values:
+            raise ValueError("BENCHMARK_NOT_FOUND")
+        benchmark_closes = values[name]
     config = HistoricalBacktestConfig(
         mode="price_core",
         alpha_profile=args.alpha_profile,
+        benchmark_closes=benchmark_closes,
         slippage_model=args.slippage_model,
         max_positions=4,
         min_score=70,

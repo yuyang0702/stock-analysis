@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
 import config as app_config
+from benchmark_data import load_benchmark_csv
 from execution_contracts import FeeBreakdown, FeeSchedule, canonical_json
 from exit_policy import (
     PositionExitState,
@@ -73,6 +74,7 @@ class HistoricalBacktestConfig:
     market_risk_exit_enabled: bool = False
     local_entry_gates_enabled: bool = False
     alpha_profile: str = "legacy"
+    benchmark_closes: Mapping[str, float] | None = field(default=None, repr=False)
     slippage_model: str = "fixed"
     max_participation_pct: float = 100.0
     min_holding_days: int = 0
@@ -104,7 +106,7 @@ class HistoricalBacktestConfig:
             raise ValueError("max_same_industry_positions must be a positive integer")
         if not math.isfinite(float(self.max_pairwise_correlation)) or not 0 <= self.max_pairwise_correlation <= 1:
             raise ValueError("max_pairwise_correlation must be between 0 and 1")
-        if self.alpha_profile not in {"legacy", "relative_v1"}:
+        if self.alpha_profile not in {"legacy", "relative_v1", "relative_v2"}:
             raise ValueError("unknown alpha_profile")
         if self.slippage_model not in {"fixed", "liquidity_v1"}:
             raise ValueError("unknown slippage_model")
@@ -785,6 +787,7 @@ def run_historical_backtest(
             max_chase_atr=config.max_chase_atr,
             max_entry_score=config.max_entry_score,
             alpha_profile=config.alpha_profile,
+            benchmark_closes=config.benchmark_closes,
             cooldown_codes={
                 code for code, until in cooldown_until.items()
                 if current_index <= int(until)
@@ -827,6 +830,7 @@ def run_historical_backtest(
             "market_risk_exit_enabled": bool(config.market_risk_exit_enabled),
             "local_entry_gates_enabled": bool(config.local_entry_gates_enabled),
             "alpha_profile": config.alpha_profile,
+            "benchmark_data_present": bool(config.benchmark_closes),
             "slippage_model": config.slippage_model,
             "max_participation_pct": float(config.max_participation_pct),
             "min_holding_days": int(config.min_holding_days),
@@ -1096,7 +1100,7 @@ def run_walk_forward(
         raise HistoricalDataValidationError("INVALID_MIN_SCORE_GRID")
     if not positions or any(value <= 0 for value in positions):
         raise HistoricalDataValidationError("INVALID_MAX_POSITIONS_GRID")
-    if any(value not in {"legacy", "relative_v1"} for value in alpha_profiles):
+    if any(value not in {"legacy", "relative_v1", "relative_v2"} for value in alpha_profiles):
         raise HistoricalDataValidationError("INVALID_ALPHA_PROFILE_GRID")
     if any(value not in {"fixed", "liquidity_v1"} for value in slippage_models):
         raise HistoricalDataValidationError("INVALID_SLIPPAGE_MODEL_GRID")
@@ -1406,6 +1410,7 @@ def _implementation_paths() -> tuple[Path, ...]:
         "trade_safety.py",
         "historical_data.py",
         "historical_strategy.py",
+        "benchmark_data.py",
         "historical_backtest.py",
         "local_entry_policy.py",
         "ml_contracts.py",
@@ -1590,6 +1595,22 @@ def _load_json_rows(path: Path) -> list[dict[str, object]]:
     return [dict(row) for row in value]
 
 
+def _benchmark_closes_from_args(args) -> dict[str, float] | None:
+    """Load only the selected independent benchmark for experimental profiles."""
+    path = str(getattr(args, "benchmark_csv", "") or "").strip()
+    if not path:
+        if getattr(args, "alpha_profile", "legacy") == "relative_v2":
+            raise ValueError("BENCHMARK_CSV_REQUIRED_FOR_RELATIVE_V2")
+        return None
+    values = load_benchmark_csv(path)
+    name = str(getattr(args, "benchmark", "") or "").strip()
+    if not name:
+        name = sorted(values)[0] if values else ""
+    if name not in values:
+        raise ValueError("BENCHMARK_NOT_FOUND")
+    return values[name]
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Point-in-time A-share historical backtest")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1647,7 +1668,9 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--max-pairwise-correlation", type=float, default=0.9)
         child.add_argument("--market-risk-exit", action="store_true")
         child.add_argument("--local-entry-gates", action="store_true")
-        child.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+        child.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="legacy")
+        child.add_argument("--benchmark-csv", default="", help="canonical independent benchmark CSV (required by relative_v2)")
+        child.add_argument("--benchmark", default="", help="benchmark name in --benchmark-csv")
         child.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")
         child.add_argument("--max-participation-pct", type=float, default=100.0)
         child.add_argument("--min-holding-days", type=int, default=0)
@@ -1679,7 +1702,9 @@ def _parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--max-pairwise-correlation", type=float, default=0.9)
     walk_forward.add_argument("--market-risk-exit", action="store_true")
     walk_forward.add_argument("--local-entry-gates", action="store_true")
-    walk_forward.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+    walk_forward.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="legacy")
+    walk_forward.add_argument("--benchmark-csv", default="", help="canonical independent benchmark CSV (required by relative_v2)")
+    walk_forward.add_argument("--benchmark", default="", help="benchmark name in --benchmark-csv")
     walk_forward.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")
     walk_forward.add_argument("--max-participation-pct", type=float, default=100.0)
     walk_forward.add_argument("--min-holding-days", type=int, default=0)
@@ -1881,6 +1906,7 @@ def main(argv: list[str] | None = None) -> int:
                     market_risk_exit_enabled=args.market_risk_exit,
                     local_entry_gates_enabled=args.local_entry_gates,
                     alpha_profile=args.alpha_profile,
+                    benchmark_closes=_benchmark_closes_from_args(args),
                     slippage_model=args.slippage_model,
                     max_participation_pct=args.max_participation_pct,
                     min_holding_days=args.min_holding_days,
@@ -1941,6 +1967,7 @@ def main(argv: list[str] | None = None) -> int:
         market_risk_exit_enabled=args.market_risk_exit,
         local_entry_gates_enabled=args.local_entry_gates,
         alpha_profile=args.alpha_profile,
+        benchmark_closes=_benchmark_closes_from_args(args),
         slippage_model=args.slippage_model,
         max_participation_pct=args.max_participation_pct,
         min_holding_days=args.min_holding_days,
