@@ -20,6 +20,7 @@ from typing import Iterable, Mapping, Sequence
 
 import config as app_config
 from benchmark_data import load_benchmark_bars
+from decision_profiles import ALPHA_PROFILES
 from execution_contracts import FeeSchedule
 from historical_data import HistoricalDataValidationError, HistoricalStore
 from historical_strategy import Candidate, generate_daily_candidates
@@ -274,6 +275,8 @@ def research_signals(
                 "amount_rank": float(candidate.evidence.get("amount_rank") or 0.0),
                 "liquidity_ratio": float(candidate.evidence.get("liquidity_ratio") or 0.0),
                 "volatility_20": float(candidate.evidence.get("volatility_20") or 0.0),
+                "return_5": float(candidate.evidence.get("return_5") or 0.0),
+                "excess_strength_20": float(candidate.evidence.get("excess_strength_20") or 0.0),
             }
             observations.append(
                 SignalObservation(
@@ -297,7 +300,10 @@ def research_signals(
         for horizon in sorted({int(value) for value in horizons})
     }
     by_horizon: dict[str, object] = {}
-    factor_names = ("score", "pct_rank", "relative_rank", "amount_rank", "liquidity_ratio", "volatility_20")
+    factor_names = (
+        "score", "pct_rank", "relative_rank", "amount_rank", "liquidity_ratio",
+        "volatility_20", "return_5", "excess_strength_20",
+    )
     for horizon in sorted({int(value) for value in horizons}):
         by_horizon[str(horizon)] = {
             "score_bucket": _group_metrics(observations, lambda item: _bucket(item.score), horizon),
@@ -377,7 +383,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-score", type=float, default=75.0)
     parser.add_argument("--horizons", default="1,3,5,10")
     parser.add_argument("--notional-per-signal", type=float, default=100_000.0)
-    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="legacy")
+    parser.add_argument("--alpha-profile", choices=ALPHA_PROFILES, default="legacy")
     parser.add_argument("--benchmark-csv")
     parser.add_argument("--benchmark", default="")
     parser.add_argument("--min-expected-net-return-bps", type=float, default=0.0)

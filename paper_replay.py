@@ -15,6 +15,8 @@ from pathlib import Path
 import pandas as pd
 
 from historical_backtest import HistoricalBacktestConfig
+from benchmark_data import load_benchmark_csv
+from decision_profiles import ALPHA_PROFILES
 from historical_data import HistoricalStore
 from historical_strategy import generate_daily_candidates
 from paper_trading import apply_paper_trades, new_account, summarize_account
@@ -88,6 +90,7 @@ def replay_paper_account(
                 max_chase_atr=config.max_chase_atr,
                 max_entry_score=config.max_entry_score,
                 alpha_profile=config.alpha_profile,
+                benchmark_closes=config.benchmark_closes,
             )
             next_date = dates[index + 1]
             pending[next_date] = candidates[: config.max_new_positions_per_day]
@@ -128,7 +131,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-trend-confirmation", action="store_true")
     parser.add_argument("--max-chase-atr", type=float, default=2.5)
     parser.add_argument("--max-entry-score", type=float, default=94.999)
-    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="relative_v1")
+    parser.add_argument("--alpha-profile", choices=ALPHA_PROFILES, default="relative_v1")
+    parser.add_argument("--benchmark-csv", default="")
+    parser.add_argument("--benchmark", default="000300.XSHG")
     return parser
 
 
@@ -136,6 +141,12 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     store = HistoricalStore(Path(args.db))
     store.initialize()
+    benchmark_closes = None
+    if args.benchmark_csv:
+        benchmark_values = load_benchmark_csv(Path(args.benchmark_csv))
+        if args.benchmark not in benchmark_values:
+            raise ValueError("BENCHMARK_NOT_FOUND")
+        benchmark_closes = benchmark_values[args.benchmark]
     config = HistoricalBacktestConfig(
         initial_cash=args.capital,
         mode=args.mode,
@@ -148,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         max_chase_atr=args.max_chase_atr,
         max_entry_score=args.max_entry_score,
         alpha_profile=args.alpha_profile,
+        benchmark_closes=benchmark_closes,
     )
     report = replay_paper_account(store, args.dataset, args.start, args.end, config)
     output = Path(args.output)

@@ -1,5 +1,7 @@
 # 项目接管与新环境恢复说明
 
+> 2026-10-04 本地决策层策略修正接管点：本轮代码已完成并通过 1123 项测试（3 项跳过）。实现了独立基准状态确认、四类实验 profile 的默认追涨/持有期约束、Walk-forward 有界 `ResearchDataset` 快照、全 profile 成本敏感性和纸面回放基准传递；严格点时股票池/行业历史数据按本轮第六项仍未实现。最新 JQData 代理验证的 Walk-forward 复合净收益为 -1.126%、holdout 无成交，当前没有生产准入证据。接管后先核对 `git status`、`docs/project_roadmap.md` 和本地输出目录，不要把代理结果或单个正收益 profile 当成券商可下单参数。
+
 > 2026-08-11 回测污染隔离接管检查点：服务器 `/opt/stock-analysis` 已部署 `97d251b` 并清理 8 月 8 日旧在线模板回测污染；211 个账户快照、217 次对账、1 条权益、1 份当前券商快照及其 JSONL/网页派生文件均已移入 `/opt/stock-analysis-backups/quarantine/joinquant-backtest-20260808-20260810/`，清理前 verified backup SHA-256 为 `614bea4fcd0302a03350cdbd6e0ba2012d49f69aac0628d39f63183f8e598b1c`。8 月 9–10 日无生产 API 回测写入，8 月 10 日 27 次真实扫描完整保留。服务器 Linux 1069 项测试通过（2 项平台限定跳过），schema 12 健康可写、服务/timer active、API 409/200 运行身份验证通过、环境哈希未变。当前账户/网页持仓文件按设计不存在；只有聚宽网站在线模拟盘更新为 `2026-08-11.1-runtime-isolation` 并回传首份 `sim_trade` 快照后才会恢复。GitHub `origin/main` 推送仍待明确外发审批，服务器未提交 P1 工作树已保存在 stash `2479aa600601f7ac8e2bcbbd08ced1c457f0b2c6` 和独立 predeploy bundle，不得误删。
 
 > 2026-08-10 接管检查点：P1/聚宽导出链路及 B0-B7 多路径因子改动已随提交 `f2c9441` 推送到 `origin/main`。修改或排查聚宽快照、原生回测、strict 导出、上传导入或便携因子前，必须先读 `docs/joinquant_exporter_development_manual.md`。Windows 全量发现共 1060 项，其中 1057 项通过；另 3 项仅因本机缺少 Linux `bash`，无法启动 `run_ubuntu.sh ledger-check`。当前新增内容为 `implemented / regression-tested / committed / pushed / not deployed / not observed / not validated`；本轮未连接或重启服务器，也未修改任何密钥、Token、Webhook、环境文件、账户或正式数据库。服务器和聚宽网站状态不可从 Git 状态推断，接手后必须重新只读核验。

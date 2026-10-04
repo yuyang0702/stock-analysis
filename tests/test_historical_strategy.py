@@ -241,6 +241,25 @@ class HistoricalStrategyTest(unittest.TestCase):
             self.assertEqual(candidates[0].evidence["alpha_profile"], "relative_v2")
             self.assertGreater(candidates[0].evidence["excess_strength_20"], 0)
 
+    def test_research_profiles_have_explicit_entry_horizons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(Path(tmp))
+            start = date(2024, 11, 20)
+            prior = 8.0
+            for offset in range(45):
+                day = (start + timedelta(days=offset)).isoformat()
+                close = round(10.0 + (offset % 6) * 0.03 + offset * 0.02, 2)
+                self._insert_market_day(store, day, "600000", close, prev_close=prior)
+                prior = close
+            day = (start + timedelta(days=44)).isoformat()
+            for profile, horizon in (("pullback_trend_v1", 5), ("short_reversal_v1", 3), ("breakout_v1", 1)):
+                candidates = generate_daily_candidates(
+                    store, "d1", day, mode="price_core", parameter_version=profile,
+                    min_score=0, alpha_profile=profile, max_chase_atr=10,
+                )
+                for candidate in candidates:
+                    self.assertEqual(candidate.evidence["horizon_days"], horizon)
+
     def test_strict_returns_no_candidates_when_features_are_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(Path(tmp))

@@ -17,6 +17,7 @@ from typing import Callable, Iterable, Mapping
 
 import config as app_config
 from benchmark_data import load_benchmark_csv
+from decision_profiles import ALPHA_PROFILES
 from execution_contracts import FeeBreakdown, FeeSchedule, canonical_json
 from exit_policy import (
     PositionExitState,
@@ -43,6 +44,7 @@ from local_entry_policy import (
     aligned_correlation,
     check_local_entry,
 )
+from research_dataset import ResearchDataset
 
 
 @dataclass(frozen=True)
@@ -106,8 +108,10 @@ class HistoricalBacktestConfig:
             raise ValueError("max_same_industry_positions must be a positive integer")
         if not math.isfinite(float(self.max_pairwise_correlation)) or not 0 <= self.max_pairwise_correlation <= 1:
             raise ValueError("max_pairwise_correlation must be between 0 and 1")
-        if self.alpha_profile not in {"legacy", "relative_v1", "relative_v2"}:
+        if self.alpha_profile not in ALPHA_PROFILES:
             raise ValueError("unknown alpha_profile")
+        if self.alpha_profile == "relative_v2" and not self.benchmark_closes:
+            raise ValueError("relative_v2 requires independent benchmark data")
         if self.slippage_model not in {"fixed", "liquidity_v1"}:
             raise ValueError("unknown slippage_model")
         if not math.isfinite(float(self.max_participation_pct)) or self.max_participation_pct <= 0:
@@ -172,6 +176,7 @@ class HistoricalPosition:
     last_adjust_factor: float = 1.0
     holding_trade_days: int = 0
     recent_returns: dict[str, float] = field(default_factory=dict)
+    target_holding_days: int = 0
 
 
 @dataclass(frozen=True)
@@ -454,7 +459,7 @@ def run_historical_backtest(
         new_positions_today = 0
         rows = {str(row["code"]): row for row in store.daily_slice(dataset_id, trade_date)}
         current_market_state = (
-            price_core_market_state(store, dataset_id, trade_date)
+            price_core_market_state(store, dataset_id, trade_date, config.benchmark_closes)
             if config.mode == "price_core" and positions and config.market_risk_exit_enabled
             else ""
         )
@@ -625,6 +630,7 @@ def run_historical_backtest(
                 entry_fee_remaining_yuan=fee,
                 last_adjust_factor=float(row["adjust_factor"]),
                 recent_returns=_prior_returns(store, dataset_id, candidate.code, order.decision_date),
+                target_holding_days=int(candidate.evidence.get("horizon_days", 0) or 0),
             )
             result.trades.append(
                 HistoricalTrade(
@@ -734,6 +740,14 @@ def run_historical_backtest(
                 continue
             position.holding_trade_days += 1
             if position.holding_trade_days < int(config.min_holding_days):
+                continue
+            if (
+                position.target_holding_days > 0
+                and position.holding_trade_days >= position.target_holding_days
+            ):
+                pending_sells.append(
+                    PendingSell(trade_date, code, position.quantity, "PROFILE_HORIZON_EXIT")
+                )
                 continue
             if config.market_risk_exit_enabled and current_market_state == "RISK_OFF":
                 pending_sells.append(
@@ -1084,6 +1098,10 @@ def run_walk_forward(
         raise HistoricalDataValidationError(
             f"INSUFFICIENT_WALK_FORWARD_DATES:{len(research_dates)}<{minimum_dates}"
         )
+    # Materialize one bounded, read-only research snapshot so parameter
+    # selection cannot accidentally mix datasets between folds and repeated
+    # scans do not perform an unbounded full-history read.
+    research_store = ResearchDataset(store, dataset_id, start, end)
     windows = build_walk_forward_windows(research_dates, count=folds)
     if len(windows) != folds:
         raise HistoricalDataValidationError("INSUFFICIENT_WALK_FORWARD_WINDOWS")
@@ -1100,7 +1118,7 @@ def run_walk_forward(
         raise HistoricalDataValidationError("INVALID_MIN_SCORE_GRID")
     if not positions or any(value <= 0 for value in positions):
         raise HistoricalDataValidationError("INVALID_MAX_POSITIONS_GRID")
-    if any(value not in {"legacy", "relative_v1", "relative_v2"} for value in alpha_profiles):
+    if any(value not in ALPHA_PROFILES for value in alpha_profiles):
         raise HistoricalDataValidationError("INVALID_ALPHA_PROFILE_GRID")
     if any(value not in {"fixed", "liquidity_v1"} for value in slippage_models):
         raise HistoricalDataValidationError("INVALID_SLIPPAGE_MODEL_GRID")
@@ -1122,7 +1140,7 @@ def run_walk_forward(
                             parameter_version=f"{base_config.parameter_version}:wf{index}:train",
                         )
                         training_result = run_historical_backtest(
-                            store,
+                            research_store,
                             dataset_id,
                             window.training_start,
                             window.training_end,
@@ -1158,7 +1176,7 @@ def run_walk_forward(
             parameter_version=f"{base_config.parameter_version}:wf{index}:validation",
         )
         validation_result = run_historical_backtest(
-            store,
+            research_store,
             dataset_id,
             window.validation_start,
             window.validation_end,
@@ -1186,7 +1204,7 @@ def run_walk_forward(
             parameter_version=f"{base_config.parameter_version}:holdout",
         )
         holdout_result = run_historical_backtest(
-            store, dataset_id, holdout[0], holdout[-1], holdout_config
+            research_store, dataset_id, holdout[0], holdout[-1], holdout_config
         )
         holdout_report = {
             "window": {"start": holdout[0], "end": holdout[-1]},
@@ -1206,7 +1224,7 @@ def run_walk_forward(
     return {
         "status": "complete" if evidence_ready else "insufficient_evidence",
         "dataset_id": str(dataset_id),
-        "dataset_hash": store.dataset_hash(dataset_id),
+        "dataset_hash": research_store.dataset_hash(dataset_id),
         "mode": base_config.mode,
         "base_parameters": {
             "max_positions": base_config.max_positions,
@@ -1411,6 +1429,8 @@ def _implementation_paths() -> tuple[Path, ...]:
         "historical_data.py",
         "historical_strategy.py",
         "benchmark_data.py",
+        "decision_profiles.py",
+        "research_dataset.py",
         "historical_backtest.py",
         "local_entry_policy.py",
         "ml_contracts.py",
@@ -1668,7 +1688,7 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--max-pairwise-correlation", type=float, default=0.9)
         child.add_argument("--market-risk-exit", action="store_true")
         child.add_argument("--local-entry-gates", action="store_true")
-        child.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="legacy")
+        child.add_argument("--alpha-profile", choices=ALPHA_PROFILES, default="legacy")
         child.add_argument("--benchmark-csv", default="", help="canonical independent benchmark CSV (required by relative_v2)")
         child.add_argument("--benchmark", default="", help="benchmark name in --benchmark-csv")
         child.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")
@@ -1702,7 +1722,7 @@ def _parser() -> argparse.ArgumentParser:
     walk_forward.add_argument("--max-pairwise-correlation", type=float, default=0.9)
     walk_forward.add_argument("--market-risk-exit", action="store_true")
     walk_forward.add_argument("--local-entry-gates", action="store_true")
-    walk_forward.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="legacy")
+    walk_forward.add_argument("--alpha-profile", choices=ALPHA_PROFILES, default="legacy")
     walk_forward.add_argument("--benchmark-csv", default="", help="canonical independent benchmark CSV (required by relative_v2)")
     walk_forward.add_argument("--benchmark", default="", help="benchmark name in --benchmark-csv")
     walk_forward.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")

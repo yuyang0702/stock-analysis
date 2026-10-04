@@ -25,6 +25,8 @@ from historical_backtest import (
     compute_metrics,
     run_historical_backtest,
 )
+from benchmark_data import load_benchmark_csv
+from decision_profiles import ALPHA_PROFILES
 from historical_data import STRICT_FEATURES, HistoricalStore, validate_dataset
 
 
@@ -513,7 +515,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pairwise-correlation", type=float, default=0.9)
     parser.add_argument("--market-risk-exit", action="store_true")
     parser.add_argument("--local-entry-gates", action="store_true")
-    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1"), default="legacy")
+    parser.add_argument("--alpha-profile", choices=ALPHA_PROFILES, default="legacy")
+    parser.add_argument("--benchmark-csv", default="", help="canonical independent benchmark CSV (required by relative_v2)")
+    parser.add_argument("--benchmark", default="000300.XSHG")
     parser.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="fixed")
     parser.add_argument("--max-participation-pct", type=float, default=100.0)
     parser.add_argument("--min-holding-days", type=int, default=0)
@@ -547,6 +551,10 @@ def main(argv: list[str] | None = None) -> int:
         slippage_model=args.slippage_model,
         max_participation_pct=args.max_participation_pct,
         min_holding_days=args.min_holding_days,
+        benchmark_closes=(
+            load_benchmark_csv(Path(args.benchmark_csv)).get(args.benchmark)
+            if args.benchmark_csv else None
+        ),
     )
     report = build_long_cycle_report(
         store,

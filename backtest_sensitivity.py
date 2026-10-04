@@ -16,6 +16,7 @@ from historical_backtest import (
 )
 from historical_data import HistoricalStore
 from benchmark_data import load_benchmark_csv
+from decision_profiles import ALPHA_PROFILES
 
 
 def _numbers(values: Iterable[float]) -> tuple[float, ...]:
@@ -81,7 +82,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--commission-multipliers", default="0.8,1,1.2")
     parser.add_argument("--slippage-multipliers", default="0.5,1,2")
-    parser.add_argument("--alpha-profile", choices=("legacy", "relative_v1", "relative_v2"), default="relative_v1")
+    parser.add_argument("--alpha-profile", choices=ALPHA_PROFILES, default="relative_v1")
     parser.add_argument("--benchmark-csv", default="")
     parser.add_argument("--benchmark", default="")
     parser.add_argument("--slippage-model", choices=("fixed", "liquidity_v1"), default="liquidity_v1")
@@ -109,15 +110,11 @@ def main(argv: list[str] | None = None) -> int:
         caution_min_score=75,
         cooldown_days=5,
         max_new_positions_per_day=2,
-        require_trend_confirmation=True,
-        max_chase_atr=2.5,
-        signal_confirmation_days=2,
         max_portfolio_risk_pct=4,
         max_same_industry_positions=2,
         max_pairwise_correlation=0.9,
         local_entry_gates_enabled=True,
         max_participation_pct=2,
-        min_holding_days=2,
     )
     report = run_cost_sensitivity(
         HistoricalStore(Path(args.db)),

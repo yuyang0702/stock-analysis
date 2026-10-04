@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import pandas as pd
 
 from candidate_core import score_candidate_frame
+from decision_profiles import ALPHA_PROFILES, RESEARCH_PROFILES, confirmed_benchmark_state
 from exit_policy import board_type, initial_stop_price, market_regime, risk_position_pct
 from historical_data import HistoricalDataValidationError, HistoricalStore, STRICT_FEATURES
 from ml_contracts import CandidateSample
@@ -230,6 +231,12 @@ def _price_core_candidates(
     benchmark_closes: Mapping[str, float] | None = None,
 ) -> list[Candidate]:
     prepared = []
+    profile_defaults = RESEARCH_PROFILES.get(alpha_profile)
+    effective_max_chase_atr = (
+        float(max_chase_atr)
+        if float(max_chase_atr) > 0
+        else (float(profile_defaults.max_chase_atr) if profile_defaults else 0.0)
+    )
     for row in rows:
         if str(row["code"]) in (cooldown_codes or set()):
             continue
@@ -245,9 +252,10 @@ def _price_core_candidates(
         ]
         atr = _atr14(history)
         prepared.append((row, history, closes, amounts, returns, atr))
-    if alpha_profile not in {"legacy", "relative_v1", "relative_v2"}:
+    if alpha_profile not in ALPHA_PROFILES:
         raise HistoricalDataValidationError(f"UNKNOWN_ALPHA_PROFILE:{alpha_profile}")
     benchmark_return = None
+    benchmark_return_5 = None
     if alpha_profile == "relative_v2":
         sessions = store.trade_dates(dataset_id, "1900-01-01", trade_date)[-21:]
         if len(sessions) < 21 or any(day not in (benchmark_closes or {}) for day in sessions):
@@ -259,6 +267,14 @@ def _price_core_candidates(
         if any(not math.isfinite(value) or value <= 0 for value in values):
             raise HistoricalDataValidationError("BENCHMARK_HISTORY_INVALID")
         benchmark_return = values[-1] / values[0] - 1
+        benchmark_return_5 = values[-1] / values[-6] - 1
+    elif benchmark_closes:
+        sessions = store.trade_dates(dataset_id, "1900-01-01", trade_date)[-21:]
+        if len(sessions) >= 21 and all(day in benchmark_closes for day in sessions):
+            values = [float(benchmark_closes[day]) for day in sessions]
+            if all(math.isfinite(value) and value > 0 for value in values):
+                benchmark_return = values[-1] / values[0] - 1
+                benchmark_return_5 = values[-1] / values[-6] - 1
     pct_values = [item[4][-1] for item in prepared]
     relative_values = [_return_over(item[2], 20) for item in prepared]
     amount_values = [item[3][-1] for item in prepared]
@@ -274,15 +290,22 @@ def _price_core_candidates(
         volatility=volatility,
         liquidity_ratio=liquidity_ratio,
     )
+    market_state = _with_benchmark_regime(
+        store, dataset_id, trade_date, market_state, benchmark_closes
+    )
     # The price-core dataset has no point-in-time index membership or status
     # history.  In that proxy mode, a weak broad tape is a reason to stay flat
     # rather than manufacture long entries from relative strength.  The signal
     # research pass showed that CAUTION entries stayed negative after costs,
     # so only NORMAL conditions can open new long positions.
     if market_state == "RISK_OFF" or (
-        market_state == "CAUTION" and alpha_profile in {"legacy", "relative_v2"}
+        market_state == "CAUTION" and alpha_profile in {
+            "legacy", "relative_v2", "pullback_trend_v1", "breakout_v1"
+        }
     ):
         return []
+    if alpha_profile == "relative_v2" and benchmark_return is None:
+        raise HistoricalDataValidationError("BENCHMARK_REQUIRED_FOR_RELATIVE_V2")
     if alpha_profile == "relative_v2" and benchmark_return < 0:
         return []
     industry_features = store.features_for_date(dataset_id, trade_date)
@@ -294,13 +317,27 @@ def _price_core_candidates(
         ma20 = sum(closes[-20:]) / 20
         trend = close > ma5 > ma10 > ma20
         breakout = close >= max(closes[-21:-1])
+        return_5 = _return_over(closes, 5)
         chase_atr = (close - ma20) / atr if atr > 0 else 0.0
         if require_trend_confirmation and not trend:
             continue
         if require_breakout_confirmation and not breakout:
             continue
-        if max_chase_atr > 0 and chase_atr > max_chase_atr:
+        if effective_max_chase_atr > 0 and chase_atr > effective_max_chase_atr:
             continue
+        if alpha_profile == "pullback_trend_v1":
+            # Trend continuation after a pullback: remain above MA20, avoid a
+            # fresh breakout, and require the latest bar not to be euphoric.
+            if not (close > ma20 and ma5 > ma10 and not breakout and return_5 <= 0.03):
+                continue
+        elif alpha_profile == "short_reversal_v1":
+            # Short-horizon mean reversion experiment.  It is long-only and
+            # deliberately bounded to shallow drawdowns inside a broader tape.
+            if not (-0.08 <= return_5 < -0.01 and close > ma20 * 0.95):
+                continue
+        elif alpha_profile == "breakout_v1":
+            if not (trend and breakout):
+                continue
         pct_rank = _percentile(returns[-1], pct_values)
         relative_strength_20 = _return_over(closes, 20)
         relative_rank = _percentile(relative_strength_20, relative_values)
@@ -310,14 +347,24 @@ def _price_core_candidates(
         liquidity_ratio_stock = _liquidity_ratio(amounts)
         liquidity_values = [_liquidity_ratio(item[3]) for item in prepared]
         liquidity_rank = _percentile(liquidity_ratio_stock, liquidity_values)
-        if alpha_profile == "relative_v2":
+        if alpha_profile == "pullback_trend_v1":
+            score = 62 + 16 * int(trend) + 16 * relative_rank + 6 * (1 - pct_rank)
+            horizon_days = profile_defaults.horizon_days
+        elif alpha_profile == "short_reversal_v1":
+            score = 64 + 18 * (1 - relative_rank) + 12 * (1 - pct_rank) + 6 * amount_rank
+            horizon_days = profile_defaults.horizon_days
+        elif alpha_profile == "breakout_v1":
+            score = 62 + 18 * int(trend) + 16 * int(breakout) + 10 * relative_rank
+            horizon_days = profile_defaults.horizon_days
+        elif alpha_profile == "relative_v2":
             # Experimental ablation: volume/volatility stay in execution risk,
             # not alpha. Independent benchmark strength must also be positive.
             excess_strength = relative_strength_20 - benchmark_return
             if excess_strength <= 0:
                 continue
             score = min(100.0, 60 + 12 * int(trend) + 8 * int(breakout) + 20 * relative_rank)
-        elif alpha_profile == "relative_v1":
+            horizon_days = 3
+        elif alpha_profile in {"relative_v1", "relative_strength_v1"}:
             # Cross-sectional strength is more useful than an absolute score
             # when the A-share market rotates between styles.  Volatility and
             # liquidity are included as execution-aware quality terms.
@@ -330,8 +377,10 @@ def _price_core_candidates(
                 + 5 * liquidity_rank
                 + 5 * (1 - volatility_rank)
             )
+            horizon_days = profile_defaults.horizon_days if profile_defaults else 5
         else:
             score = 70 + 10 * int(trend) + 8 * int(breakout) + 5 * pct_rank + 2 * amount_rank
+            horizon_days = 5
         board = board_type(str(row["code"]), close, atr)
         stop = initial_stop_price(close, min(closes[-10:]), atr, board)
         position = risk_position_pct(close, stop, board, 10, market_state)
@@ -358,8 +407,10 @@ def _price_core_candidates(
                     "pct_rank": pct_rank,
                     "amount_rank": amount_rank,
                     "alpha_profile": alpha_profile,
+                    "horizon_days": horizon_days,
                     "relative_strength_20": round(relative_strength_20, 6),
                     "benchmark_return_20": benchmark_return,
+                    "benchmark_return_5": benchmark_return_5,
                     "excess_strength_20": (relative_strength_20 - benchmark_return) if benchmark_return is not None else None,
                     "relative_rank": round(relative_rank, 6),
                     "volatility_20": round(_realized_volatility(returns[-20:]), 6),
@@ -369,6 +420,7 @@ def _price_core_candidates(
                     "market_liquidity_ratio": round(liquidity_ratio, 6),
                     "market_return_5": round(market_return_5, 4),
                     "market_return_20": round(market_return_20, 4),
+                    "return_5": round(return_5, 6),
                     "recent_returns": {
                         str(item["trade_date"]): round(
                             float(item["close"]) / float(item["prev_close"]) - 1, 6
@@ -439,8 +491,19 @@ def _median_liquidity_ratio(prepared: list[tuple]) -> float:
     return values[len(values) // 2] if values else 0.0
 
 
+def _with_benchmark_regime(store, dataset_id, trade_date, market_state, benchmark_closes):
+    if not benchmark_closes:
+        return market_state
+    # Finite causal lookback; identical inputs in live/replay/validation folds.
+    sessions = store.trade_dates(dataset_id, "1900-01-01", trade_date)[-80:]
+    confirmed = confirmed_benchmark_state(sessions, benchmark_closes)
+    severity = {"NORMAL": 0, "CAUTION": 1, "RISK_OFF": 2}
+    return confirmed if severity[confirmed] > severity[market_state] else market_state
+
+
 def price_core_market_state(
-    store: HistoricalStore, dataset_id: str, trade_date: str
+    store: HistoricalStore, dataset_id: str, trade_date: str,
+    benchmark_closes: Mapping[str, float] | None = None,
 ) -> str:
     """Return the same point-in-time tape state used by price-core entries.
 
@@ -462,13 +525,14 @@ def price_core_market_state(
             if float(item["prev_close"]) > 0
         ]
         prepared.append((row, history, closes, amounts, returns, _atr14(history)))
-    return _price_core_market_regime(
+    state = _price_core_market_regime(
         _cross_sectional_return(prepared, 5),
         _cross_sectional_return(prepared, 20),
         breadth=_trend_breadth(prepared),
         volatility=_median_volatility(prepared),
         liquidity_ratio=_median_liquidity_ratio(prepared),
     )
+    return _with_benchmark_regime(store, dataset_id, trade_date, state, benchmark_closes)
 
 
 def _price_core_market_regime(
